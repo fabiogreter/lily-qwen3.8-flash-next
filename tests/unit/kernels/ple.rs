@@ -34,7 +34,7 @@ fn cpu_hash_ids(
         let s1 = if p1 == eos { eos } else { p1 };
         let s2 = if p1 == eos || p2 == eos { eos } else { p2 };
         for j in 0..heads {
-            let mut mixed = t0 as u64 * mult[0] ^ s1 as u64 * mult[1];
+            let mut mixed = (t0 as u64 * mult[0]) ^ (s1 as u64 * mult[1]);
             if j / hpn >= 1 {
                 mixed ^= s2 as u64 * mult[2];
             }

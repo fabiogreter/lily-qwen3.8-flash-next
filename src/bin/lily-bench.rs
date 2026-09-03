@@ -3,9 +3,12 @@ use std::time::Instant;
 
 use anyhow::{Result, ensure};
 use clap::Parser;
+use lily::engine::{LanguageModel, ScratchApi};
 use lily::kernels::attention::MAX_SEQ;
 use lily::metal::MetalContext;
 use lily::model::Qwen3_5Model;
+use lily::qwen4exp::Qwen4ExpModel;
+use lily::serve::checkpoint_model_type;
 
 #[derive(Parser)]
 #[command(name = "lily-bench", about = "In-process production generation benchmark")]
@@ -30,6 +33,14 @@ fn fnv1a(tokens: &[u32]) -> u64 {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    match checkpoint_model_type(&cli.model)?.as_str() {
+        "qwen3_5_moe" => bench::<Qwen3_5Model>(&cli),
+        "qwen4_exp" => bench::<Qwen4ExpModel>(&cli),
+        other => anyhow::bail!("unsupported model_type {other:?}"),
+    }
+}
+
+fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
     ensure!(cli.prompt_len > 0, "--prompt-len must be positive");
     ensure!(cli.decode_steps > 0, "--decode-steps must be positive");
     let max_seq = cli
@@ -40,8 +51,8 @@ fn main() -> Result<()> {
     ensure!(max_seq <= MAX_SEQ, "benchmark exceeds model window {MAX_SEQ}");
 
     let ctx = MetalContext::new()?;
-    let model = Qwen3_5Model::load(&ctx, &cli.model)?;
-    let vocab = u32::try_from(model.config.vocab_size)?;
+    let model = M::load(&ctx, &cli.model)?;
+    let vocab = u32::try_from(model.vocab_size())?;
     let token = |index: usize| (index as u32).wrapping_mul(2_654_435_761) % vocab;
     let prompt: Vec<u32> = (0..cli.prompt_len).map(token).collect();
     let mut scratch = model.new_scratch_with_capacity(&ctx, max_seq)?;
@@ -67,7 +78,7 @@ fn main() -> Result<()> {
     // waiting for the previous one, with generated ids remaining on the GPU.
     // Submit the first decode before token delivery and cadence timing.
     let mut pending = model.submit_decode_step(&ctx, &mut state, &scratch, 0, 1)?;
-    let first_token_id = scratch.next_token.view(0, &[1])?.to_u32()?[0];
+    let first_token_id = scratch.next_token().view(0, &[1])?.to_u32()?[0];
     let prefill_secs = prefill_start.elapsed().as_secs_f64();
     let decode_start = Instant::now();
     let mut previous_delivery = decode_start;
@@ -89,7 +100,7 @@ fn main() -> Result<()> {
             pending.wait()?;
             None
         };
-        token_ids.push(scratch.next_token.view(index % 2, &[1])?.to_u32()?[0]);
+        token_ids.push(scratch.next_token().view(index % 2, &[1])?.to_u32()?[0]);
         let delivered = Instant::now();
         decode_intervals
             .push(delivered.duration_since(previous_delivery).as_secs_f64());
@@ -113,7 +124,7 @@ fn main() -> Result<()> {
         pending.wait()?;
         None
     };
-    token_ids.push(scratch.next_token.view(cli.decode_steps % 2, &[1])?.to_u32()?[0]);
+    token_ids.push(scratch.next_token().view(cli.decode_steps % 2, &[1])?.to_u32()?[0]);
     let delivered = Instant::now();
     decode_intervals.push(delivered.duration_since(previous_delivery).as_secs_f64());
     if let Some(completed) = completed {
@@ -146,6 +157,7 @@ fn main() -> Result<()> {
         "schema_version": 1,
         "meta": {
             "engine": "lily",
+            "model_id": M::MODEL_ID,
             "source_id": option_env!("LILY_BENCH_SOURCE_ID").unwrap_or("unknown"),
             "crate_version": env!("CARGO_PKG_VERSION"),
             "harness": "src/bin/lily-bench.rs",
