@@ -227,7 +227,7 @@ def build_model(directory: Path, layers: int, from_lily: bool, dtype: torch.dtyp
         ple = model.model.layers[i].ple.ple_embedding
         ple.ngram_embedding = LazyNGramEmbedding(prefix, store, lily, text_cfg.get("split_ngram_parts", 512), ple.ngram_embedding.embedding_dim)
 
-    state = build_state_dict(model, store, lily, layers, text_cfg)
+    state = build_state_dict(model, store, lily, text_cfg, raw_cfg.get("lily", {}).get("ple"))
     missing, unexpected = model.load_state_dict(state, strict=False, assign=True)
     # Non-persistent buffers and the lazy embedding's placeholder are expected.
     allowed_missing = {"model.rotary_emb.inv_freq", "model.rotary_emb.original_inv_freq"}
@@ -246,17 +246,29 @@ def build_model(directory: Path, layers: int, from_lily: bool, dtype: torch.dtyp
     return model, config
 
 
-def build_state_dict(model, store: Store, lily: LilyWeights | None, layers: int, text_cfg: dict) -> dict[str, torch.Tensor]:
-    """HF parameter names -> tensors, from either weight source."""
+_PLE_CONSTS = ("layer_multipliers", "ngram_heads_vocab_sizes", "ngram_heads_offsets")
+
+
+def build_state_dict(
+    model, store: Store, lily: LilyWeights | None, text_cfg: dict, ple_consts: dict | None
+) -> dict[str, torch.Tensor]:
+    """HF parameter names -> tensors, from either weight source. lily's
+    checkpoint carries the PLE hash constants in config.json, not as tensors."""
     h = text_cfg["hidden_size"]
     inter = text_cfg["moe_intermediate_size"]
     state: dict[str, torch.Tensor] = {}
     wanted = dict(model.named_parameters())
-    wanted.update({k: v for k, v in model.named_buffers() if k.endswith(("layer_multipliers", "ngram_heads_vocab_sizes", "ngram_heads_offsets"))})
+    wanted.update({k: v for k, v in model.named_buffers() if k.endswith(_PLE_CONSTS)})
     for name, param in wanted.items():
         if "ngram_embedding.weight" in name:
             continue
         src = "model.language_model." + name[len("model."):] if name.startswith("model.") else name
+        if name.endswith(_PLE_CONSTS) and not store.has(src):
+            key = name.rsplit(".", 1)[1]
+            if not ple_consts or key not in ple_consts:
+                raise SystemExit(f"{src} missing from checkpoint and config.json lily.ple")
+            state[name] = torch.tensor(ple_consts[key], dtype=torch.int64)
+            continue
         if src.endswith(".mlp.experts.gate_up_proj"):
             base = src[: -len("gate_up_proj")]
             if lily is None:
