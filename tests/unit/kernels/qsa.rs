@@ -9,7 +9,14 @@ fn random(rng: &mut StdRng, n: usize, lo: f32, hi: f32) -> Vec<f32> {
 }
 
 /// rmsnorm(+1) then partial NeoX RoPE on one head row, rounding like the kernel.
-fn prep_head(x: &[f32], w: &[f32], rot: usize, pos: usize, theta: f32, eps: f32) -> Vec<f32> {
+fn prep_head(
+    x: &[f32],
+    w: &[f32],
+    rot: usize,
+    pos: usize,
+    theta: f32,
+    eps: f32,
+) -> Vec<f32> {
     let gain: Vec<f32> = w.iter().map(|v| 1.0 + v).collect();
     let mut normed = cpu_ref::round_bf16(&cpu_ref::rmsnorm(x, &gain, x.len(), eps));
     cpu_ref::rope_neox(&mut normed, x.len(), rot, pos, theta);
@@ -20,7 +27,8 @@ fn prep_head(x: &[f32], w: &[f32], rot: usize, pos: usize, theta: f32, eps: f32)
 fn prep_q_and_block_keys_match_cpu() {
     let ctx = MetalContext::new().expect("metal context");
     let mut rng = StdRng::seed_from_u64(41);
-    let (m, nh, d, rot, ratio, base_pos) = (6usize, 4usize, INDEXER_D, 64usize, 4usize, 9usize);
+    let (m, nh, d, rot, ratio, base_pos) =
+        (6usize, 4usize, INDEXER_D, 64usize, 4usize, 9usize);
     let (theta, eps) = (1.0e7f32, 1e-6f32);
     let qk = cpu_ref::round_bf16(&random(&mut rng, m * (nh + 1) * d, -2.0, 2.0));
     let wq = cpu_ref::round_bf16(&random(&mut rng, d, -0.5, 0.5));
@@ -32,8 +40,10 @@ fn prep_q_and_block_keys_match_cpu() {
     let t_wq = Tensor::from_f32_as_bf16(&ctx, &wq, &[d]).expect("wq");
     let t_wk = Tensor::from_f32_as_bf16(&ctx, &wk, &[d]).expect("wk");
     let q = Tensor::zeros(&ctx, &[m, nh, d], DType::BF16).expect("q");
-    let cache = Tensor::from_f32_as_bf16(&ctx, &cache_init, &[max_seq, d]).expect("cache");
-    let blocks = Tensor::zeros(&ctx, &[max_seq / ratio, d], DType::BF16).expect("blocks");
+    let cache =
+        Tensor::from_f32_as_bf16(&ctx, &cache_init, &[max_seq, d]).expect("cache");
+    let blocks =
+        Tensor::zeros(&ctx, &[max_seq / ratio, d], DType::BF16).expect("blocks");
 
     // Blocks completed by this chunk: those whose four tokens all lie below
     // base_pos + m, starting at the first block touching the chunk.
@@ -41,9 +51,23 @@ fn prep_q_and_block_keys_match_cpu() {
     let complete = (base_pos + m) / ratio;
     let count = complete - first_block;
     let pass = ctx.begin().expect("pass");
-    qsa_prep_q(&ctx, &pass, &t_qk, &t_wq, &q, nh, rot, base_pos, theta, eps).expect("prep q");
+    qsa_prep_q(&ctx, &pass, &t_qk, &t_wq, &q, nh, rot, base_pos, theta, eps)
+        .expect("prep q");
     qsa_scatter_keys(&ctx, &pass, &t_qk, &cache, nh, base_pos).expect("scatter");
-    qsa_block_keys(&ctx, &pass, &cache, &t_wk, &blocks, ratio, first_block, count, rot, theta, eps).expect("blocks");
+    qsa_block_keys(
+        &ctx,
+        &pass,
+        &cache,
+        &t_wk,
+        &blocks,
+        ratio,
+        first_block,
+        count,
+        rot,
+        theta,
+        eps,
+    )
+    .expect("blocks");
     pass.commit_wait().expect("commit");
 
     let mut expected_q = Vec::with_capacity(m * nh * d);
@@ -51,9 +75,17 @@ fn prep_q_and_block_keys_match_cpu() {
     for r in 0..m {
         let row = &qk[r * (nh + 1) * d..(r + 1) * (nh + 1) * d];
         for h in 0..nh {
-            expected_q.extend(prep_head(&row[h * d..(h + 1) * d], &wq, rot, base_pos + r, theta, eps));
+            expected_q.extend(prep_head(
+                &row[h * d..(h + 1) * d],
+                &wq,
+                rot,
+                base_pos + r,
+                theta,
+                eps,
+            ));
         }
-        cache_ref[(base_pos + r) * d..(base_pos + r + 1) * d].copy_from_slice(&row[nh * d..]);
+        cache_ref[(base_pos + r) * d..(base_pos + r + 1) * d]
+            .copy_from_slice(&row[nh * d..]);
     }
     cpu_ref::assert_close(&q.to_f32().expect("q"), &expected_q, 2e-2, 2e-2);
     assert_eq!(cache.to_f32().expect("cache"), cache_ref);
@@ -62,11 +94,16 @@ fn prep_q_and_block_keys_match_cpu() {
     for b in first_block..complete {
         let mut pooled = vec![0.0f32; d];
         for i in 0..ratio {
-            for (p, v) in pooled.iter_mut().zip(&cache_ref[(b * ratio + i) * d..(b * ratio + i + 1) * d]) {
+            for (p, v) in pooled
+                .iter_mut()
+                .zip(&cache_ref[(b * ratio + i) * d..(b * ratio + i + 1) * d])
+            {
                 *p += v;
             }
         }
-        let pooled: Vec<f32> = cpu_ref::round_bf16(&pooled.iter().map(|v| v / ratio as f32).collect::<Vec<_>>());
+        let pooled: Vec<f32> = cpu_ref::round_bf16(
+            &pooled.iter().map(|v| v / ratio as f32).collect::<Vec<_>>(),
+        );
         let expected = prep_head(&pooled, &wk, rot, b * ratio, theta, eps);
         cpu_ref::assert_close(&got_blocks[b * d..(b + 1) * d], &expected, 2e-2, 2e-2);
     }
@@ -98,15 +135,21 @@ fn scores_and_selection_match_cpu() {
     let q = cpu_ref::round_bf16(&random(&mut rng, qb * nh * d, -1.0, 1.0));
     // Quantized block keys make exact score ties likely, which exercises the
     // deterministic tie break.
-    let blocks: Vec<f32> = (0..nb_max * d).map(|_| (rng.gen_range(-2i32..3)) as f32 * 0.25).collect();
+    let blocks: Vec<f32> =
+        (0..nb_max * d).map(|_| (rng.gen_range(-2i32..3)) as f32 * 0.25).collect();
     let t_q = Tensor::from_f32_as_bf16(&ctx, &q, &[qb, nh, d]).expect("q");
-    let t_blocks = Tensor::from_f32_as_bf16(&ctx, &blocks, &[nb_max, d]).expect("blocks");
+    let t_blocks =
+        Tensor::from_f32_as_bf16(&ctx, &blocks, &[nb_max, d]).expect("blocks");
     let scores = Tensor::zeros(&ctx, &[qb, nb_max], DType::F32).expect("scores");
     let sel = Tensor::zeros(&ctx, &[qb, k_max], DType::U32).expect("sel");
     let n_sel = Tensor::zeros(&ctx, &[qb], DType::U32).expect("n_sel");
     let pass = ctx.begin().expect("pass");
-    qsa_scores(&ctx, &pass, &t_q, &t_blocks, &scores, nh, nb_max, base_pos, ratio).expect("scores");
-    qsa_select_blocks(&ctx, &pass, &scores, &sel, &n_sel, qb, nb_max, base_pos, ratio, k_max).expect("select");
+    qsa_scores(&ctx, &pass, &t_q, &t_blocks, &scores, nh, nb_max, base_pos, ratio)
+        .expect("scores");
+    qsa_select_blocks(
+        &ctx, &pass, &scores, &sel, &n_sel, qb, nb_max, base_pos, ratio, k_max,
+    )
+    .expect("select");
     pass.commit_wait().expect("commit");
 
     let got_scores = scores.to_f32().expect("scores");
@@ -114,19 +157,28 @@ fn scores_and_selection_match_cpu() {
     let got_n = n_sel.to_u32().expect("n_sel");
     for qi in 0..qb {
         let nb = visible_blocks(base_pos + qi, ratio);
-        let expected = cpu_scores(&q[qi * nh * d..(qi + 1) * nh * d], &blocks, nh, d, nb);
+        let expected =
+            cpu_scores(&q[qi * nh * d..(qi + 1) * nh * d], &blocks, nh, d, nb);
         let row = &got_scores[qi * nb_max..qi * nb_max + nb];
         cpu_ref::assert_close(row, &expected, 1e-3, 1e-3);
-        assert!(got_scores[qi * nb_max + nb..(qi + 1) * nb_max].iter().all(|v| *v == f32::NEG_INFINITY));
+        assert!(
+            got_scores[qi * nb_max + nb..(qi + 1) * nb_max]
+                .iter()
+                .all(|v| *v == f32::NEG_INFINITY)
+        );
 
         // Reference selection on the kernel's own scores: sort by (score desc,
         // index asc), keep k_max, report ascending.
         let mut order: Vec<usize> = (0..nb).collect();
         order.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap().then(a.cmp(&b)));
-        let mut expected_sel: Vec<u32> = order[..k_max.min(nb)].iter().map(|&b| b as u32).collect();
+        let mut expected_sel: Vec<u32> =
+            order[..k_max.min(nb)].iter().map(|&b| b as u32).collect();
         expected_sel.sort_unstable();
         assert_eq!(got_n[qi] as usize, k_max.min(nb));
-        assert_eq!(&got_sel[qi * k_max..qi * k_max + got_n[qi] as usize], &expected_sel[..]);
+        assert_eq!(
+            &got_sel[qi * k_max..qi * k_max + got_n[qi] as usize],
+            &expected_sel[..]
+        );
     }
 }
 
@@ -135,17 +187,24 @@ fn selection_keeps_everything_below_budget() {
     let ctx = MetalContext::new().expect("metal context");
     let (ratio, k_max, qb, base_pos) = (4usize, 8usize, 3usize, 5usize);
     let nb_max = visible_blocks(base_pos + qb - 1, ratio);
-    let scores = Tensor::from_f32(&ctx, &vec![0.5f32; qb * nb_max], &[qb, nb_max]).expect("scores");
+    let scores = Tensor::from_f32(&ctx, &vec![0.5f32; qb * nb_max], &[qb, nb_max])
+        .expect("scores");
     let sel = Tensor::zeros(&ctx, &[qb, k_max], DType::U32).expect("sel");
     let n_sel = Tensor::zeros(&ctx, &[qb], DType::U32).expect("n_sel");
     let pass = ctx.begin().expect("pass");
-    qsa_select_blocks(&ctx, &pass, &scores, &sel, &n_sel, qb, nb_max, base_pos, ratio, k_max).expect("select");
+    qsa_select_blocks(
+        &ctx, &pass, &scores, &sel, &n_sel, qb, nb_max, base_pos, ratio, k_max,
+    )
+    .expect("select");
     pass.commit_wait().expect("commit");
     let got_sel = sel.to_u32().expect("sel");
     for (qi, n) in n_sel.to_u32().expect("n").into_iter().enumerate() {
         let nb = visible_blocks(base_pos + qi, ratio);
         assert_eq!(n as usize, nb);
-        assert_eq!(&got_sel[qi * k_max..qi * k_max + nb], &(0..nb as u32).collect::<Vec<_>>()[..]);
+        assert_eq!(
+            &got_sel[qi * k_max..qi * k_max + nb],
+            &(0..nb as u32).collect::<Vec<_>>()[..]
+        );
     }
 }
 
@@ -167,11 +226,15 @@ fn sparse_attention_matches_dense_over_selected_tokens() {
     let t_q = Tensor::from_f32_as_bf16(&ctx, &q, &[qb, nq, d]).expect("q");
     let t_k = Tensor::from_f32_as_bf16(&ctx, &k, &[kvh, max_seq, d]).expect("k");
     let t_v = Tensor::from_f32_as_bf16(&ctx, &v, &[kvh, max_seq, d]).expect("v");
-    let t_sel = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[qb, k_max], DType::U32).expect("sel");
-    let t_n = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&n_sel), &[qb], DType::U32).expect("n");
+    let t_sel =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[qb, k_max], DType::U32)
+            .expect("sel");
+    let t_n = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&n_sel), &[qb], DType::U32)
+        .expect("n");
     let out = Tensor::zeros(&ctx, &[qb, nq, d], DType::BF16).expect("out");
     let splits = sparse_splits(k_max, ratio);
-    let partials = Tensor::zeros(&ctx, &[qb * nq, splits, d], DType::F32).expect("partials");
+    let partials =
+        Tensor::zeros(&ctx, &[qb * nq, splits, d], DType::F32).expect("partials");
     let stats = Tensor::zeros(&ctx, &[qb * nq, splits, 2], DType::F32).expect("stats");
     let pass = ctx.begin().expect("pass");
     qsa_attention(

@@ -8,6 +8,8 @@
 pub mod chat;
 pub mod config;
 #[cfg(target_os = "macos")]
+pub mod engine;
+#[cfg(target_os = "macos")]
 pub mod generate;
 #[cfg(target_os = "macos")]
 pub mod kernels;
@@ -15,6 +17,8 @@ pub mod kernels;
 pub mod metal;
 #[cfg(target_os = "macos")]
 pub mod model;
+#[cfg(target_os = "macos")]
+pub mod moe_ffn;
 #[cfg(target_os = "macos")]
 pub mod qwen4exp;
 pub mod safetensors;

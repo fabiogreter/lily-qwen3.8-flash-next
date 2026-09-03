@@ -11,9 +11,7 @@ use anyhow::{Result, ensure};
 use crate::metal::MetalContext;
 use crate::safetensors::Checkpoint;
 use crate::tensor::Tensor;
-use crate::weights::{
-    LinearWeights, Loader, MlpWeights, MoeWeights, expect_shape,
-};
+use crate::weights::{LinearWeights, Loader, MlpWeights, MoeWeights, expect_shape};
 
 use super::config::{LayerType, Qwen4ExpConfig};
 
@@ -148,7 +146,12 @@ fn load_hc(
     Ok(HcWeights { norm, down, up, inject })
 }
 
-fn load_mlp(loader: &Loader<'_>, prefix: &str, h: usize, i: usize) -> Result<MlpWeights> {
+fn load_mlp(
+    loader: &Loader<'_>,
+    prefix: &str,
+    h: usize,
+    i: usize,
+) -> Result<MlpWeights> {
     let gate_up_proj = loader
         .linear(&[&format!("{prefix}gate_proj"), &format!("{prefix}up_proj")], h)?;
     gate_up_proj.expect_features(2 * i, h, "shared gate_up_proj")?;
@@ -159,7 +162,11 @@ fn load_mlp(loader: &Loader<'_>, prefix: &str, h: usize, i: usize) -> Result<Mlp
     Ok(MlpWeights { gate_up_proj, gate_proj, up_proj, down_proj })
 }
 
-fn load_ffn(loader: &Loader<'_>, p: &str, config: &Qwen4ExpConfig) -> Result<Box<MoeWeights>> {
+fn load_ffn(
+    loader: &Loader<'_>,
+    p: &str,
+    config: &Qwen4ExpConfig,
+) -> Result<Box<MoeWeights>> {
     let h = config.hidden_size;
     let (e, i) = (config.num_experts, config.moe_intermediate_size);
     let gate = loader.linear(&[&format!("{p}mlp.gate")], h)?;
@@ -178,10 +185,21 @@ fn load_ffn(loader: &Loader<'_>, p: &str, config: &Qwen4ExpConfig) -> Result<Box
     )?;
     let shared_gate = loader.linear(&[&format!("{p}mlp.shared_expert_gate")], h)?;
     shared_gate.expect_features(1, h, "shared_expert_gate")?;
-    Ok(Box::new(MoeWeights { gate, expert_gate, expert_up, expert_down, shared, shared_gate }))
+    Ok(Box::new(MoeWeights {
+        gate,
+        expert_gate,
+        expert_up,
+        expert_down,
+        shared,
+        shared_gate,
+    }))
 }
 
-fn load_gdn(loader: &Loader<'_>, p: &str, config: &Qwen4ExpConfig) -> Result<GdnWeights> {
+fn load_gdn(
+    loader: &Loader<'_>,
+    p: &str,
+    config: &Qwen4ExpConfig,
+) -> Result<GdnWeights> {
     let h = config.hidden_size;
     let la = format!("{p}linear_attn.");
     let heads = config.linear_num_value_heads;
@@ -228,7 +246,11 @@ fn load_gdn(loader: &Loader<'_>, p: &str, config: &Qwen4ExpConfig) -> Result<Gdn
     })
 }
 
-fn load_attn(loader: &Loader<'_>, p: &str, config: &Qwen4ExpConfig) -> Result<AttnWeights> {
+fn load_attn(
+    loader: &Loader<'_>,
+    p: &str,
+    config: &Qwen4ExpConfig,
+) -> Result<AttnWeights> {
     let h = config.hidden_size;
     let sa = format!("{p}self_attn.");
     let (hd, nq, nkv) =
@@ -272,7 +294,11 @@ fn load_attn(loader: &Loader<'_>, p: &str, config: &Qwen4ExpConfig) -> Result<At
     })
 }
 
-fn load_ple(loader: &Loader<'_>, p: &str, config: &Qwen4ExpConfig) -> Result<PleWeights> {
+fn load_ple(
+    loader: &Loader<'_>,
+    p: &str,
+    config: &Qwen4ExpConfig,
+) -> Result<PleWeights> {
     let ple = config.ple.as_ref().expect("PLE layer without PLE config");
     let h = config.hidden_size;
     let wide = config.hc_width();
@@ -281,7 +307,11 @@ fn load_ple(loader: &Loader<'_>, p: &str, config: &Qwen4ExpConfig) -> Result<Ple
         .map(|i| format!("{pp}ple_embedding.ngram_embedding.shard_{i}"))
         .collect();
     let shard_refs: Vec<&str> = shard_names.iter().map(String::as_str).collect();
-    let table = loader.linear_grouped(&shard_refs, ple.head_dim(), ple.quantization.group_size)?;
+    let table = loader.linear_grouped(
+        &shard_refs,
+        ple.head_dim(),
+        ple.quantization.group_size,
+    )?;
     table.expect_features(ple.padded_vocab_size, ple.head_dim(), "ngram table")?;
     ensure!(table.bits == ple.quantization.bits, "ngram table bit width mismatch");
 
@@ -292,13 +322,25 @@ fn load_ple(loader: &Loader<'_>, p: &str, config: &Qwen4ExpConfig) -> Result<Ple
     let norm_key = loader.tensor(&format!("{pp}norm_key.weight"))?;
     let norm_query = loader.tensor(&format!("{pp}norm_query.weight"))?;
     let norm_conv = loader.tensor(&format!("{pp}norm_conv.weight"))?;
-    for (name, t) in [("norm_key", &norm_key), ("norm_query", &norm_query), ("norm_conv", &norm_conv)] {
+    for (name, t) in [
+        ("norm_key", &norm_key),
+        ("norm_query", &norm_query),
+        ("norm_conv", &norm_conv),
+    ] {
         expect_shape(t, &[wide], name)?;
     }
     let conv_w = loader.conv_weight(&format!("{pp}conv1d.weight"))?;
     expect_shape(&conv_w, &[ple.conv_kernel_size, wide], "ple conv_w")?;
 
-    Ok(PleWeights { table, key_proj, value_proj, norm_key, norm_query, norm_conv, conv_w })
+    Ok(PleWeights {
+        table,
+        key_proj,
+        value_proj,
+        norm_key,
+        norm_query,
+        norm_conv,
+        conv_w,
+    })
 }
 
 pub fn load(
@@ -311,7 +353,8 @@ pub fn load(
         ckpt.meta(&format!("{PREFIX}embed_tokens.weight")).is_some(),
         "unsupported checkpoint layout; expected lily's qwen4_exp-affine-v1"
     );
-    let loader = Loader::new(ctx, ckpt, config.quantization, SKIP_PREFIXES, expected_bits);
+    let loader =
+        Loader::new(ctx, ckpt, config.quantization, SKIP_PREFIXES, expected_bits);
     let h = config.hidden_size;
 
     let embed_tokens = loader.linear(&[&format!("{PREFIX}embed_tokens")], h)?;
@@ -325,15 +368,23 @@ pub fn load(
     for (idx, layer_type) in config.layer_types.iter().enumerate() {
         let p = format!("{PREFIX}layers.{idx}.");
         let ple = match &config.ple {
-            Some(ple) if ple.layer == idx => Some(Box::new(load_ple(&loader, &p, config)?)),
+            Some(ple) if ple.layer == idx => {
+                Some(Box::new(load_ple(&loader, &p, config)?))
+            }
             _ => None,
         };
-        let attn_hc = load_hc(&loader, &format!("{p}attn_hyper_connection."), config, true)?;
+        let attn_hc =
+            load_hc(&loader, &format!("{p}attn_hyper_connection."), config, true)?;
         let mixer = match layer_type {
-            LayerType::LinearAttention => Mixer::Gdn(Box::new(load_gdn(&loader, &p, config)?)),
-            LayerType::FullAttention => Mixer::Attn(Box::new(load_attn(&loader, &p, config)?)),
+            LayerType::LinearAttention => {
+                Mixer::Gdn(Box::new(load_gdn(&loader, &p, config)?))
+            }
+            LayerType::FullAttention => {
+                Mixer::Attn(Box::new(load_attn(&loader, &p, config)?))
+            }
         };
-        let mlp_hc = load_hc(&loader, &format!("{p}mlp_hyper_connection."), config, true)?;
+        let mlp_hc =
+            load_hc(&loader, &format!("{p}mlp_hyper_connection."), config, true)?;
         let ffn = load_ffn(&loader, &p, config)?;
         layers.push(LayerWeights { ple, attn_hc, mixer, mlp_hc, ffn });
     }

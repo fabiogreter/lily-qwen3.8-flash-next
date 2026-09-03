@@ -36,7 +36,10 @@ impl PleHashTables {
         eos: u32,
     ) -> Result<Self> {
         ensure!(multipliers.len() >= 2, "need at least bigram multipliers");
-        ensure!(sizes.len() == offsets.len() && !sizes.is_empty(), "sizes/offsets mismatch");
+        ensure!(
+            sizes.len() == offsets.len() && !sizes.is_empty(),
+            "sizes/offsets mismatch"
+        );
         ensure!(
             sizes.iter().chain(offsets).all(|&v| v <= u32::MAX as u64),
             "table sizes/offsets must fit u32"
@@ -90,7 +93,10 @@ pub fn ple_hash_ids(
         "ids must be U32 [M, heads]"
     );
     // The multiplier buffer is 8-byte aligned by construction (offset 0).
-    ensure!(tables.multipliers.binding().1.is_multiple_of(8), "multipliers not 8-aligned");
+    ensure!(
+        tables.multipliers.binding().1.is_multiple_of(8),
+        "multipliers not 8-aligned"
+    );
     let pipeline = ctx.pipeline("ple_hash_ids", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
@@ -102,7 +108,11 @@ pub fn ple_hash_ids(
             tables.sizes.binding(),
             tables.offsets.binding(),
         ],
-        &[&u32_bytes(tables.heads), &u32_bytes(tables.heads_per_ngram), &u32_bytes(tables.eos as usize)],
+        &[
+            &u32_bytes(tables.heads),
+            &u32_bytes(tables.heads_per_ngram),
+            &u32_bytes(tables.eos as usize),
+        ],
         Grid::Threads { grid: (tables.heads, m, 1), threadgroup: (tables.heads, 1, 1) },
     )
 }
@@ -143,13 +153,21 @@ pub fn ple_gather_q4(
     let k = table.in_features();
     ensure!(table.bits == 4, "n-gram table gather is 4-bit only");
     ensure!(
-        k.is_multiple_of(8) && k.is_multiple_of(table.group_size) && table.group_size.is_multiple_of(8),
+        k.is_multiple_of(8)
+            && k.is_multiple_of(table.group_size)
+            && table.group_size.is_multiple_of(8),
         "row width {k} / group {} not word-packable",
         table.group_size
     );
-    ensure!(ids.dtype() == DType::U32 && ids.numel().is_multiple_of(heads), "ids must be U32 [M, heads]");
+    ensure!(
+        ids.dtype() == DType::U32 && ids.numel().is_multiple_of(heads),
+        "ids must be U32 [M, heads]"
+    );
     let m = ids.numel() / heads;
-    ensure!(out.numel() == m * heads * k && out.dtype() == DType::BF16, "out must be BF16 [M, heads*K]");
+    ensure!(
+        out.numel() == m * heads * k && out.dtype() == DType::BF16,
+        "out must be BF16 [M, heads*K]"
+    );
     let pipeline = ctx.pipeline("ple_gather_q4_bf16", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
@@ -178,7 +196,10 @@ pub fn ple_gate_value_bf16(
     groups: usize,
 ) -> Result<()> {
     let wide = groups * h;
-    ensure!(key.numel().is_multiple_of(wide) && key.numel() > 0, "key must be [rows, G*H]");
+    ensure!(
+        key.numel().is_multiple_of(wide) && key.numel() > 0,
+        "key must be [rows, G*H]"
+    );
     let rows = key.numel() / wide;
     for (name, t, len) in [
         ("key", key, rows * wide),
@@ -186,7 +207,10 @@ pub fn ple_gate_value_bf16(
         ("value", value, rows * h),
         ("gated", gated, rows * wide),
     ] {
-        ensure!(t.numel() == len && t.dtype() == DType::BF16, "{name} must be BF16 [{len}]");
+        ensure!(
+            t.numel() == len && t.dtype() == DType::BF16,
+            "{name} must be BF16 [{len}]"
+        );
     }
     let inv_sqrt_h = 1.0 / (h as f32).sqrt();
     let pipeline = ctx.pipeline("ple_gate_value_bf16", SOURCE, MslVersion::V3_1)?;
@@ -199,11 +223,17 @@ pub fn ple_gate_value_bf16(
 }
 
 fn check_conv(w: &Tensor, c: usize, dilation: usize) -> Result<usize> {
-    ensure!(w.numel().is_multiple_of(c) && w.dtype() == DType::BF16, "conv weight must be BF16 [KD, C]");
+    ensure!(
+        w.numel().is_multiple_of(c) && w.dtype() == DType::BF16,
+        "conv weight must be BF16 [KD, C]"
+    );
     let kd = w.numel() / c;
     ensure!(kd >= 2 && dilation >= 1, "conv kernel {kd} / dilation {dilation} invalid");
     let s = (kd - 1) * dilation;
-    ensure!(s <= PLE_MAX_CONTEXT, "conv context {s} exceeds register window {PLE_MAX_CONTEXT}");
+    ensure!(
+        s <= PLE_MAX_CONTEXT,
+        "conv context {s} exceeds register window {PLE_MAX_CONTEXT}"
+    );
     Ok(s)
 }
 
@@ -226,13 +256,22 @@ pub fn ple_conv1d_prefill(
     let s = check_conv(w, c, dilation)?;
     let kd = w.numel() / c;
     for (name, t) in [("window_in", window_in), ("window_out", window_out)] {
-        ensure!(t.numel() == c * s && t.dtype() == DType::BF16, "{name} must be BF16 [C, S]");
+        ensure!(
+            t.numel() == c * s && t.dtype() == DType::BF16,
+            "{name} must be BF16 [C, S]"
+        );
     }
     let (in_buf, in_off) = window_in.binding();
     let (out_buf, out_off) = window_out.binding();
-    ensure!(!(std::ptr::eq(in_buf, out_buf) && in_off == out_off), "windows must be distinct");
+    ensure!(
+        !(std::ptr::eq(in_buf, out_buf) && in_off == out_off),
+        "windows must be distinct"
+    );
     for (name, t) in [("base", base), ("hyper", hyper)] {
-        ensure!(t.numel() == m * c && t.dtype() == DType::BF16, "{name} must be BF16 [M, C]");
+        ensure!(
+            t.numel() == m * c && t.dtype() == DType::BF16,
+            "{name} must be BF16 [M, C]"
+        );
     }
     let pipeline = ctx.pipeline("ple_conv1d_prefill_bf16", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
@@ -265,7 +304,10 @@ pub fn ple_conv1d_step(
     let c = x.numel();
     let s = check_conv(w, c, dilation)?;
     let kd = w.numel() / c;
-    ensure!(window.numel() == c * s && window.dtype() == DType::BF16, "window must be BF16 [C, S]");
+    ensure!(
+        window.numel() == c * s && window.dtype() == DType::BF16,
+        "window must be BF16 [C, S]"
+    );
     for (name, t) in [("x", x), ("base", base), ("hyper", hyper)] {
         ensure!(t.numel() == c && t.dtype() == DType::BF16, "{name} must be BF16 [C]");
     }

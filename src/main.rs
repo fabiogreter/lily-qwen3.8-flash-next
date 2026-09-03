@@ -6,9 +6,13 @@ use anyhow::Result;
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(name = "lily", about = "Qwen3.6-35B-A3B inference server")]
+#[command(
+    name = "lily",
+    about = "Qwen3.6-35B-A3B / Qwen3.8-Flash-Next inference server"
+)]
 struct Cli {
-    /// MLX affine 4-bit Qwen3.6-35B-A3B checkpoint directory.
+    /// Checkpoint directory: an MLX affine 4-bit Qwen3.6-35B-A3B export, or
+    /// a Qwen3.8-Flash-Next conversion from `tools/convert`.
     #[arg(long)]
     model: PathBuf,
 

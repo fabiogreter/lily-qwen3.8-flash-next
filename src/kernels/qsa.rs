@@ -51,10 +51,19 @@ pub fn qsa_prep_q(
     eps: f32,
 ) -> Result<()> {
     let d = INDEXER_D;
-    ensure!(qk.dtype() == DType::BF16 && qk.numel().is_multiple_of((n_heads + 1) * d), "qk must be BF16 [M, (NH+1)*D]");
+    ensure!(
+        qk.dtype() == DType::BF16 && qk.numel().is_multiple_of((n_heads + 1) * d),
+        "qk must be BF16 [M, (NH+1)*D]"
+    );
     let m = qk.numel() / ((n_heads + 1) * d);
-    ensure!(w.numel() == d && w.dtype() == DType::BF16, "q norm weight must be BF16 [D]");
-    ensure!(q.numel() == m * n_heads * d && q.dtype() == DType::BF16, "q must be BF16 [M, NH, D]");
+    ensure!(
+        w.numel() == d && w.dtype() == DType::BF16,
+        "q norm weight must be BF16 [D]"
+    );
+    ensure!(
+        q.numel() == m * n_heads * d && q.dtype() == DType::BF16,
+        "q must be BF16 [M, NH, D]"
+    );
     ensure!(rot.is_multiple_of(2) && rot <= d, "bad rotary dim {rot}");
     let pipeline = ctx.pipeline("qsa_prep_q_bf16", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
@@ -82,9 +91,17 @@ pub fn qsa_scatter_keys(
     base_pos: usize,
 ) -> Result<()> {
     let d = INDEXER_D;
-    ensure!(qk.dtype() == DType::BF16 && qk.numel().is_multiple_of((n_heads + 1) * d), "qk must be BF16 [M, (NH+1)*D]");
+    ensure!(
+        qk.dtype() == DType::BF16 && qk.numel().is_multiple_of((n_heads + 1) * d),
+        "qk must be BF16 [M, (NH+1)*D]"
+    );
     let m = qk.numel() / ((n_heads + 1) * d);
-    ensure!(cache.shape().len() == 2 && cache.shape()[1] == d && cache.dtype() == DType::BF16, "cache must be BF16 [max_seq, D]");
+    ensure!(
+        cache.shape().len() == 2
+            && cache.shape()[1] == d
+            && cache.dtype() == DType::BF16,
+        "cache must be BF16 [max_seq, D]"
+    );
     ensure!(base_pos + m <= cache.shape()[0], "indexer key cache overflow");
     let pipeline = ctx.pipeline("qsa_scatter_keys_bf16", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
@@ -114,11 +131,25 @@ pub fn qsa_block_keys(
         return Ok(());
     }
     let d = INDEXER_D;
-    ensure!(cache.shape().len() == 2 && cache.shape()[1] == d, "cache must be [max_seq, D]");
-    ensure!(blocks.shape().len() == 2 && blocks.shape()[1] == d && blocks.dtype() == DType::BF16, "blocks must be BF16 [max_blocks, D]");
-    ensure!((first_block + count) * ratio <= cache.shape()[0], "block keys read past the cache");
+    ensure!(
+        cache.shape().len() == 2 && cache.shape()[1] == d,
+        "cache must be [max_seq, D]"
+    );
+    ensure!(
+        blocks.shape().len() == 2
+            && blocks.shape()[1] == d
+            && blocks.dtype() == DType::BF16,
+        "blocks must be BF16 [max_blocks, D]"
+    );
+    ensure!(
+        (first_block + count) * ratio <= cache.shape()[0],
+        "block keys read past the cache"
+    );
     ensure!(first_block + count <= blocks.shape()[0], "block key store overflow");
-    ensure!(w.numel() == d && w.dtype() == DType::BF16, "k norm weight must be BF16 [D]");
+    ensure!(
+        w.numel() == d && w.dtype() == DType::BF16,
+        "k norm weight must be BF16 [D]"
+    );
     let pipeline = ctx.pipeline("qsa_block_keys_bf16", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
@@ -151,10 +182,19 @@ pub fn qsa_scores(
 ) -> Result<()> {
     let d = INDEXER_D;
     ensure!(n_heads <= 4, "scores kernel stages at most 4 indexer heads");
-    ensure!(q.dtype() == DType::BF16 && q.numel().is_multiple_of(n_heads * d), "q must be BF16 [QB, NH, D]");
+    ensure!(
+        q.dtype() == DType::BF16 && q.numel().is_multiple_of(n_heads * d),
+        "q must be BF16 [QB, NH, D]"
+    );
     let qb = q.numel() / (n_heads * d);
-    ensure!(nb_max > 0 && blocks.shape()[0] >= nb_max, "block keys shorter than nb_max");
-    ensure!(scores.numel() >= qb * nb_max && scores.dtype() == DType::F32, "scores must be F32 [QB, nb_max]");
+    ensure!(
+        nb_max > 0 && blocks.shape()[0] >= nb_max,
+        "block keys shorter than nb_max"
+    );
+    ensure!(
+        scores.numel() >= qb * nb_max && scores.dtype() == DType::F32,
+        "scores must be F32 [QB, nb_max]"
+    );
     let inv_sqrt_d = 1.0 / (d as f32).sqrt();
     let pipeline = ctx.pipeline("qsa_scores_f32", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
@@ -168,7 +208,10 @@ pub fn qsa_scores(
             &u32_bytes(ratio),
             &inv_sqrt_d.to_ne_bytes(),
         ],
-        Grid::Threadgroups { groups: (nb_max.div_ceil(TG), qb, 1), threadgroup: (TG, 1, 1) },
+        Grid::Threadgroups {
+            groups: (nb_max.div_ceil(TG), qb, 1),
+            threadgroup: (TG, 1, 1),
+        },
     )
 }
 
@@ -187,14 +230,28 @@ pub fn qsa_select_blocks(
     ratio: usize,
     k_max: usize,
 ) -> Result<()> {
-    ensure!(scores.numel() >= qb * nb_max && scores.dtype() == DType::F32, "scores must be F32 [QB, nb_max]");
-    ensure!(sel.numel() >= qb * k_max && sel.dtype() == DType::U32, "sel must be U32 [QB, k_max]");
-    ensure!(n_sel.numel() >= qb && n_sel.dtype() == DType::U32, "n_sel must be U32 [QB]");
+    ensure!(
+        scores.numel() >= qb * nb_max && scores.dtype() == DType::F32,
+        "scores must be F32 [QB, nb_max]"
+    );
+    ensure!(
+        sel.numel() >= qb * k_max && sel.dtype() == DType::U32,
+        "sel must be U32 [QB, k_max]"
+    );
+    ensure!(
+        n_sel.numel() >= qb && n_sel.dtype() == DType::U32,
+        "n_sel must be U32 [QB]"
+    );
     let pipeline = ctx.pipeline("qsa_select_blocks", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
         &[scores.binding(), sel.binding(), n_sel.binding()],
-        &[&u32_bytes(nb_max), &u32_bytes(base_pos), &u32_bytes(ratio), &u32_bytes(k_max)],
+        &[
+            &u32_bytes(nb_max),
+            &u32_bytes(base_pos),
+            &u32_bytes(ratio),
+            &u32_bytes(k_max),
+        ],
         Grid::Threadgroups { groups: (qb, 1, 1), threadgroup: (SELECT_TG, 1, 1) },
     )
 }
@@ -226,24 +283,39 @@ pub fn qsa_attention(
     base_pos: usize,
     scale: f32,
 ) -> Result<()> {
-    let (kvh, max_seq, d) = (k_cache.shape()[0], k_cache.shape()[1], k_cache.shape()[2]);
+    let (kvh, max_seq, d) =
+        (k_cache.shape()[0], k_cache.shape()[1], k_cache.shape()[2]);
     ensure!(d == ATTN_D, "sparse attention is compiled for head dim {ATTN_D}, got {d}");
     ensure!(v_cache.shape() == k_cache.shape(), "k/v cache shape mismatch");
-    ensure!(q.dtype() == DType::BF16 && q.numel().is_multiple_of(qb * d), "q must be BF16 [QB, NQ, D]");
+    ensure!(
+        q.dtype() == DType::BF16 && q.numel().is_multiple_of(qb * d),
+        "q must be BF16 [QB, NQ, D]"
+    );
     let nq = q.numel() / (qb * d);
-    ensure!(nq.is_multiple_of(kvh) && nq / kvh <= 32, "NQ {nq} not a small multiple of KVH {kvh}");
+    ensure!(
+        nq.is_multiple_of(kvh) && nq / kvh <= 32,
+        "NQ {nq} not a small multiple of KVH {kvh}"
+    );
     let group = nq / kvh;
     ensure!(out.numel() == q.numel() && out.dtype() == DType::BF16, "out must match q");
-    ensure!(sel.numel() >= qb * k_max && sel.dtype() == DType::U32, "sel must be U32 [QB, k_max]");
-    ensure!(n_sel.numel() >= qb && n_sel.dtype() == DType::U32, "n_sel must be U32 [QB]");
+    ensure!(
+        sel.numel() >= qb * k_max && sel.dtype() == DType::U32,
+        "sel must be U32 [QB, k_max]"
+    );
+    ensure!(
+        n_sel.numel() >= qb && n_sel.dtype() == DType::U32,
+        "n_sel must be U32 [QB]"
+    );
     ensure!(base_pos + qb <= max_seq, "queries exceed the cache");
     let splits = sparse_splits(k_max, ratio);
     ensure!(
-        scratch.partials.numel() >= qb * nq * splits * d && scratch.partials.dtype() == DType::F32,
+        scratch.partials.numel() >= qb * nq * splits * d
+            && scratch.partials.dtype() == DType::F32,
         "sparse partials scratch too small"
     );
     ensure!(
-        scratch.stats.numel() >= qb * nq * splits * 2 && scratch.stats.dtype() == DType::F32,
+        scratch.stats.numel() >= qb * nq * splits * 2
+            && scratch.stats.dtype() == DType::F32,
         "sparse stats scratch too small"
     );
     let stage1 = ctx.pipeline("qsa_attn_split_bf16", SOURCE, MslVersion::V3_1)?;
@@ -272,7 +344,8 @@ pub fn qsa_attention(
         Grid::Threadgroups { groups: (kvh, splits, qb), threadgroup: (TG, 1, 1) },
     )?;
     pass.level_barrier(&[scratch.partials, scratch.stats])?;
-    let combine = ctx.pipeline("sdpa_decode_combine", attention::SOURCE, MslVersion::V3_1)?;
+    let combine =
+        ctx.pipeline("sdpa_decode_combine", attention::SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &combine,
         &[scratch.partials.binding(), scratch.stats.binding(), out.binding()],

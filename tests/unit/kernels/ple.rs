@@ -24,7 +24,13 @@ fn cpu_hash_ids(
     for r in 0..tokens.len() {
         let t0 = tokens[r];
         let p1 = if r >= 1 { tokens[r - 1] } else { hist[1] };
-        let p2 = if r >= 2 { tokens[r - 2] } else if r == 1 { hist[1] } else { hist[0] };
+        let p2 = if r >= 2 {
+            tokens[r - 2]
+        } else if r == 1 {
+            hist[1]
+        } else {
+            hist[0]
+        };
         let s1 = if p1 == eos { eos } else { p1 };
         let s2 = if p1 == eos || p2 == eos { eos } else { p2 };
         for j in 0..heads {
@@ -46,12 +52,21 @@ fn hash_ids_match_cpu_and_respect_eos_segments() {
     let sizes: Vec<u64> = (0..16).map(|j| 20_000_003 + 10 * j as u64).collect();
     let offsets: Vec<u64> = (0..16).map(|j| j as u64 * 20_000_100).collect();
     let eos = 248_044u32;
-    let tables = PleHashTables::new(&ctx, &mult, &sizes, &offsets, 8, eos).expect("tables");
+    let tables =
+        PleHashTables::new(&ctx, &mult, &sizes, &offsets, 8, eos).expect("tables");
 
     let tokens = vec![17u32, 248_319, eos, 5, 6, eos, eos, 9];
     let hist = [eos, 42];
-    let t_tokens = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&tokens), &[tokens.len()], DType::U32).expect("tokens");
-    let t_hist = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&hist), &[2], DType::U32).expect("hist");
+    let t_tokens = Tensor::from_bytes(
+        &ctx,
+        bytemuck::cast_slice(&tokens),
+        &[tokens.len()],
+        DType::U32,
+    )
+    .expect("tokens");
+    let t_hist =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&hist), &[2], DType::U32)
+            .expect("hist");
     let ids = Tensor::zeros(&ctx, &[tokens.len(), 16], DType::U32).expect("ids");
     let hist_out = Tensor::zeros(&ctx, &[2], DType::U32).expect("hist_out");
     let pass = ctx.begin().expect("pass");
@@ -64,7 +79,9 @@ fn hash_ids_match_cpu_and_respect_eos_segments() {
     assert_eq!(hist_out.to_u32().expect("hist"), vec![eos, 9]);
 
     // A one-token step keeps the previous last token as the older entry.
-    let one = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&[77u32]), &[1], DType::U32).expect("one");
+    let one =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&[77u32]), &[1], DType::U32)
+            .expect("one");
     let pass = ctx.begin().expect("pass");
     ple_hist_update(&ctx, &pass, &one, &hist_out, &hist_out).expect("hist step");
     pass.commit_wait().expect("commit");
@@ -81,14 +98,24 @@ fn gather_q4_group32_matches_dequant() {
     let scales = cpu_ref::round_bf16(&random(&mut rng, rows * groups, 0.001, 0.02));
     let biases = cpu_ref::round_bf16(&random(&mut rng, rows * groups, -0.1, 0.1));
     let table = QuantWeights {
-        codes: Tensor::from_bytes(&ctx, bytemuck::cast_slice(&codes), &[rows, k / 8], DType::U32).expect("codes"),
-        scales: Tensor::from_f32_as_bf16(&ctx, &scales, &[rows, groups]).expect("scales"),
-        biases: Tensor::from_f32_as_bf16(&ctx, &biases, &[rows, groups]).expect("biases"),
+        codes: Tensor::from_bytes(
+            &ctx,
+            bytemuck::cast_slice(&codes),
+            &[rows, k / 8],
+            DType::U32,
+        )
+        .expect("codes"),
+        scales: Tensor::from_f32_as_bf16(&ctx, &scales, &[rows, groups])
+            .expect("scales"),
+        biases: Tensor::from_f32_as_bf16(&ctx, &biases, &[rows, groups])
+            .expect("biases"),
         group_size: gs,
         bits: 4,
     };
     let ids: Vec<u32> = (0..m * heads).map(|_| rng.gen_range(0..rows as u32)).collect();
-    let t_ids = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&ids), &[m, heads], DType::U32).expect("ids");
+    let t_ids =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&ids), &[m, heads], DType::U32)
+            .expect("ids");
     let out = Tensor::zeros(&ctx, &[m, heads * k], DType::BF16).expect("out");
     let pass = ctx.begin().expect("pass");
     ple_gather_q4(&ctx, &pass, &table, &t_ids, heads, &out).expect("gather");
@@ -99,7 +126,12 @@ fn gather_q4_group32_matches_dequant() {
     for &id in &ids {
         expected.extend_from_slice(&dequant[id as usize * k..(id as usize + 1) * k]);
     }
-    cpu_ref::assert_close(&out.to_f32().expect("out"), &cpu_ref::round_bf16(&expected), 1e-3, 1e-2);
+    cpu_ref::assert_close(
+        &out.to_f32().expect("out"),
+        &cpu_ref::round_bf16(&expected),
+        1e-3,
+        1e-2,
+    );
 }
 
 #[test]
@@ -111,11 +143,13 @@ fn gate_value_matches_cpu() {
     let query = cpu_ref::round_bf16(&random(&mut rng, rows * g * h, -1.0, 1.0));
     let value = cpu_ref::round_bf16(&random(&mut rng, rows * h, -2.0, 2.0));
     let t_key = Tensor::from_f32_as_bf16(&ctx, &key, &[rows, g * h]).expect("key");
-    let t_query = Tensor::from_f32_as_bf16(&ctx, &query, &[rows, g * h]).expect("query");
+    let t_query =
+        Tensor::from_f32_as_bf16(&ctx, &query, &[rows, g * h]).expect("query");
     let t_value = Tensor::from_f32_as_bf16(&ctx, &value, &[rows, h]).expect("value");
     let gated = Tensor::zeros(&ctx, &[rows, g * h], DType::BF16).expect("gated");
     let pass = ctx.begin().expect("pass");
-    ple_gate_value_bf16(&ctx, &pass, &t_key, &t_query, &t_value, &gated, h, g).expect("gate");
+    ple_gate_value_bf16(&ctx, &pass, &t_key, &t_query, &t_value, &gated, h, g)
+        .expect("gate");
     pass.commit_wait().expect("commit");
 
     let mut expected = vec![0.0f32; rows * g * h];
@@ -186,26 +220,38 @@ fn dilated_conv_prefill_matches_steps_and_cpu() {
     let t_base = Tensor::from_f32_as_bf16(&ctx, &base, &[m, c]).expect("base");
     let t_hyper = Tensor::from_f32_as_bf16(&ctx, &hyper0, &[m, c]).expect("hyper");
     let pass = ctx.begin().expect("pass");
-    ple_conv1d_prefill(&ctx, &pass, &win_in, &win_out, &t_x, &t_w, &t_base, &t_hyper, dil).expect("prefill");
+    ple_conv1d_prefill(
+        &ctx, &pass, &win_in, &win_out, &t_x, &t_w, &t_base, &t_hyper, dil,
+    )
+    .expect("prefill");
     pass.commit_wait().expect("commit");
 
     let (conv, expected_window) = cpu_dilated_conv(&window, &x, &w, c, kd, dil);
-    let expected: Vec<f32> = (0..m * c).map(|i| hyper0[i] + base[i] + conv[i]).collect();
+    let expected: Vec<f32> =
+        (0..m * c).map(|i| hyper0[i] + base[i] + conv[i]).collect();
     cpu_ref::assert_close(&t_hyper.to_f32().expect("hyper"), &expected, 2e-2, 2e-2);
     cpu_ref::assert_close(&win_out.to_f32().expect("win"), &expected_window, 0.0, 0.0);
 
     // Token-by-token steps reproduce the batched result.
-    let step_window = Tensor::from_f32_as_bf16(&ctx, &window, &[c, s]).expect("step window");
+    let step_window =
+        Tensor::from_f32_as_bf16(&ctx, &window, &[c, s]).expect("step window");
     let mut stepped = Vec::with_capacity(m * c);
     for t in 0..m {
-        let xt = Tensor::from_f32_as_bf16(&ctx, &x[t * c..(t + 1) * c], &[c]).expect("xt");
-        let bt = Tensor::from_f32_as_bf16(&ctx, &base[t * c..(t + 1) * c], &[c]).expect("bt");
-        let ht = Tensor::from_f32_as_bf16(&ctx, &hyper0[t * c..(t + 1) * c], &[c]).expect("ht");
+        let xt =
+            Tensor::from_f32_as_bf16(&ctx, &x[t * c..(t + 1) * c], &[c]).expect("xt");
+        let bt = Tensor::from_f32_as_bf16(&ctx, &base[t * c..(t + 1) * c], &[c])
+            .expect("bt");
+        let ht = Tensor::from_f32_as_bf16(&ctx, &hyper0[t * c..(t + 1) * c], &[c])
+            .expect("ht");
         let pass = ctx.begin().expect("pass");
-        ple_conv1d_step(&ctx, &pass, &step_window, &xt, &t_w, &bt, &ht, dil).expect("step");
+        ple_conv1d_step(&ctx, &pass, &step_window, &xt, &t_w, &bt, &ht, dil)
+            .expect("step");
         pass.commit_wait().expect("commit");
         stepped.extend(ht.to_f32().expect("ht"));
     }
     assert_eq!(stepped, t_hyper.to_f32().expect("hyper"));
-    assert_eq!(step_window.to_f32().expect("step window"), win_out.to_f32().expect("win"));
+    assert_eq!(
+        step_window.to_f32().expect("step window"),
+        win_out.to_f32().expect("win")
+    );
 }

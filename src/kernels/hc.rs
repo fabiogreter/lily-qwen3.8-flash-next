@@ -12,7 +12,11 @@ const TG: usize = 256;
 
 fn bf16_rows(t: &Tensor, cols: usize, what: &str) -> Result<usize> {
     ensure!(t.dtype() == DType::BF16, "{what} must be BF16");
-    ensure!(t.numel().is_multiple_of(cols), "{what} numel {} not [rows, {cols}]", t.numel());
+    ensure!(
+        t.numel().is_multiple_of(cols),
+        "{what} numel {} not [rows, {cols}]",
+        t.numel()
+    );
     Ok(t.numel() / cols)
 }
 
@@ -32,7 +36,10 @@ pub fn rmsnorm_grouped_bf16(
 ) -> Result<()> {
     ensure!(groups > 0 && h > 0, "empty grouped norm");
     let rows = bf16_rows(x, groups * h, "grouped norm input")?;
-    ensure!(w.numel() == groups * h && w.dtype() == DType::BF16, "weight must be BF16 [G*H]");
+    ensure!(
+        w.numel() == groups * h && w.dtype() == DType::BF16,
+        "weight must be BF16 [G*H]"
+    );
     ensure!(out.numel() == x.numel() && out.dtype() == DType::BF16, "output mismatch");
     let pipeline = ctx.pipeline("rmsnorm_grouped_bf16", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
@@ -53,7 +60,10 @@ pub fn silu_scaled_bf16(
 ) -> Result<()> {
     let n = x.numel();
     ensure!(n > 0 && out.numel() == n, "size mismatch");
-    ensure!(x.dtype() == DType::BF16 && out.dtype() == DType::BF16, "silu_scaled expects BF16");
+    ensure!(
+        x.dtype() == DType::BF16 && out.dtype() == DType::BF16,
+        "silu_scaled expects BF16"
+    );
     let pipeline = ctx.pipeline("silu_scaled_bf16", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
@@ -75,7 +85,10 @@ pub fn hc_mix_bf16(
 ) -> Result<()> {
     let rows = bf16_rows(up, groups * h, "read-gate logits")?;
     ensure!(hn.numel() == up.numel() && hn.dtype() == DType::BF16, "hn mismatch");
-    ensure!(mixed.numel() == rows * h && mixed.dtype() == DType::BF16, "mixed must be BF16 [rows, h]");
+    ensure!(
+        mixed.numel() == rows * h && mixed.dtype() == DType::BF16,
+        "mixed must be BF16 [rows, h]"
+    );
     let pipeline = ctx.pipeline("hc_mix_bf16", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
@@ -96,8 +109,14 @@ pub fn hc_inject_bf16(
     groups: usize,
 ) -> Result<()> {
     let rows = bf16_rows(hyper, groups * h, "hyper stream")?;
-    ensure!(branch.numel() == rows * h && branch.dtype() == DType::BF16, "branch must be BF16 [rows, h]");
-    ensure!(inj.numel() == rows * groups && inj.dtype() == DType::BF16, "inject logits must be BF16 [rows, G]");
+    ensure!(
+        branch.numel() == rows * h && branch.dtype() == DType::BF16,
+        "branch must be BF16 [rows, h]"
+    );
+    ensure!(
+        inj.numel() == rows * groups && inj.dtype() == DType::BF16,
+        "inject logits must be BF16 [rows, G]"
+    );
     let inv_g = 1.0 / groups as f32;
     let pipeline = ctx.pipeline("hc_inject_bf16", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
@@ -118,7 +137,10 @@ pub fn hc_broadcast_bf16(
     groups: usize,
 ) -> Result<()> {
     let rows = bf16_rows(x, h, "stream source")?;
-    ensure!(hyper.numel() == rows * groups * h && hyper.dtype() == DType::BF16, "hyper mismatch");
+    ensure!(
+        hyper.numel() == rows * groups * h && hyper.dtype() == DType::BF16,
+        "hyper mismatch"
+    );
     let pipeline = ctx.pipeline("hc_broadcast_bf16", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,

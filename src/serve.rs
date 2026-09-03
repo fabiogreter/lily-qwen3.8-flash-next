@@ -12,12 +12,13 @@ use serde::{Deserialize, Serialize};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use crate::chat::{Conversation, Message, Role};
+use crate::engine::{DecodeStateApi, LanguageModel};
 use crate::generate::{Generator, Thinking};
 use crate::metal::MetalContext;
-use crate::model::{Qwen3_5Model, Scratch};
+use crate::model::Qwen3_5Model;
+use crate::qwen4exp::Qwen4ExpModel;
 use session::SessionStore;
 
-pub const MODEL_ID: &str = "Qwen3.6-35B-A3B";
 const MAX_REQUEST_BYTES: usize = 1 << 20;
 const SESSION_CACHE_ENTRIES: usize = 2;
 
@@ -131,25 +132,25 @@ impl ApiError {
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
-struct Engine {
+struct Engine<M: LanguageModel> {
     ctx: MetalContext,
-    model: Qwen3_5Model,
+    model: M,
     generator: Generator,
-    sessions: SessionStore,
-    scratch: Scratch,
+    sessions: SessionStore<M>,
+    scratch: M::Scratch,
     max_seq: usize,
     next_id: u64,
 }
 
-impl Engine {
+impl<M: LanguageModel> Engine<M> {
     fn load(model_dir: &Path, max_seq: usize) -> Result<Self> {
         let ctx = MetalContext::new()?;
-        let model = Qwen3_5Model::load(&ctx, model_dir)?;
-        let declared = model.config.max_position_embeddings;
+        let model = M::load(&ctx, model_dir)?;
+        let declared = model.max_position_embeddings();
         let max_seq = if declared == 0 { max_seq } else { max_seq.min(declared) };
         ensure!(max_seq > 1, "max_seq must be at least 2");
         let mut generator = Generator::from_model_dir(model_dir)?;
-        generator.add_stop_tokens(&model.config.eos_token_id.as_vec());
+        generator.add_stop_tokens(&model.eos_token_ids());
         let scratch = model.new_scratch_with_capacity(&ctx, max_seq)?;
         Ok(Self {
             ctx,
@@ -164,9 +165,10 @@ impl Engine {
 
     fn validate_request(&self, request: &ChatRequest) -> Result<Vec<u32>> {
         ensure!(
-            request.model == MODEL_ID,
-            "unknown model {:?}; this server exposes only {MODEL_ID}",
-            request.model
+            request.model == M::MODEL_ID,
+            "unknown model {:?}; this server exposes only {}",
+            request.model,
+            M::MODEL_ID
         );
         ensure!(!request.stream, "streaming is not supported");
         ensure!(!request.messages.is_empty(), "messages must not be empty");
@@ -229,7 +231,7 @@ impl Engine {
         session.tokens.extend_from_slice(suffix);
         session.tokens.extend_from_slice(&generation.tokens[..decode_fed]);
         ensure!(
-            session.state.pos == session.tokens.len(),
+            session.state.pos() == session.tokens.len(),
             "session token/state position mismatch"
         );
         self.sessions.release(session, request.prompt_cache_key.as_deref());
@@ -242,7 +244,7 @@ impl Engine {
             id,
             object: "chat.completion",
             created,
-            model: MODEL_ID,
+            model: M::MODEL_ID,
             choices: [Choice {
                 index: 0,
                 message: Message::new_assistant(generation.text),
@@ -258,7 +260,37 @@ impl Engine {
     }
 }
 
+/// The `model_type` a checkpoint's `config.json` declares.
+pub fn checkpoint_model_type(model_dir: &Path) -> Result<String> {
+    let path = model_dir.join("config.json");
+    let bytes =
+        std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    let config: serde_json::Value =
+        serde_json::from_slice(&bytes).context("parsing config.json")?;
+    config
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .with_context(|| format!("{} has no model_type", path.display()))
+}
+
+/// Serves the checkpoint at `model_dir` with the engine its `model_type` names.
 pub fn run(model_dir: &Path, bind: &str, max_seq: usize) -> Result<()> {
+    match checkpoint_model_type(model_dir)?.as_str() {
+        "qwen3_5_moe" => run_with::<Qwen3_5Model>(model_dir, bind, max_seq),
+        "qwen4_exp" => run_with::<Qwen4ExpModel>(model_dir, bind, max_seq),
+        other => anyhow::bail!(
+            "unsupported model_type {other:?}; lily serves qwen3_5_moe \
+             (Qwen3.6-35B-A3B) and qwen4_exp (Qwen3.8-Flash-Next)"
+        ),
+    }
+}
+
+fn run_with<M: LanguageModel>(
+    model_dir: &Path,
+    bind: &str,
+    max_seq: usize,
+) -> Result<()> {
     let address = bind
         .to_socket_addrs()
         .with_context(|| format!("resolving bind address {bind}"))?
@@ -267,8 +299,8 @@ pub fn run(model_dir: &Path, bind: &str, max_seq: usize) -> Result<()> {
     let server = Server::http(address)
         .map_err(|e| anyhow::anyhow!("{e}"))
         .with_context(|| format!("binding http://{bind}"))?;
-    let mut engine = Engine::load(model_dir, max_seq)?;
-    eprintln!("serving {MODEL_ID} on http://{address}");
+    let mut engine = Engine::<M>::load(model_dir, max_seq)?;
+    eprintln!("serving {} on http://{address}", M::MODEL_ID);
 
     for mut request in server.incoming_requests() {
         let result = dispatch(&mut engine, &mut request);
@@ -296,8 +328,8 @@ pub fn run(model_dir: &Path, bind: &str, max_seq: usize) -> Result<()> {
     Ok(())
 }
 
-fn dispatch(
-    engine: &mut Engine,
+fn dispatch<M: LanguageModel>(
+    engine: &mut Engine<M>,
     request: &mut Request,
 ) -> ApiResult<Response<std::io::Cursor<Vec<u8>>>> {
     let path = request.url().split('?').next().unwrap_or(request.url());
@@ -311,7 +343,7 @@ fn dispatch(
             &serde_json::json!({
                 "object": "list",
                 "data": [{
-                    "id": MODEL_ID,
+                    "id": M::MODEL_ID,
                     "object": "model",
                     "created": 0,
                     "owned_by": "lily"

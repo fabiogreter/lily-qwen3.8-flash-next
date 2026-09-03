@@ -62,7 +62,12 @@ impl QuantWeights {
         })
     }
 
-    pub(crate) fn expect_features(&self, out: usize, inp: usize, name: &str) -> Result<()> {
+    pub(crate) fn expect_features(
+        &self,
+        out: usize,
+        inp: usize,
+        name: &str,
+    ) -> Result<()> {
         ensure!(
             self.out_features() == out && self.in_features() == inp,
             "{name} is [{}, {}], expected [{out}, {inp}]",

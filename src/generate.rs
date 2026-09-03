@@ -5,8 +5,8 @@ use std::path::Path;
 use anyhow::{Result, ensure};
 
 use crate::chat::Conversation;
+use crate::engine::{DecodeStateApi, LanguageModel, ScratchApi};
 use crate::metal::MetalContext;
-use crate::model::{DecodeState, Qwen3_5Model, Scratch};
 pub use crate::tokenizer::Thinking;
 use crate::tokenizer::Tokenizer;
 
@@ -56,38 +56,38 @@ impl Generator {
         self.tokenizer.decode(tokens, true)
     }
 
-    pub fn generate(
+    pub fn generate<M: LanguageModel>(
         &self,
         ctx: &MetalContext,
-        model: &Qwen3_5Model,
-        state: &mut DecodeState,
-        scratch: &mut Scratch,
+        model: &M,
+        state: &mut M::State,
+        scratch: &mut M::Scratch,
         prompt_ids: &[u32],
         max_tokens: usize,
     ) -> Result<Generation> {
         ensure!(!prompt_ids.is_empty(), "empty prompt");
-        let pos_before = state.pos;
+        let pos_before = state.pos();
         model.prefill(ctx, state, scratch, prompt_ids)?;
         let tokens = self.decode_pipelined(ctx, model, state, scratch, max_tokens)?;
         let stopped = ends_with_stop_token(&tokens, &self.stop_tokens);
         let text = self.decode_text(&tokens)?;
         let fed = state
-            .pos
+            .pos()
             .checked_sub(pos_before)
             .ok_or_else(|| anyhow::anyhow!("decode state moved backwards"))?;
         Ok(Generation { tokens, text, stopped, fed })
     }
 
-    fn decode_pipelined(
+    fn decode_pipelined<M: LanguageModel>(
         &self,
         ctx: &MetalContext,
-        model: &Qwen3_5Model,
-        state: &mut DecodeState,
-        scratch: &Scratch,
+        model: &M,
+        state: &mut M::State,
+        scratch: &M::Scratch,
         max_tokens: usize,
     ) -> Result<Vec<u32>> {
         let read_slot = |slot: usize| -> Result<u32> {
-            Ok(scratch.next_token.view(slot, &[1])?.to_u32()?[0])
+            Ok(scratch.next_token().view(slot, &[1])?.to_u32()?[0])
         };
         let mut tokens = Vec::new();
         if max_tokens == 0 {

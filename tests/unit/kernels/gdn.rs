@@ -537,8 +537,21 @@ fn gdn_fused_decode_f32_matches_cpu() {
         let out = Tensor::zeros(&ctx, &[h, dim], DType::BF16).expect("out");
         let pass = ctx.begin().expect("pass");
         gdn_step_gated_fused(
-            &ctx, &pass, &t_qkv, &t_a, &t_b, &t_a_log, &t_dt_bias, &t_state, &t_z,
-            &t_norm_w, &out, scale, hk, eps, GdnGate::Silu,
+            &ctx,
+            &pass,
+            &t_qkv,
+            &t_a,
+            &t_b,
+            &t_a_log,
+            &t_dt_bias,
+            &t_state,
+            &t_z,
+            &t_norm_w,
+            &out,
+            scale,
+            hk,
+            eps,
+            GdnGate::Silu,
         )
         .expect("F32 fused decode");
         pass.commit_wait().expect("commit");
@@ -970,7 +983,8 @@ fn gated_rmsnorm_matches_cpu() {
     let out = Tensor::zeros(&ctx, &[rows, d], DType::BF16).expect("out");
 
     let pass = ctx.begin().expect("pass");
-    gated_rmsnorm(&ctx, &pass, &tx, &tg, &tw, &out, eps, GdnGate::Silu).expect("gated_rmsnorm");
+    gated_rmsnorm(&ctx, &pass, &tx, &tg, &tw, &out, eps, GdnGate::Silu)
+        .expect("gated_rmsnorm");
     pass.commit_wait().expect("commit");
 
     let expected = cpu_ref::gated_rmsnorm(
@@ -997,7 +1011,8 @@ fn gated_rmsnorm_sigmoid_gate_matches_cpu() {
     let tw = Tensor::from_f32(&ctx, &w, &[d]).expect("w");
     let out = Tensor::zeros(&ctx, &[rows, d], DType::BF16).expect("out");
     let pass = ctx.begin().expect("pass");
-    gated_rmsnorm(&ctx, &pass, &tx, &tg, &tw, &out, eps, GdnGate::Sigmoid).expect("gated");
+    gated_rmsnorm(&ctx, &pass, &tx, &tg, &tw, &out, eps, GdnGate::Sigmoid)
+        .expect("gated");
     pass.commit_wait().expect("commit");
     let expected = cpu_ref::gated_rmsnorm_with(
         &cpu_ref::round_bf16(&x),

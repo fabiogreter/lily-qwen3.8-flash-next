@@ -5,4 +5,7 @@
 //! Attention on top.
 
 pub mod config;
+pub mod model;
 pub mod weights;
+
+pub use model::{DecodeState, Qwen4ExpModel, Scratch};

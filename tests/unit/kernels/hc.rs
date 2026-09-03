@@ -33,7 +33,8 @@ fn grouped_rmsnorm_matches_per_segment_cpu() {
     for r in 0..rows {
         for s in 0..g {
             let seg = &x[(r * g + s) * h..(r * g + s + 1) * h];
-            let gain: Vec<f32> = w[s * h..(s + 1) * h].iter().map(|v| 1.0 + v).collect();
+            let gain: Vec<f32> =
+                w[s * h..(s + 1) * h].iter().map(|v| 1.0 + v).collect();
             let normed = cpu_ref::rmsnorm(seg, &gain, h, eps);
             expected[(r * g + s) * h..(r * g + s + 1) * h].copy_from_slice(&normed);
         }
@@ -55,7 +56,8 @@ fn mix_and_inject_match_cpu() {
     let t_up = Tensor::from_f32_as_bf16(&ctx, &up, &[rows, g * h]).expect("up");
     let t_hn = Tensor::from_f32_as_bf16(&ctx, &hn, &[rows, g * h]).expect("hn");
     let t_mixed = Tensor::zeros(&ctx, &[rows, h], DType::BF16).expect("mixed");
-    let t_hyper = Tensor::from_f32_as_bf16(&ctx, &hyper, &[rows, g * h]).expect("hyper");
+    let t_hyper =
+        Tensor::from_f32_as_bf16(&ctx, &hyper, &[rows, g * h]).expect("hyper");
     let t_branch = Tensor::from_f32_as_bf16(&ctx, &branch, &[rows, h]).expect("branch");
     let t_inj = Tensor::from_f32_as_bf16(&ctx, &inj, &[rows, g]).expect("inj");
 
@@ -99,7 +101,10 @@ fn broadcast_and_scaled_silu() {
     let got = hyper.to_f32().expect("hyper");
     for r in 0..rows {
         for s in 0..g {
-            assert_eq!(&got[(r * g + s) * h..(r * g + s + 1) * h], &x[r * h..(r + 1) * h]);
+            assert_eq!(
+                &got[(r * g + s) * h..(r * g + s + 1) * h],
+                &x[r * h..(r + 1) * h]
+            );
         }
     }
     let expected: Vec<f32> = x.iter().map(|v| cpu_ref::silu(v * 0.25)).collect();

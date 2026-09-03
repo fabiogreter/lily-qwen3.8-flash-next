@@ -260,12 +260,14 @@ impl Qwen4ExpConfig {
             "QSA requires one indexer key head, got {}",
             t.indexer_kv_heads
         );
-        let gdn_gate = match t.output_gate_type.as_deref().unwrap_or(t.hidden_act.as_str())
-        {
-            "silu" => GateAct::Silu,
-            "sigmoid" => GateAct::Sigmoid,
-            other => anyhow::bail!("unsupported GDN output gate activation {other:?}"),
-        };
+        let gdn_gate =
+            match t.output_gate_type.as_deref().unwrap_or(t.hidden_act.as_str()) {
+                "silu" => GateAct::Silu,
+                "sigmoid" => GateAct::Sigmoid,
+                other => {
+                    anyhow::bail!("unsupported GDN output gate activation {other:?}")
+                }
+            };
         let q = &wrapper.lily.quantization;
         let quantization = QuantizationConfig {
             group_size: q.default.group_size,
