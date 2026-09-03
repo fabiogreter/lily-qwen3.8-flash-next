@@ -176,6 +176,23 @@ pub fn gated_rmsnorm(
     d: usize,
     eps: f32,
 ) -> Vec<f32> {
+    gated_rmsnorm_with(x, gate, w, d, eps, silu)
+}
+
+pub fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// [`gated_rmsnorm`] with an arbitrary gate activation (Qwen3.8-Flash-Next
+/// gates with a plain sigmoid).
+pub fn gated_rmsnorm_with(
+    x: &[f32],
+    gate: &[f32],
+    w: &[f32],
+    d: usize,
+    eps: f32,
+    act: fn(f32) -> f32,
+) -> Vec<f32> {
     let rows = x.len() / d;
     let mut out = vec![0.0f32; x.len()];
     for row in 0..rows {
@@ -183,7 +200,7 @@ pub fn gated_rmsnorm(
         let mean_sq = xs.iter().map(|v| v * v).sum::<f32>() / d as f32;
         let inv_rms = 1.0 / (mean_sq + eps).sqrt();
         for i in 0..d {
-            out[row * d + i] = w[i] * xs[i] * inv_rms * silu(gate[row * d + i]);
+            out[row * d + i] = w[i] * xs[i] * inv_rms * act(gate[row * d + i]);
         }
     }
     out

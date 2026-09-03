@@ -10,13 +10,16 @@ use anyhow::{Context as _, Result, ensure};
 use lily::metal::{MetalContext, MslVersion};
 use objc2_metal::MTLLibrary as _;
 
-const SHADERS: [(&str, &str); 8] = [
+const SHADERS: [(&str, &str); 11] = [
     ("attention.metal", include_str!("../src/kernels/metal/attention.metal")),
     ("elementwise.metal", include_str!("../src/kernels/metal/elementwise.metal")),
     ("gdn.metal", include_str!("../src/kernels/metal/gdn.metal")),
     ("gemm.metal", include_str!("../src/kernels/metal/gemm.metal")),
+    ("hc.metal", include_str!("../src/kernels/metal/hc.metal")),
     ("moe.metal", include_str!("../src/kernels/metal/moe.metal")),
     ("norm.metal", include_str!("../src/kernels/metal/norm.metal")),
+    ("ple.metal", include_str!("../src/kernels/metal/ple.metal")),
+    ("qsa.metal", include_str!("../src/kernels/metal/qsa.metal")),
     ("quant.metal", include_str!("../src/kernels/metal/quant.metal")),
     ("skinny.metal", include_str!("../src/kernels/metal/skinny.metal")),
 ];

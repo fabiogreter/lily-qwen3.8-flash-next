@@ -1,0 +1,229 @@
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+
+use super::*;
+use crate::cpu_ref;
+
+fn random(rng: &mut StdRng, n: usize, lo: f32, hi: f32) -> Vec<f32> {
+    (0..n).map(|_| rng.gen_range(lo..hi)).collect()
+}
+
+/// rmsnorm(+1) then partial NeoX RoPE on one head row, rounding like the kernel.
+fn prep_head(x: &[f32], w: &[f32], rot: usize, pos: usize, theta: f32, eps: f32) -> Vec<f32> {
+    let gain: Vec<f32> = w.iter().map(|v| 1.0 + v).collect();
+    let mut normed = cpu_ref::round_bf16(&cpu_ref::rmsnorm(x, &gain, x.len(), eps));
+    cpu_ref::rope_neox(&mut normed, x.len(), rot, pos, theta);
+    normed
+}
+
+#[test]
+fn prep_q_and_block_keys_match_cpu() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(41);
+    let (m, nh, d, rot, ratio, base_pos) = (6usize, 4usize, INDEXER_D, 64usize, 4usize, 9usize);
+    let (theta, eps) = (1.0e7f32, 1e-6f32);
+    let qk = cpu_ref::round_bf16(&random(&mut rng, m * (nh + 1) * d, -2.0, 2.0));
+    let wq = cpu_ref::round_bf16(&random(&mut rng, d, -0.5, 0.5));
+    let wk = cpu_ref::round_bf16(&random(&mut rng, d, -0.5, 0.5));
+    let max_seq = 32usize;
+    let cache_init = cpu_ref::round_bf16(&random(&mut rng, max_seq * d, -2.0, 2.0));
+
+    let t_qk = Tensor::from_f32_as_bf16(&ctx, &qk, &[m, (nh + 1) * d]).expect("qk");
+    let t_wq = Tensor::from_f32_as_bf16(&ctx, &wq, &[d]).expect("wq");
+    let t_wk = Tensor::from_f32_as_bf16(&ctx, &wk, &[d]).expect("wk");
+    let q = Tensor::zeros(&ctx, &[m, nh, d], DType::BF16).expect("q");
+    let cache = Tensor::from_f32_as_bf16(&ctx, &cache_init, &[max_seq, d]).expect("cache");
+    let blocks = Tensor::zeros(&ctx, &[max_seq / ratio, d], DType::BF16).expect("blocks");
+
+    // Blocks completed by this chunk: those whose four tokens all lie below
+    // base_pos + m, starting at the first block touching the chunk.
+    let first_block = base_pos / ratio;
+    let complete = (base_pos + m) / ratio;
+    let count = complete - first_block;
+    let pass = ctx.begin().expect("pass");
+    qsa_prep_q(&ctx, &pass, &t_qk, &t_wq, &q, nh, rot, base_pos, theta, eps).expect("prep q");
+    qsa_scatter_keys(&ctx, &pass, &t_qk, &cache, nh, base_pos).expect("scatter");
+    qsa_block_keys(&ctx, &pass, &cache, &t_wk, &blocks, ratio, first_block, count, rot, theta, eps).expect("blocks");
+    pass.commit_wait().expect("commit");
+
+    let mut expected_q = Vec::with_capacity(m * nh * d);
+    let mut cache_ref = cache_init.clone();
+    for r in 0..m {
+        let row = &qk[r * (nh + 1) * d..(r + 1) * (nh + 1) * d];
+        for h in 0..nh {
+            expected_q.extend(prep_head(&row[h * d..(h + 1) * d], &wq, rot, base_pos + r, theta, eps));
+        }
+        cache_ref[(base_pos + r) * d..(base_pos + r + 1) * d].copy_from_slice(&row[nh * d..]);
+    }
+    cpu_ref::assert_close(&q.to_f32().expect("q"), &expected_q, 2e-2, 2e-2);
+    assert_eq!(cache.to_f32().expect("cache"), cache_ref);
+
+    let got_blocks = blocks.to_f32().expect("blocks");
+    for b in first_block..complete {
+        let mut pooled = vec![0.0f32; d];
+        for i in 0..ratio {
+            for (p, v) in pooled.iter_mut().zip(&cache_ref[(b * ratio + i) * d..(b * ratio + i + 1) * d]) {
+                *p += v;
+            }
+        }
+        let pooled: Vec<f32> = cpu_ref::round_bf16(&pooled.iter().map(|v| v / ratio as f32).collect::<Vec<_>>());
+        let expected = prep_head(&pooled, &wk, rot, b * ratio, theta, eps);
+        cpu_ref::assert_close(&got_blocks[b * d..(b + 1) * d], &expected, 2e-2, 2e-2);
+    }
+    // Blocks outside the range stay untouched (zero).
+    assert!(got_blocks[complete * d..].iter().all(|&v| v == 0.0));
+}
+
+fn cpu_scores(q: &[f32], blocks: &[f32], nh: usize, d: usize, nb: usize) -> Vec<f32> {
+    (0..nb)
+        .map(|b| {
+            let mut s = 0.0f32;
+            for h in 0..nh {
+                let dot: f32 = (0..d).map(|i| q[h * d + i] * blocks[b * d + i]).sum();
+                s += dot.max(0.0);
+            }
+            s / (d as f32).sqrt()
+        })
+        .collect()
+}
+
+#[test]
+fn scores_and_selection_match_cpu() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(42);
+    let (nh, d, ratio, k_max) = (4usize, INDEXER_D, 4usize, 5usize);
+    // Positions 40..43 see 10 or 11 complete blocks: more than k_max.
+    let (qb, base_pos) = (4usize, 40usize);
+    let nb_max = visible_blocks(base_pos + qb - 1, ratio);
+    let q = cpu_ref::round_bf16(&random(&mut rng, qb * nh * d, -1.0, 1.0));
+    // Quantized block keys make exact score ties likely, which exercises the
+    // deterministic tie break.
+    let blocks: Vec<f32> = (0..nb_max * d).map(|_| (rng.gen_range(-2i32..3)) as f32 * 0.25).collect();
+    let t_q = Tensor::from_f32_as_bf16(&ctx, &q, &[qb, nh, d]).expect("q");
+    let t_blocks = Tensor::from_f32_as_bf16(&ctx, &blocks, &[nb_max, d]).expect("blocks");
+    let scores = Tensor::zeros(&ctx, &[qb, nb_max], DType::F32).expect("scores");
+    let sel = Tensor::zeros(&ctx, &[qb, k_max], DType::U32).expect("sel");
+    let n_sel = Tensor::zeros(&ctx, &[qb], DType::U32).expect("n_sel");
+    let pass = ctx.begin().expect("pass");
+    qsa_scores(&ctx, &pass, &t_q, &t_blocks, &scores, nh, nb_max, base_pos, ratio).expect("scores");
+    qsa_select_blocks(&ctx, &pass, &scores, &sel, &n_sel, qb, nb_max, base_pos, ratio, k_max).expect("select");
+    pass.commit_wait().expect("commit");
+
+    let got_scores = scores.to_f32().expect("scores");
+    let got_sel = sel.to_u32().expect("sel");
+    let got_n = n_sel.to_u32().expect("n_sel");
+    for qi in 0..qb {
+        let nb = visible_blocks(base_pos + qi, ratio);
+        let expected = cpu_scores(&q[qi * nh * d..(qi + 1) * nh * d], &blocks, nh, d, nb);
+        let row = &got_scores[qi * nb_max..qi * nb_max + nb];
+        cpu_ref::assert_close(row, &expected, 1e-3, 1e-3);
+        assert!(got_scores[qi * nb_max + nb..(qi + 1) * nb_max].iter().all(|v| *v == f32::NEG_INFINITY));
+
+        // Reference selection on the kernel's own scores: sort by (score desc,
+        // index asc), keep k_max, report ascending.
+        let mut order: Vec<usize> = (0..nb).collect();
+        order.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap().then(a.cmp(&b)));
+        let mut expected_sel: Vec<u32> = order[..k_max.min(nb)].iter().map(|&b| b as u32).collect();
+        expected_sel.sort_unstable();
+        assert_eq!(got_n[qi] as usize, k_max.min(nb));
+        assert_eq!(&got_sel[qi * k_max..qi * k_max + got_n[qi] as usize], &expected_sel[..]);
+    }
+}
+
+#[test]
+fn selection_keeps_everything_below_budget() {
+    let ctx = MetalContext::new().expect("metal context");
+    let (ratio, k_max, qb, base_pos) = (4usize, 8usize, 3usize, 5usize);
+    let nb_max = visible_blocks(base_pos + qb - 1, ratio);
+    let scores = Tensor::from_f32(&ctx, &vec![0.5f32; qb * nb_max], &[qb, nb_max]).expect("scores");
+    let sel = Tensor::zeros(&ctx, &[qb, k_max], DType::U32).expect("sel");
+    let n_sel = Tensor::zeros(&ctx, &[qb], DType::U32).expect("n_sel");
+    let pass = ctx.begin().expect("pass");
+    qsa_select_blocks(&ctx, &pass, &scores, &sel, &n_sel, qb, nb_max, base_pos, ratio, k_max).expect("select");
+    pass.commit_wait().expect("commit");
+    let got_sel = sel.to_u32().expect("sel");
+    for (qi, n) in n_sel.to_u32().expect("n").into_iter().enumerate() {
+        let nb = visible_blocks(base_pos + qi, ratio);
+        assert_eq!(n as usize, nb);
+        assert_eq!(&got_sel[qi * k_max..qi * k_max + nb], &(0..nb as u32).collect::<Vec<_>>()[..]);
+    }
+}
+
+#[test]
+fn sparse_attention_matches_dense_over_selected_tokens() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(43);
+    let (kvh, group, d, ratio, k_max) = (2usize, 12usize, 256usize, 4usize, 3usize);
+    let nq = kvh * group;
+    let (qb, base_pos, max_seq) = (3usize, 20usize, 64usize);
+    let scale = 1.0 / (d as f32).sqrt();
+    let q = cpu_ref::round_bf16(&random(&mut rng, qb * nq * d, -1.0, 1.0));
+    let k = cpu_ref::round_bf16(&random(&mut rng, kvh * max_seq * d, -1.0, 1.0));
+    let v = cpu_ref::round_bf16(&random(&mut rng, kvh * max_seq * d, -1.0, 1.0));
+    // Hand-picked ascending selections (k_max blocks each).
+    let sel: Vec<u32> = vec![0, 2, 4, 1, 2, 3, 0, 3, 5];
+    let n_sel: Vec<u32> = vec![3, 3, 3];
+
+    let t_q = Tensor::from_f32_as_bf16(&ctx, &q, &[qb, nq, d]).expect("q");
+    let t_k = Tensor::from_f32_as_bf16(&ctx, &k, &[kvh, max_seq, d]).expect("k");
+    let t_v = Tensor::from_f32_as_bf16(&ctx, &v, &[kvh, max_seq, d]).expect("v");
+    let t_sel = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[qb, k_max], DType::U32).expect("sel");
+    let t_n = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&n_sel), &[qb], DType::U32).expect("n");
+    let out = Tensor::zeros(&ctx, &[qb, nq, d], DType::BF16).expect("out");
+    let splits = sparse_splits(k_max, ratio);
+    let partials = Tensor::zeros(&ctx, &[qb * nq, splits, d], DType::F32).expect("partials");
+    let stats = Tensor::zeros(&ctx, &[qb * nq, splits, 2], DType::F32).expect("stats");
+    let pass = ctx.begin().expect("pass");
+    qsa_attention(
+        &ctx,
+        &pass,
+        &t_q,
+        &t_k,
+        &t_v,
+        &t_sel,
+        &t_n,
+        &out,
+        &SparseSplitScratch { partials: &partials, stats: &stats },
+        qb,
+        k_max,
+        ratio,
+        base_pos,
+        scale,
+    )
+    .expect("sparse attention");
+    pass.commit_wait().expect("commit");
+
+    let mut expected = vec![0.0f32; qb * nq * d];
+    for qi in 0..qb {
+        let pos = base_pos + qi;
+        let tail_start = visible_blocks(pos, ratio) * ratio;
+        let mut tokens: Vec<usize> = Vec::new();
+        for &b in &sel[qi * k_max..qi * k_max + n_sel[qi] as usize] {
+            tokens.extend((0..ratio).map(|i| b as usize * ratio + i));
+        }
+        tokens.extend(tail_start..=pos);
+        assert_eq!(tokens.len(), attended_tokens(pos, ratio, n_sel[qi] as usize));
+        for hq in 0..nq {
+            let kh = hq / group;
+            let qrow = &q[(qi * nq + hq) * d..(qi * nq + hq + 1) * d];
+            let logits: Vec<f32> = tokens
+                .iter()
+                .map(|&t| {
+                    let krow = &k[(kh * max_seq + t) * d..(kh * max_seq + t + 1) * d];
+                    qrow.iter().zip(krow).map(|(a, b)| a * b).sum::<f32>() * scale
+                })
+                .collect();
+            let m = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let weights: Vec<f32> = logits.iter().map(|l| (l - m).exp()).collect();
+            let sum: f32 = weights.iter().sum();
+            let o = &mut expected[(qi * nq + hq) * d..(qi * nq + hq + 1) * d];
+            for (w, &t) in weights.iter().zip(&tokens) {
+                let vrow = &v[(kh * max_seq + t) * d..(kh * max_seq + t + 1) * d];
+                for i in 0..d {
+                    o[i] += w / sum * vrow[i];
+                }
+            }
+        }
+    }
+    cpu_ref::assert_close(&out.to_f32().expect("out"), &expected, 2e-2, 2e-2);
+}

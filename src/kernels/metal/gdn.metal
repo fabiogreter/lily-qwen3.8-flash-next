@@ -5,6 +5,16 @@ using namespace metal;
 
 #define DIM 128
 
+// Output-gate activation selector shared by the gated norms: 0 = SiLU
+// (Qwen3.5), 1 = sigmoid (Qwen3.8-Flash-Next's `output_gate_type`).
+#define GDN_GATE_SILU 0u
+#define GDN_GATE_SIGMOID 1u
+
+static inline float gate_activation(float gate, uint gate_act) {
+    const float sig = 1.0f / (1.0f + exp(-gate));
+    return gate_act == GDN_GATE_SIGMOID ? sig : gate * sig;
+}
+
 // One GDN decode step per value head; each thread owns one state column.
 // Value head h uses key head h / vpk; state is FP32 [H, DIM, DIM].
 template <typename StateT>
@@ -93,6 +103,7 @@ kernel void NAME(device const bfloat* q       [[buffer(0)]],                  \
                  constant float&      scale   [[buffer(11)]],                 \
                  constant uint&       vpk     [[buffer(12)]],                 \
                  constant float&      eps     [[buffer(13)]],                 \
+                 constant uint&       gate_act [[buffer(14)]],                \
                  uint h    [[threadgroup_position_in_grid]],                  \
                  uint tid  [[thread_index_in_threadgroup]],                   \
                  uint sg   [[simdgroup_index_in_threadgroup]],                \
@@ -125,8 +136,8 @@ kernel void NAME(device const bfloat* q       [[buffer(0)]],                  \
     }                                                                         \
     threadgroup_barrier(mem_flags::mem_threadgroup);                          \
     const float gate = float(z[h * DIM + tid]);                               \
-    const float silu = gate / (1.0f + exp(-gate));                            \
-    out[h * DIM + tid] = bfloat(norm_w[tid] * rv * inv_rms * silu);           \
+    const float act = gate_activation(gate, gate_act);                        \
+    out[h * DIM + tid] = bfloat(norm_w[tid] * rv * inv_rms * act);            \
 }
 
 GDN_STEP_GATED_WRAPPER(gdn_step_gated, float)
@@ -330,6 +341,7 @@ kernel void gated_rmsnorm_bf16(device const bfloat* x    [[buffer(0)]],  // [row
                                device bfloat*       out  [[buffer(3)]],  // [rows, D]
                                constant uint&       D    [[buffer(4)]],
                                constant float&      eps  [[buffer(5)]],
+                               constant uint&       gate_act [[buffer(6)]],
                                uint row  [[threadgroup_position_in_grid]],
                                uint tid  [[thread_index_in_threadgroup]],
                                uint sg   [[simdgroup_index_in_threadgroup]],
@@ -357,7 +369,7 @@ kernel void gated_rmsnorm_bf16(device const bfloat* x    [[buffer(0)]],  // [row
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = tid; i < D; i += TG) {
         float g = float(gate[row * D + i]);
-        float s = g / (1.0f + exp(-g));
+        float s = gate_activation(g, gate_act);
         out[row * D + i] = bfloat(w[i] * float(x[row * D + i]) * inv_rms * s);
     }
 }

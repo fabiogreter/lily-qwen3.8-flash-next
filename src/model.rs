@@ -16,8 +16,8 @@ use crate::kernels::elementwise::{
     sigmoid_mul_bf16, silu_mul_bf16, split_cols_bf16,
 };
 use crate::kernels::gdn::{
-    GDN_HEAD_DIM, GDN_STATE_DTYPE, GdnRegscanStaging, conv1d_prefill, conv1d_step,
-    gated_rmsnorm, gdn_prefill, gdn_step_gated_fused,
+    GDN_HEAD_DIM, GDN_STATE_DTYPE, GdnGate, GdnRegscanStaging, conv1d_prefill,
+    conv1d_step, gated_rmsnorm, gdn_prefill, gdn_step_gated_fused,
 };
 use crate::kernels::norm::{add_rmsnorm_bf16, rmsnorm_bf16};
 use crate::kernels::{moe, quant, skinny};
@@ -803,6 +803,7 @@ impl Qwen3_5Model {
                         &w.norm_w,
                         &ps.gdn_gated,
                         eps,
+                        GdnGate::Silu,
                     )?;
                     project_mat(
                         ctx,
@@ -1287,6 +1288,7 @@ impl Qwen3_5Model {
                 self.gdn_scale,
                 self.config.linear_num_key_heads,
                 self.config.rms_norm_eps,
+                GdnGate::Silu,
             )?;
         }
         pass.level_barrier(&[&s.gdn_gated, gdn_state])?;

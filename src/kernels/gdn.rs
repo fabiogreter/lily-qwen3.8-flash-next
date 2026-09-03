@@ -17,6 +17,14 @@ const SOURCE: &str = include_str!("metal/gdn.metal");
 /// Recurrent state is F32 because rounding compounds across tokens.
 pub const GDN_STATE_DTYPE: DType = DType::F32;
 
+/// Activation applied to the output gate `z` inside the gated RMSNorm.
+/// Qwen3.5 uses SiLU; Qwen3.8-Flash-Next sets `output_gate_type = "sigmoid"`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GdnGate {
+    Silu = 0,
+    Sigmoid = 1,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn gdn_step_gated_fused(
     ctx: &MetalContext,
@@ -33,6 +41,7 @@ pub fn gdn_step_gated_fused(
     scale: f32,
     num_k_heads: usize,
     eps: f32,
+    gate_act: GdnGate,
 ) -> Result<()> {
     let num_heads = a.numel();
     let dim = GDN_HEAD_DIM;
@@ -71,7 +80,12 @@ pub fn gdn_step_gated_fused(
             norm_w.binding(),
             out.binding(),
         ],
-        &[&scale.to_ne_bytes(), &u32_bytes(vpk), &eps.to_ne_bytes()],
+        &[
+            &scale.to_ne_bytes(),
+            &u32_bytes(vpk),
+            &eps.to_ne_bytes(),
+            &u32_bytes(gate_act as usize),
+        ],
         Grid::Threadgroups { groups: (num_heads, 1, 1), threadgroup: (dim, 1, 1) },
     )
 }
@@ -306,6 +320,7 @@ pub fn conv1d_step(
 }
 
 /// Gated RMS norm over rows of size `d` with F32 weights.
+#[allow(clippy::too_many_arguments)]
 pub fn gated_rmsnorm(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
@@ -314,6 +329,7 @@ pub fn gated_rmsnorm(
     w: &Tensor,
     out: &Tensor,
     eps: f32,
+    gate_act: GdnGate,
 ) -> Result<()> {
     let d = w.numel();
     ensure!(w.dtype() == DType::F32, "gated_rmsnorm weight must be F32");
@@ -328,7 +344,7 @@ pub fn gated_rmsnorm(
     pass.dispatch_at(
         &pipeline,
         &[x.binding(), gate.binding(), w.binding(), out.binding()],
-        &[&u32_bytes(d), &eps.to_ne_bytes()],
+        &[&u32_bytes(d), &eps.to_ne_bytes(), &u32_bytes(gate_act as usize)],
         Grid::Threadgroups { groups: (rows, 1, 1), threadgroup: (256, 1, 1) },
     )
 }

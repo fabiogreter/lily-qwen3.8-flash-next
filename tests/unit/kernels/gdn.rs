@@ -538,7 +538,7 @@ fn gdn_fused_decode_f32_matches_cpu() {
         let pass = ctx.begin().expect("pass");
         gdn_step_gated_fused(
             &ctx, &pass, &t_qkv, &t_a, &t_b, &t_a_log, &t_dt_bias, &t_state, &t_z,
-            &t_norm_w, &out, scale, hk, eps,
+            &t_norm_w, &out, scale, hk, eps, GdnGate::Silu,
         )
         .expect("F32 fused decode");
         pass.commit_wait().expect("commit");
@@ -970,7 +970,7 @@ fn gated_rmsnorm_matches_cpu() {
     let out = Tensor::zeros(&ctx, &[rows, d], DType::BF16).expect("out");
 
     let pass = ctx.begin().expect("pass");
-    gated_rmsnorm(&ctx, &pass, &tx, &tg, &tw, &out, eps).expect("gated_rmsnorm");
+    gated_rmsnorm(&ctx, &pass, &tx, &tg, &tw, &out, eps, GdnGate::Silu).expect("gated_rmsnorm");
     pass.commit_wait().expect("commit");
 
     let expected = cpu_ref::gated_rmsnorm(
@@ -979,6 +979,33 @@ fn gated_rmsnorm_matches_cpu() {
         &w,
         d,
         eps,
+    );
+    cpu_ref::assert_close(&out.to_f32().expect("read"), &expected, 2e-2, 2e-2);
+}
+
+#[test]
+fn gated_rmsnorm_sigmoid_gate_matches_cpu() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(77);
+    let (rows, d) = (6, 128);
+    let eps = 1e-6;
+    let x = random_vec(&mut rng, rows * d, -2.0, 2.0);
+    let gate = random_vec(&mut rng, rows * d, -3.0, 3.0);
+    let w = random_vec(&mut rng, d, 0.5, 1.5);
+    let tx = Tensor::from_f32_as_bf16(&ctx, &x, &[rows, d]).expect("x");
+    let tg = Tensor::from_f32_as_bf16(&ctx, &gate, &[rows, d]).expect("gate");
+    let tw = Tensor::from_f32(&ctx, &w, &[d]).expect("w");
+    let out = Tensor::zeros(&ctx, &[rows, d], DType::BF16).expect("out");
+    let pass = ctx.begin().expect("pass");
+    gated_rmsnorm(&ctx, &pass, &tx, &tg, &tw, &out, eps, GdnGate::Sigmoid).expect("gated");
+    pass.commit_wait().expect("commit");
+    let expected = cpu_ref::gated_rmsnorm_with(
+        &cpu_ref::round_bf16(&x),
+        &cpu_ref::round_bf16(&gate),
+        &w,
+        d,
+        eps,
+        cpu_ref::sigmoid,
     );
     cpu_ref::assert_close(&out.to_f32().expect("read"), &expected, 2e-2, 2e-2);
 }

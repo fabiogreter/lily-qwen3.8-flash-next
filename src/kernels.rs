@@ -4,8 +4,11 @@ pub mod attention;
 pub mod elementwise;
 pub mod gdn;
 pub mod gemm;
+pub mod hc;
 pub mod moe;
 pub mod norm;
+pub mod ple;
+pub mod qsa;
 pub mod quant;
 pub mod skinny;
 

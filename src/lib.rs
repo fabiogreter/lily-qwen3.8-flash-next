@@ -15,6 +15,8 @@ pub mod kernels;
 pub mod metal;
 #[cfg(target_os = "macos")]
 pub mod model;
+#[cfg(target_os = "macos")]
+pub mod qwen4exp;
 pub mod safetensors;
 #[cfg(target_os = "macos")]
 pub mod serve;

@@ -62,7 +62,7 @@ impl QuantWeights {
         })
     }
 
-    fn expect_features(&self, out: usize, inp: usize, name: &str) -> Result<()> {
+    pub(crate) fn expect_features(&self, out: usize, inp: usize, name: &str) -> Result<()> {
         ensure!(
             self.out_features() == out && self.in_features() == inp,
             "{name} is [{}, {}], expected [{out}, {inp}]",
@@ -169,19 +169,43 @@ fn to_dtype(dtype: &SafetensorsDType) -> Result<DType> {
     }
 }
 
+/// The bit width a projection is expected to be stored at, keyed by the
+/// tensor bases being loaded. Each model layout has its own policy.
+pub(crate) type BitsPolicy = fn(&[&str]) -> usize;
+
 /// Checkpoint access that records every consumed tensor name so `finish` can
 /// verify nothing in the file was silently ignored.
-struct Loader<'a> {
+pub(crate) struct Loader<'a> {
     ctx: &'a MetalContext,
     ckpt: Checkpoint,
     quant: QuantizationConfig,
     skip_prefixes: &'static [&'static str],
+    expected_bits: BitsPolicy,
     consumed: RefCell<HashSet<String>>,
+}
+
+impl<'a> Loader<'a> {
+    pub(crate) fn new(
+        ctx: &'a MetalContext,
+        ckpt: Checkpoint,
+        quant: QuantizationConfig,
+        skip_prefixes: &'static [&'static str],
+        expected_bits: BitsPolicy,
+    ) -> Self {
+        Self {
+            ctx,
+            ckpt,
+            quant,
+            skip_prefixes,
+            expected_bits,
+            consumed: RefCell::new(HashSet::new()),
+        }
+    }
 }
 
 impl Loader<'_> {
     /// Reads one tensor straight into a fresh shared-storage Metal buffer.
-    fn tensor(&self, name: &str) -> Result<Tensor> {
+    pub(crate) fn tensor(&self, name: &str) -> Result<Tensor> {
         self.consumed.borrow_mut().insert(name.to_string());
         let meta = self
             .ckpt
@@ -205,7 +229,7 @@ impl Loader<'_> {
     /// Like [`Self::tensor`] but upcasts BF16 to F32 host-side — for the few
     /// small parameters whose kernels want f32 while mlx checkpoints store
     /// bf16 (the GDN GatedNorm weight).
-    fn tensor_f32(&self, name: &str) -> Result<Tensor> {
+    pub(crate) fn tensor_f32(&self, name: &str) -> Result<Tensor> {
         let t = self.tensor(name)?;
         match t.dtype() {
             DType::F32 => Ok(t),
@@ -273,8 +297,20 @@ impl Loader<'_> {
         Tensor::from_buffer(buf, &[rows, k], dtype)
     }
 
-    /// Loads one quantized projection, or several fused along the output dim.
-    fn linear(&self, bases: &[&str], k: usize) -> Result<LinearWeights> {
+    /// Loads one quantized projection, or several fused along the output dim,
+    /// at the loader's default group size.
+    pub(crate) fn linear(&self, bases: &[&str], k: usize) -> Result<LinearWeights> {
+        self.linear_grouped(bases, k, self.quant.group_size)
+    }
+
+    /// [`Self::linear`] with an explicit quantization group size, for the few
+    /// tensors whose row width is not a multiple of the default group.
+    pub(crate) fn linear_grouped(
+        &self,
+        bases: &[&str],
+        k: usize,
+        group_size: usize,
+    ) -> Result<LinearWeights> {
         let weights: Vec<String> =
             bases.iter().map(|b| format!("{b}.weight")).collect();
         ensure!(
@@ -282,7 +318,7 @@ impl Loader<'_> {
             "{} is not an MLX quantized projection",
             bases[0]
         );
-        let q = self.quant;
+        let q = QuantizationConfig { group_size, bits: self.quant.bits };
         ensure!(
             k.is_multiple_of(q.group_size) && k.is_multiple_of(8),
             "in_features {k} not divisible by group size {} / packing",
@@ -302,10 +338,10 @@ impl Loader<'_> {
             weights[0]
         );
         let bits = 32 * cols / k;
-        let expected_bits = expected_projection_bits(bases);
+        let expected_bits = (self.expected_bits)(bases);
         ensure!(
             bits == expected_bits,
-            "{} uses {bits}-bit storage; expected {expected_bits}-bit for this Qwen3.6-35B-A3B projection",
+            "{} uses {bits}-bit storage; expected {expected_bits}-bit for this projection",
             weights[0]
         );
         let scales: Vec<String> = bases.iter().map(|b| format!("{b}.scales")).collect();
@@ -324,7 +360,7 @@ impl Loader<'_> {
     /// Loads the conv1d weight, accepting the HF `[C, 1, KD]` or mlx
     /// `[C, KD, 1]` layout and transposing to the tap-major `[KD, C]` the conv
     /// kernel consumes.
-    fn conv_weight(&self, name: &str) -> Result<Tensor> {
+    pub(crate) fn conv_weight(&self, name: &str) -> Result<Tensor> {
         self.consumed.borrow_mut().insert(name.to_string());
         let bytes = self.ckpt.read(name)?;
         let meta =
@@ -353,7 +389,7 @@ impl Loader<'_> {
 
     /// Fails if the checkpoint holds tensors lily neither consumed nor
     /// skip-listed — the guard against silent name-scheme drift.
-    fn finish(&self) -> Result<()> {
+    pub(crate) fn finish(&self) -> Result<()> {
         let consumed = self.consumed.borrow();
         let mut unconsumed: Vec<&str> = self
             .ckpt
@@ -375,7 +411,7 @@ impl Loader<'_> {
     }
 }
 
-fn expect_shape(t: &Tensor, shape: &[usize], name: &str) -> Result<()> {
+pub(crate) fn expect_shape(t: &Tensor, shape: &[usize], name: &str) -> Result<()> {
     ensure!(t.shape() == shape, "{name} shape {:?} != expected {shape:?}", t.shape());
     Ok(())
 }
@@ -547,13 +583,13 @@ pub fn load(
         "unsupported checkpoint layout; expected MLX Qwen3.6-35B-A3B"
     );
     let prefix = MLX_PREFIX;
-    let loader = Loader {
+    let loader = Loader::new(
         ctx,
         ckpt,
-        quant: config.quantization.expect("validated config"),
-        skip_prefixes: MLX_SKIP_PREFIXES,
-        consumed: RefCell::new(HashSet::new()),
-    };
+        config.quantization.expect("validated config"),
+        MLX_SKIP_PREFIXES,
+        expected_projection_bits,
+    );
     let h = config.hidden_size;
 
     let embed_tokens = loader.linear(&[&format!("{prefix}embed_tokens")], h)?;
