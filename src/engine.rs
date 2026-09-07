@@ -26,6 +26,11 @@ pub trait ScratchApi {
     /// `F32[vocab]`: the logits of the most recent step (prefill leaves the
     /// last prompt token's). Host reads need an idle GPU.
     fn logits(&self) -> &Tensor;
+    /// Model-specific diagnostics of the most recent step for probes
+    /// (e.g. the sparse-attention block selection). Host reads need an idle GPU.
+    fn debug_json(&self) -> Result<serde_json::Value> {
+        Ok(serde_json::Value::Null)
+    }
 }
 
 pub trait LanguageModel: Sized {

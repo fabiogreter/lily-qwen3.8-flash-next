@@ -151,7 +151,8 @@ impl<M: LanguageModel> Engine<M> {
         ensure!(max_seq > 1, "max_seq must be at least 2");
         let mut generator = Generator::from_model_dir(model_dir)?;
         generator.add_stop_tokens(&model.eos_token_ids());
-        let scratch = model.new_scratch_with_capacity(&ctx, max_seq)?;
+        let mut scratch = model.new_scratch_with_capacity(&ctx, max_seq)?;
+        warm_up(&ctx, &model, &mut scratch)?;
         Ok(Self {
             ctx,
             model,
@@ -258,6 +259,29 @@ impl<M: LanguageModel> Engine<M> {
             },
         })
     }
+}
+
+/// Compiles the Metal pipelines a short request needs by running a throwaway
+/// two-token prompt and one pipelined decode pair, so the first real request
+/// does not pay the shader compile (tens of seconds on the 48-layer model).
+/// Kernels only long contexts reach (sparse attention) still compile on first
+/// use.
+fn warm_up<M: LanguageModel>(
+    ctx: &MetalContext,
+    model: &M,
+    scratch: &mut M::Scratch,
+) -> Result<()> {
+    let started = std::time::Instant::now();
+    let mut state = model.new_state(ctx, 4)?;
+    // Two arbitrary in-vocabulary ids: the values do not matter, only that the
+    // prefill and decode graphs get encoded once.
+    model.prefill(ctx, &mut state, scratch, &[1, 2])?;
+    let first = model.submit_decode_step(ctx, &mut state, scratch, 0, 1)?;
+    let second = model.submit_decode_step(ctx, &mut state, scratch, 1, 0)?;
+    first.wait()?;
+    second.wait()?;
+    eprintln!("warm-up done in {:.1}s", started.elapsed().as_secs_f64());
+    Ok(())
 }
 
 /// The `model_type` a checkpoint's `config.json` declares.

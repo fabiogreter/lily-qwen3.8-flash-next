@@ -302,11 +302,41 @@ def render_prompt(directory: Path, prompt: str, thinking: bool) -> list[int]:
     return tok(text, add_special_tokens=False)["input_ids"]
 
 
+def capture_selections(model, last: int, seq_len: int, ratio: int) -> tuple[list, dict]:
+    """Hooks every QSA indexer to record, for the last `last` positions, the
+    selected block ids (tokens of complete blocks, expressed as block index)."""
+    selections: dict = {}
+    hooks = []
+    positions = list(range(max(0, seq_len - last), seq_len))
+
+    def make_hook(layer_idx):
+        def hook(module, args, output):
+            mask = output[0, 0]  # [seq, kv]; selected where True / 0.0
+            selected = mask if mask.dtype == torch.bool else mask == 0
+            per_pos = {}
+            for pos in positions:
+                toks = torch.nonzero(selected[pos]).flatten()
+                nb = (pos + 1) // ratio
+                blocks = sorted(set((toks[toks < nb * ratio] // ratio).tolist()))
+                per_pos[pos] = blocks
+            selections[layer_idx] = per_pos
+        return hook
+
+    for i, layer in enumerate(model.model.layers):
+        if hasattr(layer, "self_attn"):
+            hooks.append(layer.self_attn.indexer.register_forward_hook(make_hook(i)))
+    return hooks, selections
+
+
 @torch.no_grad()
 def run(model, tokens: list[int], last: int, greedy_steps: int) -> dict:
     ids = torch.tensor([tokens], dtype=torch.long)
+    ratio = model.config.indexer_compress_ratio
+    hooks, selections = capture_selections(model, last, len(tokens), ratio)
     started = time.time()
     out = model(input_ids=ids, use_cache=greedy_steps > 0)
+    for h in hooks:
+        h.remove()
     logits = out.logits[0].float()
     elapsed = time.time() - started
     argmax = logits.argmax(dim=-1).tolist()
@@ -314,7 +344,13 @@ def run(model, tokens: list[int], last: int, greedy_steps: int) -> dict:
     for pos in range(max(0, len(tokens) - last), len(tokens)):
         values, idx = logits[pos].topk(8)
         top.append({"position": pos, "ids": idx.tolist(), "logits": [round(v, 4) for v in values.tolist()]})
-    result = {"prompt_token_ids": tokens, "argmax": argmax, "top8_last": top, "prefill_seconds": round(elapsed, 2)}
+    result = {
+        "prompt_token_ids": tokens,
+        "argmax": argmax,
+        "top8_last": top,
+        "prefill_seconds": round(elapsed, 2),
+        "selected_blocks": {str(layer): {str(p): b for p, b in per_pos.items()} for layer, per_pos in selections.items()},
+    }
     if greedy_steps > 0:
         past = out.past_key_values
         chosen = [argmax[-1]]

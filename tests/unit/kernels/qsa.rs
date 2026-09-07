@@ -19,7 +19,17 @@ fn prep_head(
 ) -> Vec<f32> {
     let gain: Vec<f32> = w.iter().map(|v| 1.0 + v).collect();
     let mut normed = cpu_ref::round_bf16(&cpu_ref::rmsnorm(x, &gain, x.len(), eps));
-    cpu_ref::rope_neox(&mut normed, x.len(), rot, pos, theta);
+    // The kernel rounds cos/sin, both products and the sum to bf16, like the
+    // torch reference does on bf16 tensors.
+    let bf = |v: f32| cpu_ref::round_bf16(&[v])[0];
+    let half = rot / 2;
+    for j in 0..half {
+        let angle = pos as f32 * theta.powf(-2.0 * j as f32 / rot as f32);
+        let (c, s) = (bf(angle.cos()), bf(angle.sin()));
+        let (lo, hi) = (normed[j], normed[half + j]);
+        normed[j] = bf(bf(lo * c) - bf(hi * s));
+        normed[half + j] = bf(bf(hi * c) + bf(lo * s));
+    }
     normed
 }
 
@@ -266,6 +276,104 @@ fn sparse_attention_matches_dense_over_selected_tokens() {
         }
         tokens.extend(tail_start..=pos);
         assert_eq!(tokens.len(), attended_tokens(pos, ratio, n_sel[qi] as usize));
+        for hq in 0..nq {
+            let kh = hq / group;
+            let qrow = &q[(qi * nq + hq) * d..(qi * nq + hq + 1) * d];
+            let logits: Vec<f32> = tokens
+                .iter()
+                .map(|&t| {
+                    let krow = &k[(kh * max_seq + t) * d..(kh * max_seq + t + 1) * d];
+                    qrow.iter().zip(krow).map(|(a, b)| a * b).sum::<f32>() * scale
+                })
+                .collect();
+            let m = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let weights: Vec<f32> = logits.iter().map(|l| (l - m).exp()).collect();
+            let sum: f32 = weights.iter().sum();
+            let o = &mut expected[(qi * nq + hq) * d..(qi * nq + hq + 1) * d];
+            for (w, &t) in weights.iter().zip(&tokens) {
+                let vrow = &v[(kh * max_seq + t) * d..(kh * max_seq + t + 1) * d];
+                for i in 0..d {
+                    o[i] += w / sum * vrow[i];
+                }
+            }
+        }
+    }
+    cpu_ref::assert_close(&out.to_f32().expect("out"), &expected, 2e-2, 2e-2);
+}
+
+/// The production shape puts the incomplete tail block alone in the last
+/// split (2048 selected tokens fill exactly eight splits); reproduce that with
+/// a 64-block budget over 256 tokens and tails of 0..3 tokens.
+#[test]
+fn sparse_attention_tail_in_its_own_split_matches_cpu() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(44);
+    let (kvh, group, d, ratio, k_max) = (2usize, 12usize, 256usize, 4usize, 64usize);
+    let nq = kvh * group;
+    let (qb, base_pos, max_seq) = (4usize, 299usize, 320usize);
+    let scale = 1.0 / (d as f32).sqrt();
+    let q = cpu_ref::round_bf16(&random(&mut rng, qb * nq * d, -1.0, 1.0));
+    let k = cpu_ref::round_bf16(&random(&mut rng, kvh * max_seq * d, -1.0, 1.0));
+    let v = cpu_ref::round_bf16(&random(&mut rng, kvh * max_seq * d, -1.0, 1.0));
+    // Every query selects 64 distinct blocks out of its visible 75 or 76.
+    let mut sel: Vec<u32> = Vec::new();
+    for qi in 0..qb {
+        let nb = visible_blocks(base_pos + qi, ratio);
+        let mut blocks: Vec<u32> = (0..nb as u32).collect();
+        for i in (1..blocks.len()).rev() {
+            let j = rng.gen_range(0..=i);
+            blocks.swap(i, j);
+        }
+        let mut chosen = blocks[..k_max].to_vec();
+        chosen.sort_unstable();
+        sel.extend(chosen);
+    }
+    let n_sel = vec![k_max as u32; qb];
+
+    let t_q = Tensor::from_f32_as_bf16(&ctx, &q, &[qb, nq, d]).expect("q");
+    let t_k = Tensor::from_f32_as_bf16(&ctx, &k, &[kvh, max_seq, d]).expect("k");
+    let t_v = Tensor::from_f32_as_bf16(&ctx, &v, &[kvh, max_seq, d]).expect("v");
+    let t_sel =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[qb, k_max], DType::U32)
+            .expect("sel");
+    let t_n = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&n_sel), &[qb], DType::U32)
+        .expect("n");
+    let out = Tensor::zeros(&ctx, &[qb, nq, d], DType::BF16).expect("out");
+    let splits = sparse_splits(k_max, ratio);
+    assert_eq!(splits, 2, "the tail must fall into a second split");
+    let partials =
+        Tensor::zeros(&ctx, &[qb * nq, splits, d], DType::F32).expect("partials");
+    let stats = Tensor::zeros(&ctx, &[qb * nq, splits, 2], DType::F32).expect("stats");
+    let pass = ctx.begin().expect("pass");
+    qsa_attention(
+        &ctx,
+        &pass,
+        &t_q,
+        &t_k,
+        &t_v,
+        &t_sel,
+        &t_n,
+        &out,
+        &SparseSplitScratch { partials: &partials, stats: &stats },
+        qb,
+        k_max,
+        ratio,
+        base_pos,
+        scale,
+    )
+    .expect("sparse attention");
+    pass.commit_wait().expect("commit");
+
+    let mut expected = vec![0.0f32; qb * nq * d];
+    for qi in 0..qb {
+        let pos = base_pos + qi;
+        let tail_start = visible_blocks(pos, ratio) * ratio;
+        let mut tokens: Vec<usize> = Vec::new();
+        for &b in &sel[qi * k_max..(qi + 1) * k_max] {
+            tokens.extend((0..ratio).map(|i| b as usize * ratio + i));
+        }
+        tokens.extend(tail_start..=pos);
+        assert_eq!(tokens.len(), k_max * ratio + (pos + 1 - tail_start));
         for hq in 0..nq {
             let kh = hq / group;
             let qrow = &q[(qi * nq + hq) * d..(qi * nq + hq + 1) * d];

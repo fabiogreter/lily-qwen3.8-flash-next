@@ -1533,6 +1533,15 @@ impl ScratchApi for Scratch {
     fn logits(&self) -> &Tensor {
         &self.logits
     }
+
+    /// The block selection of the last sparse-attention decode step (query
+    /// row 0): `null` until a step ran past the dense limit.
+    fn debug_json(&self) -> Result<serde_json::Value> {
+        let n = self.qsa.n_sel.to_u32()?[0] as usize;
+        let k_max = self.qsa.sel.shape()[1];
+        let sel = self.qsa.sel.to_u32()?;
+        Ok(serde_json::json!({ "selected_blocks": &sel[..n.min(k_max)] }))
+    }
 }
 
 impl LanguageModel for Qwen4ExpModel {

@@ -14,6 +14,22 @@ using namespace metal;
 
 // --- Indexer projections --------------------------------------------------------
 
+// One NeoX RoPE pair with the reference's bf16 arithmetic: cos/sin, both
+// products and the sum are each rounded to bf16, as torch does for
+// `q * cos + rotate_half(q) * sin` on bf16 tensors. The indexer's block
+// selection is a hard top-k, so matching this rounding keeps the selected
+// set reproducible against the reference where f32 math would flip
+// near-tied blocks.
+static inline void qsa_rope_pair_bf16(bfloat lo, bfloat hi, float angle,
+                                      device bfloat* out_lo, device bfloat* out_hi) {
+    const float c = float(bfloat(cos(angle)));
+    const float s = float(bfloat(sin(angle)));
+    const float l = float(lo);
+    const float h = float(hi);
+    *out_lo = bfloat(float(bfloat(l * c)) - float(bfloat(h * s)));
+    *out_hi = bfloat(float(bfloat(h * c)) + float(bfloat(l * s)));
+}
+
 // q[row, h, :] = rope(rmsnorm(qk[row, h*D..]) * (1 + w)) at position base_pos + row.
 // One threadgroup per (row, head); D threads.
 kernel void qsa_prep_q_bf16(device const bfloat* qk  [[buffer(0)]],  // [M, (NH+1)*D]
@@ -55,14 +71,9 @@ kernel void qsa_prep_q_bf16(device const bfloat* qk  [[buffer(0)]],  // [M, (NH+
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint half_rot = rot / 2;
     if (tid < half_rot) {
-        const float inv_freq = pow(theta, -2.0f * float(tid) / float(rot));
-        const float angle = float(base_pos + row) * inv_freq;
-        const float c = cos(angle);
-        const float s = sin(angle);
-        const float lo = float(normed[tid]);
-        const float hi = float(normed[half_rot + tid]);
-        q[dst + tid] = bfloat(lo * c - hi * s);
-        q[dst + half_rot + tid] = bfloat(hi * c + lo * s);
+        const float angle = float(base_pos + row) * pow(theta, -2.0f * float(tid) / float(rot));
+        qsa_rope_pair_bf16(normed[tid], normed[half_rot + tid], angle,
+                           q + dst + tid, q + dst + half_rot + tid);
     } else if (tid >= rot) {
         q[dst + tid] = normed[tid];
     }
@@ -124,14 +135,9 @@ kernel void qsa_block_keys_bf16(device const bfloat* cache [[buffer(0)]],  // [m
     const ulong dst = (ulong)b * D;
     const uint half_rot = rot / 2;
     if (tid < half_rot) {
-        const float inv_freq = pow(theta, -2.0f * float(tid) / float(rot));
-        const float angle = float(b * ratio) * inv_freq;
-        const float c = cos(angle);
-        const float s = sin(angle);
-        const float lo = float(normed[tid]);
-        const float hi = float(normed[half_rot + tid]);
-        blk[dst + tid] = bfloat(lo * c - hi * s);
-        blk[dst + half_rot + tid] = bfloat(hi * c + lo * s);
+        const float angle = float(b * ratio) * pow(theta, -2.0f * float(tid) / float(rot));
+        qsa_rope_pair_bf16(normed[tid], normed[half_rot + tid], angle,
+                           blk + dst + tid, blk + dst + half_rot + tid);
     } else if (tid >= rot) {
         blk[dst + tid] = normed[tid];
     }

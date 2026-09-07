@@ -47,6 +47,7 @@ struct Step {
     chosen: u32,
     ids: Vec<u32>,
     logits: Vec<f32>,
+    debug: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -97,13 +98,15 @@ fn probe<M: LanguageModel>(cli: &Cli) -> Result<Record> {
     model.prefill(&ctx, &mut state, &mut scratch, &prompt)?;
     let prefill_seconds = started.elapsed().as_secs_f64();
 
-    let read_step =
-        |scratch: &M::Scratch, slot: usize, position: usize| -> Result<Step> {
-            let chosen = scratch.next_token().view(slot, &[1])?.to_u32()?[0];
-            let logits = scratch.logits().to_f32()?;
-            let (ids, values) = top_k(&logits, cli.top);
-            Ok(Step { position, chosen, ids, logits: values })
-        };
+    let read_step = |scratch: &M::Scratch,
+                     slot: usize,
+                     position: usize|
+     -> Result<Step> {
+        let chosen = scratch.next_token().view(slot, &[1])?.to_u32()?[0];
+        let logits = scratch.logits().to_f32()?;
+        let (ids, values) = top_k(&logits, cli.top);
+        Ok(Step { position, chosen, ids, logits: values, debug: scratch.debug_json()? })
+    };
 
     let mut steps = vec![read_step(&scratch, 0, prompt.len() - 1)?];
     let started = Instant::now();
