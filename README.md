@@ -13,10 +13,12 @@ Lily exposes a minimal subset of the OpenAI chat completions API and always
 decodes greedily. The Metal kernels compile from source at runtime; there is
 no offline shader build step.
 
-Upstream's performance reports for the 35B model, with measurement contract:
+Performance reports, with measurement contract:
 
-- [2026-09-01: MLX 0.31.2](docs/2026-09-01-performance-mlx-0.31.2.md)
-- [2026-09-02: MLX 0.32.2](docs/2026-09-02-performance-mlx-0.32.2.md)
+- [2026-09-07: Qwen3.8-Flash-Next on the M5 Max](docs/2026-09-07-performance-qwen38-flash-next.md)
+  (decode 82 tok/s at 1K context, 70 at 16K; prefill 1 950 to 1 260 tok/s)
+- upstream, Qwen3.6-35B-A3B: [2026-09-01: MLX 0.31.2](docs/2026-09-01-performance-mlx-0.31.2.md),
+  [2026-09-02: MLX 0.32.2](docs/2026-09-02-performance-mlx-0.32.2.md)
 
 ## Qwen3.8-Flash-Next
 
