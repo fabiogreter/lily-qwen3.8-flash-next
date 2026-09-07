@@ -35,6 +35,7 @@ def main() -> None:
     tokens = json.loads(Path(args.tokens).read_text())
     probe = json.loads(Path(args.probe).read_text())
     lily_sel = {s["position"]: set((s.get("debug") or {}).get("selected_blocks") or []) for s in probe["steps"]}
+    lily_scores = {s["position"]: (s.get("debug") or {}).get("block_scores") for s in probe["steps"]}
     positions = [p for p in lily_sel if lily_sel[p] and p < len(tokens)]
 
     model, config = build_model(Path(args.lily).expanduser(), args.layers, from_lily=True, dtype=torch.bfloat16)
@@ -79,6 +80,13 @@ def main() -> None:
             disputed = sorted(lily_sel[pos] - hf_set)
             details = ", ".join(f"{b}: {scores[b].item():.4f} ({(kth - scores[b].item()) / kth * 100:.2f}%)" for b in disputed)
             print(f"{'':>9}{pos:>5} {nb:>4} {kth:>9.4f} {k1:>9.4f} {(kth - k1) / kth * 100:>7.3f}%  {details}")
+            mine = lily_scores.get(pos)
+            if mine and len(mine) >= nb:
+                mine_t = torch.tensor(mine[:nb])
+                rel = ((mine_t - scores).abs() / scores.abs().clamp_min(1e-6))
+                spread = (scores.max() - scores.min()) / scores.max() * 100
+                print(f"{'':>15}lily vs hf block scores: max rel diff {rel.max().item() * 100:.3f}%, "
+                      f"mean {rel.mean().item() * 100:.3f}%; hf score spread (max-min)/max = {spread.item():.2f}%")
 
 
 if __name__ == "__main__":

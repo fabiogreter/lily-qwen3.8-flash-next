@@ -1540,7 +1540,14 @@ impl ScratchApi for Scratch {
         let n = self.qsa.n_sel.to_u32()?[0] as usize;
         let k_max = self.qsa.sel.shape()[1];
         let sel = self.qsa.sel.to_u32()?;
-        Ok(serde_json::json!({ "selected_blocks": &sel[..n.min(k_max)] }))
+        // The score row is valid up to the query's visible block count, which
+        // the reader derives from the position; cap the dump for sanity.
+        let scores = self.qsa.scores.to_f32()?;
+        let dumped = scores.len().min(self.qsa.scores.shape()[1]).min(65536);
+        Ok(serde_json::json!({
+            "selected_blocks": &sel[..n.min(k_max)],
+            "block_scores": &scores[..dumped],
+        }))
     }
 }
 
