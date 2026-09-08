@@ -15,15 +15,19 @@ const ROWS_PER_TG: usize = 4;
 /// Largest row count compiled for register-A kernels.
 const REG_MAX_M: usize = 8;
 
-/// Minimum output width for register-A; variants use different reduction orders.
+/// Output width from which register-A is used for every small m. Below it,
+/// register-A still wins for `m <= REG_SMALL_M` rows (measured on the M5 Max
+/// at Qwen3.8-Flash-Next's shapes: the staged walk is latency-bound for
+/// narrow, deep projections), so the threshold only matters above that.
 const WIDE_N_MIN: usize = 65536;
+const REG_SMALL_M: usize = 8;
 
 /// Rows, one simdgroup each, per register-A threadgroup.
 const WIDE_ROWS_PER_TG: usize = 2;
 
 /// Selects register-A when shape and packing constraints hold.
 fn reg_routes(m: usize, n: usize, block_walk_ok: bool) -> bool {
-    block_walk_ok && m <= REG_MAX_M && n >= WIDE_N_MIN
+    block_walk_ok && m <= REG_MAX_M && (n >= WIDE_N_MIN || m <= REG_SMALL_M)
 }
 
 /// Requires a fused stack and every slice to use the same reduction variant.
@@ -52,7 +56,8 @@ fn staged_grid(n: usize) -> Grid {
     }
 }
 
-/// Kernel names for the per-m register-A instantiations (index m - 1).
+/// Kernel names for the per-m register-A instantiations (index m - 1), by
+/// output type: bf16 activations, f32 logits.
 const Q4_REG_FNS: [&str; REG_MAX_M] = [
     "gemm_skinny_q4_bf16_reg_m1",
     "gemm_skinny_q4_bf16_reg_m2",
@@ -62,6 +67,26 @@ const Q4_REG_FNS: [&str; REG_MAX_M] = [
     "gemm_skinny_q4_bf16_reg_m6",
     "gemm_skinny_q4_bf16_reg_m7",
     "gemm_skinny_q4_bf16_reg_m8",
+];
+const Q8_REG_FNS: [&str; REG_MAX_M] = [
+    "gemm_skinny_q8_bf16_reg_m1",
+    "gemm_skinny_q8_bf16_reg_m2",
+    "gemm_skinny_q8_bf16_reg_m3",
+    "gemm_skinny_q8_bf16_reg_m4",
+    "gemm_skinny_q8_bf16_reg_m5",
+    "gemm_skinny_q8_bf16_reg_m6",
+    "gemm_skinny_q8_bf16_reg_m7",
+    "gemm_skinny_q8_bf16_reg_m8",
+];
+const Q4_REG_FNS_F32: [&str; REG_MAX_M] = [
+    "gemm_skinny_q4_f32_reg_m1",
+    "gemm_skinny_q4_f32_reg_m2",
+    "gemm_skinny_q4_f32_reg_m3",
+    "gemm_skinny_q4_f32_reg_m4",
+    "gemm_skinny_q4_f32_reg_m5",
+    "gemm_skinny_q4_f32_reg_m6",
+    "gemm_skinny_q4_f32_reg_m7",
+    "gemm_skinny_q4_f32_reg_m8",
 ];
 
 fn reg_grid(n: usize, rows_per_tg: usize) -> Grid {
@@ -99,9 +124,10 @@ fn validate_q4(
         "scales/biases shape mismatch for [{n}, {k}] gs={}",
         w.group_size
     );
+    ensure!(a.dtype() == DType::BF16, "skinny q4 GEMM input must be BF16");
     ensure!(
-        a.dtype() == DType::BF16 && c.dtype() == DType::BF16,
-        "skinny q4 GEMM activations must be BF16"
+        matches!(c.dtype(), DType::BF16 | DType::F32),
+        "skinny q4 GEMM output must be BF16 or F32"
     );
     Ok((m, k, n))
 }
@@ -119,10 +145,11 @@ fn dispatch_q4_staged(
     c: &Tensor,
     (m, k, n): (usize, usize, usize),
 ) -> Result<()> {
-    let fn_name = if m <= REG_MAX_M {
-        "gemm_skinny_q4_bf16_m8"
-    } else {
-        "gemm_skinny_q4_bf16_m16"
+    let fn_name = match (m <= REG_MAX_M, c.dtype()) {
+        (true, DType::F32) => "gemm_skinny_q4_f32_m8",
+        (false, DType::F32) => "gemm_skinny_q4_f32_m16",
+        (true, _) => "gemm_skinny_q4_bf16_m8",
+        (false, _) => "gemm_skinny_q4_bf16_m16",
     };
     let pipeline = ctx.pipeline(fn_name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
@@ -147,7 +174,8 @@ fn dispatch_q4_reg(
     c: &Tensor,
     (m, k, n): (usize, usize, usize),
 ) -> Result<()> {
-    let pipeline = ctx.pipeline(Q4_REG_FNS[m - 1], SOURCE, MslVersion::V3_1)?;
+    let names = if c.dtype() == DType::F32 { &Q4_REG_FNS_F32 } else { &Q4_REG_FNS };
+    let pipeline = ctx.pipeline(names[m - 1], SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
         &[
@@ -162,8 +190,59 @@ fn dispatch_q4_reg(
     )
 }
 
+/// Small-M affine-Q8 GEMM (staged-A only; the 8-bit tensors are the narrow
+/// routers, gates and stream mixers). Same numerics as the bf16 dequant +
+/// GEMM fallback it replaces, at a fraction of the memory traffic.
+pub fn gemm_skinny_q8_nt(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    a: &Tensor,
+    w: &QuantWeights,
+    c: &Tensor,
+) -> Result<()> {
+    let (n, k) = (w.out_features(), w.in_features());
+    let m = a.shape()[0];
+    ensure!(m > 0 && m <= DENSE_SMALLM_THRESHOLD, "skinny q8 GEMM handles 1..={DENSE_SMALLM_THRESHOLD} rows (got {m})");
+    ensure!(w.bits == 8, "skinny q8 GEMM needs 8-bit weights");
+    ensure!(
+        w.group_size.is_multiple_of(8) && k.is_multiple_of(8),
+        "skinny q8 GEMM needs group_size % 8 == 0 and K % 8 == 0 (k={k}, gs={})",
+        w.group_size
+    );
+    ensure!(a.shape() == [m, k], "A shape {:?} != [{m}, {k}]", a.shape());
+    ensure!(c.numel() == m * n, "C numel {} != {m}x{n}", c.numel());
+    ensure!(a.dtype() == DType::BF16, "skinny q8 GEMM input must be BF16");
+    // Register-A for small m (no threadgroup staging or barriers: the
+    // narrow, deep mixers and routers are latency-bound in the staged walk).
+    if m <= REG_MAX_M && c.dtype() == DType::BF16 && w.group_size.is_multiple_of(16) && k.is_multiple_of(16) {
+        let pipeline = ctx.pipeline(Q8_REG_FNS[m - 1], SOURCE, MslVersion::V3_1)?;
+        return pass.dispatch_at(
+            &pipeline,
+            &[w.codes.binding(), w.scales.binding(), w.biases.binding(), a.binding(), c.binding()],
+            &[&u32_bytes(k), &u32_bytes(n), &u32_bytes(w.group_size)],
+            reg_grid(n, WIDE_ROWS_PER_TG),
+        );
+    }
+    let fn_name = match (m <= REG_MAX_M, c.dtype()) {
+        (true, DType::F32) => "gemm_skinny_q8_f32_m8",
+        (false, DType::F32) => "gemm_skinny_q8_f32_m16",
+        (true, DType::BF16) => "gemm_skinny_q8_bf16_m8",
+        (false, DType::BF16) => "gemm_skinny_q8_bf16_m16",
+        _ => anyhow::bail!("skinny q8 GEMM output must be BF16 or F32"),
+    };
+    let pipeline = ctx.pipeline(fn_name, SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[w.codes.binding(), w.scales.binding(), w.biases.binding(), a.binding(), c.binding()],
+        &[&u32_bytes(k), &u32_bytes(n), &u32_bytes(w.group_size), &u32_bytes(m)],
+        staged_grid(n),
+    )
+}
+
 /// Small-M affine-Q4 GEMM with BF16-rounded dequantization. Register-A requires
-/// `m <= 8`, `group_size == 64`, `K % 64 == 0`, and a wide output.
+/// `m <= 8`, `group_size == 64`, `K % 64 == 0`, and a wide output. `c` may be
+/// BF16 or F32 (the latter for logits); the f32 result is what the bf16
+/// variant rounds.
 pub fn gemm_skinny_q4_nt(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,

@@ -11,7 +11,7 @@ use std::path::Path;
 use anyhow::{Result, ensure};
 
 use crate::chat::Conversation;
-use crate::engine::{DecodeStateApi, Draw, LanguageModel, ScratchApi};
+use crate::engine::{DecodeStateApi, Draw, LanguageModel, NextStep, ScratchApi};
 use crate::kernels::sample::SamplingParams;
 use crate::metal::MetalContext;
 pub use crate::tokenizer::Thinking;
@@ -34,6 +34,9 @@ pub struct Generation {
     /// Number of prompt and generated tokens actually fed into the state
     /// (the final generated token is drawn but never fed).
     pub fed: usize,
+    /// Speculative decoding: draft tokens proposed and confirmed.
+    pub drafted: usize,
+    pub accepted: usize,
 }
 
 fn ends_with_stop_token(tokens: &[u32], stop_tokens: &[u32]) -> bool {
@@ -46,6 +49,79 @@ pub struct GenerateOptions<'a> {
     pub sampling: &'a SamplingParams,
     /// Ids that end the generation, in addition to the tokenizer's.
     pub stop_tokens: &'a [u32],
+    /// Draft tokens per speculative step (capped by the model; `0` decodes
+    /// one token per step).
+    pub drafts: usize,
+}
+
+/// What [`speculate`] reports.
+pub struct Speculated {
+    pub finish: FinishReason,
+    pub drafted: usize,
+    pub accepted: usize,
+}
+
+/// Speculative decoding through a model's draft head, from a state that has
+/// fed its prompt and drawn `tokens[0]` (already delivered). Each step
+/// verifies the pending token plus the current drafts in one pass, emits the
+/// confirmed prefix and one fresh draw, then rolls back and proposes again.
+/// Tokens reach `on_token` as they are confirmed; `is_stop` ends the
+/// generation at that token (which is still pushed).
+#[allow(clippy::too_many_arguments)]
+pub fn speculate<M: LanguageModel>(
+    ctx: &MetalContext,
+    model: &M,
+    state: &mut M::State,
+    scratch: &mut M::Scratch,
+    params: &SamplingParams,
+    drafts: usize,
+    max_tokens: usize,
+    tokens: &mut Vec<u32>,
+    is_stop: &dyn Fn(u32) -> bool,
+    on_token: &mut dyn FnMut(u32) -> Result<bool>,
+) -> Result<Speculated> {
+    let k = drafts.min(model.max_drafts()).max(1);
+    ensure!(tokens.len() == 1, "speculation starts right after the first draw");
+    let (mut drafted, mut accepted) = (0usize, 0usize);
+    let mut proposals = model.draft_initial(ctx, state, scratch, tokens[0], k)?;
+    let mut ahead = None;
+    loop {
+        let pending = *tokens.last().expect("tokens is never empty");
+        let step0 = tokens.len();
+        let sampled = model.verify(ctx, state, scratch, pending, &proposals, params, step0, ahead.take())?;
+        // Row j confirms draft j when its draw equals it; the first row that
+        // does not (or the row after the last draft) supplies the fresh token.
+        let mut kept = 0usize;
+        let mut finish = None;
+        for (j, &token) in sampled.iter().enumerate() {
+            tokens.push(token);
+            if is_stop(token) {
+                finish = Some(FinishReason::StopToken);
+            } else if !on_token(token)? {
+                finish = Some(FinishReason::Callback);
+            } else if tokens.len() >= max_tokens {
+                finish = Some(FinishReason::Length);
+            }
+            kept = j;
+            if finish.is_some() || j >= proposals.len() || proposals[j] != token {
+                break;
+            }
+        }
+        drafted += proposals.len();
+        accepted += kept;
+        match finish {
+            Some(finish) => {
+                model.finish_speculation(ctx, state, scratch, kept, None, 0)?;
+                return Ok(Speculated { finish, drafted, accepted });
+            }
+            None => {
+                let next = NextStep { token: sampled[kept], params, step0: tokens.len() };
+                let (next_proposals, next_ahead) = model.finish_speculation(ctx, state, scratch, kept, Some(next), k)?;
+                proposals = next_proposals;
+                ahead = next_ahead;
+            }
+        }
+    }
 }
 
 pub struct Generator {
@@ -119,19 +195,38 @@ impl Generator {
         let first = read_slot(scratch, 0)?;
         tokens.push(first);
         let mut finish = FinishReason::Length;
+        let (mut drafted, mut accepted) = (0usize, 0usize);
         if is_stop(first) {
             finish = FinishReason::StopToken;
         } else if !on_token(first)? {
             finish = FinishReason::Callback;
         } else if tokens.len() < options.max_tokens {
-            finish = self.decode_loop(ctx, model, state, scratch, options, &mut tokens, on_token)?;
+            if options.drafts > 0 && model.max_drafts() > 0 {
+                let outcome = speculate(
+                    ctx,
+                    model,
+                    state,
+                    scratch,
+                    params,
+                    options.drafts,
+                    options.max_tokens,
+                    &mut tokens,
+                    &is_stop,
+                    on_token,
+                )?;
+                finish = outcome.finish;
+                drafted = outcome.drafted;
+                accepted = outcome.accepted;
+            } else {
+                finish = self.decode_loop(ctx, model, state, scratch, options, &mut tokens, on_token)?;
+            }
         }
         let fed = state
             .pos()
             .checked_sub(pos_before)
             .ok_or_else(|| anyhow::anyhow!("decode state moved backwards"))?;
-        debug_assert_eq!(fed, prompt_ids.len() + tokens.len() - 1);
-        Ok(Generation { tokens, finish, fed })
+        ensure!(fed == prompt_ids.len() + tokens.len() - 1, "state fed {fed} tokens for {} prompt and {} drawn", prompt_ids.len(), tokens.len());
+        Ok(Generation { tokens, finish, fed, drafted, accepted })
     }
 
     /// The pipelined loop proper. `tokens` holds the tokens drawn so far, the

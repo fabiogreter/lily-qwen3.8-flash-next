@@ -1024,3 +1024,147 @@ fn gated_rmsnorm_sigmoid_gate_matches_cpu() {
     );
     cpu_ref::assert_close(&out.to_f32().expect("read"), &expected, 2e-2, 2e-2);
 }
+
+/// The intermediate states the regscan records after each token are exactly
+/// the states a scan over that many tokens would leave behind (the register
+/// values are the same; only the store differs), so rolling back to one of
+/// them is bit-identical to never having fed the rejected tokens.
+#[test]
+fn gdn_prefill_regscan_mid_states_match_prefix_scans() {
+    let ctx = MetalContext::new().expect("metal context");
+    let dim = GDN_HEAD_DIM;
+    let (hk, h, m) = (2usize, 4usize, 4usize);
+    let scale = 1.0 / (dim as f32).sqrt();
+    let mut rng = StdRng::seed_from_u64(91);
+    let c = (2 * hk + h) * dim;
+    let a_log = Tensor::from_f32(&ctx, &random_vec(&mut rng, h, -2.0, 0.5), &[h]).expect("a_log");
+    let dt_bias = Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, h, -0.5, 0.5), &[h]).expect("dt_bias");
+    let qkv = random_vec(&mut rng, m * c, -1.0, 1.0);
+    let a = random_vec(&mut rng, m * h, -1.0, 1.0);
+    let b = random_vec(&mut rng, m * h, -1.0, 1.0);
+    let init_state = random_vec(&mut rng, h * dim * dim, -0.5, 0.5);
+
+    // Full scan with mid capture of the first m-1 tokens.
+    let state = Tensor::from_f32(&ctx, &init_state, &[h, dim, dim]).expect("state");
+    let mid = Tensor::zeros(&ctx, &[m - 1, h, dim, dim], DType::F32).expect("mid");
+    let t_qkv = Tensor::from_f32_as_bf16(&ctx, &qkv, &[m, c]).expect("qkv");
+    let ta = Tensor::from_f32_as_bf16(&ctx, &a, &[m, h]).expect("a");
+    let tb = Tensor::from_f32_as_bf16(&ctx, &b, &[m, h]).expect("b");
+    let (qk_norm, decay, beta) = staging_tensors(&ctx, m, hk, h);
+    let staging = GdnRegscanStaging { qk_norm: &qk_norm, decay: &decay, beta: &beta };
+    let out = Tensor::zeros(&ctx, &[m, h, dim], DType::BF16).expect("out");
+    let pass = ctx.begin().expect("pass");
+    gdn_prefill_mid(&ctx, &pass, &t_qkv, &ta, &tb, &a_log, &dt_bias, &staging, &state, &out, scale, hk, Some(&mid))
+        .expect("gdn_prefill_mid");
+    pass.commit_wait().expect("commit");
+    let mid_all = mid.to_f32().expect("read mid");
+    let per = h * dim * dim;
+
+    for n in 1..m {
+        let prefix_state = Tensor::from_f32(&ctx, &init_state, &[h, dim, dim]).expect("state");
+        let (_, got) = run_regscan(
+            &ctx, &qkv[..n * c], &a[..n * h], &b[..n * h], &a_log, &dt_bias, &prefix_state, scale, hk, h,
+        );
+        assert_eq!(got, mid_all[(n - 1) * per..n * per], "mid state after {n} tokens");
+    }
+    // A caller that passes more mid slots than tokens is rejected.
+    let too_many = Tensor::zeros(&ctx, &[m + 1, h, dim, dim], DType::F32).expect("mid");
+    let pass = ctx.begin().expect("pass");
+    assert!(gdn_prefill_mid(&ctx, &pass, &t_qkv, &ta, &tb, &a_log, &dt_bias, &staging, &state, &out, scale, hk, Some(&too_many)).is_err());
+}
+
+/// Rolling a conv window back to `n` rows equals running the conv over just
+/// those rows, for GDN (S = KD-1) and PLE-like (S = 9) window lengths.
+#[test]
+fn conv_window_rollback_matches_prefix_window() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(93);
+    for s in [3usize, 9] {
+        let (c, m) = (40usize, 5usize);
+        let kd = s + 1; // a plain conv with KD-1 = s taps keeps an S-long window (GPU cross-check only for KD <= 9)
+        let win0 = random_vec(&mut rng, c * s, -1.0, 1.0);
+        let x = random_vec(&mut rng, m * c, -1.0, 1.0);
+        let w = random_vec(&mut rng, kd * c, -1.0, 1.0);
+        let t_win0 = Tensor::from_f32_as_bf16(&ctx, &win0, &[c, s]).expect("win0");
+        let t_x = Tensor::from_f32_as_bf16(&ctx, &x, &[m, c]).expect("x");
+        let t_w = Tensor::from_f32_as_bf16(&ctx, &w, &[kd, c]).expect("w");
+        let (r_win0, r_x) = (t_win0.to_f32().expect("read"), t_x.to_f32().expect("read"));
+        for n in 0..=m {
+            // Host reference: the last S entries of win0 ++ x[..n] per channel.
+            let host: Vec<f32> = (0..c)
+                .flat_map(|ch| {
+                    let seq: Vec<f32> = (0..s).map(|i| r_win0[ch * s + i]).chain((0..n).map(|r| r_x[r * c + ch])).collect();
+                    seq[seq.len() - s..].to_vec()
+                })
+                .collect();
+            let expected = if n == 0 || kd > 9 {
+                host
+            } else {
+                let win_out = Tensor::zeros(&ctx, &[c, s], DType::BF16).expect("win_out");
+                let out = Tensor::zeros(&ctx, &[n, c], DType::BF16).expect("out");
+                let xn = t_x.view(0, &[n, c]).expect("prefix");
+                let pass = ctx.begin().expect("pass");
+                conv1d_prefill(&ctx, &pass, &t_win0, &win_out, &xn, &t_w, &out).expect("conv1d_prefill");
+                pass.commit_wait().expect("commit");
+                let gpu = win_out.to_f32().expect("read");
+                assert_eq!(gpu, host, "host window reference vs conv1d_prefill, S={s} n={n}");
+                gpu
+            };
+            let rolled = Tensor::zeros(&ctx, &[c, s], DType::BF16).expect("rolled");
+            let pass = ctx.begin().expect("pass");
+            conv_window_rollback(&ctx, &pass, &t_win0, &t_x, &rolled, n).expect("rollback");
+            pass.commit_wait().expect("commit");
+            assert_eq!(rolled.to_f32().expect("read"), expected, "S={s} n={n}");
+        }
+    }
+}
+
+/// GPU time of the two recurrence kernels at Qwen3.8-Flash-Next's shape over
+/// 36 layers, for small token counts: the register scan (prefill) against
+/// the coalesced single-token step kernel looped per token.
+#[test]
+#[ignore = "timing; run with --nocapture"]
+fn gdn_small_m_timing() {
+    let ctx = MetalContext::new().expect("metal context");
+    let dim = GDN_HEAD_DIM;
+    let (hk, h, layers) = (16usize, 48usize, 36usize);
+    let scale = 1.0 / (dim as f32).sqrt();
+    let mut rng = StdRng::seed_from_u64(5);
+    let c = (2 * hk + h) * dim;
+    let a_log = Tensor::from_f32(&ctx, &random_vec(&mut rng, h, -2.0, 0.5), &[h]).expect("a_log");
+    let dt_bias = Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, h, -0.5, 0.5), &[h]).expect("dt_bias");
+    let norm_w = Tensor::from_f32(&ctx, &vec![1.0; dim], &[dim]).expect("norm_w");
+    let states: Vec<Tensor> = (0..layers).map(|_| Tensor::from_f32(&ctx, &random_vec(&mut rng, h * dim * dim, -0.5, 0.5), &[h, dim, dim]).expect("state")).collect();
+    for m in [1usize, 2, 4] {
+        let qkv = Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, m * c, -1.0, 1.0), &[m, c]).expect("qkv");
+        let a = Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, m * h, -1.0, 1.0), &[m, h]).expect("a");
+        let b = Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, m * h, -1.0, 1.0), &[m, h]).expect("b");
+        let z = Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, m * h * dim, -1.0, 1.0), &[m, h * dim]).expect("z");
+        let (qk_norm, decay, beta) = staging_tensors(&ctx, m, hk, h);
+        let staging = GdnRegscanStaging { qk_norm: &qk_norm, decay: &decay, beta: &beta };
+        let out = Tensor::zeros(&ctx, &[m, h, dim], DType::BF16).expect("out");
+        let gated = Tensor::zeros(&ctx, &[h * dim], DType::BF16).expect("gated");
+        for variant in ["regscan", "step-loop"] {
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let pass = ctx.begin_concurrent().expect("pass");
+                for state in &states {
+                    if variant == "regscan" {
+                        gdn_prefill(&ctx, &pass, &qkv, &a, &b, &a_log, &dt_bias, &staging, state, &out, scale, hk).expect("regscan");
+                    } else {
+                        for t in 0..m {
+                            let row = |x: &Tensor, w: usize| x.view(t * w, &[w]).expect("row");
+                            gdn_step_gated_fused(&ctx, &pass, &row(&qkv, c), &row(&a, h), &row(&b, h), &a_log, &dt_bias, state, &row(&z, h * dim), &norm_w, &gated, scale, hk, 1e-6, GdnGate::Sigmoid).expect("step");
+                            pass.level_barrier(&[state]).expect("barrier");
+                        }
+                    }
+                    pass.level_barrier(&[state]).expect("barrier");
+                }
+                let done = pass.commit().expect("commit").wait_retain().expect("wait");
+                let t = done.timing().expect("timing");
+                best = best.min(t.gpu_end_secs - t.gpu_start_secs);
+            }
+            eprintln!("gdn {layers} layers m={m} {variant}: {:.2} ms", best * 1e3);
+        }
+    }
+}

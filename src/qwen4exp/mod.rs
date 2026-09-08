@@ -7,7 +7,8 @@
 pub mod config;
 pub mod model;
 pub mod ngram;
+mod spec;
 pub mod weights;
 
-pub use model::{DecodeState, Qwen4ExpModel, Scratch};
+pub use model::{DecodeState, Encoder, MAX_DRAFTS, Qwen4ExpModel, Scratch};
 pub use ngram::NgramStorage;

@@ -2,6 +2,13 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// Word copy for buffer-to-buffer state restores inside a compute pass.
+kernel void copy_u32(device const uint* src [[buffer(0)]],
+                     device uint*       dst [[buffer(1)]],
+                     uint gid [[thread_position_in_grid]]) {
+    dst[gid] = src[gid];
+}
+
 kernel void add_bf16(device const bfloat* a   [[buffer(0)]],
                      device const bfloat* b   [[buffer(1)]],
                      device bfloat*       out [[buffer(2)]],

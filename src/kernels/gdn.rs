@@ -199,6 +199,28 @@ pub fn gdn_prefill(
     scale: f32,
     num_k_heads: usize,
 ) -> Result<()> {
+    gdn_prefill_mid(ctx, pass, qkv, a, b, a_log, dt_bias, staging, state, out, scale, num_k_heads, None)
+}
+
+/// [`gdn_prefill`] that also records the running state after each of the
+/// first `mid.shape()[0]` tokens into `mid` (F32 `[count, H, 128, 128]`), for
+/// rolling back a speculative batch to an accepted prefix.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_prefill_mid(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    qkv: &Tensor,
+    a: &Tensor,
+    b: &Tensor,
+    a_log: &Tensor,
+    dt_bias: &Tensor,
+    staging: &GdnRegscanStaging<'_>,
+    state: &Tensor,
+    out: &Tensor,
+    scale: f32,
+    num_k_heads: usize,
+    mid: Option<&Tensor>,
+) -> Result<()> {
     let num_heads = a_log.numel();
     let dim = GDN_HEAD_DIM;
     ensure!(
@@ -231,8 +253,22 @@ pub fn gdn_prefill(
         "beta must be F32 [M, H]"
     );
 
+    let mid_count = match mid {
+        Some(t) => {
+            ensure!(
+                t.dtype() == DType::F32 && t.shape().len() == 4 && t.shape()[1..] == [num_heads, dim, dim],
+                "mid states must be F32 [count, H, {dim}, {dim}]"
+            );
+            ensure!(t.shape()[0] <= m, "more mid states ({}) than tokens ({m})", t.shape()[0]);
+            t.shape()[0]
+        }
+        None => 0,
+    };
+
     gdn_qk_l2norm(ctx, pass, qkv, staging.qk_norm, scale, num_k_heads, num_heads)?;
     gdn_gates(ctx, pass, a, b, a_log, dt_bias, staging.decay, staging.beta)?;
+    // The scan reads the staging the two dispatches above wrote.
+    pass.level_barrier(&[staging.qk_norm, staging.decay, staging.beta])?;
     let scan = ctx.pipeline("gdn_prefill_regscan", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &scan,
@@ -243,9 +279,42 @@ pub fn gdn_prefill(
             staging.beta.binding(),
             state.binding(),
             out.binding(),
+            // Never written when mid_count is 0; the state buffer stands in.
+            mid.unwrap_or(state).binding(),
         ],
-        &[&u32_bytes(m), &u32_bytes(num_heads), &u32_bytes(vpk)],
+        &[&u32_bytes(m), &u32_bytes(num_heads), &u32_bytes(vpk), &u32_bytes(mid_count)],
         Grid::Threadgroups { groups: (num_heads, dim / 4, 1), threadgroup: (32, 4, 1) },
+    )
+}
+
+/// Rewinds a conv window to the state after only the first `n` rows of `x`
+/// followed `window_in`: `window_out` (`[C, S]`, may not alias `window_in`)
+/// gets the last `S` entries of `window_in ++ x[..n]`. `x` is `[M, C]` with
+/// `n <= M`; `S` is the window length (GDN: `KD-1`, PLE: `(KD-1)*dilation`).
+pub fn conv_window_rollback(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    window_in: &Tensor,
+    x: &Tensor,
+    window_out: &Tensor,
+    n: usize,
+) -> Result<()> {
+    ensure!(window_in.shape().len() == 2 && x.shape().len() == 2, "window must be [C, S] and x [M, C]");
+    let (c, s) = (window_in.shape()[0], window_in.shape()[1]);
+    ensure!(window_out.shape() == [c, s], "window_out shape {:?} != [{c}, {s}]", window_out.shape());
+    ensure!(x.shape()[1] == c && n <= x.shape()[0], "x {:?} does not hold {n} rows of {c} channels", x.shape());
+    for t in [window_in, x, window_out] {
+        ensure!(t.dtype() == DType::BF16, "conv window rollback expects BF16");
+    }
+    let (in_buf, in_off) = window_in.binding();
+    let (out_buf, out_off) = window_out.binding();
+    ensure!(!(std::ptr::eq(in_buf, out_buf) && in_off == out_off), "window buffers must be distinct");
+    let pipeline = ctx.pipeline("conv_window_rollback_bf16", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[window_in.binding(), x.binding(), window_out.binding()],
+        &[&u32_bytes(c), &u32_bytes(s), &u32_bytes(n)],
+        Grid::Threads { grid: (c, 1, 1), threadgroup: (256.min(c), 1, 1) },
     )
 }
 

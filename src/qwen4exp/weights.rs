@@ -18,9 +18,10 @@ use super::config::{LayerType, Qwen4ExpConfig};
 use super::ngram::{self, NgramStorage, NgramTable, PagedTable};
 
 const PREFIX: &str = "model.language_model.";
-/// The converter drops these; listing them keeps `finish` tolerant of a
-/// checkpoint that carried them anyway.
+/// Skipped tensors: the vision tower is never converted, and the draft head
+/// (`mtp.*`) is only read when the caller asks for it.
 const SKIP_PREFIXES: &[&str] = &["model.visual.", "mtp."];
+const MTP_PREFIX: &str = "mtp.";
 
 /// One hyper-connection (gated residual) block: a grouped norm over the
 /// `hc_count` streams, the low-rank read gate, and the per-stream write gate
@@ -99,6 +100,25 @@ pub struct LayerWeights {
     pub ffn: Box<MoeWeights>,
 }
 
+/// The multi-token-prediction draft head: the trunk's wide residual and the
+/// next token's embedding are normed, projected and summed per stream into a
+/// fresh residual, one trunk-style attention+MoE block runs on it, and its own
+/// stream mixer feeds the shared LM head.
+pub struct MtpWeights {
+    /// `[h]` zero-centered norm of the token embedding.
+    pub norm_embedding: Tensor,
+    /// `[hc_count * h]` zero-centered grouped norm of the incoming residual.
+    pub norm_hidden: Tensor,
+    /// `[h, h]`, applied to the normed embedding (8-bit).
+    pub fc_embedding: LinearWeights,
+    /// `[h, h]`, applied to each normed stream (8-bit).
+    pub fc_hidden: LinearWeights,
+    /// The block: always a full-attention layer with its own indexer.
+    pub layer: LayerWeights,
+    /// The head-level read that collapses the streams before the LM head.
+    pub mixer: HcWeights,
+}
+
 pub struct ModelWeights {
     /// `[vocab, h]` token table.
     pub embed_tokens: LinearWeights,
@@ -107,6 +127,8 @@ pub struct ModelWeights {
     /// The model-level read that collapses the streams before the LM head.
     pub final_mixer: HcWeights,
     pub layers: Vec<LayerWeights>,
+    /// The draft head, when the checkpoint has it and the caller wanted it.
+    pub mtp: Option<Box<MtpWeights>>,
 }
 
 /// The converter's storage policy: routers, gates and the small mixing
@@ -122,8 +144,37 @@ fn expected_bits(bases: &[&str]) -> usize {
             || b.ends_with(".ple.key_proj")
             || b.ends_with(".ple.value_proj")
             || b.ends_with(".indexer.index_qk_proj")
+            || b == "mtp.fc_embedding"
+            || b == "mtp.fc_hidden"
     };
     if q8 { 8 } else { 4 }
+}
+
+fn load_mtp(loader: &Loader<'_>, config: &Qwen4ExpConfig) -> Result<MtpWeights> {
+    let h = config.hidden_size;
+    let wide = config.hc_width();
+    let norm_embedding = loader.tensor(&format!("{MTP_PREFIX}pre_fc_norm_embedding.weight"))?;
+    expect_shape(&norm_embedding, &[h], "mtp pre_fc_norm_embedding")?;
+    let norm_hidden = loader.tensor(&format!("{MTP_PREFIX}pre_fc_norm_hidden.weight"))?;
+    expect_shape(&norm_hidden, &[wide], "mtp pre_fc_norm_hidden")?;
+    let fc_embedding = loader.linear(&[&format!("{MTP_PREFIX}fc_embedding")], h)?;
+    fc_embedding.expect_features(h, h, "mtp fc_embedding")?;
+    let fc_hidden = loader.linear(&[&format!("{MTP_PREFIX}fc_hidden")], h)?;
+    fc_hidden.expect_features(h, h, "mtp fc_hidden")?;
+    let p = format!("{MTP_PREFIX}layers.0.");
+    let attn_hc = load_hc(loader, &format!("{p}attn_hyper_connection."), config, true)?;
+    let mixer_w = Mixer::Attn(Box::new(load_attn(loader, &p, config)?));
+    let mlp_hc = load_hc(loader, &format!("{p}mlp_hyper_connection."), config, true)?;
+    let ffn = load_ffn(loader, &p, config)?;
+    let mixer = load_hc(loader, &format!("{MTP_PREFIX}hyper_connection_mixer."), config, false)?;
+    Ok(MtpWeights {
+        norm_embedding,
+        norm_hidden,
+        fc_embedding,
+        fc_hidden,
+        layer: LayerWeights { ple: None, attn_hc, mixer: mixer_w, mlp_hc, ffn },
+        mixer,
+    })
 }
 
 fn load_hc(
@@ -373,11 +424,14 @@ fn load_ple(
     })
 }
 
+/// Loads the trunk, and the draft head when `with_mtp` is set and the
+/// checkpoint declares one (the `mtp.*` tensors are skipped otherwise).
 pub fn load(
     ctx: &MetalContext,
     dir: impl AsRef<Path>,
     config: &Qwen4ExpConfig,
     storage: NgramStorage,
+    with_mtp: bool,
 ) -> Result<ModelWeights> {
     let ckpt = Checkpoint::open(&dir)?;
     ensure!(
@@ -420,6 +474,11 @@ pub fn load(
         layers.push(LayerWeights { ple, attn_hc, mixer, mlp_hc, ffn });
     }
 
+    let mtp = match (&config.mtp, with_mtp) {
+        (Some(_), true) => Some(Box::new(load_mtp(&loader, config)?)),
+        _ => None,
+    };
+
     loader.finish()?;
-    Ok(ModelWeights { embed_tokens, lm_head, final_mixer, layers })
+    Ok(ModelWeights { embed_tokens, lm_head, final_mixer, layers, mtp })
 }

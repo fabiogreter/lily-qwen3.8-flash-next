@@ -403,6 +403,8 @@ pub fn moe_sort_slots(
         &[&u32_bytes(s)],
         Grid::Threads { grid: (s, 1, 1), threadgroup: (64, 1, 1) },
     )?;
+    // Histogram → scans → scatter: each reads what the previous wrote.
+    pass.level_barrier(&[b.counts])?;
     let scan = ctx.pipeline("moe_scan_offsets", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &scan,
@@ -410,6 +412,7 @@ pub fn moe_sort_slots(
         &[&u32_bytes(num_experts), &u32_bytes(tile_m)],
         Grid::Threads { grid: (1, 1, 1), threadgroup: (1, 1, 1) },
     )?;
+    pass.level_barrier(&[b.offsets, b.tile_offsets, b.cursors])?;
     let scatter = ctx.pipeline("moe_scatter_slots", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &scatter,

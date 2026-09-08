@@ -4,6 +4,7 @@ use std::time::Instant;
 use anyhow::{Result, ensure};
 use clap::Parser;
 use lily::engine::{DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi};
+use lily::generate::speculate;
 use lily::kernels::sample::SamplingParams;
 use lily::metal::PendingPass;
 use lily::kernels::attention::MAX_SEQ;
@@ -26,6 +27,10 @@ struct Cli {
     /// Stream the paged n-gram table through the page cache before measuring.
     #[arg(long, default_value_t = false)]
     ngram_preload: bool,
+    /// Draft tokens per step: measures speculative decoding through the
+    /// checkpoint's draft head instead of the pipelined one-token loop.
+    #[arg(long, default_value_t = 0)]
+    drafts: usize,
     #[arg(long)]
     json_out: PathBuf,
 }
@@ -80,7 +85,10 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
     ensure!(max_seq <= MAX_SEQ, "benchmark exceeds model window {MAX_SEQ}");
 
     let ctx = MetalContext::new()?;
-    let model = M::load(&ctx, &cli.model, &LoadOptions::default())?;
+    let model = M::load(&ctx, &cli.model, &LoadOptions { mtp_drafts: cli.drafts, ..LoadOptions::default() })?;
+    if cli.drafts > 0 {
+        return bench_speculative(cli, &ctx, &model);
+    }
     if cli.ngram_preload {
         let started = Instant::now();
         let bytes = model.warm_storage(false)?;
@@ -249,6 +257,67 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
         cli.decode_steps,
         decode_secs,
         cli.decode_steps as f64 / decode_secs,
+    );
+    Ok(())
+}
+
+/// Greedy speculative decoding: prefill, then `decode_steps` tokens through
+/// the draft head, reporting tokens per second and the acceptance rate.
+fn bench_speculative<M: LanguageModel>(cli: &Cli, ctx: &MetalContext, model: &M) -> Result<()> {
+    ensure!(model.max_drafts() > 0, "this checkpoint has no draft head");
+    let max_seq = cli.prompt_len + cli.decode_steps + 2 * cli.drafts + 2;
+    let vocab = u32::try_from(model.vocab_size())?;
+    let token = |index: usize| (index as u32).wrapping_mul(2_654_435_761) % vocab;
+    let prompt: Vec<u32> = (0..cli.prompt_len).map(token).collect();
+    let mut scratch = model.new_scratch_with_capacity(ctx, max_seq)?;
+    let never_stop = |_: u32| false;
+    let mut run = |steps: usize| -> Result<(f64, f64, usize, usize, Vec<u32>)> {
+        let mut state = model.new_state(ctx, max_seq)?;
+        let prefill_start = Instant::now();
+        model.prefill(ctx, &mut state, &mut scratch, &prompt, Some(draw(0)))?;
+        let first = scratch.next_token().view(0, &[1])?.to_u32()?[0];
+        let prefill_secs = prefill_start.elapsed().as_secs_f64();
+        let mut tokens = vec![first];
+        let decode_start = Instant::now();
+        let outcome = speculate(ctx, model, &mut state, &mut scratch, &GREEDY, cli.drafts, steps + 1, &mut tokens, &never_stop, &mut |_| Ok(true))?;
+        let decode_secs = decode_start.elapsed().as_secs_f64();
+        Ok((prefill_secs, decode_secs, outcome.drafted, outcome.accepted, tokens))
+    };
+    // Warm-up compiles the pipelines for every shape the loop uses.
+    run(4)?;
+    let (prefill_secs, decode_secs, drafted, accepted, tokens) = run(cli.decode_steps)?;
+    let generated = tokens.len() - 1;
+    let digest = fnv1a(&tokens[1..]);
+    let report = serde_json::json!({
+        "schema_version": 1,
+        "meta": {"engine": "lily", "model_id": M::MODEL_ID, "harness": "src/bin/lily-bench.rs", "crate_version": env!("CARGO_PKG_VERSION")},
+        "workload": {"prompt_len": cli.prompt_len, "decode_steps": cli.decode_steps, "decode_mode": format!("speculative_{}_drafts", cli.drafts)},
+        "results": {
+            "prefill": {"wall_secs": prefill_secs, "tok_s": cli.prompt_len as f64 / prefill_secs},
+            "decode": {
+                "wall_secs": decode_secs,
+                "tokens": generated,
+                "tok_s": generated as f64 / decode_secs,
+                "drafted": drafted,
+                "accepted": accepted,
+                "token_digest": format!("{digest:016x}"),
+                "token_ids": &tokens[1..],
+            },
+        },
+    });
+    std::fs::write(&cli.json_out, serde_json::to_vec_pretty(&report)?)?;
+    eprintln!(
+        "prefill: {} tok in {:.3}s ({:.1} tok/s) | speculative decode ({} drafts): {} tokens in {:.3}s ({:.1} tok/s), {}/{} drafts accepted ({:.1}%) | digest={digest:016x}",
+        cli.prompt_len,
+        prefill_secs,
+        cli.prompt_len as f64 / prefill_secs,
+        cli.drafts,
+        generated,
+        decode_secs,
+        generated as f64 / decode_secs,
+        accepted,
+        drafted,
+        100.0 * accepted as f64 / drafted.max(1) as f64,
     );
     Ok(())
 }

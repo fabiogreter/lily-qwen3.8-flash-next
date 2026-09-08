@@ -36,6 +36,17 @@ struct Cli {
     #[arg(long, default_value_t = 16)]
     max_sessions: usize,
 
+    /// Directory for the disk tier of the session cache (sessions evicted
+    /// from GPU memory are written here and read back when a prompt shares
+    /// their prefix). Default: ~/Library/Caches/lily/sessions.
+    #[arg(long)]
+    disk_cache_dir: Option<PathBuf>,
+
+    /// Most bytes the disk tier may hold, e.g. `100G`; `0` disables it.
+    /// Least recently used sessions go first.
+    #[arg(long, default_value = "100G")]
+    disk_cache_bytes: String,
+
     /// Where the Qwen3.8-Flash-Next n-gram table lives: `paged` reads rows
     /// from the checkpoint files through the page cache (32 GB less GPU
     /// memory), `resident` uploads it whole.
@@ -51,6 +62,12 @@ struct Cli {
     /// (32 GB that other applications can no longer reclaim).
     #[arg(long)]
     ngram_lock: bool,
+
+    /// Draft tokens per step for speculative decoding with the checkpoint's
+    /// multi-token-prediction head (Qwen3.8-Flash-Next conversions that
+    /// include it); 0 turns the head off.
+    #[arg(long, default_value_t = 2)]
+    mtp_drafts: usize,
 
     /// Chat prompts open a reasoning block unless the request says otherwise.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -100,6 +117,11 @@ fn parse_bytes(text: &str) -> Result<usize> {
     Ok((value * scale) as usize)
 }
 
+fn default_disk_cache_dir() -> PathBuf {
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    home.join("Library").join("Caches").join("lily").join("sessions")
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let options = ServeOptions {
@@ -107,9 +129,12 @@ fn main() -> Result<()> {
         max_seq: cli.max_seq,
         cache_bytes: cli.cache_bytes.as_deref().map(parse_bytes).transpose()?,
         max_sessions: cli.max_sessions,
+        disk_cache_dir: Some(cli.disk_cache_dir.unwrap_or_else(default_disk_cache_dir)),
+        disk_cache_bytes: parse_bytes(&cli.disk_cache_bytes)? as u64,
         ngram_storage: cli.ngram_table,
         ngram_preload: cli.ngram_preload,
         ngram_lock: cli.ngram_lock,
+        mtp_drafts: cli.mtp_drafts,
         thinking: cli.thinking,
         reasoning_effort: cli.reasoning_effort,
         queue: cli.queue,

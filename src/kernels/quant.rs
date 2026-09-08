@@ -216,7 +216,13 @@ pub fn gemm_quant_bf16_nt(
     );
     let staged = scratch.view(0, &[n, k])?;
     dequant_to_bf16(ctx, pass, w, &staged)?;
-    gemm_bf16_nt(ctx, pass, a, &staged, c)
+    // The GEMM reads the staged dequant, and the next projection's dequant
+    // must not overwrite the staging while it does: both edges get barriers
+    // (no-ops on a serial encoder; the staged path is only taken for chunks
+    // past the skinny kernels' row limit, where the GEMMs fill the GPU).
+    pass.level_barrier(&[&staged])?;
+    gemm_bf16_nt(ctx, pass, a, &staged, c)?;
+    pass.level_barrier(&[c])
 }
 
 /// Block-mapped grouped GEMM with Q4 dequantization fused into B-tile staging.

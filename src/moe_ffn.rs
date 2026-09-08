@@ -47,6 +47,7 @@ pub(crate) fn project_stack_or_slices<const N: usize>(
         // f32 orders.
         let c = stack_c.view(0, &[m, n_total])?;
         skinny::gemm_skinny_q4_nt(ctx, pass, a, stack_w, &c)?;
+        pass.level_barrier(&[&c])?;
         let outs: [&Tensor; N] = std::array::from_fn(|i| projections[i].1);
         split_cols_bf16(ctx, pass, &c, &outs)?;
         return Ok(());
@@ -60,7 +61,9 @@ pub(crate) fn project_stack_or_slices<const N: usize>(
 
 /// Dispatches a GEMM on the projection's storage precision; quantized weights
 /// stage a bf16 dequant into `scratch` first (see `quant::gemm_q4_bf16_nt`),
-/// unless the site routes to the skinny small-m kernel.
+/// unless the site routes to a skinny small-m kernel (4- and 8-bit). Every
+/// route ends with one dispatch writing `c`; ordering after it is the
+/// caller's (the dequant staging carries its own internal barrier).
 pub(crate) fn project_mat(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
@@ -69,9 +72,14 @@ pub(crate) fn project_mat(
     c: &Tensor,
     scratch: &Tensor,
 ) -> Result<()> {
-    if w.bits == 4 && skinny::dense_smallm_routes(a.shape()[0]) {
-        skinny::gemm_skinny_q4_nt(ctx, pass, a, w, c)?;
-        return Ok(());
+    let m = a.shape()[0];
+    if skinny::dense_smallm_routes(m) {
+        if w.bits == 4 {
+            return skinny::gemm_skinny_q4_nt(ctx, pass, a, w, c);
+        }
+        if w.bits == 8 && w.group_size.is_multiple_of(8) && w.in_features().is_multiple_of(8) {
+            return skinny::gemm_skinny_q8_nt(ctx, pass, a, w, c);
+        }
     }
     quant::gemm_quant_bf16_nt(ctx, pass, a, w, c, scratch)
 }
@@ -306,7 +314,23 @@ pub(crate) fn prefill_moe(
             tile.label(),
         );
     }
+    // Level structure for a concurrent encoder (serial encoders ignore the
+    // barriers): the shared expert depends only on `x`, so its projections
+    // are encoded alongside the router and the two chains meet at the final
+    // gated add.
+    let shared = &moe_w.shared;
     project_mat(ctx, pass, io.x, &moe_w.gate, &ms.router_logits, io.dequant)?;
+    project_stack_or_slices(
+        ctx,
+        pass,
+        io.x,
+        &shared.gate_up_proj,
+        io.stack,
+        [(&shared.gate_proj, io.mlp_gate), (&shared.up_proj, io.mlp_up)],
+        io.dequant,
+    )?;
+    project_mat(ctx, pass, io.x, &moe_w.shared_gate, &ms.shared_gate, io.dequant)?;
+    pass.level_barrier(&[&ms.router_logits, io.mlp_gate, io.mlp_up, &ms.shared_gate])?;
     moe::moe_router_topk_rows(
         ctx,
         pass,
@@ -315,11 +339,15 @@ pub(crate) fn prefill_moe(
         &ms.scores,
         dims.norm_topk_prob,
     )?;
+    silu_mul_bf16(ctx, pass, io.mlp_gate, io.mlp_up, io.mlp_act)?;
+    pass.level_barrier(&[&ms.indices, &ms.scores, io.mlp_act])?;
+    project_mat(ctx, pass, io.mlp_act, &shared.down_proj, &ms.shared_out, io.dequant)?;
     // The GEMV route consumes the router output directly in natural (row, k)
     // pair order: no counting sort, no gather, no block maps.
     if matches!(ms.route, quant::MoeRoute::Grouped(_)) {
         moe::fill_zero_u32(ctx, pass, &ms.counts)?;
         moe::fill_zero_u32(ctx, pass, &ms.cursors)?;
+        pass.level_barrier(&[&ms.counts, &ms.cursors])?;
         moe::moe_sort_slots(
             ctx,
             pass,
@@ -336,6 +364,7 @@ pub(crate) fn prefill_moe(
             top_k,
             ms.tile.rows(),
         )?;
+        pass.level_barrier(&[&ms.ids_sorted, &ms.offsets, &ms.tile_offsets, &ms.slot_of])?;
         gather_rows_bf16(ctx, pass, io.x, &ms.ids_sorted, &ms.gx)?;
         moe::moe_build_blocks(
             ctx,
@@ -357,6 +386,7 @@ pub(crate) fn prefill_moe(
             h,
             ms.tile.rows(),
         )?;
+        pass.level_barrier(&[&ms.gx, &ms.blocks_gu, &ms.blocks_dn])?;
     }
 
     match ms.route {
@@ -383,7 +413,9 @@ pub(crate) fn prefill_moe(
                 nb_gu,
                 ms.tile,
             )?;
+            pass.level_barrier(&[&ms.eg, &ms.eu])?;
             silu_mul_bf16(ctx, pass, &ms.eg, &ms.eu, &ms.ea)?;
+            pass.level_barrier(&[&ms.ea])?;
             quant::gemm_q4_grouped_nt(
                 ctx,
                 pass,
@@ -394,6 +426,7 @@ pub(crate) fn prefill_moe(
                 nb_dn,
                 ms.tile,
             )?;
+            pass.level_barrier(&[&ms.ed])?;
             moe::moe_combine_rows(
                 ctx,
                 pass,
@@ -423,10 +456,14 @@ pub(crate) fn prefill_moe(
             };
             // Build one union map shared by the three expert projections.
             moe::moe_union_experts(ctx, pass, &ms.indices, &ms.umap)?;
+            pass.level_barrier(&[&ms.umap])?;
             run_gemv(&moe_w.expert_gate, inter, io.x, &ms.eg, false)?;
             run_gemv(&moe_w.expert_up, inter, io.x, &ms.eu, false)?;
+            pass.level_barrier(&[&ms.eg, &ms.eu])?;
             silu_mul_bf16(ctx, pass, &ms.eg, &ms.eu, &ms.ea)?;
+            pass.level_barrier(&[&ms.ea])?;
             run_gemv(&moe_w.expert_down, h, &ms.ea, &ms.ed, true)?;
+            pass.level_barrier(&[&ms.ed])?;
             // GEMV outputs are in natural (row, k) pair order: the combine
             // reads the identity slot map.
             moe::moe_combine_rows(
@@ -441,19 +478,9 @@ pub(crate) fn prefill_moe(
         }
     }
 
-    let shared = &moe_w.shared;
-    project_stack_or_slices(
-        ctx,
-        pass,
-        io.x,
-        &shared.gate_up_proj,
-        io.stack,
-        [(&shared.gate_proj, io.mlp_gate), (&shared.up_proj, io.mlp_up)],
-        io.dequant,
-    )?;
-    silu_mul_bf16(ctx, pass, io.mlp_gate, io.mlp_up, io.mlp_act)?;
-    project_mat(ctx, pass, io.mlp_act, &shared.down_proj, &ms.shared_out, io.dequant)?;
-    project_mat(ctx, pass, io.x, &moe_w.shared_gate, &ms.shared_gate, io.dequant)?;
+    // Both chains are complete: the routed sum is in `out`, the shared
+    // expert in `shared_out`.
+    pass.level_barrier(&[io.out, &ms.shared_out])?;
     moe::moe_row_gate_add(ctx, pass, &ms.shared_out, &ms.shared_gate, io.out)
 }
 

@@ -15,6 +15,8 @@ build step.
 
 Reports, with measurement contract:
 
+- [2026-09-08: phase 3, speculative decoding and the disk tier](docs/2026-09-08-phase3-speculation-disk-report.md)
+  (98 tok/s greedy with two drafts against 76 plain; evicted sessions resume from disk)
 - [2026-09-08: phase 2, the server and its memory](docs/2026-09-08-phase2-server-report.md)
   (71 GB resident, 32 GB table in the page cache, decode 78 tok/s greedy / 62 to 75 sampling)
 - [2026-09-07: Qwen3.8-Flash-Next engine on the M5 Max](docs/2026-09-07-performance-qwen38-flash-next.md)
@@ -37,7 +39,16 @@ The checkpoint is produced by `tools/convert/convert_qwen38_flash_next.py`
 from the raw Hugging Face BF16 weights: affine 4-bit / group 64 for experts,
 attention, GDN, shared expert and embeddings, 4-bit / group 32 for the n-gram
 table, 8-bit for routers, gates and the hyper-connection mixers. The full
-checkpoint is 103 GB on disk.
+checkpoint is 103 GB on disk, plus 1.5 GB for the multi-token-prediction
+draft head (`--mtp-only` appends it to an existing conversion).
+
+**Speculative decoding.** With the draft head converted, the server verifies
+the head's proposals in batched trunk passes (`--mtp-drafts`, default 2): on
+the M5 Max greedy decoding runs at 98 tok/s instead of 76, with about 80% of
+drafts accepted on code and prose. Outputs do not depend on the draft count;
+the usage block reports `completion_tokens_details` with accepted and rejected
+drafts. Sampling with temperature accepts fewer drafts (the head drafts
+greedily) and gains less.
 
 **Memory.** Only 71 GB of it is uploaded to the GPU. The 32 GB n-gram table
 is a pure row gather (16 rows of 100 bytes per token), so the server memory
@@ -140,6 +151,13 @@ so parallel conversations never destroy each other's context. Per-token caches
 grow in 8 192-token steps. `usage.prompt_tokens_details.cached_tokens`
 reports the reuse.
 
+Sessions evicted from GPU memory go to a disk tier
+(`--disk-cache-dir`, default `~/Library/Caches/lily/sessions`;
+`--disk-cache-bytes`, default 100 GB, least recently used first, `0` turns it
+off). A later prompt that shares their prefix reads it back in about a second
+per few gigabytes instead of recomputing it; the tier survives restarts and
+is keyed by the model's cache layout, so other models never read it.
+
 ### Flags
 
 | flag | default | meaning |
@@ -150,6 +168,9 @@ reports the reuse.
 | `--ngram-table` | `paged` | `paged` (memory-mapped) or `resident` (uploaded) n-gram table |
 | `--ngram-preload` | true | read the table at startup so no request pays cold reads |
 | `--ngram-lock` | false | `mlock` the table (32 GB other apps cannot reclaim) |
+| `--mtp-drafts` | 2 | draft tokens per speculative step (0 turns the draft head off) |
+| `--disk-cache-dir` | `~/Library/Caches/lily/sessions` | where evicted sessions are kept |
+| `--disk-cache-bytes` | 100G | disk tier budget, LRU; `0` disables the tier |
 | `--thinking` | true | open a reasoning block unless the request says otherwise |
 | `--reasoning-effort` | template default | `low`, `medium`, `xhigh` |
 | `--temperature` … `--repetition-penalty` | generation_config | sampling defaults |
@@ -157,7 +178,8 @@ reports the reuse.
 
 Two more binaries share the engine: `lily-probe` runs one prompt step by step
 and records the top logits (used by `tools/reference/compare.py`), and
-`lily-bench` measures prefill and pipelined decode throughput.
+`lily-bench` measures prefill and pipelined decode throughput (`--drafts N`
+measures speculative decoding and its acceptance rate instead).
 
 ## Tests
 
@@ -180,7 +202,15 @@ LILY_MODEL_DIR_35B=/path/to/Qwen3.6-35B-A3B-4bit \
 
 LILY_MODEL_DIR_FLASH=/path/to/Qwen3.8-Flash-Next-lily-q4 \
   cargo test --release --lib paged_gather_timing -- --ignored --nocapture
+
+# Speculation invariance and the disk-tier round trip (a 4-layer conversion
+# with the draft head is enough):
+LILY_MODEL_DIR_FLASH=/path/to/Qwen3.8-Flash-Next-lily-q4-l4 \
+  cargo test --release --test test_speculative_flash -- --ignored --test-threads=1
 ```
+
+End-to-end scripts against a running server live in `tools/e2e/` (`e2e.sh`,
+`longctx.py`, `disk.py`).
 
 ## Source layout
 
@@ -189,7 +219,8 @@ src/config.rs         strict 35B-A3B checkpoint validation
 src/weights.rs        MLX affine Q4/Q8 weight loading (shared loader)
 src/model.rs          Qwen3.5 prefill and decode graph
 src/moe_ffn.rs        sparse-MoE FFN graph shared by both models
-src/qwen4exp/         Qwen3.8-Flash-Next config, weights, n-gram table, model graph
+src/qwen4exp/         Qwen3.8-Flash-Next config, weights, n-gram table, model graph,
+                      speculative decoding (spec.rs)
 src/engine.rs         the model-agnostic trait the server drives
 src/generate.rs       tokenizer wrapper and the pipelined decode loop
 src/serve.rs          engine thread, request flow, OpenAI response shapes
@@ -198,6 +229,7 @@ src/serve/api.rs      request schemas and validation
 src/serve/stream.rs   detokenizer, reasoning split, tool-call blocks, stop strings
 src/serve/tools.rs    tool schemas and the <tool_call> XML parser
 src/serve/session.rs  session cache with checkpoints, forks and a byte budget
+src/serve/disk.rs     the disk tier below it (LRU, budget, format-tagged files)
 src/kernels/          Rust dispatch and Metal shader sources
   hc.*                hyper-connection (gated residual) kernels
   ple.*               n-gram embedding kernels

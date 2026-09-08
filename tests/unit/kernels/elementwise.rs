@@ -111,3 +111,27 @@ fn argmax_f32_stages_match_first_max_reference() {
     combined_pass.commit_wait().expect("combined commit");
     assert_eq!(out.to_u32().expect("read combined result")[0], expected);
 }
+
+#[test]
+fn copy_words_copies_any_dtype_and_rejects_mismatch() {
+    let ctx = MetalContext::new().expect("metal context");
+    let src: Vec<f32> = (0..1000).map(|i| i as f32 * 0.5 - 7.0).collect();
+    let t_src = Tensor::from_f32(&ctx, &src, &[10, 100]).expect("src");
+    let t_dst = Tensor::zeros(&ctx, &[1000], DType::F32).expect("dst");
+    let pass = ctx.begin().expect("pass");
+    copy_words(&ctx, &pass, &t_src, &t_dst).expect("copy");
+    pass.commit_wait().expect("commit");
+    assert_eq!(t_dst.to_f32().expect("read"), src);
+
+    let ids: Vec<u32> = (0..6).collect();
+    let t_ids = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&ids), &[6], DType::U32).expect("ids");
+    let t_out = Tensor::zeros(&ctx, &[6], DType::U32).expect("out");
+    let pass = ctx.begin().expect("pass");
+    copy_words(&ctx, &pass, &t_ids, &t_out).expect("copy u32");
+    pass.commit_wait().expect("commit");
+    assert_eq!(t_out.to_u32().expect("read"), ids);
+
+    let short = Tensor::zeros(&ctx, &[999], DType::F32).expect("short");
+    let pass = ctx.begin().expect("pass");
+    assert!(copy_words(&ctx, &pass, &t_src, &short).is_err());
+}

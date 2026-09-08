@@ -11,13 +11,20 @@ MLX-community convention to match.
 ```
 config.json                       HF config.json + a top-level "lily" block (see below)
 model-XXXXX-of-YYYYY.safetensors  quantized text-model tensors, ~2 GB shards
-model.safetensors.index.json      standard HF weight_map
+mtp-XXXXX-of-YYYYY.safetensors    the multi-token-prediction draft head (optional, see below)
+model.safetensors.index.json      standard HF weight_map (covers both shard families)
 tokenizer.json, tokenizer_config.json, chat_template.jinja,
 generation_config.json            copied verbatim from the source checkpoint
 ```
 
-Everything under `model.visual.*` (vision tower) and `mtp.*` (multi-token
-prediction head) is dropped. The engine is text-only and greedy in phase 1.
+Everything under `model.visual.*` (vision tower) is dropped. The `mtp.*`
+draft head (one full-attention decoder block, `pre_fc_norm_embedding`,
+`pre_fc_norm_hidden`, `fc_embedding`, `fc_hidden`, and its own
+`hyper_connection_mixer`) is converted with the same rules as the trunk
+(`fc_embedding`/`fc_hidden` at 8 bits, the two `pre_fc_norm_*` weights
+verbatim) and written to `mtp-*` shards: by default in the same run, or later
+with `--mtp-only` into an existing conversion, which merges the index and adds
+a `lily.mtp` block to `config.json`. `--no-mtp` drops it.
 
 ## Tensor naming
 
@@ -53,6 +60,7 @@ and `[E, out, in/group_size]`. lily flattens the leading dims at load.
 | hyper-connection `input_mix_weight_down`, `input_mix_weight_up`, `block_inject_weight` (per layer and the model-level mixer) | 8 | 64 |
 | PLE `key_proj`, `value_proj`                                            | 8    | 64    |
 | QSA indexer `index_qk_proj`                                             | 8    | 64    |
+| MTP `fc_embedding`, `fc_hidden`                                         | 8    | 64    |
 
 The n-gram table rows are 160 wide, which is not a multiple of 64, hence
 group 32 there. Routers, gates and the small mixing projections stay at 8 bits
@@ -100,7 +108,8 @@ converter asserts they match the formulas in
   "source_revision": "f5d08274bafd880402bd16f5e3e6c514136ec06c",
   "layers": 48,                       // number of decoder layers kept (truncation for tests)
   "quantization": {"default": {"bits": 4, "group_size": 64}, ...per-tensor overrides...},
-  "ple": {"layer_multipliers": [...], "ngram_heads_vocab_sizes": [...], "ngram_heads_offsets": [...]}
+  "ple": {"layer_multipliers": [...], "ngram_heads_vocab_sizes": [...], "ngram_heads_offsets": [...]},
+  "mtp": {"layers": 1, "layer_types": ["full_attention"], "rope_theta": 10000000, ...} // or null
 }
 ```
 

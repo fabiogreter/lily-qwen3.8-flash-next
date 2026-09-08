@@ -12,15 +12,43 @@
 //! state and the checkpoint restored, so the original lineage survives (a
 //! parallel conversation sharing only the system prompt must not destroy a
 //! long context). Sessions are evicted least-recently-used under the budget.
+//!
+//! Below the GPU tier sits an optional disk tier ([`DiskStore`]): sessions
+//! evicted from GPU memory are written out (per-token caches plus their
+//! checkpoints and a snapshot of the live end) and a later prompt that shares
+//! a prefix reads them back instead of recomputing it. A disk hit at the live
+//! end moves the session back to the GPU (the file copy is dropped); a hit at
+//! an earlier checkpoint forks from the file and leaves it in place.
 
 use std::sync::Arc;
+use std::time::Instant;
 
-use anyhow::{Result, ensure};
+use anyhow::{Context as _, Result, ensure};
 
+use super::disk::DiskStore;
 use crate::engine::{DecodeStateApi, LanguageModel, SnapshotApi};
 use crate::metal::MetalContext;
 
 type SnapshotOf<M> = <<M as LanguageModel>::State as DecodeStateApi>::Snapshot;
+
+/// Sessions shorter than this are not worth a round trip to disk.
+const MIN_DISK_TOKENS: usize = 256;
+
+/// The best position to resume `prompt` from given a lineage's tokens and
+/// its resumable positions: the live end when the lineage is a strict prefix
+/// of the prompt (and `live_end` is resumable), else the latest resumable
+/// position within the common prefix. Never `>= prompt.len()`.
+fn resume_position(tokens: &[u32], checkpoints: &[usize], live_end: bool, prompt: &[u32]) -> Option<usize> {
+    let lcp = common_prefix_len(tokens, prompt);
+    let limit = lcp.min(prompt.len().checked_sub(1)?);
+    if tokens.len() <= limit {
+        if live_end {
+            return (!tokens.is_empty()).then_some(tokens.len());
+        }
+        return checkpoints.iter().rev().copied().find(|&p| p > 0 && p <= limit);
+    }
+    checkpoints.iter().rev().copied().find(|&p| p > 0 && p <= limit)
+}
 
 pub struct Session<M: LanguageModel> {
     /// Tokens fed into `state`; `state.pos() == tokens.len()` when at rest.
@@ -57,12 +85,8 @@ impl<M: LanguageModel> Session<M> {
     /// session is a strict prefix of the prompt, else the latest checkpoint
     /// within the common prefix. Never `>= prompt.len()`.
     fn resume_position(&self, prompt: &[u32]) -> Option<usize> {
-        let lcp = common_prefix_len(&self.tokens, prompt);
-        let limit = lcp.min(prompt.len().checked_sub(1)?);
-        if self.tokens.len() <= limit {
-            return (!self.tokens.is_empty()).then_some(self.tokens.len());
-        }
-        self.checkpoints.iter().rev().map(|c| c.pos()).find(|&p| p > 0 && p <= limit)
+        let positions: Vec<usize> = self.checkpoints.iter().map(|c| c.pos()).collect();
+        resume_position(&self.tokens, &positions, true, prompt)
     }
 
     fn checkpoint_at(&self, pos: usize) -> Option<&Arc<SnapshotOf<M>>> {
@@ -77,6 +101,9 @@ pub struct Acquired<M: LanguageModel> {
     pub reused: usize,
     /// Whether the session was forked from a cached lineage (diagnostics).
     pub forked: bool,
+    /// Whether the reused prefix was read from the disk tier, and how long
+    /// that took.
+    pub from_disk: Option<std::time::Duration>,
 }
 
 pub struct SessionStore<M: LanguageModel> {
@@ -85,11 +112,22 @@ pub struct SessionStore<M: LanguageModel> {
     max_sessions: usize,
     max_checkpoints: usize,
     clock: u64,
+    disk: Option<DiskStore>,
 }
 
 impl<M: LanguageModel> SessionStore<M> {
     pub fn new(budget_bytes: usize, max_sessions: usize, max_checkpoints: usize) -> Self {
-        Self { entries: Vec::new(), budget_bytes, max_sessions, max_checkpoints: max_checkpoints.max(1), clock: 0 }
+        Self { entries: Vec::new(), budget_bytes, max_sessions, max_checkpoints: max_checkpoints.max(1), clock: 0, disk: None }
+    }
+
+    /// Attaches the disk tier.
+    pub fn with_disk(mut self, disk: DiskStore) -> Self {
+        self.disk = Some(disk);
+        self
+    }
+
+    pub fn disk(&self) -> Option<&DiskStore> {
+        self.disk.as_ref()
     }
 
     pub fn budget_bytes(&self) -> usize {
@@ -126,18 +164,34 @@ impl<M: LanguageModel> SessionStore<M> {
                 (p, key_match, entry.last_used)
             });
 
+        // The disk tier competes on resume position; ties go to the GPU.
+        let best_disk = self.disk.as_ref().and_then(|disk| {
+            disk.entries()
+                .iter()
+                .filter_map(|e| resume_position(&e.tokens, &e.checkpoints, true, prompt).map(|p| (e.id.clone(), p, e.tokens.len())))
+                .max_by_key(|(id, p, _)| {
+                    let key_match = cache_key.is_some_and(|k| disk.entries().iter().any(|e| &e.id == id && e.cache_key.as_deref() == Some(k)));
+                    (*p, key_match)
+                })
+        });
+        if let Some((id, pos, len)) = best_disk
+            && best.is_none_or(|(_, gpu_pos)| pos > gpu_pos)
+        {
+            return self.acquire_from_disk(ctx, model, prompt, &id, pos, len);
+        }
+
         let Some((index, resume_at)) = best else {
             let state = model.new_state(ctx, prompt.len())?;
             let session = Session::new(state);
-            self.trim(session.bytes());
-            return Ok(Acquired { session, reused: 0, forked: false });
+            self.trim(ctx, session.bytes());
+            return Ok(Acquired { session, reused: 0, forked: false, from_disk: None });
         };
 
         if resume_at == self.entries[index].tokens.len() {
             // Pure extension of the live end: take the session as is.
             let session = self.entries.swap_remove(index);
             ensure!(session.state.pos() == resume_at, "cached decode state out of step with its tokens");
-            return Ok(Acquired { session, reused: resume_at, forked: false });
+            return Ok(Acquired { session, reused: resume_at, forked: false, from_disk: None });
         }
 
         // Fork: copy the per-token prefix, restore the recurrent checkpoint.
@@ -154,16 +208,111 @@ impl<M: LanguageModel> SessionStore<M> {
         let mut session = Session::new(state);
         session.tokens = source.tokens[..resume_at].to_vec();
         session.checkpoints.push(checkpoint);
-        self.trim(session.bytes());
-        Ok(Acquired { session, reused: resume_at, forked: true })
+        self.trim(ctx, session.bytes());
+        Ok(Acquired { session, reused: resume_at, forked: true, from_disk: None })
+    }
+
+    /// Builds a session from disk entry `id` resumed at `pos`: the per-token
+    /// caches up to `pos` and the checkpoint there. A live-end hit consumes
+    /// the entry; a checkpoint hit forks from it and leaves it on disk.
+    fn acquire_from_disk(
+        &mut self,
+        ctx: &MetalContext,
+        model: &M,
+        prompt: &[u32],
+        id: &str,
+        pos: usize,
+        len: usize,
+    ) -> Result<Acquired<M>> {
+        let started = Instant::now();
+        let disk = self.disk.as_mut().expect("disk tier");
+        let tokens = disk.entries().iter().find(|e| e.id == id).map(|e| e.tokens[..pos].to_vec()).context("disk entry vanished")?;
+        let mut state = model.new_state(ctx, prompt.len().max(pos))?;
+        let result = (|| -> Result<SnapshotOf<M>> {
+            let mut prefix = disk.open_prefix(id)?;
+            state.read_prefix(ctx, pos, &mut prefix)?;
+            let mut ckpt = disk.open_checkpoint(id, pos)?;
+            let snapshot = model.read_snapshot(ctx, &mut ckpt)?;
+            ensure!(snapshot.pos() == pos, "checkpoint file at {pos} holds position {}", snapshot.pos());
+            state.restore(ctx, &snapshot)?;
+            Ok(snapshot)
+        })();
+        let snapshot = match result {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                // A damaged entry must not poison every later request.
+                eprintln!("session cache: dropping unreadable disk entry {id}: {error:#}");
+                disk.remove(id);
+                let state = model.new_state(ctx, prompt.len())?;
+                let session = Session::new(state);
+                self.trim(ctx, session.bytes());
+                return Ok(Acquired { session, reused: 0, forked: false, from_disk: None });
+            }
+        };
+        let forked = pos != len;
+        if forked {
+            disk.touch(id);
+        } else {
+            disk.remove(id);
+        }
+        let mut session = Session::new(state);
+        session.tokens = tokens;
+        session.checkpoints.push(Arc::new(snapshot));
+        self.trim(ctx, session.bytes());
+        Ok(Acquired { session, reused: pos, forked, from_disk: Some(started.elapsed()) })
     }
 
     /// Evicts least-recently-used sessions until `extra` more bytes fit the
-    /// budget (or the store is empty).
-    fn trim(&mut self, extra: usize) {
+    /// budget (or the store is empty), spilling them to the disk tier.
+    fn trim(&mut self, ctx: &MetalContext, extra: usize) {
         while !self.entries.is_empty() && self.used_bytes() + extra > self.budget_bytes {
             let Some(victim) = self.lru_index() else { break };
-            self.entries.swap_remove(victim);
+            let session = self.entries.swap_remove(victim);
+            self.spill(ctx, session);
+        }
+    }
+
+    /// Writes an evicted session to the disk tier (when there is one and the
+    /// session is long enough to be worth it). Failures only cost the copy.
+    fn spill(&mut self, ctx: &MetalContext, session: Session<M>) {
+        let Some(disk) = self.disk.as_mut() else { return };
+        if session.tokens.len() < MIN_DISK_TOKENS || session.state.pos() != session.tokens.len() {
+            return;
+        }
+        let started = Instant::now();
+        let live = match session.state.snapshot(ctx) {
+            Ok(live) => live,
+            Err(error) => {
+                eprintln!("session cache: cannot snapshot an evicted session: {error:#}");
+                return;
+            }
+        };
+        let n = session.tokens.len();
+        let mut positions: Vec<usize> = session.checkpoints.iter().map(|c| c.pos()).filter(|&p| p > 0 && p < n).collect();
+        positions.push(n);
+        let result = disk.store(
+            &session.tokens,
+            session.cache_key.as_deref(),
+            &positions,
+            &mut |w| session.state.write_prefix(n, w),
+            &mut |pos, w| {
+                if pos == n {
+                    live.write_to(w)
+                } else {
+                    session.checkpoint_at(pos).context("checkpoint vanished")?.write_to(w)
+                }
+            },
+        );
+        match result {
+            Ok(Some(id)) => eprintln!(
+                "session cache: spilled {n} tokens to disk as {id} in {:.2}s ({} entries, {:.1}/{:.1} GB on disk)",
+                started.elapsed().as_secs_f64(),
+                disk.len(),
+                disk.used_bytes() as f64 / 1e9,
+                disk.budget_bytes() as f64 / 1e9
+            ),
+            Ok(None) => {}
+            Err(error) => eprintln!("session cache: spilling to disk failed: {error:#}"),
         }
     }
 
@@ -175,7 +324,7 @@ impl<M: LanguageModel> SessionStore<M> {
     /// `tokens.len()`. Old checkpoints beyond the per-session cap are dropped
     /// (the newest are the ones the next request most likely resumes from),
     /// and the store is trimmed to budget and count.
-    pub fn release(&mut self, mut session: Session<M>, cache_key: Option<&str>) {
+    pub fn release(&mut self, ctx: &MetalContext, mut session: Session<M>, cache_key: Option<&str>) {
         if session.state.pos() != session.tokens.len() || session.tokens.is_empty() {
             return;
         }
@@ -191,7 +340,8 @@ impl<M: LanguageModel> SessionStore<M> {
             || (self.used_bytes() > self.budget_bytes && self.entries.len() > 1)
         {
             let Some(victim) = self.lru_index() else { break };
-            self.entries.swap_remove(victim);
+            let session = self.entries.swap_remove(victim);
+            self.spill(ctx, session);
         }
     }
 }

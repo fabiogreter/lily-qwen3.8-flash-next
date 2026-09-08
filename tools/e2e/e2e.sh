@@ -92,6 +92,9 @@ curl -s $URL/v1/chat/completions -H 'Content-Type: application/json' -d '{"model
 echo "== 8. cancellation: client drops a streaming request after 1.5s"
 curl -sN --max-time 1.5 $URL/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"x","messages":[{"role":"user","content":"Count from 1 to 500, one number per line."}],"max_tokens":2000,"stream":true,"chat_template_kwargs":{"enable_thinking":false}}' | wc -l
 sleep 1
+echo "== 8b. speculation statistics in usage (completion_tokens_details when the draft head is on)"
+curl -s $URL/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"x","messages":[{"role":"user","content":"Write a Python function that reverses a list, with a docstring."}],"max_tokens":120,"temperature":0,"chat_template_kwargs":{"enable_thinking":false}}' | python3 -c 'import json,sys; r=json.load(sys.stdin); print(r["usage"].get("completion_tokens_details"), "completion", r["usage"]["completion_tokens"]); print(repr(r["choices"][0]["message"]["content"][:160]))'
+
 echo "== 9. regenerate the very first prompt (identical prompt, should resume from its checkpoint)"
 curl -s $URL/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "model":"Qwen3.8-Flash-Next","messages":[{"role":"user","content":"What is the capital of Switzerland? Answer in one sentence."}],

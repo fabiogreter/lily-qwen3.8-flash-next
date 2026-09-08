@@ -19,6 +19,12 @@ pub trait SnapshotApi {
     fn pos(&self) -> usize;
     /// GPU bytes the snapshot holds.
     fn bytes(&self) -> usize;
+    /// Serializes the snapshot (for the on-disk session tier; models that
+    /// support it also implement [`LanguageModel::read_snapshot`]). GPU idle.
+    fn write_to(&self, w: &mut dyn std::io::Write) -> Result<()> {
+        let _ = w;
+        anyhow::bail!("this model does not persist sessions")
+    }
 }
 
 /// Per-session recurrent/cache state.
@@ -58,6 +64,21 @@ pub trait DecodeStateApi: Sized {
     /// `from` (which must have fed at least that many). GPU idle; the caller
     /// follows up with [`Self::restore`] to set the recurrent part and position.
     fn copy_prefix_from(&mut self, ctx: &MetalContext, from: &Self, tokens: usize) -> Result<()>;
+
+    /// Streams the first `tokens` entries of every per-token cache to `w`, in
+    /// the layout [`Self::read_prefix`] expects. GPU idle.
+    fn write_prefix(&self, tokens: usize, w: &mut dyn std::io::Write) -> Result<()> {
+        let _ = (tokens, w);
+        anyhow::bail!("this model does not persist sessions")
+    }
+
+    /// Fills the first `tokens` entries of every per-token cache from `r`
+    /// (capacity permitting; grow first). GPU idle; follow up with
+    /// [`Self::restore`].
+    fn read_prefix(&mut self, ctx: &MetalContext, tokens: usize, r: &mut dyn std::io::Read) -> Result<()> {
+        let _ = (ctx, tokens, r);
+        anyhow::bail!("this model does not persist sessions")
+    }
 }
 
 /// Per-engine intermediates.
@@ -81,6 +102,8 @@ pub trait ScratchApi {
 pub struct LoadOptions {
     /// Where the Qwen3.8-Flash-Next n-gram table lives.
     pub ngram_storage: crate::qwen4exp::NgramStorage,
+    /// Draft tokens per speculative step; `0` leaves the draft head unloaded.
+    pub mtp_drafts: usize,
 }
 
 /// Which draw a decode pass ends with.
@@ -110,6 +133,19 @@ pub trait LanguageModel: Sized {
 
     /// Bytes the per-token caches take per token of capacity, for budgeting.
     fn bytes_per_token(&self) -> usize;
+
+    /// A tag identifying the on-disk layout of this model's sessions (model,
+    /// cache shapes, optional heads); `None` when sessions cannot be
+    /// persisted. Files written under a different tag are never read.
+    fn persistence_format(&self) -> Option<String> {
+        None
+    }
+
+    /// Reads a snapshot [`SnapshotApi::write_to`] wrote.
+    fn read_snapshot(&self, ctx: &MetalContext, r: &mut dyn std::io::Read) -> Result<<Self::State as DecodeStateApi>::Snapshot> {
+        let _ = (ctx, r);
+        anyhow::bail!("this model does not persist sessions")
+    }
 
     /// Warms weights served from disk (the paged n-gram table), pinning them
     /// in memory when `lock` is set, and returns the bytes found resident;
@@ -164,4 +200,77 @@ pub trait LanguageModel: Sized {
         slot_out: usize,
         draw: Draw<'_>,
     ) -> Result<EncodedPass<'a>>;
+
+    // --- speculative decoding (models with a draft head) ------------------
+
+    /// Draft tokens per step the model can propose; `0` when it has no draft
+    /// head loaded, in which case the remaining methods are never called.
+    fn max_drafts(&self) -> usize {
+        0
+    }
+
+    /// The first proposals of a request: up to `drafts` tokens following
+    /// `first`, the token the prefill drew. Waits for the GPU.
+    fn draft_initial(
+        &self,
+        ctx: &MetalContext,
+        state: &mut Self::State,
+        scratch: &mut Self::Scratch,
+        first: u32,
+        drafts: usize,
+    ) -> Result<Vec<u32>> {
+        let _ = (ctx, state, scratch, first, drafts);
+        anyhow::bail!("this model has no draft head")
+    }
+
+    /// Feeds `pending` and `drafts` in one batched pass and draws one token
+    /// per row (draw `step0 + row` of the request), waiting for the GPU. The
+    /// state is then mid-step: it has fed every row, and must be completed
+    /// with [`Self::finish_speculation`] before anything else. `ahead` is the
+    /// pass [`Self::finish_speculation`] may have encoded for exactly these
+    /// arguments; the model fills in the token-dependent inputs and commits it.
+    #[allow(clippy::too_many_arguments)]
+    fn verify<'a>(
+        &self,
+        ctx: &'a MetalContext,
+        state: &mut Self::State,
+        scratch: &mut Self::Scratch,
+        pending: u32,
+        drafts: &[u32],
+        params: &SamplingParams,
+        step0: usize,
+        ahead: Option<EncodedPass<'a>>,
+    ) -> Result<Vec<u32>> {
+        let _ = (ctx, state, scratch, pending, drafts, params, step0, ahead);
+        anyhow::bail!("this model has no draft head")
+    }
+
+    /// Completes a verify pass: keeps `pending` plus the first `accepted`
+    /// drafts as fed (rolling the state back past the rest) and, when `next`
+    /// is given, proposes up to `drafts` tokens following it. Returns the
+    /// proposals (empty when `next` is `None`) and, when it could encode it
+    /// while the GPU drafted, the next verify pass for `(params, step0)` in
+    /// `next`, to hand back to [`Self::verify`]. Waits for the GPU.
+    fn finish_speculation<'a>(
+        &self,
+        ctx: &'a MetalContext,
+        state: &mut Self::State,
+        scratch: &mut Self::Scratch,
+        accepted: usize,
+        next: Option<NextStep<'_>>,
+        drafts: usize,
+    ) -> Result<(Vec<u32>, Option<EncodedPass<'a>>)> {
+        let _ = (ctx, state, scratch, accepted, next, drafts);
+        anyhow::bail!("this model has no draft head")
+    }
+}
+
+/// What the following speculative step will verify with: the fresh token and
+/// the sampler settings of its pass.
+#[derive(Clone, Copy)]
+pub struct NextStep<'p> {
+    pub token: u32,
+    pub params: &'p SamplingParams,
+    /// Draw index of the pass's first row.
+    pub step0: usize,
 }

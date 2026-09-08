@@ -24,6 +24,16 @@ pub struct RopeParameters {
     pub partial_rotary_factor: f32,
 }
 
+/// The multi-token-prediction draft head the converter appends with
+/// `--mtp-only`: `layers` trunk-style blocks (Qwen3.8 ships one, a full
+/// attention block) fed by the trunk's wide residual and the next token's
+/// embedding, ending in its own stream mixer before the shared LM head.
+#[derive(Clone, Copy, Debug)]
+pub struct MtpConfig {
+    pub layers: usize,
+    pub rope_theta: f32,
+}
+
 /// Qwen Sparse Attention indexer: `n_heads` query heads score one shared key
 /// head per compressed block; the `budget / compress_ratio` best blocks plus
 /// the incomplete tail block are attended.
@@ -180,11 +190,22 @@ struct PleJson {
 }
 
 #[derive(Deserialize)]
+struct MtpJson {
+    layers: usize,
+    #[serde(default)]
+    layer_types: Vec<LayerType>,
+    rope_theta: f32,
+}
+
+#[derive(Deserialize)]
 struct LilyJson {
     format: String,
     quantization: QuantBlockJson,
     #[serde(default)]
     ple: PleJson,
+    /// Present (non-null) when the checkpoint carries the `mtp.*` tensors.
+    #[serde(default)]
+    mtp: Option<MtpJson>,
 }
 
 #[derive(Deserialize)]
@@ -228,6 +249,8 @@ pub struct Qwen4ExpConfig {
     pub indexer: IndexerConfig,
     /// Default affine quantization of the linear projections.
     pub quantization: QuantizationConfig,
+    /// The draft head, when the checkpoint includes it.
+    pub mtp: Option<MtpConfig>,
 }
 
 impl Qwen4ExpConfig {
@@ -326,6 +349,20 @@ impl Qwen4ExpConfig {
             more => anyhow::bail!("only one PLE layer is supported, got {more:?}"),
         };
 
+        let mtp = match wrapper.lily.mtp {
+            None => None,
+            Some(m) => {
+                ensure!(
+                    m.layers == 1 && m.layer_types.as_slice() == [LayerType::FullAttention],
+                    "unsupported MTP head: {} layers of {:?} (lily runs one full-attention block)",
+                    m.layers,
+                    m.layer_types
+                );
+                ensure!(m.rope_theta.is_finite() && m.rope_theta > 0.0, "invalid MTP rope_theta");
+                Some(MtpConfig { layers: m.layers, rope_theta: m.rope_theta })
+            }
+        };
+
         let config = Self {
             hidden_size: t.hidden_size,
             num_hidden_layers: t.num_hidden_layers,
@@ -359,6 +396,7 @@ impl Qwen4ExpConfig {
                 compress_ratio: t.indexer_compress_ratio,
             },
             quantization,
+            mtp,
         };
         config.validate_flash_next()?;
         Ok(config)

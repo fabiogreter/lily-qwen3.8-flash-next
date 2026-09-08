@@ -19,10 +19,10 @@ use crate::kernels::attention::{
     MAX_SEQ, k_norm_rope_scatter_decode, q_norm_rope_split_decode, rope_neox,
     scatter_kv, sdpa_decode, sdpa_prefill, sdpa_split_scratch_splits, split_q_gate,
 };
-use crate::kernels::elementwise::{gather_row_bf16, sigmoid_mul_bf16};
+use crate::kernels::elementwise::{add_bf16, copy_words, gather_row_bf16, sigmoid_mul_bf16};
 use crate::kernels::gdn::{
     GDN_HEAD_DIM, GDN_STATE_DTYPE, GdnGate, GdnRegscanStaging, conv1d_prefill,
-    conv1d_step, gated_rmsnorm, gdn_prefill, gdn_step_gated_fused,
+    conv1d_step, gated_rmsnorm, gdn_prefill_mid, gdn_step_gated_fused,
 };
 use crate::kernels::hc::{
     hc_broadcast_bf16, hc_inject_bf16, hc_mix_bf16, rmsnorm_grouped_bf16,
@@ -31,7 +31,7 @@ use crate::kernels::hc::{
 use crate::kernels::norm::rmsnorm_bf16;
 use crate::kernels::ple;
 use crate::kernels::qsa::{self, INDEXER_D, SparseSplitScratch};
-use crate::kernels::sample::{SamplerScratch, sample_f32};
+use crate::kernels::sample::{SamplerScratch, SamplingParams, sample_f32};
 use crate::kernels::{quant, skinny};
 use crate::metal::{BlitCopy, ComputePass, EncodedPass, MetalContext};
 use crate::moe_ffn::{
@@ -43,7 +43,8 @@ use crate::tensor::{DType, Tensor};
 use super::config::{GateAct, Qwen4ExpConfig};
 use super::ngram::{NgramHasher, NgramStorage, NgramTable, StagedRows};
 use super::weights::{
-    self, AttnWeights, GdnWeights, HcWeights, Mixer, ModelWeights, PleWeights,
+    self, AttnWeights, GdnWeights, HcWeights, LayerWeights, Mixer, ModelWeights, MtpWeights,
+    PleWeights,
 };
 
 /// Every RMSNorm in this model is zero-centered: gain = 1 + weight. (The GDN
@@ -61,6 +62,46 @@ const QSA_QUERY_BATCH: usize = 256;
 /// indexer keys per step), so a session's footprint follows its length.
 const CAPACITY_STEP: usize = 8192;
 
+/// Most draft tokens a speculative step may verify at once (the spec scratch
+/// is sized for it).
+pub const MAX_DRAFTS: usize = 3;
+
+/// How the batched (multi-row) graph is encoded: the serial encoder orders
+/// every dispatch implicitly; the concurrent one runs a dependency level's
+/// dispatches together and relies on the explicit barriers in this file.
+/// Both give bit-identical results. Measured on the M5 Max: the concurrent
+/// encoder wins for a few rows (53 ms → 22 ms at one row, where 2 229
+/// dispatches each waited for the previous one), the serial encoder for big
+/// chunks (8 000 tokens: 1 366 against 882 tok/s, where the coarse
+/// level barriers stall more than the driver's own hazard tracking).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Encoder {
+    Serial,
+    Concurrent,
+}
+
+/// Row count up to which the batched graph is encoded concurrently.
+const CONCURRENT_ROWS_MAX: usize = 16;
+
+fn encoder_for(rows: usize) -> Encoder {
+    if let Some(forced) = std::env::var_os("LILY_BATCHED_ENCODER") {
+        return if forced == "serial" { Encoder::Serial } else { Encoder::Concurrent };
+    }
+    if rows <= CONCURRENT_ROWS_MAX { Encoder::Concurrent } else { Encoder::Serial }
+}
+
+/// What a batched pass computes after its layers.
+#[derive(Clone, Copy)]
+pub(super) enum BatchMode<'p> {
+    /// Prompt prefill: logits (and a draw) for the last row only, plus the
+    /// draft head's catch-up over the chunk when the model has one.
+    Prefill { draw: Option<Draw<'p>> },
+    /// Speculative verification: a draw per row (`step0 + row` indexes the
+    /// request's draws), recurrent states after each row recorded for
+    /// rollback, no draft-head work (that follows once acceptance is known).
+    Verify { params: &'p SamplingParams, step0: usize },
+}
+
 fn moe_dims(cfg: &Qwen4ExpConfig) -> MoeDims {
     MoeDims {
         num_experts: cfg.num_experts,
@@ -73,14 +114,14 @@ fn moe_dims(cfg: &Qwen4ExpConfig) -> MoeDims {
 
 pub struct Qwen4ExpModel {
     pub config: Qwen4ExpConfig,
-    weights: ModelWeights,
-    attn_scale: f32,
+    pub(super) weights: ModelWeights,
+    pub(super) attn_scale: f32,
     gdn_scale: f32,
     gdn_gate: GdnGate,
-    hasher: Option<NgramHasher>,
+    pub(super) hasher: Option<NgramHasher>,
 }
 
-enum LayerState {
+pub(super) enum LayerState {
     Gdn {
         /// Recurrent state, fp32 `[H, 128, 128]`.
         state: Tensor,
@@ -102,10 +143,31 @@ enum LayerState {
 /// Per-Layer Embedding recurrent state: the two-token hash history (host
 /// side, since the host hashes) and the dilated conv window, double-buffered
 /// like the GDN conv windows.
-struct PleState {
-    hist: [u32; 2],
-    conv_windows: [Tensor; 2],
+pub(super) struct PleState {
+    pub(super) hist: [u32; 2],
+    pub(super) conv_windows: [Tensor; 2],
     eos: u32,
+}
+
+/// The draft head's per-session state: its attention caches (positions
+/// aligned with the trunk's) and the trunk's wide residual for the last fed
+/// token, which pairs with the next token to form the head's next input.
+pub(super) struct MtpState {
+    pub(super) layer: LayerState,
+    /// bf16 `[hc_count * h]`.
+    pub(super) hidden: Tensor,
+}
+
+/// A verify pass whose acceptance is still pending: enough to roll the state
+/// back to any accepted prefix of the verified tokens.
+pub(super) struct SpecPending {
+    pub(super) pos_before: usize,
+    pub(super) hist_before: Option<[u32; 2]>,
+    /// The verified tokens (pending token first, then the drafts).
+    pub(super) tokens: Vec<u32>,
+    /// The trunk's draw per row.
+    pub(super) sampled: Vec<u32>,
+    pub(super) uses_penalties: bool,
 }
 
 impl PleState {
@@ -121,24 +183,28 @@ pub struct DecodeState {
     pub pos: usize,
     /// Tokens the per-token caches hold; grows in `CAPACITY_STEP`s.
     capacity: usize,
-    layers: Vec<LayerState>,
+    pub(super) layers: Vec<LayerState>,
     /// Which double-buffered window slot is current (all recurrent layers
     /// advance in lockstep): prefill chunks read it, write the other, then
     /// flip; decode steps update it in place.
-    conv_slot: usize,
-    ple: Option<PleState>,
+    pub(super) conv_slot: usize,
+    pub(super) ple: Option<PleState>,
+    pub(super) mtp: Option<MtpState>,
+    pub(super) spec: Option<SpecPending>,
     kv_heads: usize,
     head_dim: usize,
     ratio: usize,
 }
 
 /// The recurrent part of a [`DecodeState`] at one position: GDN states and
-/// conv windows, the PLE conv window and hash history.
+/// conv windows, the PLE conv window and hash history, the draft head's
+/// last hidden.
 pub struct Snapshot {
     pos: usize,
     /// Per GDN layer, in layer order: `(state, conv_window)`.
     gdn: Vec<(Tensor, Tensor)>,
     ple: Option<([u32; 2], Tensor)>,
+    mtp_hidden: Option<Tensor>,
 }
 
 impl SnapshotApi for Snapshot {
@@ -149,7 +215,45 @@ impl SnapshotApi for Snapshot {
     fn bytes(&self) -> usize {
         self.gdn.iter().map(|(a, b)| a.byte_len() + b.byte_len()).sum::<usize>()
             + self.ple.as_ref().map_or(0, |(_, w)| w.byte_len())
+            + self.mtp_hidden.as_ref().map_or(0, Tensor::byte_len)
     }
+
+    /// Layout: position (u64 LE); per GDN layer the state then the conv
+    /// window; the PLE hash history (2 x u32 LE) and window; the draft head's
+    /// hidden. Shapes come from the model, so nothing else is written.
+    fn write_to(&self, w: &mut dyn std::io::Write) -> Result<()> {
+        w.write_all(&(self.pos as u64).to_le_bytes())?;
+        for (state, window) in &self.gdn {
+            state.write_to(w)?;
+            window.write_to(w)?;
+        }
+        if let Some((hist, window)) = &self.ple {
+            w.write_all(&hist[0].to_le_bytes())?;
+            w.write_all(&hist[1].to_le_bytes())?;
+            window.write_to(w)?;
+        }
+        if let Some(hidden) = &self.mtp_hidden {
+            hidden.write_to(w)?;
+        }
+        Ok(())
+    }
+}
+
+/// Visits an attention layer's cache regions holding the first `tokens`
+/// entries, in the fixed persistence order: K per head, V per head, indexer
+/// keys, block keys of the blocks those tokens start.
+fn attn_prefix_regions(lstate: &LayerState, tokens: usize, ratio: usize, f: &mut dyn FnMut(&Tensor) -> Result<()>) -> Result<()> {
+    let LayerState::Attn { k_cache, v_cache, idx_keys, blk_keys } = lstate else { return Ok(()) };
+    for cache in [k_cache, v_cache] {
+        let (heads, cap, d) = (cache.shape()[0], cache.shape()[1], cache.shape()[2]);
+        ensure!(tokens <= cap, "prefix of {tokens} exceeds capacity {cap}");
+        for h in 0..heads {
+            f(&cache.view(h * cap * d, &[tokens, d])?)?;
+        }
+    }
+    f(&idx_keys.view(0, &[tokens, INDEXER_D])?)?;
+    let blocks = tokens.div_ceil(ratio).min(blk_keys.shape()[0]);
+    f(&blk_keys.view(0, &[blocks, INDEXER_D])?)
 }
 
 fn clone_tensor(ctx: &MetalContext, t: &Tensor) -> Result<Tensor> {
@@ -200,6 +304,10 @@ impl DecodeState {
         if let Some(ple) = &mut self.ple {
             ple.reset();
         }
+        if let Some(mtp) = &self.mtp {
+            mtp.hidden.zero_fill();
+        }
+        self.spec = None;
         self.pos = 0;
         self.conv_slot = 0;
         Ok(())
@@ -214,13 +322,55 @@ impl DecodeState {
         })
     }
 
-    /// Per-token cache bytes for `capacity` tokens across all attention layers.
+    /// Per-token cache bytes for `capacity` tokens across all attention
+    /// layers, the draft head's included.
     fn cache_bytes(&self, capacity: usize) -> usize {
-        let attn_layers = self.layers.iter().filter(|l| matches!(l, LayerState::Attn { .. })).count();
+        let attn_layers = self.layers.iter().filter(|l| matches!(l, LayerState::Attn { .. })).count()
+            + usize::from(self.mtp.is_some());
         let per_token = 2 * self.kv_heads * self.head_dim * 2 + INDEXER_D * 2;
         let blocks = (capacity / self.ratio).max(1) * INDEXER_D * 2;
         attn_layers * (capacity * per_token + blocks)
     }
+
+    /// Replaces an attention layer's caches with ones of `capacity` tokens,
+    /// copying the first `pos` entries. GPU idle.
+    fn grow_attn(&self, ctx: &MetalContext, lstate: &mut LayerState, capacity: usize) -> Result<()> {
+        let LayerState::Attn { k_cache, v_cache, idx_keys, blk_keys } = lstate else {
+            return Ok(());
+        };
+        let LayerState::Attn { k_cache: k2, v_cache: v2, idx_keys: i2, blk_keys: b2 } =
+            DecodeState::attn_caches(ctx, self.kv_heads, self.head_dim, self.ratio, capacity)?
+        else {
+            unreachable!()
+        };
+        let mut copies = Vec::new();
+        head_block_copies(k_cache, &k2, self.pos, &mut copies)?;
+        head_block_copies(v_cache, &v2, self.pos, &mut copies)?;
+        row_copy(idx_keys, &i2, self.pos, &mut copies)?;
+        row_copy(blk_keys, &b2, self.pos.div_ceil(self.ratio), &mut copies)?;
+        ctx.blit_copy(&copies)?;
+        drop(copies);
+        *k_cache = k2;
+        *v_cache = v2;
+        *idx_keys = i2;
+        *blk_keys = b2;
+        Ok(())
+    }
+}
+
+/// Copies the first `tokens` entries of one attention layer's caches.
+fn attn_prefix_copies<'t>(dst: &'t LayerState, src: &'t LayerState, tokens: usize, ratio: usize, out: &mut Vec<BlitCopy<'t>>) -> Result<()> {
+    if let (
+        LayerState::Attn { k_cache, v_cache, idx_keys, blk_keys },
+        LayerState::Attn { k_cache: k0, v_cache: v0, idx_keys: i0, blk_keys: b0 },
+    ) = (dst, src)
+    {
+        head_block_copies(k0, k_cache, tokens, out)?;
+        head_block_copies(v0, v_cache, tokens, out)?;
+        row_copy(i0, idx_keys, tokens, out)?;
+        row_copy(b0, blk_keys, tokens.div_ceil(ratio), out)?;
+    }
+    Ok(())
 }
 
 /// Sparse-attention scratch shared by decode (one query) and prefill
@@ -265,7 +415,7 @@ impl QsaScratch {
 }
 
 /// Single-token PLE intermediates.
-struct PleScratch {
+pub(super) struct PleScratch {
     /// U32 `[rows, heads]`: hashed row ids (resident table) or the
     /// sequential ids of the staged rows (paged table).
     ids: Tensor,
@@ -324,16 +474,16 @@ impl PleScratch {
 }
 
 /// Hyper-connection read intermediates for `rows` tokens.
-struct HcScratch {
+pub(super) struct HcScratch {
     /// `[rows, G*H]` normed streams.
-    hn: Tensor,
+    pub(super) hn: Tensor,
     /// `[rows, lowrank]` read-gate logits and activation.
     down: Tensor,
     act: Tensor,
     /// `[rows, G*H]` per-element gate logits.
-    up: Tensor,
+    pub(super) up: Tensor,
     /// `[rows, H]` the block input.
-    mixed: Tensor,
+    pub(super) mixed: Tensor,
     /// `[rows, G]` write-gate logits.
     inj: Tensor,
 }
@@ -400,27 +550,69 @@ pub struct Scratch {
     logits: Tensor,
     sdpa_partials: Tensor,
     sdpa_stats: Tensor,
-    sampler: SamplerScratch,
+    pub(super) sampler: SamplerScratch,
     /// Tokens written by the in-graph sampler (`U32[2]`): two ping-pong
     /// slots so the pipelined loop can host-read step N's token while the
     /// in-flight step N+1 writes the other slot.
     pub next_token: Tensor,
     /// Prefill staging for the largest quantized projection.
-    dequant: Tensor,
+    pub(super) dequant: Tensor,
     moe: MoeScratch,
     /// Session-lived batched prefill intermediates, grown on demand and capped
     /// at `PREFILL_CHUNK` rows.
-    prefill: Option<PrefillScratch>,
+    pub(super) prefill: Option<PrefillScratch>,
+    /// Speculative-decoding intermediates (models with a draft head).
+    pub(super) spec: Option<SpecScratch>,
+}
+
+/// What a verify pass records so a draft pass can roll the recurrent state
+/// back to the accepted prefix, plus the draft head's small buffers.
+pub(super) struct SpecScratch {
+    /// Per GDN layer: F32 `[MAX_DRAFTS, H, 128, 128]`, the state after each
+    /// verified row but the last.
+    pub(super) mid: Vec<Tensor>,
+    /// Per GDN layer: bf16 `[MAX_DRAFTS + 1, C]`, the verified rows' conv inputs.
+    pub(super) conv_in: Vec<Tensor>,
+    /// bf16 `[MAX_DRAFTS + 1, G*H]`: the PLE conv inputs.
+    pub(super) ple_conv_in: Option<Tensor>,
+    /// F32 `[MAX_DRAFTS + 1, vocab]`.
+    pub(super) logits: Tensor,
+    /// U32 `[MAX_DRAFTS + 1]`: the trunk's draw per verified row.
+    pub(super) verify_tokens: Tensor,
+    /// U32 `[MAX_DRAFTS]`: the draft head's proposals.
+    pub(super) draft_tokens: Tensor,
+    /// U32 `[MAX_DRAFTS + 1]`: host-written tokens for the head's catch-up rows.
+    pub(super) mtp_ids: Tensor,
+}
+
+impl SpecScratch {
+    fn new(ctx: &MetalContext, cfg: &Qwen4ExpConfig) -> Result<Self> {
+        let heads = cfg.linear_num_value_heads;
+        let c = cfg.gdn_conv_channels();
+        let gdn_layers = cfg.layer_types.iter().filter(|t| matches!(t, super::config::LayerType::LinearAttention)).count();
+        let rows = MAX_DRAFTS + 1;
+        Ok(Self {
+            mid: (0..gdn_layers)
+                .map(|_| Tensor::zeros(ctx, &[MAX_DRAFTS, heads, GDN_HEAD_DIM, GDN_HEAD_DIM], GDN_STATE_DTYPE))
+                .collect::<Result<_>>()?,
+            conv_in: (0..gdn_layers).map(|_| Tensor::zeros(ctx, &[rows, c], DType::BF16)).collect::<Result<_>>()?,
+            ple_conv_in: cfg.ple.as_ref().map(|_| Tensor::zeros(ctx, &[rows, cfg.hc_width()], DType::BF16)).transpose()?,
+            logits: Tensor::zeros(ctx, &[rows, cfg.vocab_size], DType::F32)?,
+            verify_tokens: Tensor::zeros(ctx, &[rows], DType::U32)?,
+            draft_tokens: Tensor::zeros(ctx, &[MAX_DRAFTS], DType::U32)?,
+            mtp_ids: Tensor::zeros(ctx, &[rows], DType::U32)?,
+        })
+    }
 }
 
 /// Batched prefill intermediates at a capacity that only grows; each chunk
 /// uses exact row-prefix views.
-struct PrefillScratch {
-    m: usize,
-    ids: Tensor,
+pub(super) struct PrefillScratch {
+    pub(super) m: usize,
+    pub(super) ids: Tensor,
     x: Tensor,
-    hyper: Tensor,
-    hc: HcScratch,
+    pub(super) hyper: Tensor,
+    pub(super) hc: HcScratch,
     branch_out: Tensor,
     mlp_gate: Tensor,
     mlp_up: Tensor,
@@ -445,7 +637,11 @@ struct PrefillScratch {
     stack: Tensor,
     moe: PrefillMoeScratch,
     qsa: QsaScratch,
-    ple: Option<PleScratch>,
+    pub(super) ple: Option<PleScratch>,
+    /// Draft head: its residual stream and the trunk hiddens feeding it,
+    /// bf16 `[m, G*H]` each (models with a draft head only).
+    pub(super) mtp_hyper: Option<Tensor>,
+    mtp_hidden_in: Option<Tensor>,
 }
 
 struct GdnStageScratch {
@@ -461,6 +657,7 @@ impl PrefillScratch {
         capacity: usize,
         max_seq: usize,
         table: Option<&NgramTable>,
+        with_mtp: bool,
     ) -> Result<Self> {
         ensure!(capacity > 0, "prefill scratch capacity must be nonzero");
         let m = capacity;
@@ -516,16 +713,24 @@ impl PrefillScratch {
             moe: PrefillMoeScratch::new(ctx, &moe_dims(cfg), m)?,
             qsa: QsaScratch::new(ctx, cfg, max_seq, QSA_QUERY_BATCH.min(m))?,
             ple: table.map(|t| PleScratch::new(ctx, cfg, m, t)).transpose()?,
+            mtp_hyper: with_mtp.then(|| Tensor::zeros(ctx, &[m, cfg.hc_width()], bf)).transpose()?,
+            mtp_hidden_in: with_mtp.then(|| Tensor::zeros(ctx, &[m, cfg.hc_width()], bf)).transpose()?,
         })
     }
 
     /// Views of the capacity scratch for one chunk of `tokens`, uploading the
     /// token ids (the GPU is idle here: chunks are commit_wait-synchronized).
-    fn chunk(&self, tokens: &[u32]) -> Result<Self> {
-        let m = tokens.len();
+    pub(super) fn chunk(&self, tokens: &[u32]) -> Result<Self> {
+        let chunk = self.rows(tokens.len())?;
+        chunk.ids.write_bytes(bytemuck::cast_slice(tokens))?;
+        Ok(chunk)
+    }
+
+    /// Row-prefix views for `m` rows without touching the ids.
+    pub(super) fn rows(&self, m: usize) -> Result<Self> {
         ensure!(m <= self.m, "chunk of {m} tokens exceeds scratch capacity {}", self.m);
         let ids = prefix_rows(&self.ids, m)?;
-        let chunk = Self {
+        Ok(Self {
             m,
             ids,
             x: prefix_rows(&self.x, m)?,
@@ -569,19 +774,29 @@ impl PrefillScratch {
                 stats: self.qsa.stats.view(0, self.qsa.stats.shape())?,
             },
             ple: self.ple.as_ref().map(|p| p.rows(m)).transpose()?,
-        };
-        chunk.ids.write_bytes(bytemuck::cast_slice(tokens))?;
-        Ok(chunk)
+            mtp_hyper: self.mtp_hyper.as_ref().map(|t| prefix_rows(t, m)).transpose()?,
+            mtp_hidden_in: self.mtp_hidden_in.as_ref().map(|t| prefix_rows(t, m)).transpose()?,
+        })
     }
+}
+
+/// What a verify pass records per layer for rollback: the GDN states after
+/// each row but the last, and the rows' conv inputs (GDN and PLE) so the conv
+/// windows can be rewound.
+pub(super) struct Capture {
+    pub(super) mid: Option<Tensor>,
+    pub(super) conv_in: Tensor,
+    pub(super) ple_conv_in: Option<Tensor>,
 }
 
 impl Qwen4ExpModel {
     pub fn load(ctx: &MetalContext, dir: impl AsRef<Path>) -> Result<Self> {
-        Self::load_with(ctx, dir, NgramStorage::default())
+        Self::load_with(ctx, dir, NgramStorage::default(), true)
     }
 
-    /// Loads with the n-gram table `storage` of choice.
-    pub fn load_with(ctx: &MetalContext, dir: impl AsRef<Path>, storage: NgramStorage) -> Result<Self> {
+    /// Loads with the n-gram table `storage` of choice, and the draft head
+    /// when `with_mtp` and the checkpoint has one.
+    pub fn load_with(ctx: &MetalContext, dir: impl AsRef<Path>, storage: NgramStorage, with_mtp: bool) -> Result<Self> {
         let config = Qwen4ExpConfig::from_model_dir(&dir)?;
         ensure!(
             config.linear_key_head_dim == GDN_HEAD_DIM
@@ -594,7 +809,7 @@ impl Qwen4ExpModel {
             "indexer head dim {} unsupported (kernels are compiled for {INDEXER_D})",
             config.indexer.head_dim
         );
-        let weights = weights::load(ctx, &dir, &config, storage)?;
+        let weights = weights::load(ctx, &dir, &config, storage, with_mtp)?;
         let hasher = match &config.ple {
             Some(p) => Some(NgramHasher::new(
                 &p.layer_multipliers,
@@ -614,6 +829,18 @@ impl Qwen4ExpModel {
         Ok(Self { config, weights, attn_scale, gdn_scale, gdn_gate, hasher })
     }
 
+    /// Whether the draft head is loaded.
+    pub fn has_mtp(&self) -> bool {
+        self.weights.mtp.is_some()
+    }
+
+    fn begin_batched<'a>(&self, ctx: &'a MetalContext, rows: usize) -> Result<ComputePass<'a>> {
+        match encoder_for(rows) {
+            Encoder::Serial => ctx.begin(),
+            Encoder::Concurrent => ctx.begin_concurrent(),
+        }
+    }
+
     /// The n-gram table, when the checkpoint has a PLE layer.
     fn ple_table(&self) -> Option<&NgramTable> {
         self.weights.layers.iter().find_map(|l| l.ple.as_ref()).map(|p| &p.table)
@@ -622,7 +849,7 @@ impl Qwen4ExpModel {
     /// Stages the n-gram rows for `tokens` following `hist` into `p`: hashed
     /// ids for a resident table, the rows themselves for a paged one. The GPU
     /// must not be reading `p`.
-    fn stage_ngram(&self, w: &PleWeights, p: &PleScratch, tokens: &[u32], hist: [u32; 2]) -> Result<()> {
+    pub(super) fn stage_ngram(&self, w: &PleWeights, p: &PleScratch, tokens: &[u32], hist: [u32; 2]) -> Result<()> {
         let hasher = self.hasher.as_ref().expect("PLE weights without hasher");
         let mut ids = Vec::with_capacity(tokens.len() * hasher.heads());
         hasher.ids(tokens, hist, &mut ids);
@@ -691,12 +918,21 @@ impl Qwen4ExpModel {
                 eos: p.eos_token_id,
             })
         }).transpose()?;
+        let mtp = match &self.weights.mtp {
+            Some(_) => Some(MtpState {
+                layer: DecodeState::attn_caches(ctx, cfg.num_key_value_heads, cfg.head_dim, ratio, capacity)?,
+                hidden: Tensor::zeros(ctx, &[cfg.hc_width()], DType::BF16)?,
+            }),
+            None => None,
+        };
         Ok(DecodeState {
             pos: 0,
             capacity,
             layers,
             conv_slot: 0,
             ple,
+            mtp,
+            spec: None,
             kv_heads: cfg.num_key_value_heads,
             head_dim: cfg.head_dim,
             ratio,
@@ -788,7 +1024,27 @@ impl Qwen4ExpModel {
             dequant: Tensor::zeros(ctx, &[dequant_numel], bf)?,
             moe: MoeScratch::new(ctx, &moe_dims(cfg))?,
             prefill: None,
+            spec: self.weights.mtp.as_ref().map(|_| SpecScratch::new(ctx, cfg)).transpose()?,
         })
+    }
+
+    /// Makes sure `s.prefill` can hold chunks of `needed` rows.
+    pub(super) fn ensure_prefill_scratch(&self, ctx: &MetalContext, s: &mut Scratch, needed: usize) -> Result<()> {
+        let needed = needed.min(PREFILL_CHUNK);
+        let have = s.prefill.as_ref().map_or(0, |p| p.m);
+        if have < needed {
+            let target = needed.next_power_of_two().min(PREFILL_CHUNK);
+            s.prefill = None;
+            s.prefill = Some(PrefillScratch::new(
+                ctx,
+                &self.config,
+                target,
+                MAX_SEQ,
+                self.ple_table(),
+                self.weights.mtp.is_some(),
+            )?);
+        }
+        Ok(())
     }
 
     /// Encodes one decode step reading `next_token[slot_in]` and drawing
@@ -803,6 +1059,7 @@ impl Qwen4ExpModel {
         slot_out: usize,
         draw: Draw<'_>,
     ) -> Result<EncodedPass<'a>> {
+        ensure!(state.spec.is_none(), "decode step during a pending speculative step");
         let pass = ctx.begin_concurrent()?;
         self.encode_decode_graph(ctx, &pass, state, s, slot_in, slot_out, draw)?;
         pass.end()
@@ -831,20 +1088,9 @@ impl Qwen4ExpModel {
         draw: Option<Draw<'_>>,
     ) -> Result<()> {
         ensure!(!tokens.is_empty(), "empty prompt");
+        ensure!(state.spec.is_none(), "prefill during a pending speculative step");
         state.ensure_capacity(ctx, state.pos + tokens.len())?;
-        let needed = tokens.len().min(PREFILL_CHUNK);
-        let have = s.prefill.as_ref().map_or(0, |p| p.m);
-        if have < needed {
-            let target = needed.next_power_of_two().min(PREFILL_CHUNK);
-            s.prefill = None;
-            s.prefill = Some(PrefillScratch::new(
-                ctx,
-                &self.config,
-                target,
-                MAX_SEQ,
-                self.ple_table(),
-            )?);
-        }
+        self.ensure_prefill_scratch(ctx, s, tokens.len())?;
         let s = &*s;
         let capacity = s
             .prefill
@@ -852,13 +1098,28 @@ impl Qwen4ExpModel {
             .ok_or_else(|| anyhow::anyhow!("prefill scratch missing after growth"))?;
         let ple_w = self.weights.layers.iter().find_map(|l| l.ple.as_deref());
         let mut remaining = tokens.len();
+        let profile = std::env::var_os("LILY_PROFILE").is_some();
         for chunk in tokens.chunks(PREFILL_CHUNK) {
             let ps = capacity.chunk(chunk)?;
             if let (Some(w), Some(p), Some(pst)) = (ple_w, &ps.ple, &state.ple) {
                 self.stage_ngram(w, p, chunk, pst.hist)?;
             }
             remaining -= chunk.len();
-            self.encode_prefill_chunk(ctx, state, s, &ps, if remaining == 0 { draw } else { None })?;
+            let mode = BatchMode::Prefill { draw: if remaining == 0 { draw } else { None } };
+            let started = std::time::Instant::now();
+            let encoded = self.encode_batch(ctx, state, s, &ps, mode)?;
+            let encoded_at = std::time::Instant::now();
+            let completed = encoded.commit()?.wait_retain()?;
+            if profile {
+                let gpu = completed.timing().map(|t| (t.gpu_end_secs - t.gpu_start_secs) * 1e3).unwrap_or(-1.0);
+                eprintln!(
+                    "profile prefill m={}: encode {:.2} ms, gpu {:.2} ms, total {:.2} ms",
+                    chunk.len(),
+                    (encoded_at - started).as_secs_f64() * 1e3,
+                    gpu,
+                    started.elapsed().as_secs_f64() * 1e3
+                );
+            }
             state.pos += chunk.len();
             if let Some(pst) = &mut state.ple {
                 pst.hist = NgramHasher::advance(pst.hist, chunk);
@@ -871,134 +1132,188 @@ impl Qwen4ExpModel {
 
     // --- prefill ------------------------------------------------------------
 
-    fn encode_prefill_chunk(
+    /// Encodes the batched graph for the chunk `ps` at `state.pos` without
+    /// committing: every layer over all rows, then the head according to
+    /// `mode`. Barriers mark every inter-level data edge so the same code runs
+    /// on the serial and the concurrent encoder.
+    pub(super) fn encode_batch<'a>(
         &self,
-        ctx: &MetalContext,
+        ctx: &'a MetalContext,
         state: &DecodeState,
         s: &Scratch,
         ps: &PrefillScratch,
-        draw: Option<Draw<'_>>,
-    ) -> Result<()> {
-        let pass = ctx.begin()?;
+        mode: BatchMode<'_>,
+    ) -> Result<EncodedPass<'a>> {
         let m = ps.m;
+        let pass = self.begin_batched(ctx, m)?;
         ensure!(state.pos + m <= state.capacity, "sequence full ({})", state.capacity);
         let cfg = &self.config;
         let (h, g) = (cfg.hidden_size, cfg.hc_count);
         let pos = state.pos;
         let conv_slot = state.conv_slot;
+        let verify = matches!(mode, BatchMode::Verify { .. });
+        if verify {
+            ensure!(m <= MAX_DRAFTS + 1, "verify batch of {m} rows exceeds {}", MAX_DRAFTS + 1);
+        }
+        let spec = if verify { s.spec.as_ref() } else { None };
 
         quant::gather_rows_q4(ctx, &pass, &self.weights.embed_tokens, &ps.ids, &ps.x)?;
+        pass.level_barrier(&[&ps.x])?;
         hc_broadcast_bf16(ctx, &pass, &ps.x, &ps.hyper, h, g)?;
+        pass.level_barrier(&[&ps.hyper])?;
 
+        let mut gdn_index = 0usize;
         for (layer, lstate) in self.weights.layers.iter().zip(state.layers.iter()) {
-            if let (Some(ple_w), Some(ple_s), Some(pst)) =
-                (&layer.ple, &ps.ple, &state.ple)
-            {
-                self.ple_prefill(ctx, &pass, ple_w, ple_s, pst, conv_slot, s, ps)?;
-            }
-
-            self.hc_read_prefill(ctx, &pass, &layer.attn_hc, s, ps)?;
-            match (&layer.mixer, lstate) {
-                (Mixer::Gdn(w), LayerState::Gdn { state, conv_windows }) => {
-                    self.gdn_prefill_branch(
-                        ctx,
-                        &pass,
-                        w,
-                        s,
-                        ps,
-                        state,
-                        conv_windows,
-                        conv_slot,
-                    )?;
+            let ple = match (&layer.ple, &ps.ple, &state.ple) {
+                (Some(w), Some(p), Some(pst)) => Some((w.as_ref(), p, pst)),
+                _ => None,
+            };
+            let capture = match (spec, lstate) {
+                (Some(sp), LayerState::Gdn { .. }) => {
+                    let mid = (m > 1).then(|| sp.mid[gdn_index].view(0, &[m - 1, cfg.linear_num_value_heads, GDN_HEAD_DIM, GDN_HEAD_DIM])).transpose()?;
+                    Some(Capture { mid, conv_in: prefix_rows(&sp.conv_in[gdn_index], m)?, ple_conv_in: sp.ple_conv_in.as_ref().map(|t| prefix_rows(t, m)).transpose()? })
                 }
-                (
-                    Mixer::Attn(w),
-                    LayerState::Attn { k_cache, v_cache, idx_keys, blk_keys },
-                ) => {
-                    self.attn_prefill_branch(
-                        ctx, &pass, w, s, ps, k_cache, v_cache, idx_keys, blk_keys, pos,
-                    )?;
-                }
-                _ => anyhow::bail!("layer/state kind mismatch"),
+                (Some(sp), LayerState::Attn { .. }) => Some(Capture { mid: None, conv_in: prefix_rows(&sp.conv_in[0], 0)?, ple_conv_in: sp.ple_conv_in.as_ref().map(|t| prefix_rows(t, m)).transpose()? }),
+                _ => None,
+            };
+            if matches!(lstate, LayerState::Gdn { .. }) {
+                gdn_index += 1;
             }
-            hc_inject_bf16(ctx, &pass, &ps.hyper, &ps.branch_out, &ps.hc.inj, h, g)?;
-
-            self.hc_read_prefill(ctx, &pass, &layer.mlp_hc, s, ps)?;
-            prefill_moe(
-                ctx,
-                &pass,
-                &moe_dims(cfg),
-                &layer.ffn,
-                &PrefillMoeIo {
-                    x: &ps.hc.mixed,
-                    out: &ps.branch_out,
-                    stack: &ps.stack,
-                    mlp_gate: &ps.mlp_gate,
-                    mlp_up: &ps.mlp_up,
-                    mlp_act: &ps.mlp_act,
-                    dequant: &s.dequant,
-                },
-                &ps.moe,
-            )?;
-            hc_inject_bf16(ctx, &pass, &ps.hyper, &ps.branch_out, &ps.hc.inj, h, g)?;
+            self.block_batched(ctx, &pass, layer, lstate, &ps.hyper, pos, conv_slot, s, ps, ple, capture.as_ref())?;
         }
 
-        if let Some(draw) = draw {
-            // Only the last prompt token feeds decoding: pull its stream row
-            // into the single-token scratch and reuse the decode head path.
-            gather_row_bf16(ctx, &pass, &ps.hyper, &s.hyper, m - 1)?;
-            self.hc_read_decode(ctx, &pass, &self.weights.final_mixer, s)?;
-            quant::gemv_quant(
-                ctx,
-                &pass,
-                &self.weights.lm_head,
-                &s.hc.mixed,
-                &s.logits,
-            )?;
-            // Slot 0 by convention: the pipelined loop's first decode step
-            // consumes the prefill token from this slot.
-            let out = s.next_token.view(0, &[1])?;
-            sample_f32(ctx, &pass, &s.logits, &s.sampler, draw.params, draw.step, &out)?;
+        match mode {
+            BatchMode::Prefill { draw } => {
+                if let Some(draw) = draw {
+                    // Only the last prompt token feeds decoding: pull its stream
+                    // row into the single-token scratch and reuse the decode
+                    // head path.
+                    gather_row_bf16(ctx, &pass, &ps.hyper, &s.hyper, m - 1)?;
+                    pass.level_barrier(&[&s.hyper])?;
+                    self.hc_read_decode(ctx, &pass, &self.weights.final_mixer, s)?;
+                    quant::gemv_quant(ctx, &pass, &self.weights.lm_head, &s.hc.mixed, &s.logits)?;
+                    pass.level_barrier(&[&s.logits])?;
+                    // Slot 0 by convention: the pipelined loop's first decode step
+                    // consumes the prefill token from this slot.
+                    let out = s.next_token.view(0, &[1])?;
+                    sample_f32(ctx, &pass, &s.logits, &s.sampler, draw.params, draw.step, &out)?;
+                    pass.level_barrier(&[&s.next_token])?;
+                }
+                if let (Some(mtp), Some(mst)) = (&self.weights.mtp, &state.mtp) {
+                    self.mtp_catch_up(ctx, &pass, mtp, mst, pos, s, ps)?;
+                }
+            }
+            BatchMode::Verify { params, step0 } => {
+                let sp = s.spec.as_ref().ok_or_else(|| anyhow::anyhow!("verify pass without spec scratch"))?;
+                self.hc_read_batched(ctx, &pass, &self.weights.final_mixer, &ps.hyper, s, ps)?;
+                let logits = prefix_rows(&sp.logits, m)?;
+                project_mat(ctx, &pass, &ps.hc.mixed, &self.weights.lm_head, &logits, &s.dequant)?;
+                pass.level_barrier(&[&logits])?;
+                // One draw per row; the rows share the sampler scratch (and
+                // the penalty counts, which must see earlier rows' draws).
+                for j in 0..m {
+                    let row = sp.logits.view(j * cfg.vocab_size, &[cfg.vocab_size])?;
+                    let out = sp.verify_tokens.view(j, &[1])?;
+                    sample_f32(ctx, &pass, &row, &s.sampler, params, step0 + j, &out)?;
+                    pass.level_barrier(&[&sp.verify_tokens])?;
+                }
+            }
         }
-        pass.commit_wait()
+        pass.end()
     }
 
-    /// hyper `[m, G*H]` → `ps.hc.mixed` `[m, H]` (and the write-gate logits
-    /// when the block has an inject weight).
-    fn hc_read_prefill(
+    /// One decoder block over the rows of `ps` on the residual `hyper`
+    /// (`[m, G*H]`): the optional PLE, the mixer branch, the MoE, each read
+    /// and written through its hyper-connection. `capture` (verify passes)
+    /// records what a rollback needs.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn block_batched(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        layer: &LayerWeights,
+        lstate: &LayerState,
+        hyper: &Tensor,
+        pos: usize,
+        conv_slot: usize,
+        s: &Scratch,
+        ps: &PrefillScratch,
+        ple: Option<(&PleWeights, &PleScratch, &PleState)>,
+        capture: Option<&Capture>,
+    ) -> Result<()> {
+        let cfg = &self.config;
+        let (h, g) = (cfg.hidden_size, cfg.hc_count);
+        if let Some((w, p, pst)) = ple {
+            self.ple_batched(ctx, pass, w, p, pst, conv_slot, hyper, s, ps, capture.and_then(|c| c.ple_conv_in.as_ref()))?;
+        }
+
+        self.hc_read_batched(ctx, pass, &layer.attn_hc, hyper, s, ps)?;
+        match (&layer.mixer, lstate) {
+            (Mixer::Gdn(w), LayerState::Gdn { state, conv_windows }) => {
+                self.gdn_batched(ctx, pass, w, s, ps, state, conv_windows, conv_slot, capture)?;
+            }
+            (Mixer::Attn(w), LayerState::Attn { k_cache, v_cache, idx_keys, blk_keys }) => {
+                self.attn_batched(ctx, pass, w, s, ps, k_cache, v_cache, idx_keys, blk_keys, pos)?;
+            }
+            _ => anyhow::bail!("layer/state kind mismatch"),
+        }
+        pass.level_barrier(&[&ps.branch_out])?;
+        hc_inject_bf16(ctx, pass, hyper, &ps.branch_out, &ps.hc.inj, h, g)?;
+        pass.level_barrier(&[hyper])?;
+
+        self.hc_read_batched(ctx, pass, &layer.mlp_hc, hyper, s, ps)?;
+        prefill_moe(
+            ctx,
+            pass,
+            &moe_dims(cfg),
+            &layer.ffn,
+            &PrefillMoeIo {
+                x: &ps.hc.mixed,
+                out: &ps.branch_out,
+                stack: &ps.stack,
+                mlp_gate: &ps.mlp_gate,
+                mlp_up: &ps.mlp_up,
+                mlp_act: &ps.mlp_act,
+                dequant: &s.dequant,
+            },
+            &ps.moe,
+        )?;
+        pass.level_barrier(&[&ps.branch_out])?;
+        hc_inject_bf16(ctx, pass, hyper, &ps.branch_out, &ps.hc.inj, h, g)?;
+        pass.level_barrier(&[hyper])
+    }
+
+    /// `hyper` `[m, G*H]` → `ps.hc.mixed` `[m, H]` (and the write-gate logits
+    /// when the block has an inject weight). Leaves `mixed`/`inj` ordered.
+    pub(super) fn hc_read_batched(
         &self,
         ctx: &MetalContext,
         pass: &ComputePass<'_>,
         hc: &HcWeights,
+        hyper: &Tensor,
         s: &Scratch,
         ps: &PrefillScratch,
     ) -> Result<()> {
         let cfg = &self.config;
         let (h, g) = (cfg.hidden_size, cfg.hc_count);
         let inv_g = 1.0 / g as f32;
-        rmsnorm_grouped_bf16(
-            ctx,
-            pass,
-            &ps.hyper,
-            &hc.norm,
-            &ps.hc.hn,
-            h,
-            g,
-            cfg.rms_norm_eps,
-            NORM_WEIGHT_BIAS,
-        )?;
+        rmsnorm_grouped_bf16(ctx, pass, hyper, &hc.norm, &ps.hc.hn, h, g, cfg.rms_norm_eps, NORM_WEIGHT_BIAS)?;
+        pass.level_barrier(&[&ps.hc.hn])?;
         project_mat(ctx, pass, &ps.hc.hn, &hc.down, &ps.hc.down, &s.dequant)?;
-        silu_scaled_bf16(ctx, pass, &ps.hc.down, &ps.hc.act, inv_g)?;
-        project_mat(ctx, pass, &ps.hc.act, &hc.up, &ps.hc.up, &s.dequant)?;
-        hc_mix_bf16(ctx, pass, &ps.hc.up, &ps.hc.hn, &ps.hc.mixed, h, g)?;
         if let Some(inject) = &hc.inject {
             project_mat(ctx, pass, &ps.hc.hn, inject, &ps.hc.inj, &s.dequant)?;
         }
-        Ok(())
+        pass.level_barrier(&[&ps.hc.down, &ps.hc.inj])?;
+        silu_scaled_bf16(ctx, pass, &ps.hc.down, &ps.hc.act, inv_g)?;
+        pass.level_barrier(&[&ps.hc.act])?;
+        project_mat(ctx, pass, &ps.hc.act, &hc.up, &ps.hc.up, &s.dequant)?;
+        pass.level_barrier(&[&ps.hc.up])?;
+        hc_mix_bf16(ctx, pass, &ps.hc.up, &ps.hc.hn, &ps.hc.mixed, h, g)?;
+        pass.level_barrier(&[&ps.hc.mixed])
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn ple_prefill(
+    fn ple_batched(
         &self,
         ctx: &MetalContext,
         pass: &ComputePass<'_>,
@@ -1006,51 +1321,29 @@ impl Qwen4ExpModel {
         p: &PleScratch,
         pst: &PleState,
         conv_slot: usize,
+        hyper: &Tensor,
         s: &Scratch,
         ps: &PrefillScratch,
+        conv_capture: Option<&Tensor>,
     ) -> Result<()> {
         let cfg = &self.config;
         let ple = cfg.ple.as_ref().expect("PLE weights without PLE config");
         let (h, g, eps) = (cfg.hidden_size, cfg.hc_count, cfg.rms_norm_eps);
         self.gather_ngram(ctx, pass, w, p, ps.m)?;
+        rmsnorm_grouped_bf16(ctx, pass, hyper, &w.norm_query, &p.query_n, h, g, eps, NORM_WEIGHT_BIAS)?;
+        pass.level_barrier(&[&p.emb, &p.query_n])?;
         project_mat(ctx, pass, &p.emb, &w.key_proj, &p.key, &s.dequant)?;
         project_mat(ctx, pass, &p.emb, &w.value_proj, &p.value, &s.dequant)?;
-        rmsnorm_grouped_bf16(
-            ctx,
-            pass,
-            &p.key,
-            &w.norm_key,
-            &p.key_n,
-            h,
-            g,
-            eps,
-            NORM_WEIGHT_BIAS,
-        )?;
-        rmsnorm_grouped_bf16(
-            ctx,
-            pass,
-            &ps.hyper,
-            &w.norm_query,
-            &p.query_n,
-            h,
-            g,
-            eps,
-            NORM_WEIGHT_BIAS,
-        )?;
-        ple::ple_gate_value_bf16(
-            ctx, pass, &p.key_n, &p.query_n, &p.value, &p.gated, h, g,
-        )?;
-        rmsnorm_grouped_bf16(
-            ctx,
-            pass,
-            &p.gated,
-            &w.norm_conv,
-            &p.gated_n,
-            h,
-            g,
-            eps,
-            NORM_WEIGHT_BIAS,
-        )?;
+        pass.level_barrier(&[&p.key, &p.value])?;
+        rmsnorm_grouped_bf16(ctx, pass, &p.key, &w.norm_key, &p.key_n, h, g, eps, NORM_WEIGHT_BIAS)?;
+        pass.level_barrier(&[&p.key_n])?;
+        ple::ple_gate_value_bf16(ctx, pass, &p.key_n, &p.query_n, &p.value, &p.gated, h, g)?;
+        pass.level_barrier(&[&p.gated])?;
+        rmsnorm_grouped_bf16(ctx, pass, &p.gated, &w.norm_conv, &p.gated_n, h, g, eps, NORM_WEIGHT_BIAS)?;
+        pass.level_barrier(&[&p.gated_n])?;
+        if let Some(keep) = conv_capture {
+            copy_words(ctx, pass, &p.gated_n, keep)?;
+        }
         ple::ple_conv1d_prefill(
             ctx,
             pass,
@@ -1059,13 +1352,14 @@ impl Qwen4ExpModel {
             &p.gated_n,
             &w.conv_w,
             &p.gated,
-            &ps.hyper,
+            hyper,
             ple.ngram_size,
-        )
+        )?;
+        pass.level_barrier(&[hyper, &pst.conv_windows[1 - conv_slot]])
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn gdn_prefill_branch(
+    fn gdn_batched(
         &self,
         ctx: &MetalContext,
         pass: &ComputePass<'_>,
@@ -1075,6 +1369,7 @@ impl Qwen4ExpModel {
         gdn_state: &Tensor,
         conv_windows: &[Tensor; 2],
         conv_slot: usize,
+        capture: Option<&Capture>,
     ) -> Result<()> {
         let cfg = &self.config;
         project_stack_or_slices(
@@ -1091,6 +1386,10 @@ impl Qwen4ExpModel {
             ],
             &s.dequant,
         )?;
+        pass.level_barrier(&[&ps.qkv, &ps.z, &ps.a, &ps.b])?;
+        if let Some(c) = capture {
+            copy_words(ctx, pass, &ps.qkv, &c.conv_in)?;
+        }
         conv1d_prefill(
             ctx,
             pass,
@@ -1100,12 +1399,13 @@ impl Qwen4ExpModel {
             &w.conv_w,
             &ps.qkv_conv,
         )?;
+        pass.level_barrier(&[&ps.qkv_conv, &conv_windows[1 - conv_slot]])?;
         let staging = GdnRegscanStaging {
             qk_norm: &ps.gdn_stage.qk_norm,
             decay: &ps.gdn_stage.decay,
             beta: &ps.gdn_stage.beta,
         };
-        gdn_prefill(
+        gdn_prefill_mid(
             ctx,
             pass,
             &ps.qkv_conv,
@@ -1118,22 +1418,16 @@ impl Qwen4ExpModel {
             &ps.gdn_out,
             self.gdn_scale,
             cfg.linear_num_key_heads,
+            capture.and_then(|c| c.mid.as_ref()),
         )?;
-        gated_rmsnorm(
-            ctx,
-            pass,
-            &ps.gdn_out,
-            &ps.z,
-            &w.norm_w,
-            &ps.gdn_gated,
-            cfg.rms_norm_eps,
-            self.gdn_gate,
-        )?;
+        pass.level_barrier(&[&ps.gdn_out, gdn_state])?;
+        gated_rmsnorm(ctx, pass, &ps.gdn_out, &ps.z, &w.norm_w, &ps.gdn_gated, cfg.rms_norm_eps, self.gdn_gate)?;
+        pass.level_barrier(&[&ps.gdn_gated])?;
         project_mat(ctx, pass, &ps.gdn_gated, &w.out_proj, &ps.branch_out, &s.dequant)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn attn_prefill_branch(
+    pub(super) fn attn_batched(
         &self,
         ctx: &MetalContext,
         pass: &ComputePass<'_>,
@@ -1146,10 +1440,30 @@ impl Qwen4ExpModel {
         blk_keys: &Tensor,
         pos: usize,
     ) -> Result<()> {
+        self.attn_batched_theta(ctx, pass, w, s, ps, k_cache, v_cache, idx_keys, blk_keys, pos, self.config.rope_parameters.rope_theta)
+    }
+
+    /// The attention branch over `ps.hc.mixed` at positions `pos..pos+m`
+    /// against the given caches, with an explicit RoPE base (the draft head
+    /// declares its own).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn attn_batched_theta(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        w: &AttnWeights,
+        s: &Scratch,
+        ps: &PrefillScratch,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        idx_keys: &Tensor,
+        blk_keys: &Tensor,
+        pos: usize,
+        theta: f32,
+    ) -> Result<()> {
         let cfg = &self.config;
         let eps = cfg.rms_norm_eps;
         let rot = cfg.rotary_dim();
-        let theta = cfg.rope_parameters.rope_theta;
         let m = ps.m;
         let idx = &cfg.indexer;
         let (nq, hd) = (cfg.num_attention_heads, cfg.head_dim);
@@ -1163,109 +1477,45 @@ impl Qwen4ExpModel {
             [(&w.q_proj, &ps.qg), (&w.k_proj, &ps.k_new), (&w.v_proj, &ps.v_new)],
             &s.dequant,
         )?;
+        project_mat(ctx, pass, &ps.hc.mixed, &w.indexer.qk_proj, &ps.idx_qk, &s.dequant)?;
+        pass.level_barrier(&[&ps.qg, &ps.k_new, &ps.v_new, &ps.idx_qk])?;
         split_q_gate(ctx, pass, &ps.qg, &ps.q, &ps.gate)?;
-        rmsnorm_bf16(ctx, pass, &ps.q, &w.q_norm, &ps.q, eps, NORM_WEIGHT_BIAS)?;
-        rmsnorm_bf16(
-            ctx,
-            pass,
-            &ps.k_new,
-            &w.k_norm,
-            &ps.k_new,
-            eps,
-            NORM_WEIGHT_BIAS,
-        )?;
-        rope_neox(ctx, pass, &ps.q, nq, rot, pos, theta)?;
-        rope_neox(ctx, pass, &ps.k_new, cfg.num_key_value_heads, rot, pos, theta)?;
-        scatter_kv(ctx, pass, k_cache, &ps.k_new, pos)?;
-        scatter_kv(ctx, pass, v_cache, &ps.v_new, pos)?;
-
-        // Indexer: queries for this chunk, raw keys into the cache, and the
-        // block keys every block completed so far by this chunk.
-        project_mat(
-            ctx,
-            pass,
-            &ps.hc.mixed,
-            &w.indexer.qk_proj,
-            &ps.idx_qk,
-            &s.dequant,
-        )?;
-        qsa::qsa_prep_q(
-            ctx,
-            pass,
-            &ps.idx_qk,
-            &w.indexer.q_norm,
-            &ps.idx_q,
-            idx.n_heads,
-            rot,
-            pos,
-            theta,
-            eps,
-        )?;
+        rmsnorm_bf16(ctx, pass, &ps.k_new, &w.k_norm, &ps.k_new, eps, NORM_WEIGHT_BIAS)?;
+        // Indexer: queries for this chunk, raw keys into the cache.
+        qsa::qsa_prep_q(ctx, pass, &ps.idx_qk, &w.indexer.q_norm, &ps.idx_q, idx.n_heads, rot, pos, theta, eps)?;
         qsa::qsa_scatter_keys(ctx, pass, &ps.idx_qk, idx_keys, idx.n_heads, pos)?;
+        pass.level_barrier(&[&ps.q, &ps.gate, &ps.k_new, &ps.idx_q, idx_keys])?;
+        rmsnorm_bf16(ctx, pass, &ps.q, &w.q_norm, &ps.q, eps, NORM_WEIGHT_BIAS)?;
+        rope_neox(ctx, pass, &ps.k_new, cfg.num_key_value_heads, rot, pos, theta)?;
+        // Block keys for every block this chunk completes.
         let first_block = pos / idx.compress_ratio;
         let complete = (pos + m) / idx.compress_ratio;
-        qsa::qsa_block_keys(
-            ctx,
-            pass,
-            idx_keys,
-            &w.indexer.k_norm,
-            blk_keys,
-            idx.compress_ratio,
-            first_block,
-            complete - first_block,
-            rot,
-            theta,
-            eps,
-        )?;
+        if complete > first_block {
+            qsa::qsa_block_keys(ctx, pass, idx_keys, &w.indexer.k_norm, blk_keys, idx.compress_ratio, first_block, complete - first_block, rot, theta, eps)?;
+        }
+        pass.level_barrier(&[&ps.q, &ps.k_new, blk_keys])?;
+        rope_neox(ctx, pass, &ps.q, nq, rot, pos, theta)?;
+        scatter_kv(ctx, pass, k_cache, &ps.k_new, pos)?;
+        scatter_kv(ctx, pass, v_cache, &ps.v_new, pos)?;
+        pass.level_barrier(&[&ps.q, k_cache, v_cache])?;
 
         if pos + m <= idx.dense_limit() {
             // Every query sees at most the budget: the selection is the whole
             // causal window, so the dense kernel is exact.
-            sdpa_prefill(
-                ctx,
-                pass,
-                &ps.q,
-                k_cache,
-                v_cache,
-                &ps.attn_o,
-                pos,
-                self.attn_scale,
-            )?;
+            sdpa_prefill(ctx, pass, &ps.q, k_cache, v_cache, &ps.attn_o, pos, self.attn_scale)?;
         } else {
             let qb_cap = ps.qsa.n_sel.numel();
             for q0 in (0..m).step_by(qb_cap) {
                 let qb = qb_cap.min(m - q0);
                 let base = pos + q0;
                 let nb_max = qsa::visible_blocks(base + qb - 1, idx.compress_ratio);
-                let idx_q = ps.idx_q.view(
-                    q0 * idx.n_heads * INDEXER_D,
-                    &[qb, idx.n_heads, INDEXER_D],
-                )?;
+                let idx_q = ps.idx_q.view(q0 * idx.n_heads * INDEXER_D, &[qb, idx.n_heads, INDEXER_D])?;
                 let q = ps.q.view(q0 * nq * hd, &[qb, nq, hd])?;
                 let out = ps.attn_o.view(q0 * nq * hd, &[qb, nq, hd])?;
-                qsa::qsa_scores(
-                    ctx,
-                    pass,
-                    &idx_q,
-                    blk_keys,
-                    &ps.qsa.scores,
-                    idx.n_heads,
-                    nb_max,
-                    base,
-                    idx.compress_ratio,
-                )?;
-                qsa::qsa_select_blocks(
-                    ctx,
-                    pass,
-                    &ps.qsa.scores,
-                    &ps.qsa.sel,
-                    &ps.qsa.n_sel,
-                    qb,
-                    nb_max,
-                    base,
-                    idx.compress_ratio,
-                    idx.block_topk(),
-                )?;
+                qsa::qsa_scores(ctx, pass, &idx_q, blk_keys, &ps.qsa.scores, idx.n_heads, nb_max, base, idx.compress_ratio)?;
+                pass.level_barrier(&[&ps.qsa.scores])?;
+                qsa::qsa_select_blocks(ctx, pass, &ps.qsa.scores, &ps.qsa.sel, &ps.qsa.n_sel, qb, nb_max, base, idx.compress_ratio, idx.block_topk())?;
+                pass.level_barrier(&[&ps.qsa.sel, &ps.qsa.n_sel])?;
                 qsa::qsa_attention(
                     ctx,
                     pass,
@@ -1282,10 +1532,128 @@ impl Qwen4ExpModel {
                     base,
                     self.attn_scale,
                 )?;
+                // The next sub-batch reuses the score/selection scratch.
+                pass.level_barrier(&[&out])?;
             }
         }
+        pass.level_barrier(&[&ps.attn_o])?;
         sigmoid_mul_bf16(ctx, pass, &ps.gate, &ps.attn_o, &ps.attn_gated)?;
+        pass.level_barrier(&[&ps.attn_gated])?;
         project_mat(ctx, pass, &ps.attn_gated, &w.o_proj, &ps.branch_out, &s.dequant)
+    }
+
+    // --- draft head -----------------------------------------------------------
+
+    /// Runs the draft head over the chunk during prefill so its caches keep up
+    /// with the trunk: row `j` pairs the trunk hidden of token `pos+j-1` with
+    /// token `pos+j` (the previous chunk's last hidden comes from the state;
+    /// at position 0 there is no earlier hidden, so that row is skipped).
+    /// Afterwards the state's hidden holds the chunk's last row.
+    #[allow(clippy::too_many_arguments)]
+    fn mtp_catch_up(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        mtp: &MtpWeights,
+        mst: &MtpState,
+        pos: usize,
+        s: &Scratch,
+        ps: &PrefillScratch,
+    ) -> Result<()> {
+        let wide = self.config.hc_width();
+        let m = ps.m;
+        let hidden_in = ps.mtp_hidden_in.as_ref().ok_or_else(|| anyhow::anyhow!("draft head without prefill scratch"))?;
+        let (rows, pos0) = if pos > 0 { (m, pos - 1) } else { (m - 1, 0) };
+        if rows > 0 {
+            if pos > 0 {
+                copy_words(ctx, pass, &mst.hidden, &hidden_in.view(0, &[wide])?)?;
+                if m > 1 {
+                    copy_words(ctx, pass, &ps.hyper.view(0, &[m - 1, wide])?, &hidden_in.view(wide, &[m - 1, wide])?)?;
+                }
+            } else {
+                copy_words(ctx, pass, &ps.hyper.view(0, &[m - 1, wide])?, &hidden_in.view(0, &[m - 1, wide])?)?;
+            }
+            let ids = if pos > 0 { ps.ids.view(0, &[m])? } else { ps.ids.view(1, &[m - 1])? };
+            pass.level_barrier(&[hidden_in])?;
+            let ps_rows = ps.rows(rows)?;
+            self.mtp_block(ctx, pass, mtp, mst, &hidden_in.view(0, &[rows, wide])?, &ids, pos0, s, &ps_rows)?;
+        }
+        // The chunk's last trunk hidden pairs with the next token, whenever
+        // it arrives. (Ordered after the reads above by the block's barriers,
+        // or trivially when no row ran.)
+        copy_words(ctx, pass, &ps.hyper.view((m - 1) * wide, &[wide])?, &mst.hidden)?;
+        pass.level_barrier(&[&mst.hidden])
+    }
+
+    /// The draft head's block over `rows` inputs: `hidden` (`[rows, G*H]`
+    /// trunk or head residuals) and `ids` (`[rows]`, the tokens following
+    /// them) become the head's residual in `ps.mtp_hyper`, and the block runs
+    /// at head positions `pos0..pos0+rows` against the head's caches. Leaves
+    /// `ps.mtp_hyper` ordered.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn mtp_block(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        mtp: &MtpWeights,
+        mst: &MtpState,
+        hidden: &Tensor,
+        ids: &Tensor,
+        pos0: usize,
+        s: &Scratch,
+        ps: &PrefillScratch,
+    ) -> Result<()> {
+        let cfg = &self.config;
+        let (h, g, eps) = (cfg.hidden_size, cfg.hc_count, cfg.rms_norm_eps);
+        let rows = ps.m;
+        ensure!(hidden.shape() == [rows, g * h] && ids.numel() == rows, "draft head input shape mismatch");
+        let hyper = ps.mtp_hyper.as_ref().ok_or_else(|| anyhow::anyhow!("draft head without scratch"))?;
+        let theta = cfg.mtp.map_or(cfg.rope_parameters.rope_theta, |m| m.rope_theta);
+
+        // Per stream: fc_hidden(norm(stream)); shared: fc_embedding(norm(emb)).
+        rmsnorm_grouped_bf16(ctx, pass, hidden, &mtp.norm_hidden, &ps.hc.hn, h, g, eps, NORM_WEIGHT_BIAS)?;
+        quant::gather_rows_q4(ctx, pass, &self.weights.embed_tokens, ids, &ps.x)?;
+        pass.level_barrier(&[&ps.hc.hn, &ps.x])?;
+        let hn_streams = ps.hc.hn.view(0, &[rows * g, h])?;
+        let hyper_streams = hyper.view(0, &[rows * g, h])?;
+        project_mat(ctx, pass, &hn_streams, &mtp.fc_hidden, &hyper_streams, &s.dequant)?;
+        rmsnorm_bf16(ctx, pass, &ps.x, &mtp.norm_embedding, &ps.x, eps, NORM_WEIGHT_BIAS)?;
+        pass.level_barrier(&[hyper, &ps.x])?;
+        project_mat(ctx, pass, &ps.x, &mtp.fc_embedding, &ps.branch_out, &s.dequant)?;
+        pass.level_barrier(&[&ps.branch_out])?;
+        hc_broadcast_bf16(ctx, pass, &ps.branch_out, &ps.hc.up, h, g)?;
+        pass.level_barrier(&[&ps.hc.up])?;
+        add_bf16(ctx, pass, hyper, &ps.hc.up, hyper)?;
+        pass.level_barrier(&[hyper])?;
+
+        // The block itself: a trunk-style attention layer with its own RoPE base.
+        let Mixer::Attn(w) = &mtp.layer.mixer else { anyhow::bail!("draft head block is not attention") };
+        let LayerState::Attn { k_cache, v_cache, idx_keys, blk_keys } = &mst.layer else { anyhow::bail!("draft head state is not attention") };
+        self.hc_read_batched(ctx, pass, &mtp.layer.attn_hc, hyper, s, ps)?;
+        self.attn_batched_theta(ctx, pass, w, s, ps, k_cache, v_cache, idx_keys, blk_keys, pos0, theta)?;
+        pass.level_barrier(&[&ps.branch_out])?;
+        hc_inject_bf16(ctx, pass, hyper, &ps.branch_out, &ps.hc.inj, h, g)?;
+        pass.level_barrier(&[hyper])?;
+        self.hc_read_batched(ctx, pass, &mtp.layer.mlp_hc, hyper, s, ps)?;
+        prefill_moe(
+            ctx,
+            pass,
+            &moe_dims(cfg),
+            &mtp.layer.ffn,
+            &PrefillMoeIo {
+                x: &ps.hc.mixed,
+                out: &ps.branch_out,
+                stack: &ps.stack,
+                mlp_gate: &ps.mlp_gate,
+                mlp_up: &ps.mlp_up,
+                mlp_act: &ps.mlp_act,
+                dequant: &s.dequant,
+            },
+            &ps.moe,
+        )?;
+        pass.level_barrier(&[&ps.branch_out])?;
+        hc_inject_bf16(ctx, pass, hyper, &ps.branch_out, &ps.hc.inj, h, g)?;
+        pass.level_barrier(&[hyper])
     }
 
     // --- decode -------------------------------------------------------------
@@ -1678,30 +2046,14 @@ impl DecodeStateApi for DecodeState {
             return Ok(());
         }
         let capacity = round_capacity(tokens)?;
-        let (kv_heads, head_dim, ratio) = (self.kv_heads, self.head_dim, self.ratio);
-        for lstate in &mut self.layers {
-            if let LayerState::Attn { k_cache, v_cache, idx_keys, blk_keys } = lstate {
-                let LayerState::Attn {
-                    k_cache: k2,
-                    v_cache: v2,
-                    idx_keys: i2,
-                    blk_keys: b2,
-                } = DecodeState::attn_caches(ctx, kv_heads, head_dim, ratio, capacity)?
-                else {
-                    unreachable!()
-                };
-                let mut copies = Vec::new();
-                head_block_copies(k_cache, &k2, self.pos, &mut copies)?;
-                head_block_copies(v_cache, &v2, self.pos, &mut copies)?;
-                row_copy(idx_keys, &i2, self.pos, &mut copies)?;
-                row_copy(blk_keys, &b2, self.pos.div_ceil(ratio), &mut copies)?;
-                ctx.blit_copy(&copies)?;
-                drop(copies);
-                *k_cache = k2;
-                *v_cache = v2;
-                *idx_keys = i2;
-                *blk_keys = b2;
-            }
+        let mut layers = std::mem::take(&mut self.layers);
+        for lstate in &mut layers {
+            self.grow_attn(ctx, lstate, capacity)?;
+        }
+        self.layers = layers;
+        if let Some(mut mtp) = self.mtp.take() {
+            self.grow_attn(ctx, &mut mtp.layer, capacity)?;
+            self.mtp = Some(mtp);
         }
         self.capacity = capacity;
         Ok(())
@@ -1719,7 +2071,8 @@ impl DecodeStateApi for DecodeState {
             })
             .sum();
         let ple = self.ple.as_ref().map_or(0, |p| 2 * p.conv_windows[0].byte_len());
-        recurrent + ple + self.cache_bytes(self.capacity)
+        let mtp = self.mtp.as_ref().map_or(0, |m| m.hidden.byte_len());
+        recurrent + ple + mtp + self.cache_bytes(self.capacity)
     }
 
     fn snapshot(&self, ctx: &MetalContext) -> Result<Snapshot> {
@@ -1734,7 +2087,11 @@ impl DecodeStateApi for DecodeState {
             Some(p) => Some((p.hist, clone_tensor(ctx, &p.conv_windows[slot])?)),
             None => None,
         };
-        Ok(Snapshot { pos: self.pos, gdn, ple })
+        let mtp_hidden = match &self.mtp {
+            Some(m) => Some(clone_tensor(ctx, &m.hidden)?),
+            None => None,
+        };
+        Ok(Snapshot { pos: self.pos, gdn, ple, mtp_hidden })
     }
 
     fn restore(&mut self, ctx: &MetalContext, snapshot: &Snapshot) -> Result<()> {
@@ -1757,9 +2114,17 @@ impl DecodeStateApi for DecodeState {
             (None, None) => {}
             _ => anyhow::bail!("snapshot PLE state mismatch"),
         }
+        match (&self.mtp, &snapshot.mtp_hidden) {
+            (Some(m), Some(h)) => {
+                copies.push(BlitCopy { src: h, src_offset: 0, dst: &m.hidden, dst_offset: 0, len: h.byte_len() });
+            }
+            (None, None) => {}
+            _ => anyhow::bail!("snapshot draft-head state mismatch"),
+        }
         ctx.blit_copy(&copies)?;
         self.pos = snapshot.pos;
         self.conv_slot = 0;
+        self.spec = None;
         Ok(())
     }
 
@@ -1768,18 +2133,32 @@ impl DecodeStateApi for DecodeState {
         self.ensure_capacity(ctx, tokens)?;
         let mut copies = Vec::new();
         for (dst, src) in self.layers.iter().zip(&from.layers) {
-            if let (
-                LayerState::Attn { k_cache, v_cache, idx_keys, blk_keys },
-                LayerState::Attn { k_cache: k0, v_cache: v0, idx_keys: i0, blk_keys: b0 },
-            ) = (dst, src)
-            {
-                head_block_copies(k0, k_cache, tokens, &mut copies)?;
-                head_block_copies(v0, v_cache, tokens, &mut copies)?;
-                row_copy(i0, idx_keys, tokens, &mut copies)?;
-                row_copy(b0, blk_keys, tokens.div_ceil(self.ratio), &mut copies)?;
-            }
+            attn_prefix_copies(dst, src, tokens, self.ratio, &mut copies)?;
+        }
+        match (&self.mtp, &from.mtp) {
+            (Some(dst), Some(src)) => attn_prefix_copies(&dst.layer, &src.layer, tokens, self.ratio, &mut copies)?,
+            (None, None) => {}
+            _ => anyhow::bail!("draft-head state mismatch between sessions"),
         }
         ctx.blit_copy(&copies)
+    }
+
+    fn write_prefix(&self, tokens: usize, w: &mut dyn std::io::Write) -> Result<()> {
+        ensure!(tokens <= self.pos, "state has fed {} tokens, {tokens} requested", self.pos);
+        let mut sink = |t: &Tensor| t.write_to(w);
+        for lstate in self.layers.iter().chain(self.mtp.as_ref().map(|m| &m.layer)) {
+            attn_prefix_regions(lstate, tokens, self.ratio, &mut sink)?;
+        }
+        Ok(())
+    }
+
+    fn read_prefix(&mut self, ctx: &MetalContext, tokens: usize, r: &mut dyn std::io::Read) -> Result<()> {
+        self.ensure_capacity(ctx, tokens)?;
+        let mut source = |t: &Tensor| t.fill_from(r);
+        for lstate in self.layers.iter().chain(self.mtp.as_ref().map(|m| &m.layer)) {
+            attn_prefix_regions(lstate, tokens, self.ratio, &mut source)?;
+        }
+        Ok(())
     }
 }
 
@@ -1820,7 +2199,7 @@ impl LanguageModel for Qwen4ExpModel {
     const MODEL_ID: &'static str = "Qwen3.8-Flash-Next";
 
     fn load(ctx: &MetalContext, dir: &Path, options: &LoadOptions) -> Result<Self> {
-        Qwen4ExpModel::load_with(ctx, dir, options.ngram_storage)
+        Qwen4ExpModel::load_with(ctx, dir, options.ngram_storage, options.mtp_drafts > 0)
     }
 
     fn max_position_embeddings(&self) -> usize {
@@ -1835,9 +2214,62 @@ impl LanguageModel for Qwen4ExpModel {
         self.config.vocab_size
     }
 
+    fn persistence_format(&self) -> Option<String> {
+        let cfg = &self.config;
+        Some(format!(
+            "{};layers={};kv={}x{};indexer={}/{};mtp={}",
+            super::config::FORMAT,
+            cfg.num_hidden_layers,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            INDEXER_D,
+            cfg.indexer.compress_ratio,
+            self.weights.mtp.is_some()
+        ))
+    }
+
+    fn read_snapshot(&self, ctx: &MetalContext, r: &mut dyn std::io::Read) -> Result<Snapshot> {
+        let cfg = &self.config;
+        let mut pos = [0u8; 8];
+        r.read_exact(&mut pos)?;
+        let pos = usize::try_from(u64::from_le_bytes(pos))?;
+        let heads = cfg.linear_num_value_heads;
+        let c = cfg.gdn_conv_channels();
+        let kd = cfg.linear_conv_kernel_dim;
+        let mut gdn = Vec::new();
+        for _ in cfg.layer_types.iter().filter(|t| matches!(t, super::config::LayerType::LinearAttention)) {
+            let state = Tensor::zeros(ctx, &[heads, GDN_HEAD_DIM, GDN_HEAD_DIM], GDN_STATE_DTYPE)?;
+            state.fill_from(r)?;
+            let window = Tensor::zeros(ctx, &[c, kd - 1], DType::BF16)?;
+            window.fill_from(r)?;
+            gdn.push((state, window));
+        }
+        let ple = match &cfg.ple {
+            Some(p) => {
+                let mut hist = [0u8; 8];
+                r.read_exact(&mut hist)?;
+                let h = [u32::from_le_bytes(hist[..4].try_into()?), u32::from_le_bytes(hist[4..].try_into()?)];
+                let window = Tensor::zeros(ctx, &[cfg.hc_width(), p.conv_state_len()], DType::BF16)?;
+                window.fill_from(r)?;
+                Some((h, window))
+            }
+            None => None,
+        };
+        let mtp_hidden = match &self.weights.mtp {
+            Some(_) => {
+                let hidden = Tensor::zeros(ctx, &[cfg.hc_width()], DType::BF16)?;
+                hidden.fill_from(r)?;
+                Some(hidden)
+            }
+            None => None,
+        };
+        Ok(Snapshot { pos, gdn, ple, mtp_hidden })
+    }
+
     fn bytes_per_token(&self) -> usize {
         let cfg = &self.config;
-        let attn_layers = cfg.layer_types.iter().filter(|t| matches!(t, super::config::LayerType::FullAttention)).count();
+        let attn_layers = cfg.layer_types.iter().filter(|t| matches!(t, super::config::LayerType::FullAttention)).count()
+            + usize::from(self.weights.mtp.is_some());
         attn_layers * (2 * cfg.num_key_value_heads * cfg.head_dim * 2 + INDEXER_D * 2 + INDEXER_D * 2 / cfg.indexer.compress_ratio)
     }
 
@@ -1885,5 +2317,39 @@ impl LanguageModel for Qwen4ExpModel {
         draw: Draw<'_>,
     ) -> Result<EncodedPass<'a>> {
         Qwen4ExpModel::encode_decode_step(self, ctx, state, scratch, slot_in, slot_out, draw)
+    }
+
+    fn max_drafts(&self) -> usize {
+        Qwen4ExpModel::max_drafts(self)
+    }
+
+    fn draft_initial(&self, ctx: &MetalContext, state: &mut DecodeState, scratch: &mut Scratch, first: u32, drafts: usize) -> Result<Vec<u32>> {
+        Qwen4ExpModel::draft_initial(self, ctx, state, scratch, first, drafts)
+    }
+
+    fn verify<'a>(
+        &self,
+        ctx: &'a MetalContext,
+        state: &mut DecodeState,
+        scratch: &mut Scratch,
+        pending: u32,
+        drafts: &[u32],
+        params: &SamplingParams,
+        step0: usize,
+        ahead: Option<EncodedPass<'a>>,
+    ) -> Result<Vec<u32>> {
+        Qwen4ExpModel::verify(self, ctx, state, scratch, pending, drafts, params, step0, ahead)
+    }
+
+    fn finish_speculation<'a>(
+        &self,
+        ctx: &'a MetalContext,
+        state: &mut DecodeState,
+        scratch: &mut Scratch,
+        accepted: usize,
+        next: Option<crate::engine::NextStep<'_>>,
+        drafts: usize,
+    ) -> Result<(Vec<u32>, Option<EncodedPass<'a>>)> {
+        Qwen4ExpModel::finish_speculation(self, ctx, state, scratch, accepted, next, drafts)
     }
 }

@@ -127,6 +127,29 @@ impl Tensor {
         Ok(())
     }
 
+    /// Streams the tensor's contents to `w`. Same idle-GPU contract as
+    /// [`Self::raw_bytes`].
+    pub fn write_to(&self, w: &mut dyn std::io::Write) -> Result<()> {
+        w.write_all(self.contents())?;
+        Ok(())
+    }
+
+    /// Fills the tensor from `r` (exactly its byte length). Same idle-GPU
+    /// contract as [`Self::write_bytes`].
+    pub fn fill_from(&self, r: &mut dyn std::io::Read) -> Result<()> {
+        // SAFETY: shared-storage buffer holding at least offset + numel*size
+        // bytes (checked at construction); the GPU is idle on this buffer per
+        // the doc contract; the slice is dropped before any other access.
+        let dst = unsafe {
+            core::slice::from_raw_parts_mut(
+                self.buf.contents().as_ptr().cast::<u8>().add(self.offset),
+                self.byte_len(),
+            )
+        };
+        r.read_exact(dst)?;
+        Ok(())
+    }
+
     pub fn from_bytes(
         ctx: &MetalContext,
         bytes: &[u8],

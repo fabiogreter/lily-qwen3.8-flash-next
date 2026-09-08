@@ -8,6 +8,7 @@
 //! next token.
 
 pub mod api;
+pub mod disk;
 pub mod http;
 mod session;
 pub mod stream;
@@ -66,6 +67,12 @@ pub struct ServeOptions {
     pub ngram_preload: bool,
     /// Pin the preloaded table in memory (`mlock`).
     pub ngram_lock: bool,
+    /// Draft tokens per speculative step (0 disables the draft head).
+    pub mtp_drafts: usize,
+    /// Where evicted sessions are kept on disk (`None` disables the tier).
+    pub disk_cache_dir: Option<std::path::PathBuf>,
+    /// Most bytes the disk tier may hold.
+    pub disk_cache_bytes: u64,
     pub thinking: bool,
     pub reasoning_effort: Option<String>,
     pub queue: usize,
@@ -200,6 +207,7 @@ struct Engine<M: LanguageModel> {
     sessions: SessionStore<M>,
     scratch: M::Scratch,
     max_seq: usize,
+    drafts: usize,
     next_id: u64,
 }
 
@@ -215,12 +223,14 @@ impl<M: LanguageModel> Engine<M> {
     fn load(model_dir: &Path, options: &ServeOptions, generator: Arc<Generator>) -> Result<Self> {
         let ctx = MetalContext::new()?;
         let started = Instant::now();
-        let model = M::load(&ctx, model_dir, &LoadOptions { ngram_storage: options.ngram_storage })?;
+        let model = M::load(&ctx, model_dir, &LoadOptions { ngram_storage: options.ngram_storage, mtp_drafts: options.mtp_drafts })?;
+        let drafts = options.mtp_drafts.min(model.max_drafts());
         eprintln!(
-            "loaded {} in {:.1}s ({:.1} GB resident)",
+            "loaded {} in {:.1}s ({:.1} GB resident){}",
             M::MODEL_ID,
             started.elapsed().as_secs_f64(),
-            ctx.current_allocated() as f64 / 1e9
+            ctx.current_allocated() as f64 / 1e9,
+            if drafts > 0 { format!(", speculative decoding with {drafts} drafts per step") } else { String::new() }
         );
         if options.ngram_preload || options.ngram_lock {
             let started = Instant::now();
@@ -266,13 +276,31 @@ impl<M: LanguageModel> Engine<M> {
                  lower --max-seq or raise --cache-bytes"
             );
         }
+        let mut sessions = SessionStore::new(budget, options.max_sessions, CHECKPOINTS_PER_SESSION);
+        if let (Some(dir), true) = (&options.disk_cache_dir, options.disk_cache_bytes > 0) {
+            match model.persistence_format() {
+                Some(format) => {
+                    let disk = disk::DiskStore::open(dir, &format, options.disk_cache_bytes)?;
+                    eprintln!(
+                        "session cache: disk tier at {} ({} entries, {:.1}/{:.1} GB)",
+                        disk.dir().display(),
+                        disk.len(),
+                        disk.used_bytes() as f64 / 1e9,
+                        disk.budget_bytes() as f64 / 1e9
+                    );
+                    sessions = sessions.with_disk(disk);
+                }
+                None => eprintln!("session cache: {} cannot persist sessions; disk tier off", M::MODEL_ID),
+            }
+        }
         Ok(Self {
             ctx,
             model,
             generator,
-            sessions: SessionStore::new(budget, options.max_sessions, CHECKPOINTS_PER_SESSION),
+            sessions,
             scratch,
             max_seq,
+            drafts,
             next_id: 1,
         })
     }
@@ -301,7 +329,7 @@ impl<M: LanguageModel> Engine<M> {
         if sink.cancelled() {
             return Ok(());
         }
-        let Engine { ctx, model, generator, sessions, scratch, max_seq, next_id } = self;
+        let Engine { ctx, model, generator, sessions, scratch, max_seq, drafts, next_id } = self;
         ensure!(p.prompt.len() < *max_seq, "prompt too long for the server context");
         let n = p.prompt.len();
         let started = Instant::now();
@@ -379,7 +407,7 @@ impl<M: LanguageModel> Engine<M> {
             }
         };
 
-        let options = GenerateOptions { max_tokens: p.max_tokens, sampling: &p.sampling, stop_tokens: &[] };
+        let options = GenerateOptions { max_tokens: p.max_tokens, sampling: &p.sampling, stop_tokens: &[], drafts: *drafts };
         let decode_started = Instant::now();
         let generation = generator.generate(
             ctx,
@@ -411,7 +439,7 @@ impl<M: LanguageModel> Engine<M> {
         session.tokens.extend_from_slice(&p.prompt[reused..]);
         session.tokens.extend_from_slice(&generation.tokens[..fed_generated]);
         ensure!(session.state.pos() == session.tokens.len(), "session token/state position mismatch");
-        sessions.release(session, p.cache_key.as_deref());
+        sessions.release(ctx, session, p.cache_key.as_deref());
 
         let completion_tokens = generation.tokens.len();
         let finish_reason = match generation.finish {
@@ -420,28 +448,41 @@ impl<M: LanguageModel> Engine<M> {
             _ => "stop",
         };
         eprintln!(
-            "{}: {} prompt tokens ({} cached{}), {} generated, prefix {:.2}s, decode {:.2}s ({:.1} tok/s), finish={finish_reason}, sessions={} ({:.1}/{:.1} GB)",
+            "{}: {} prompt tokens ({} cached{}{}), {} generated, prefix {:.2}s, decode {:.2}s ({:.1} tok/s){}, finish={finish_reason}, sessions={} ({:.1}/{:.1} GB){}",
             id,
             n,
             reused,
             if acquired.forked { ", forked" } else { "" },
+            acquired.from_disk.map(|d| format!(", from disk in {:.2}s", d.as_secs_f64())).unwrap_or_default(),
             completion_tokens,
             prefix_secs,
             decode_secs,
             completion_tokens as f64 / decode_secs.max(1e-9),
+            if generation.drafted > 0 {
+                format!(", drafts {}/{} accepted", generation.accepted, generation.drafted)
+            } else {
+                String::new()
+            },
             sessions.len(),
             sessions.used_bytes() as f64 / 1e9,
             sessions.budget_bytes() as f64 / 1e9,
+            sessions.disk().map(|d| format!(", disk {} ({:.1} GB)", d.len(), d.used_bytes() as f64 / 1e9)).unwrap_or_default(),
         );
         if sink.cancelled() {
             return Ok(());
         }
-        let usage = json!({
+        let mut usage = json!({
             "prompt_tokens": n,
             "completion_tokens": completion_tokens,
             "total_tokens": n + completion_tokens,
             "prompt_tokens_details": {"cached_tokens": reused},
         });
+        if generation.drafted > 0 {
+            usage["completion_tokens_details"] = json!({
+                "accepted_prediction_tokens": generation.accepted,
+                "rejected_prediction_tokens": generation.drafted - generation.accepted,
+            });
+        }
         if p.stream {
             if p.kind == Kind::Chat {
                 sink.sse(&chunk(&id, created, M::MODEL_ID, json!({}), Some(finish_reason)));

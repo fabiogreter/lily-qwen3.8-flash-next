@@ -13,6 +13,11 @@ bit-identical to what lily's Q4/Q8 Metal kernels consume.
 
 `mlx` needs a Metal device even for CPU arrays, so a real conversion must run
 outside any GPU-less sandbox; `--dry-run` never imports it.
+
+`--mtp-only` adds the multi-token-prediction draft head (the `mtp.*` tensors:
+one attention+MoE block plus its input projections and output mixer) to an
+existing conversion as extra `mtp-*.safetensors` shards, merging them into the
+index and config so the engine can run speculative decoding.
 """
 
 from __future__ import annotations
@@ -33,7 +38,8 @@ import numpy as np
 FORMAT_NAME = "qwen4_exp-affine-v1"
 SOURCE_REPOSITORY = "Qwen/Qwen3.8-Flash-Next"
 LAYER_PREFIX = "model.language_model.layers."
-DROP_PREFIXES = ("model.visual.", "mtp.")
+DROP_PREFIXES = ("model.visual.",)
+MTP_PREFIX = "mtp."
 COPIED_FILES = (
     "tokenizer.json",
     "tokenizer_config.json",
@@ -160,6 +166,7 @@ _Q4_SUFFIXES = (
     r"\.mlp\.experts\.down_proj$",
 )
 _Q8_SUFFIXES = (
+    r"^mtp\.fc_(embedding|hidden)\.weight$",
     r"\.mlp\.gate\.weight$",
     r"\.mlp\.shared_expert_gate\.weight$",
     r"hyper_connection(_mixer)?\.input_mix_weight_(down|up)\.weight$",
@@ -168,6 +175,7 @@ _Q8_SUFFIXES = (
     r"\.self_attn\.indexer\.index_qk_proj\.weight$",
 )
 _COPY_SUFFIXES = (
+    r"^mtp\.pre_fc_norm_(embedding|hidden)\.weight$",
     r"\.hc_norm\.weight$",
     r"\.self_attn\.(q_norm|k_norm)\.weight$",
     r"\.self_attn\.indexer\.(q_layernorm|k_layernorm)\.weight$",
@@ -183,9 +191,9 @@ _PLE_CONSTS = (
 _NGRAM_SHARD = re.compile(r"\.ple\.ple_embedding\.ngram_embedding\.shard_\d+\.weight$")
 
 
-def plan_tensor(t: SourceTensor, keep_layers: int, ngram: Quant) -> Plan:
+def plan_tensor(t: SourceTensor, keep_layers: int, ngram: Quant, mtp: bool = True) -> Plan:
     name = t.name
-    if name.startswith(DROP_PREFIXES):
+    if name.startswith(DROP_PREFIXES) or (not mtp and name.startswith(MTP_PREFIX)):
         return Plan("drop")
     li = layer_index(name)
     if li is not None and li >= keep_layers:
@@ -211,6 +219,8 @@ def plan_tensor(t: SourceTensor, keep_layers: int, ngram: Quant) -> Plan:
 
 
 def category(name: str) -> str:
+    if name.startswith(MTP_PREFIX):
+        return "mtp"
     if "ngram_embedding.shard_" in name:
         return "ngram"
     if ".mlp.experts." in name:
@@ -225,10 +235,10 @@ def gate_up_output_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
     return (e, two_i // 2, h)
 
 
-def estimate(tensors: list[SourceTensor], keep_layers: int, ngram: Quant) -> Totals:
+def estimate(tensors: list[SourceTensor], keep_layers: int, ngram: Quant, mtp: bool = True) -> Totals:
     totals = Totals()
     for t in tensors:
-        plan = plan_tensor(t, keep_layers, ngram)
+        plan = plan_tensor(t, keep_layers, ngram, mtp)
         cat = category(t.name)
         if plan.kind in ("drop", "ple_const"):
             continue
@@ -387,9 +397,10 @@ def write_safetensors(path: Path, tensors: dict[str, OutTensor]) -> None:
 class ShardWriter:
     """Accumulates output tensors and flushes ~shard_bytes safetensors files."""
 
-    def __init__(self, dst: Path, shard_bytes: int):
+    def __init__(self, dst: Path, shard_bytes: int, stem: str = "model"):
         self.dst = dst
         self.shard_bytes = shard_bytes
+        self.stem = stem
         self.pending: dict[str, OutTensor] = {}
         self.pending_bytes = 0
         self.files: list[Path] = []
@@ -416,20 +427,42 @@ class ShardWriter:
         self.pending = {}
         self.pending_bytes = 0
 
-    def finish(self) -> None:
+    def finish(self, merge: bool = False) -> None:
+        """Names the shards and writes the index; with `merge`, the new tensors
+        are added to the directory's existing index instead."""
         self.flush()
         n = len(self.files)
         renamed: dict[str, str] = {}
         for i, path in enumerate(self.files):
-            final = f"model-{i + 1:05d}-of-{n:05d}.safetensors"
+            final = f"{self.stem}-{i + 1:05d}-of-{n:05d}.safetensors"
             path.rename(self.dst / final)
             renamed[path.name] = final
         weight_map = {k: renamed[v] for k, v in self.weight_map.items()}
-        index = {"metadata": {"total_size": self.total_bytes}, "weight_map": weight_map}
-        (self.dst / "model.safetensors.index.json").write_text(json.dumps(index, indent=2, sort_keys=True))
+        index_path = self.dst / "model.safetensors.index.json"
+        total = self.total_bytes
+        if merge:
+            existing = json.loads(index_path.read_text())
+            clash = set(existing["weight_map"]) & set(weight_map)
+            if clash:
+                raise SystemExit(f"index already holds {sorted(clash)[:3]}...; refusing to merge")
+            weight_map = {**existing["weight_map"], **weight_map}
+            total += existing.get("metadata", {}).get("total_size", 0)
+        index = {"metadata": {"total_size": total}, "weight_map": weight_map}
+        index_path.write_text(json.dumps(index, indent=2, sort_keys=True))
 
 
-def write_config(src: Path, dst: Path, keep_layers: int, ngram: Quant, ple: dict, revision: str | None) -> None:
+def mtp_block(text_cfg: dict) -> dict:
+    """What the engine needs to know about the converted draft head."""
+    mtp = text_cfg.get("mtp") or {}
+    return {
+        "layers": text_cfg.get("mtp_num_hidden_layers", mtp.get("num_hidden_layers", 1)),
+        "layer_types": mtp.get("layer_types", ["full_attention"]),
+        "rope_theta": mtp.get("rope_theta", text_cfg["rope_parameters"]["rope_theta"]),
+        "quantization": {"default": {"bits": Q4.bits, "group_size": Q4.group_size, "mode": "affine"}},
+    }
+
+
+def write_config(src: Path, dst: Path, keep_layers: int, ngram: Quant, ple: dict, revision: str | None, mtp: bool) -> None:
     cfg = json.loads((src / "config.json").read_text())
     text = cfg["text_config"]
     text["num_hidden_layers"] = keep_layers
@@ -445,9 +478,22 @@ def write_config(src: Path, dst: Path, keep_layers: int, ngram: Quant, ple: dict
             "q8_suffixes": list(_Q8_SUFFIXES),
         },
         "ple": ple,
-        "dropped": list(DROP_PREFIXES),
+        "mtp": mtp_block(text) if mtp else None,
+        "dropped": list(DROP_PREFIXES) + ([] if mtp else [MTP_PREFIX]),
     }
     (dst / "config.json").write_text(json.dumps(cfg, indent=2))
+
+
+def add_mtp_to_config(dst: Path) -> None:
+    """Marks an existing conversion's config as carrying the draft head."""
+    path = dst / "config.json"
+    cfg = json.loads(path.read_text())
+    lily = cfg["lily"]
+    if lily.get("mtp"):
+        raise SystemExit(f"{path} already declares an MTP block")
+    lily["mtp"] = mtp_block(cfg["text_config"])
+    lily["dropped"] = [p for p in lily.get("dropped", []) if p != MTP_PREFIX]
+    path.write_text(json.dumps(cfg, indent=2))
 
 
 def source_revision(src: Path) -> str | None:
@@ -480,25 +526,38 @@ def convert(args: argparse.Namespace) -> None:
     if keep_layers < 1 or keep_layers > text_cfg["num_hidden_layers"]:
         raise SystemExit(f"--layers must be in 1..{text_cfg['num_hidden_layers']}")
 
-    totals = estimate(tensors, keep_layers, ngram)
-    print_totals(f"planned output for {keep_layers} layers (ngram {ngram.bits}-bit g{ngram.group_size})", totals)
+    mtp = not args.no_mtp
+    if args.mtp_only:
+        # Only the draft head, appended to a finished conversion.
+        tensors = [t for t in tensors if t.name.startswith(MTP_PREFIX)]
+        if not tensors:
+            raise SystemExit("source has no mtp.* tensors")
+        if not (dst / "model.safetensors.index.json").exists():
+            raise SystemExit(f"{dst} is not a finished conversion (no index); run a full conversion first")
+        if any(dst.glob("mtp-*.safetensors")):
+            raise SystemExit(f"{dst} already holds mtp shards; refusing to overwrite")
+        mtp = True
+    totals = estimate(tensors, keep_layers, ngram, mtp)
+    what = "the MTP draft head" if args.mtp_only else f"{keep_layers} layers (ngram {ngram.bits}-bit g{ngram.group_size}{', no mtp' if not mtp else ''})"
+    print_totals(f"planned output for {what}", totals)
     if args.dry_run:
         return
 
     dst.mkdir(parents=True, exist_ok=True)
-    if any(dst.glob("model-*.safetensors")):
-        raise SystemExit(f"{dst} already holds shards; refusing to overwrite")
-    for name in COPIED_FILES:
-        if (src / name).exists():
-            shutil.copy2(src / name, dst / name)
+    if not args.mtp_only:
+        if any(dst.glob("model-*.safetensors")):
+            raise SystemExit(f"{dst} already holds shards; refusing to overwrite")
+        for name in COPIED_FILES:
+            if (src / name).exists():
+                shutil.copy2(src / name, dst / name)
 
-    planned = [(t, plan_tensor(t, keep_layers, ngram)) for t in tensors]
+    planned = [(t, plan_tensor(t, keep_layers, ngram, mtp)) for t in tensors]
     planned = [(t, p) for t, p in planned if p.kind != "drop"]
     src_bytes = sum(t.nbytes for t, _ in planned)
     quant_positions = [i for i, (_, p) in enumerate(planned) if p.kind == "quant"]
     check_idx = set(np.random.default_rng(0).choice(quant_positions, size=min(3, len(quant_positions)), replace=False).tolist())
 
-    writer = ShardWriter(dst, int(args.shard_bytes))
+    writer = ShardWriter(dst, int(args.shard_bytes), stem="mtp" if args.mtp_only else "model")
     ple_consts: dict[str, list[int]] = {}
     checked: list[tuple[str, float]] = []
     started = time.time()
@@ -539,10 +598,13 @@ def convert(args: argparse.Namespace) -> None:
                 f"{done_bytes / max(elapsed, 1e-9) / 1e9:5.2f} GB/s, {elapsed:6.0f}s  {t.name[-64:]}",
                 flush=True,
             )
-    writer.finish()
+    writer.finish(merge=args.mtp_only)
 
-    ple = verify_ple_constants(text_cfg, ple_consts) if ple_consts else {}
-    write_config(src, dst, keep_layers, ngram, ple, source_revision(src))
+    if args.mtp_only:
+        add_mtp_to_config(dst)
+    else:
+        ple = verify_ple_constants(text_cfg, ple_consts) if ple_consts else {}
+        write_config(src, dst, keep_layers, ngram, ple, source_revision(src), mtp)
 
     elapsed = time.time() - started
     print(f"\nwrote {len(writer.files)} shards, {fmt_gb(writer.total_bytes)} in {elapsed:.0f}s to {dst}")
@@ -558,6 +620,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--ngram-bits", type=int, default=4, choices=(2, 3, 4, 8))
     parser.add_argument("--ngram-group", type=int, default=32, choices=(32, 64, 128))
     parser.add_argument("--shard-bytes", type=float, default=2e9)
+    parser.add_argument("--no-mtp", action="store_true", help="drop the mtp.* draft head (it is converted by default)")
+    parser.add_argument("--mtp-only", action="store_true", help="append only the mtp.* draft head to an existing conversion in --dst")
     parser.add_argument("--dry-run", action="store_true", help="only print the size plan")
     convert(parser.parse_args(argv))
 

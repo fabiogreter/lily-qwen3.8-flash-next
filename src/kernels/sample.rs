@@ -114,6 +114,20 @@ impl SamplerScratch {
 
     /// Clears the emission histogram at the start of a request. The GPU must
     /// be idle on this scratch.
+    /// Undoes one count of `token` (a draw that was discarded). The GPU must
+    /// be idle on the counts.
+    pub fn uncount(&self, token: u32) {
+        let i = token as usize;
+        if i >= self.counts.numel() {
+            return;
+        }
+        // SAFETY: shared-storage buffer, GPU idle by contract, index in range.
+        unsafe {
+            let p = self.counts.contents_ptr().cast::<u32>().add(i);
+            *p = (*p).saturating_sub(1);
+        }
+    }
+
     pub fn reset_counts(&self) {
         self.counts.zero_fill();
     }

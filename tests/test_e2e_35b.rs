@@ -36,7 +36,7 @@ fn qwen36_35b_greedy_matches_golden() -> Result<()> {
     let mut state = model.new_state(&ctx, capacity)?;
     let mut scratch = model.new_scratch_with_capacity(&ctx, capacity)?;
     let greedy = SamplingParams::greedy();
-    let options = GenerateOptions { max_tokens: expected.len(), sampling: &greedy, stop_tokens: &[] };
+    let options = GenerateOptions { max_tokens: expected.len(), sampling: &greedy, stop_tokens: &[], drafts: 0 };
     let actual = generator.generate(
         &ctx,
         &model,

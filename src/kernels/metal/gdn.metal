@@ -189,6 +189,9 @@ kernel void gdn_gates(device const bfloat* a       [[buffer(0)]],  // [M, H]
 }
 
 // Register-resident prefill scan over tokens, one simdgroup per value column.
+// After token t < mid_count the running state is also written to `mid` slot t
+// (`[mid_count, H, DIM, DIM]`), so a caller that later rejects tokens t+1..
+// can roll the recurrence back without rerunning it.
 template <typename StateT>
 static inline void gdn_prefill_regscan_body(device const bfloat* qkv,
                                             device const bfloat* qk,
@@ -196,9 +199,11 @@ static inline void gdn_prefill_regscan_body(device const bfloat* qkv,
                                             device const float* beta,
                                             device StateT* state,
                                             device bfloat* out,
+                                            device StateT* mid,
                                             uint M,
                                             uint H,
                                             uint vpk,
+                                            uint mid_count,
                                             uint2 tg,
                                             uint sg,
                                             uint lane) {
@@ -240,6 +245,13 @@ static inline void gdn_prefill_regscan_body(device const bfloat* qkv,
         if (lane == 0) {
             out[((ulong)t * H + h) * DIM + dv] = bfloat(o);
         }
+        if (t < mid_count) {
+            device StateT* md = mid + (ulong)t * H * DIM * DIM
+                + ((ulong)h * DIM + NK * lane) * DIM + dv;
+            for (uint i = 0; i < NK; ++i) {
+                md[i * DIM] = StateT(s[i]);
+            }
+        }
     }
     for (uint i = 0; i < NK; ++i) {
         st[i * DIM] = StateT(s[i]);
@@ -253,14 +265,16 @@ kernel void NAME(device const bfloat* qkv   [[buffer(0)]],                    \
                  device const float*  beta  [[buffer(3)]],                    \
                  device STATE_T*      state [[buffer(4)]],                    \
                  device bfloat*       out   [[buffer(5)]],                    \
-                 constant uint&       M     [[buffer(6)]],                    \
-                 constant uint&       H     [[buffer(7)]],                    \
-                 constant uint&       vpk   [[buffer(8)]],                    \
+                 device STATE_T*      mid   [[buffer(6)]],                    \
+                 constant uint&       M     [[buffer(7)]],                    \
+                 constant uint&       H     [[buffer(8)]],                    \
+                 constant uint&       vpk   [[buffer(9)]],                    \
+                 constant uint&       mid_count [[buffer(10)]],               \
                  uint2 tg   [[threadgroup_position_in_grid]],                 \
                  uint  sg   [[simdgroup_index_in_threadgroup]],               \
                  uint  lane [[thread_index_in_simdgroup]]) {                  \
-    gdn_prefill_regscan_body(qkv, qk, decay, beta, state, out, M, H, vpk, tg,\
-                             sg, lane);                                       \
+    gdn_prefill_regscan_body(qkv, qk, decay, beta, state, out, mid, M, H, vpk,\
+                             mid_count, tg, sg, lane);                        \
 }
 
 GDN_REGSCAN_WRAPPER(gdn_prefill_regscan, float)
@@ -286,6 +300,22 @@ kernel void conv1d_step_bf16(device bfloat*       window [[buffer(0)]],  // [C, 
         window[c * taps + t] = window[c * taps + t + 1];
     }
     window[c * taps + taps - 1] = bfloat(xc);
+}
+
+// Rewinds a conv window: `win_out` becomes the window after only the first
+// `n` rows of `x` followed `win_in` (the last S inputs of win_in ++ x[0..n]).
+// Shared by the GDN conv (S = KD-1) and the dilated PLE conv (S = (KD-1)*DIL).
+kernel void conv_window_rollback_bf16(device const bfloat* win_in  [[buffer(0)]],  // [C, S]
+                                      device const bfloat* x       [[buffer(1)]],  // [M, C]
+                                      device bfloat*       win_out [[buffer(2)]],  // [C, S]
+                                      constant uint&       C       [[buffer(3)]],
+                                      constant uint&       S       [[buffer(4)]],
+                                      constant uint&       n       [[buffer(5)]],
+                                      uint c [[thread_position_in_grid]]) {
+    for (uint s = 0; s < S; ++s) {
+        const uint i = n + s;  // index into win_in ++ x[0..n]
+        win_out[c * S + s] = i < S ? win_in[c * S + i] : x[(ulong)(i - S) * C + c];
+    }
 }
 
 // Tiled conv1d prefill uses separate input/output windows to avoid races.
