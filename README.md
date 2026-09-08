@@ -154,9 +154,11 @@ reports the reuse.
 Sessions evicted from GPU memory go to a disk tier
 (`--disk-cache-dir`, default `~/Library/Caches/lily/sessions`;
 `--disk-cache-bytes`, default 100 GB, least recently used first, `0` turns it
-off). A later prompt that shares their prefix reads it back in about a second
-per few gigabytes instead of recomputing it; the tier survives restarts and
-is keyed by the model's cache layout, so other models never read it.
+off; `--disk-cache-ttl`, default 3 days unused, after which an entry is
+deleted even when the budget has room). A later prompt that shares their
+prefix reads it back in about a second per few gigabytes instead of
+recomputing it; the tier survives restarts and is keyed by the model's cache
+layout, so other models never read it.
 
 ### Flags
 
@@ -171,6 +173,7 @@ is keyed by the model's cache layout, so other models never read it.
 | `--mtp-drafts` | 2 | draft tokens per speculative step (0 turns the draft head off) |
 | `--disk-cache-dir` | `~/Library/Caches/lily/sessions` | where evicted sessions are kept |
 | `--disk-cache-bytes` | 100G | disk tier budget, LRU; `0` disables the tier |
+| `--disk-cache-ttl` | 3d | delete disk entries unused this long (`0`: never) |
 | `--thinking` | true | open a reasoning block unless the request says otherwise |
 | `--reasoning-effort` | template default | `low`, `medium`, `xhigh` |
 | `--temperature` … `--repetition-penalty` | generation_config | sampling defaults |

@@ -73,6 +73,8 @@ pub struct ServeOptions {
     pub disk_cache_dir: Option<std::path::PathBuf>,
     /// Most bytes the disk tier may hold.
     pub disk_cache_bytes: u64,
+    /// Seconds an entry may go unused on disk before it is deleted (0: never).
+    pub disk_cache_ttl_secs: u64,
     pub thinking: bool,
     pub reasoning_effort: Option<String>,
     pub queue: usize,
@@ -280,13 +282,14 @@ impl<M: LanguageModel> Engine<M> {
         if let (Some(dir), true) = (&options.disk_cache_dir, options.disk_cache_bytes > 0) {
             match model.persistence_format() {
                 Some(format) => {
-                    let disk = disk::DiskStore::open(dir, &format, options.disk_cache_bytes)?;
+                    let disk = disk::DiskStore::open(dir, &format, options.disk_cache_bytes, options.disk_cache_ttl_secs)?;
                     eprintln!(
-                        "session cache: disk tier at {} ({} entries, {:.1}/{:.1} GB)",
+                        "session cache: disk tier at {} ({} entries, {:.1}/{:.1} GB, entries expire after {})",
                         disk.dir().display(),
                         disk.len(),
                         disk.used_bytes() as f64 / 1e9,
-                        disk.budget_bytes() as f64 / 1e9
+                        disk.budget_bytes() as f64 / 1e9,
+                        if disk.max_age_secs() == 0 { "never".to_owned() } else { format!("{:.1} days unused", disk.max_age_secs() as f64 / 86_400.0) }
                     );
                     sessions = sessions.with_disk(disk);
                 }

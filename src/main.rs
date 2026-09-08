@@ -47,6 +47,12 @@ struct Cli {
     #[arg(long, default_value = "100G")]
     disk_cache_bytes: String,
 
+    /// How long an evicted session may sit unused on disk before it is
+    /// deleted, e.g. `3d`, `12h`, `90m`; `0` keeps entries until the budget
+    /// evicts them.
+    #[arg(long, default_value = "3d")]
+    disk_cache_ttl: String,
+
     /// Where the Qwen3.8-Flash-Next n-gram table lives: `paged` reads rows
     /// from the checkpoint files through the page cache (32 GB less GPU
     /// memory), `resident` uploads it whole.
@@ -117,6 +123,23 @@ fn parse_bytes(text: &str) -> Result<usize> {
     Ok((value * scale) as usize)
 }
 
+/// Parses `3d`, `12h`, `90m`, `45s` or a bare number of seconds.
+fn parse_duration_secs(text: &str) -> Result<u64> {
+    let text = text.trim();
+    let (digits, unit) = text
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .map_or((text, ""), |i| text.split_at(i));
+    let value: f64 = digits.parse().with_context(|| format!("invalid duration {text:?}"))?;
+    let scale = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "s" => 1.0,
+        "m" => 60.0,
+        "h" => 3600.0,
+        "d" => 86_400.0,
+        other => anyhow::bail!("unknown duration unit {other:?} (use s, m, h or d)"),
+    };
+    Ok((value * scale) as u64)
+}
+
 fn default_disk_cache_dir() -> PathBuf {
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     home.join("Library").join("Caches").join("lily").join("sessions")
@@ -131,6 +154,7 @@ fn main() -> Result<()> {
         max_sessions: cli.max_sessions,
         disk_cache_dir: Some(cli.disk_cache_dir.unwrap_or_else(default_disk_cache_dir)),
         disk_cache_bytes: parse_bytes(&cli.disk_cache_bytes)? as u64,
+        disk_cache_ttl_secs: parse_duration_secs(&cli.disk_cache_ttl)?,
         ngram_storage: cli.ngram_table,
         ngram_preload: cli.ngram_preload,
         ngram_lock: cli.ngram_lock,

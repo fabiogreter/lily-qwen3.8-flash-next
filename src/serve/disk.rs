@@ -8,9 +8,11 @@
 //! for every token, as the model's `write_prefix` lays them out) and one
 //! `ckpt-<pos>.bin` per resumable position (the model's snapshot layout, the
 //! live end included). Entries are evicted least-recently-used under a byte
-//! budget; the index is rebuilt from the meta files at startup, so the tier
-//! survives restarts. Entries whose format tag differs are left alone (they
-//! belong to another model or layout) but never read.
+//! budget and expire after a maximum age since their last use (so a quiet
+//! machine does not keep 100 GB of stale sessions); the index is rebuilt from
+//! the meta files at startup, so the tier survives restarts. Entries whose
+//! format tag differs are left alone (they belong to another model or layout)
+//! but never read.
 
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -51,6 +53,8 @@ pub struct DiskStore {
     dir: PathBuf,
     format: String,
     budget: u64,
+    /// Seconds an entry may go unused before it is deleted (0: never).
+    max_age: u64,
     entries: Vec<DiskEntry>,
     next_id: u64,
 }
@@ -66,8 +70,9 @@ fn dir_name(format: &str) -> String {
 
 impl DiskStore {
     /// Opens (creating) the tier for `format` under `root` with `budget`
-    /// bytes, indexing the entries already there and trimming to budget.
-    pub fn open(root: &Path, format: &str, budget: u64) -> Result<Self> {
+    /// bytes and a `max_age` in seconds (0 for none), indexing the entries
+    /// already there, expiring the stale ones and trimming to budget.
+    pub fn open(root: &Path, format: &str, budget: u64, max_age: u64) -> Result<Self> {
         let dir = root.join(dir_name(format));
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let mut entries = Vec::new();
@@ -99,9 +104,33 @@ impl DiskStore {
                 }
             }
         }
-        let mut store = Self { dir, format: format.to_owned(), budget, entries, next_id };
+        let mut store = Self { dir, format: format.to_owned(), budget, max_age, entries, next_id };
+        store.expire();
         store.trim(0);
         Ok(store)
+    }
+
+    /// Deletes entries unused for longer than the maximum age. Called on
+    /// open, on every store and before every lookup, so the tier shrinks on
+    /// its own even when nothing new is written.
+    pub fn expire(&mut self) {
+        if self.max_age == 0 {
+            return;
+        }
+        let now = now_secs();
+        let stale: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|e| now.saturating_sub(e.last_used) > self.max_age)
+            .map(|e| e.id.clone())
+            .collect();
+        for id in stale {
+            self.remove(&id);
+        }
+    }
+
+    pub fn max_age_secs(&self) -> u64 {
+        self.max_age
     }
 
     fn load_meta(path: &Path, format: &str) -> Result<Meta> {
@@ -153,6 +182,7 @@ impl DiskStore {
     ) -> Result<Option<String>> {
         ensure!(!tokens.is_empty(), "empty session");
         ensure!(checkpoints.contains(&tokens.len()), "the live end must be a checkpoint");
+        self.expire();
         let id = format!("s{}", self.next_id);
         let path = self.dir.join(&id);
         let result = self.write_entry(&path, tokens, cache_key, checkpoints, prefix, checkpoint);

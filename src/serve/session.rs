@@ -165,6 +165,9 @@ impl<M: LanguageModel> SessionStore<M> {
             });
 
         // The disk tier competes on resume position; ties go to the GPU.
+        if let Some(disk) = self.disk.as_mut() {
+            disk.expire();
+        }
         let best_disk = self.disk.as_ref().and_then(|disk| {
             disk.entries()
                 .iter()
