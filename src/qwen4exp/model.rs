@@ -1841,9 +1841,9 @@ impl LanguageModel for Qwen4ExpModel {
         attn_layers * (2 * cfg.num_key_value_heads * cfg.head_dim * 2 + INDEXER_D * 2 + INDEXER_D * 2 / cfg.indexer.compress_ratio)
     }
 
-    fn warm_storage(&self) -> Result<u64> {
+    fn warm_storage(&self, lock: bool) -> Result<u64> {
         match self.ple_table() {
-            Some(NgramTable::Paged(table)) => table.preload(),
+            Some(NgramTable::Paged(table)) => table.preload(lock),
             _ => Ok(0),
         }
     }

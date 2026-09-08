@@ -64,6 +64,8 @@ pub struct ServeOptions {
     pub max_sessions: usize,
     pub ngram_storage: NgramStorage,
     pub ngram_preload: bool,
+    /// Pin the preloaded table in memory (`mlock`).
+    pub ngram_lock: bool,
     pub thinking: bool,
     pub reasoning_effort: Option<String>,
     pub queue: usize,
@@ -181,6 +183,9 @@ fn relay(stream: TcpStream, rx: Receiver<Out>, cancelled: Arc<AtomicBool>) {
             Out::Start { .. } => {}
         }
     }
+    if cancelled.load(Ordering::Relaxed) {
+        return;
+    }
     if let Err(error) = response.finish() {
         eprintln!("response error: {error:#}");
     }
@@ -217,11 +222,16 @@ impl<M: LanguageModel> Engine<M> {
             started.elapsed().as_secs_f64(),
             ctx.current_allocated() as f64 / 1e9
         );
-        if options.ngram_preload {
+        if options.ngram_preload || options.ngram_lock {
             let started = Instant::now();
-            let bytes = model.warm_storage()?;
+            let bytes = model.warm_storage(options.ngram_lock)?;
             if bytes > 0 {
-                eprintln!("preloaded {:.1} GB of paged weights in {:.1}s", bytes as f64 / 1e9, started.elapsed().as_secs_f64());
+                eprintln!(
+                    "paged weights: {:.1} GB resident after preload in {:.1}s{}",
+                    bytes as f64 / 1e9,
+                    started.elapsed().as_secs_f64(),
+                    if options.ngram_lock { " (locked)" } else { "" }
+                );
             }
         }
         let declared = model.max_position_embeddings();

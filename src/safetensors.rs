@@ -167,12 +167,33 @@ impl Checkpoint {
         );
         let mut file = File::open(&meta.shard)
             .with_context(|| format!("opening {}", meta.shard.display()))?;
+        // Weights read once into GPU buffers must not evict the page cache:
+        // the paged n-gram table lives there and would go cold on every load.
+        set_nocache(&file);
         file.seek(SeekFrom::Start(meta.start))
             .with_context(|| format!("seeking to {name}"))?;
         file.read_exact(buf).with_context(|| format!("reading {name}"))?;
         Ok(())
     }
 }
+
+/// Asks the kernel not to keep this file's pages in the unified buffer cache
+/// (`F_NOCACHE`). Best effort; reads still work if it fails.
+#[cfg(target_os = "macos")]
+fn set_nocache(file: &File) {
+    use std::os::unix::io::AsRawFd as _;
+    unsafe extern "C" {
+        fn fcntl(fd: std::ffi::c_int, cmd: std::ffi::c_int, ...) -> std::ffi::c_int;
+    }
+    const F_NOCACHE: std::ffi::c_int = 48;
+    // SAFETY: plain fcntl on a valid descriptor; the return value is ignored.
+    unsafe {
+        fcntl(file.as_raw_fd(), F_NOCACHE, 1 as std::ffi::c_int);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_nocache(_file: &File) {}
 
 /// Parses one shard's header: 8-byte little-endian header length, then the
 /// JSON header; `data_offsets` are relative to the data section that follows.

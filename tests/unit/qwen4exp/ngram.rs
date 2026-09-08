@@ -158,7 +158,8 @@ fn paged_table_gathers_rows_from_shard_files() {
         assert_eq!(&biases[i * groups * 2..(i + 1) * groups * 2], bytemuck::cast_slice::<u16, u8>(want_biases));
     }
     assert!(table.gather(&[12], &mut codes[..words * 4], &mut scales[..groups * 2], &mut biases[..groups * 2]).is_err());
-    assert_eq!(table.preload().expect("preload") as usize, (rows0 + rows1) * (words * 4 + groups * 4));
+    assert!(table.preload(false).expect("preload") >= table.bytes());
+    assert_eq!(table.bytes() as usize, (rows0 + rows1) * (words * 4 + groups * 4));
 
     // The same rows through the staging buffers on the GPU side.
     let ctx = MetalContext::new().expect("metal");
@@ -172,4 +173,56 @@ fn paged_table_gathers_rows_from_shard_files() {
     assert_eq!(&staged_codes[words..2 * words], &codes1[(11 - rows0) * words..(12 - rows0) * words]);
     assert_eq!(stage.seq_ids(n).expect("ids").to_u32().expect("ids"), (0..n as u32).collect::<Vec<_>>());
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Host cost of staging one token's rows from a real checkpoint; run with
+/// `LILY_MODEL_DIR_FLASH=<ckpt> cargo test --release --lib paged_gather_timing -- --ignored --nocapture`.
+#[test]
+#[ignore = "timing only; needs LILY_MODEL_DIR_FLASH"]
+fn paged_gather_timing() {
+    let Ok(dir) = std::env::var("LILY_MODEL_DIR_FLASH") else { return };
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint");
+    let bases = shard_bases("model.language_model.layers.1.ple.", 128);
+    let table = PagedTable::open(&ckpt, &bases, 32).expect("paged table");
+    eprintln!("resident before: {:.2} GB of {:.2} GB", table.resident_bytes().unwrap() as f64 / 1e9, table.bytes() as f64 / 1e9);
+    let n = 16;
+    let (cb, gb) = (table.codes_bytes(), table.group_bytes());
+    let mut codes = vec![0u8; n * cb];
+    let mut scales = vec![0u8; n * gb];
+    let mut biases = vec![0u8; n * gb];
+    let mut seed = 12345u64;
+    let mut fresh_ids = move || -> Vec<u32> {
+        (0..n)
+            .map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((seed >> 33) % 320_001_536) as u32
+            })
+            .collect()
+    };
+    let time = |label: &str, f: &mut dyn FnMut()| {
+        let mut samples = Vec::new();
+        for _ in 0..100 {
+            let t = std::time::Instant::now();
+            f();
+            samples.push(t.elapsed().as_secs_f64());
+        }
+        samples.sort_by(f64::total_cmp);
+        eprintln!("{label}: median {:.1} us, p90 {:.1} us, max {:.1} us", samples[50] * 1e6, samples[90] * 1e6, samples[99] * 1e6);
+    };
+    time("fresh random rows (likely cold)", &mut || {
+        let ids = fresh_ids();
+        table.gather(&ids, &mut codes, &mut scales, &mut biases).unwrap();
+    });
+    let ids = fresh_ids();
+    table.gather(&ids, &mut codes, &mut scales, &mut biases).unwrap();
+    time("same rows again (warm)", &mut || table.gather(&ids, &mut codes, &mut scales, &mut biases).unwrap());
+    if std::env::var_os("LILY_PRELOAD").is_some() {
+        let t = std::time::Instant::now();
+        let resident = table.preload(false).unwrap();
+        eprintln!("preload: {:.2} GB resident after {:.1}s", resident as f64 / 1e9, t.elapsed().as_secs_f64());
+        time("fresh random rows after preload", &mut || {
+            let ids = fresh_ids();
+            table.gather(&ids, &mut codes, &mut scales, &mut biases).unwrap();
+        });
+    }
 }

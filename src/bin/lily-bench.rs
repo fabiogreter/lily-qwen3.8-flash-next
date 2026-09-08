@@ -23,6 +23,9 @@ struct Cli {
     decode_steps: usize,
     #[arg(long, default_value_t = false)]
     gpu_timing: bool,
+    /// Stream the paged n-gram table through the page cache before measuring.
+    #[arg(long, default_value_t = false)]
+    ngram_preload: bool,
     #[arg(long)]
     json_out: PathBuf,
 }
@@ -78,6 +81,11 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
 
     let ctx = MetalContext::new()?;
     let model = M::load(&ctx, &cli.model, &LoadOptions::default())?;
+    if cli.ngram_preload {
+        let started = Instant::now();
+        let bytes = model.warm_storage(false)?;
+        eprintln!("paged weights: {:.1} GB resident after preload in {:.1}s", bytes as f64 / 1e9, started.elapsed().as_secs_f64());
+    }
     let vocab = u32::try_from(model.vocab_size())?;
     let token = |index: usize| (index as u32).wrapping_mul(2_654_435_761) % vocab;
     let prompt: Vec<u32> = (0..cli.prompt_len).map(token).collect();

@@ -42,10 +42,15 @@ struct Cli {
     #[arg(long, default_value = "paged")]
     ngram_table: NgramStorage,
 
-    /// Stream the paged n-gram table through the page cache at startup so the
-    /// first requests do not pay cold reads.
-    #[arg(long)]
+    /// Read the whole paged n-gram table at startup so the first requests do
+    /// not pay cold reads (32 GB of evictable page cache).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     ngram_preload: bool,
+
+    /// Pin the preloaded table in memory with mlock so it never goes cold
+    /// (32 GB that other applications can no longer reclaim).
+    #[arg(long)]
+    ngram_lock: bool,
 
     /// Chat prompts open a reasoning block unless the request says otherwise.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -104,6 +109,7 @@ fn main() -> Result<()> {
         max_sessions: cli.max_sessions,
         ngram_storage: cli.ngram_table,
         ngram_preload: cli.ngram_preload,
+        ngram_lock: cli.ngram_lock,
         thinking: cli.thinking,
         reasoning_effort: cli.reasoning_effort,
         queue: cli.queue,

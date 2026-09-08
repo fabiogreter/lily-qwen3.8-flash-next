@@ -3,18 +3,16 @@
 //!
 //! * [`NgramTable::Resident`] keeps the quantized table in GPU memory and
 //!   gathers rows by hashed id, as phase 1 did.
-//! * [`NgramTable::Paged`] leaves the table in the checkpoint files and reads
-//!   the 16 rows a token needs with `pread` into a small staging buffer, which
-//!   the same gather kernel then dequantizes with sequential ids. The rows live
-//!   in the page cache, evictable, instead of in wired GPU memory: on the
-//!   128 GB machine this frees 32 GB for KV and session caches at no quality
-//!   cost. A warm page-cache read is a few microseconds per row.
+//! * [`NgramTable::Paged`] leaves the table in the checkpoint files, memory
+//!   maps them, and copies the 16 rows a token needs into a small staging
+//!   buffer, which the same gather kernel then dequantizes with sequential
+//!   ids. The rows live in the page cache, evictable (or pinned on request),
+//!   instead of in wired GPU memory: on the 128 GB machine this frees 32 GB
+//!   for KV and session caches at no quality cost. A warm row is a memcpy.
 
 use std::fs::File;
-use std::os::unix::fs::FileExt as _;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Sender};
 
 use anyhow::{Context as _, Result, ensure};
 
@@ -102,10 +100,111 @@ impl NgramHasher {
     }
 }
 
-/// One tensor's bytes: the file holding it and its offset there.
+/// A read-only shared mapping of one shard file.
+struct Mapping {
+    ptr: *const u8,
+    len: usize,
+}
+
+// SAFETY: the mapping is immutable file-backed memory; concurrent reads from
+// any thread are fine, and it is only unmapped when the last owner drops.
+unsafe impl Send for Mapping {}
+unsafe impl Sync for Mapping {}
+
+impl Mapping {
+    fn open(path: &Path) -> Result<Self> {
+        use std::os::unix::io::AsRawFd as _;
+        let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let len = file.metadata().context("file metadata")?.len() as usize;
+        ensure!(len > 0, "{} is empty", path.display());
+        // SAFETY: a fresh read-only shared mapping of the whole file.
+        let ptr = unsafe { sys::mmap(std::ptr::null_mut(), len, sys::PROT_READ, sys::MAP_SHARED, file.as_raw_fd(), 0) };
+        ensure!(ptr != sys::MAP_FAILED, "mmap of {} failed: {}", path.display(), std::io::Error::last_os_error());
+        Ok(Self { ptr: ptr.cast::<u8>().cast_const(), len })
+    }
+
+    fn slice(&self, offset: usize, len: usize) -> &[u8] {
+        assert!(offset + len <= self.len, "mapping read out of range");
+        // SAFETY: in-bounds view of the mapping, which outlives `self`.
+        unsafe { core::slice::from_raw_parts(self.ptr.add(offset), len) }
+    }
+
+    /// Hints that `[offset, offset+len)` will be read soon (asynchronous
+    /// read-ahead for pages not yet resident).
+    fn will_need(&self, offset: usize, len: usize) {
+        let page = sys::page_size();
+        let start = offset & !(page - 1);
+        let end = (offset + len).min(self.len);
+        // SAFETY: page-aligned range inside the mapping; advice only.
+        unsafe {
+            sys::madvise(self.ptr.add(start).cast_mut().cast(), end - start, sys::MADV_WILLNEED);
+        }
+    }
+
+    /// Bytes of `[offset, offset+len)` currently resident in memory.
+    fn resident(&self, offset: usize, len: usize) -> Result<usize> {
+        let page = sys::page_size();
+        let start = offset & !(page - 1);
+        let end = (offset + len).min(self.len).div_ceil(page) * page;
+        let end = end.min(self.len.div_ceil(page) * page);
+        let pages = (end - start) / page;
+        let mut vec = vec![0u8; pages];
+        // SAFETY: page-aligned range inside the mapping; `vec` has one byte per page.
+        let rc = unsafe { sys::mincore(self.ptr.add(start).cast_mut().cast(), end - start, vec.as_mut_ptr().cast()) };
+        ensure!(rc == 0, "mincore failed: {}", std::io::Error::last_os_error());
+        Ok(vec.iter().filter(|&&b| b & 1 != 0).count() * page)
+    }
+
+    /// Pins `[offset, offset+len)` in memory.
+    fn lock(&self, offset: usize, len: usize) -> Result<()> {
+        let page = sys::page_size();
+        let start = offset & !(page - 1);
+        let end = (offset + len).min(self.len);
+        // SAFETY: page-aligned range inside the mapping.
+        let rc = unsafe { sys::mlock(self.ptr.add(start).cast_mut().cast(), end - start) };
+        ensure!(rc == 0, "mlock failed: {}", std::io::Error::last_os_error());
+        Ok(())
+    }
+}
+
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        // SAFETY: unmapping what `open` mapped.
+        unsafe {
+            sys::munmap(self.ptr.cast_mut().cast(), self.len);
+        }
+    }
+}
+
+/// The handful of libSystem calls the mapping needs, declared here to avoid a
+/// dependency on the `libc` crate.
+mod sys {
+    use std::ffi::{c_int, c_void};
+
+    pub const PROT_READ: c_int = 1;
+    pub const MAP_SHARED: c_int = 1;
+    pub const MADV_WILLNEED: c_int = 3;
+    pub const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
+
+    unsafe extern "C" {
+        pub fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, offset: i64) -> *mut c_void;
+        pub fn munmap(addr: *mut c_void, len: usize) -> c_int;
+        pub fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
+        pub fn mincore(addr: *mut c_void, len: usize, vec: *mut u8) -> c_int;
+        pub fn mlock(addr: *mut c_void, len: usize) -> c_int;
+        fn getpagesize() -> c_int;
+    }
+
+    pub fn page_size() -> usize {
+        // SAFETY: no preconditions.
+        (unsafe { getpagesize() }) as usize
+    }
+}
+
+/// One tensor's bytes: the mapping holding it and its offset there.
 struct Region {
-    file: Arc<File>,
-    start: u64,
+    map: Arc<Mapping>,
+    start: usize,
 }
 
 /// One contiguous row range of the table (its codes, scales and biases may
@@ -117,8 +216,10 @@ struct ShardRegion {
     rows: usize,
 }
 
-/// The table's layout and files, shared with the reader threads.
-struct TableInner {
+/// The table left in the checkpoint files, memory-mapped and read row by
+/// row on demand. Warm rows are memcpys from the page cache; cold rows get a
+/// read-ahead hint for the whole batch first so their faults overlap.
+pub struct PagedTable {
     regions: Vec<ShardRegion>,
     /// `row_starts[i]` is the first global row of region `i`; one extra entry
     /// holds the total.
@@ -128,30 +229,9 @@ struct TableInner {
     group_size: usize,
 }
 
-/// A raw destination pointer handed to a reader thread. The batch that owns
-/// the memory blocks until every task reports back, so the pointer outlives
-/// its use.
-struct SendPtr(*mut u8);
-unsafe impl Send for SendPtr {}
-
-struct Task {
-    ids: Vec<u32>,
-    codes: SendPtr,
-    scales: SendPtr,
-    biases: SendPtr,
-    done: Sender<Result<()>>,
-}
-
-/// The table left in the checkpoint files, read row by row on demand. A small
-/// persistent pool of reader threads hides the latency of cold rows (a token
-/// needs 16 rows from random places in 32 GB; one cold SSD read is ~100 us,
-/// so serially a cold token costs milliseconds, in parallel a fraction).
-pub struct PagedTable {
-    inner: Arc<TableInner>,
-    workers: Vec<Sender<Task>>,
-}
-
-const READER_THREADS: usize = 8;
+/// Batches at least this large are copied by several threads (prefill);
+/// smaller ones (decode) are hinted and copied inline.
+const PARALLEL_ROWS: usize = 256;
 
 impl PagedTable {
     pub const BITS: usize = 4;
@@ -162,7 +242,7 @@ impl PagedTable {
         ensure!(!bases.is_empty(), "n-gram table has no shards");
         let mut regions = Vec::with_capacity(bases.len());
         let mut row_starts = vec![0usize];
-        let mut files: Vec<(std::path::PathBuf, Arc<File>)> = Vec::new();
+        let mut maps: Vec<(std::path::PathBuf, Arc<Mapping>)> = Vec::new();
         let mut words = None;
         let mut groups = None;
         for base in bases {
@@ -194,18 +274,16 @@ impl PagedTable {
             words = Some(w);
             groups = Some(g);
             let mut open = |meta: &crate::safetensors::TensorMeta| -> Result<Region> {
-                let file = match files.iter().find(|(p, _)| p == meta.shard()) {
-                    Some((_, f)) => f.clone(),
+                let map = match maps.iter().find(|(p, _)| p == meta.shard()) {
+                    Some((_, m)) => m.clone(),
                     None => {
-                        let f = Arc::new(
-                            File::open(meta.shard())
-                                .with_context(|| format!("opening {}", meta.shard().display()))?,
-                        );
-                        files.push((meta.shard().to_path_buf(), f.clone()));
-                        f
+                        let m = Arc::new(Mapping::open(meta.shard())?);
+                        maps.push((meta.shard().to_path_buf(), m.clone()));
+                        m
                     }
                 };
-                Ok(Region { file, start: meta.start() })
+                ensure!(meta.start() as usize + meta.byte_len() <= map.len, "{base}: tensor beyond its shard file");
+                Ok(Region { map, start: meta.start() as usize })
             };
             regions.push(ShardRegion {
                 codes: open(codes)?,
@@ -222,59 +300,62 @@ impl PagedTable {
             "table width {} does not match {groups} groups of {group_size}",
             words * (32 / Self::BITS)
         );
-        let inner = Arc::new(TableInner { regions, row_starts, words, groups, group_size });
-        let mut workers = Vec::with_capacity(READER_THREADS);
-        for i in 0..READER_THREADS {
-            let (tx, rx) = mpsc::channel::<Task>();
-            let table = inner.clone();
-            std::thread::Builder::new()
-                .name(format!("ngram-reader-{i}"))
-                .spawn(move || {
-                    while let Ok(task) = rx.recv() {
-                        let n = task.ids.len();
-                        let (cb, gb) = (table.codes_bytes(), table.group_bytes());
-                        // SAFETY: the batch owner sized these ranges for `n`
-                        // rows and waits for `done` before touching them.
-                        let result = unsafe {
-                            table.read_rows(
-                                &task.ids,
-                                core::slice::from_raw_parts_mut(task.codes.0, n * cb),
-                                core::slice::from_raw_parts_mut(task.scales.0, n * gb),
-                                core::slice::from_raw_parts_mut(task.biases.0, n * gb),
-                            )
-                        };
-                        let _ = task.done.send(result);
-                    }
-                })
-                .context("spawning n-gram reader thread")?;
-            workers.push(tx);
-        }
-        Ok(Self { inner, workers })
+        Ok(Self { regions, row_starts, words, groups, group_size })
     }
 
     pub fn rows(&self) -> usize {
-        self.inner.rows()
+        *self.row_starts.last().unwrap_or(&0)
     }
 
     /// Row width in elements.
     pub fn width(&self) -> usize {
-        self.inner.words * (32 / Self::BITS)
+        self.words * (32 / Self::BITS)
     }
 
     pub fn group_size(&self) -> usize {
-        self.inner.group_size
+        self.group_size
     }
 
     fn codes_bytes(&self) -> usize {
-        self.inner.codes_bytes()
+        self.words * 4
     }
 
     fn group_bytes(&self) -> usize {
-        self.inner.group_bytes()
+        self.groups * 2
+    }
+
+    /// Bytes of the table on disk.
+    pub fn bytes(&self) -> u64 {
+        self.regions.iter().map(|r| (r.rows * (self.codes_bytes() + 2 * self.group_bytes())) as u64).sum()
+    }
+
+    /// The three byte ranges of `row`: (region, offsets of codes, scales, biases).
+    fn locate(&self, row: usize) -> Result<(&ShardRegion, usize, usize, usize)> {
+        let region_index = self.row_starts.partition_point(|&s| s <= row);
+        ensure!(region_index >= 1 && row < self.rows(), "n-gram row {row} out of range");
+        let region = &self.regions[region_index - 1];
+        let local = row - self.row_starts[region_index - 1];
+        Ok((
+            region,
+            region.codes.start + local * self.codes_bytes(),
+            region.scales.start + local * self.group_bytes(),
+            region.biases.start + local * self.group_bytes(),
+        ))
+    }
+
+    fn copy_rows(&self, ids: &[u32], codes: &mut [u8], scales: &mut [u8], biases: &mut [u8]) -> Result<()> {
+        let (cb, gb) = (self.codes_bytes(), self.group_bytes());
+        for (i, &id) in ids.iter().enumerate() {
+            let (region, c, s, b) = self.locate(id as usize)?;
+            codes[i * cb..(i + 1) * cb].copy_from_slice(region.codes.map.slice(c, cb));
+            scales[i * gb..(i + 1) * gb].copy_from_slice(region.scales.map.slice(s, gb));
+            biases[i * gb..(i + 1) * gb].copy_from_slice(region.biases.map.slice(b, gb));
+        }
+        Ok(())
     }
 
     /// Reads the rows `ids` into row-major `codes`, `scales` and `biases`
-    /// (each exactly `ids.len()` rows wide), spread over the reader threads.
+    /// (each exactly `ids.len()` rows wide).
     pub fn gather(
         &self,
         ids: &[u32],
@@ -288,125 +369,82 @@ impl PagedTable {
             "staging buffers do not match {} rows",
             ids.len()
         );
-        if ids.len() <= 2 {
-            return self.inner.read_rows(ids, codes, scales, biases);
+        if ids.len() < PARALLEL_ROWS {
+            // Issue every page's read-ahead first so cold rows overlap their
+            // SSD latency instead of faulting one after another.
+            for &id in ids {
+                let (region, c, s, b) = self.locate(id as usize)?;
+                region.codes.map.will_need(c, cb);
+                region.scales.map.will_need(s, gb);
+                region.biases.map.will_need(b, gb);
+            }
+            return self.copy_rows(ids, codes, scales, biases);
         }
-        let parts = ids.len().min(self.workers.len());
-        let per = ids.len().div_ceil(parts);
-        let (done_tx, done_rx) = mpsc::channel();
-        let mut sent = 0;
-        let mut offset = 0;
-        for (w, chunk) in ids.chunks(per).enumerate() {
-            let n = chunk.len();
-            let task = Task {
-                ids: chunk.to_vec(),
-                // SAFETY: disjoint sub-ranges of the caller's buffers.
-                codes: SendPtr(unsafe { codes.as_mut_ptr().add(offset * cb) }),
-                scales: SendPtr(unsafe { scales.as_mut_ptr().add(offset * gb) }),
-                biases: SendPtr(unsafe { biases.as_mut_ptr().add(offset * gb) }),
-                done: done_tx.clone(),
-            };
-            self.workers[w % self.workers.len()]
-                .send(task)
-                .map_err(|_| anyhow::anyhow!("n-gram reader thread is gone"))?;
-            sent += 1;
-            offset += n;
-        }
-        drop(done_tx);
-        let mut first_error = None;
-        for _ in 0..sent {
-            match done_rx.recv() {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    first_error.get_or_insert(e);
+        let threads = 8usize.min(ids.len() / 64).max(1);
+        let per = ids.len().div_ceil(threads);
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(threads);
+            let mut rest = (ids, codes, scales, biases);
+            loop {
+                let n = per.min(rest.0.len());
+                if n == 0 {
+                    break;
                 }
-                Err(_) => {
-                    first_error.get_or_insert(anyhow::anyhow!("n-gram reader thread is gone"));
+                let (ids_a, ids_b) = rest.0.split_at(n);
+                let (c_a, c_b) = rest.1.split_at_mut(n * cb);
+                let (s_a, s_b) = rest.2.split_at_mut(n * gb);
+                let (b_a, b_b) = rest.3.split_at_mut(n * gb);
+                rest = (ids_b, c_b, s_b, b_b);
+                handles.push(scope.spawn(move || self.copy_rows(ids_a, c_a, s_a, b_a)));
+            }
+            for handle in handles {
+                handle.join().map_err(|_| anyhow::anyhow!("n-gram copy thread panicked"))??;
+            }
+            Ok(())
+        })
+    }
+
+    /// Reads the whole table once so its pages are resident, and pins them
+    /// with `mlock` when `lock` is set. Returns the bytes found resident
+    /// afterwards (from `mincore`), which is what the log should show.
+    pub fn preload(&self, lock: bool) -> Result<u64> {
+        let (cb, gb) = (self.codes_bytes(), self.group_bytes());
+        let mut sink = 0u64;
+        for region in &self.regions {
+            for (part, len) in [
+                (&region.codes, region.rows * cb),
+                (&region.scales, region.rows * gb),
+                (&region.biases, region.rows * gb),
+            ] {
+                part.map.will_need(part.start, len);
+                let bytes = part.map.slice(part.start, len);
+                // Touch one word per page; the sum keeps the loads alive.
+                let page = sys::page_size();
+                let mut off = 0;
+                while off < len {
+                    sink = sink.wrapping_add(bytes[off] as u64);
+                    off += page;
+                }
+                if lock {
+                    part.map.lock(part.start, len)?;
                 }
             }
         }
-        match first_error {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+        std::hint::black_box(sink);
+        self.resident_bytes()
     }
 
-    /// Streams every table byte through the page cache once so the first
-    /// requests do not pay cold random reads. Costs the table's size in
-    /// evictable page-cache memory and a few seconds of sequential I/O.
-    pub fn preload(&self) -> Result<u64> {
-        self.inner.preload()
-    }
-}
-
-impl TableInner {
-    fn rows(&self) -> usize {
-        *self.row_starts.last().unwrap_or(&0)
-    }
-
-    fn codes_bytes(&self) -> usize {
-        self.words * 4
-    }
-
-    fn group_bytes(&self) -> usize {
-        self.groups * 2
-    }
-
-    fn read_rows(&self, ids: &[u32], codes: &mut [u8], scales: &mut [u8], biases: &mut [u8]) -> Result<()> {
+    /// Bytes of the table currently resident in memory.
+    pub fn resident_bytes(&self) -> Result<u64> {
         let (cb, gb) = (self.codes_bytes(), self.group_bytes());
-        for (i, &id) in ids.iter().enumerate() {
-            self.read_row(
-                id as usize,
-                &mut codes[i * cb..(i + 1) * cb],
-                &mut scales[i * gb..(i + 1) * gb],
-                &mut biases[i * gb..(i + 1) * gb],
-            )?;
-        }
-        Ok(())
-    }
-
-    fn read_row(&self, row: usize, codes: &mut [u8], scales: &mut [u8], biases: &mut [u8]) -> Result<()> {
-        let region_index = self.row_starts.partition_point(|&s| s <= row);
-        ensure!(region_index >= 1 && row < self.rows(), "n-gram row {row} out of range");
-        let region = &self.regions[region_index - 1];
-        let local = (row - self.row_starts[region_index - 1]) as u64;
-        region
-            .codes
-            .file
-            .read_exact_at(codes, region.codes.start + local * self.codes_bytes() as u64)
-            .context("reading n-gram codes")?;
-        region
-            .scales
-            .file
-            .read_exact_at(scales, region.scales.start + local * self.group_bytes() as u64)
-            .context("reading n-gram scales")?;
-        region
-            .biases
-            .file
-            .read_exact_at(biases, region.biases.start + local * self.group_bytes() as u64)
-            .context("reading n-gram biases")?;
-        Ok(())
-    }
-
-    /// Streams every table byte through the page cache once so the first
-    /// requests do not pay cold random reads. Costs the table's size in
-    /// evictable page-cache memory and a few seconds of sequential I/O.
-    fn preload(&self) -> Result<u64> {
-        let mut buf = vec![0u8; 8 << 20];
         let mut total = 0u64;
         for region in &self.regions {
             for (part, len) in [
-                (&region.codes, region.rows * self.codes_bytes()),
-                (&region.scales, region.rows * self.group_bytes()),
-                (&region.biases, region.rows * self.group_bytes()),
+                (&region.codes, region.rows * cb),
+                (&region.scales, region.rows * gb),
+                (&region.biases, region.rows * gb),
             ] {
-                let mut done = 0usize;
-                while done < len {
-                    let n = buf.len().min(len - done);
-                    part.file.read_exact_at(&mut buf[..n], part.start + done as u64)?;
-                    done += n;
-                }
-                total += len as u64;
+                total += part.map.resident(part.start, len)? as u64;
             }
         }
         Ok(total)
@@ -441,16 +479,16 @@ impl StagedRows {
         ensure!(capacity > 0, "staging capacity must be nonzero");
         let seq: Vec<u32> = (0..capacity as u32).collect();
         Ok(Self {
-            codes: Tensor::zeros(ctx, &[capacity, table.inner.words], DType::U32)?,
-            scales: Tensor::zeros(ctx, &[capacity, table.inner.groups], DType::BF16)?,
-            biases: Tensor::zeros(ctx, &[capacity, table.inner.groups], DType::BF16)?,
+            codes: Tensor::zeros(ctx, &[capacity, table.words], DType::U32)?,
+            scales: Tensor::zeros(ctx, &[capacity, table.groups], DType::BF16)?,
+            biases: Tensor::zeros(ctx, &[capacity, table.groups], DType::BF16)?,
             seq_ids: Tensor::from_bytes(
                 ctx,
                 bytemuck::cast_slice(&seq),
                 &[capacity],
                 DType::U32,
             )?,
-            group_size: table.inner.group_size,
+            group_size: table.group_size,
             capacity,
         })
     }

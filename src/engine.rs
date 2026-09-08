@@ -111,9 +111,11 @@ pub trait LanguageModel: Sized {
     /// Bytes the per-token caches take per token of capacity, for budgeting.
     fn bytes_per_token(&self) -> usize;
 
-    /// Warms weights served from disk (the paged n-gram table) and returns
-    /// the bytes touched; models without such weights return 0.
-    fn warm_storage(&self) -> Result<u64> {
+    /// Warms weights served from disk (the paged n-gram table), pinning them
+    /// in memory when `lock` is set, and returns the bytes found resident;
+    /// models without such weights return 0.
+    fn warm_storage(&self, lock: bool) -> Result<u64> {
+        let _ = lock;
         Ok(0)
     }
 
