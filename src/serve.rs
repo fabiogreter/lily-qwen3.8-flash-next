@@ -1,80 +1,76 @@
-//! A deliberately small, serial OpenAI-compatible chat-completions server.
+//! Lily's OpenAI-compatible API server.
+//!
+//! One engine thread owns the GPU and runs requests strictly one at a time
+//! from a bounded queue. The HTTP thread parses and validates requests (400s
+//! never touch the engine), and a small responder thread per request relays
+//! the engine's output to the socket, so a slow or vanished client never
+//! stalls the decode loop; its write failure cancels the generation at the
+//! next token.
 
+pub mod api;
+pub mod http;
 mod session;
+pub mod stream;
+pub mod tools;
 
-use std::io::Read as _;
-use std::net::ToSocketAddrs;
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, ensure};
-use serde::{Deserialize, Serialize};
-use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
+use serde::Serialize;
+use serde_json::{Value, json};
 
-use crate::chat::{Conversation, Message, Role};
-use crate::engine::{DecodeStateApi, LanguageModel};
-use crate::generate::{Generator, Thinking};
+use crate::engine::{DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi};
+use crate::generate::{FinishReason, GenerateOptions, Generator};
+use crate::kernels::attention::MAX_SEQ;
+use crate::kernels::sample::SamplingParams;
 use crate::metal::MetalContext;
 use crate::model::Qwen3_5Model;
-use crate::qwen4exp::Qwen4ExpModel;
+use crate::qwen4exp::{NgramStorage, Qwen4ExpModel};
+use api::{Defaults, Kind, Prepared};
 use session::SessionStore;
+use stream::{Event, OutputParser, ParserConfig};
+use tools::ParsedToolCall;
 
-const MAX_REQUEST_BYTES: usize = 1 << 20;
-const SESSION_CACHE_ENTRIES: usize = 2;
+const MAX_REQUEST_BYTES: usize = 32 << 20;
+/// Recurrent-state checkpoints kept per session (the newest ones).
+const CHECKPOINTS_PER_SESSION: usize = 3;
+/// Left free below the device's recommended working set when the cache
+/// budget is derived automatically.
+const BUDGET_MARGIN_BYTES: usize = 2 << 30;
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ChatRequest {
-    model: String,
-    messages: Conversation,
-    #[serde(default = "default_max_tokens")]
-    max_tokens: usize,
-    #[serde(default)]
-    stream: bool,
-    #[serde(default)]
-    prompt_cache_key: Option<String>,
+/// Sampling defaults from the command line; unset fields fall back to the
+/// checkpoint's `generation_config.json`, then to OpenAI's defaults.
+#[derive(Debug, Clone, Default)]
+pub struct SamplingOverrides {
+    pub temperature: Option<f32>,
+    pub top_k: Option<usize>,
+    pub top_p: Option<f32>,
+    pub min_p: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub repetition_penalty: Option<f32>,
 }
 
-fn default_max_tokens() -> usize {
-    128
+#[derive(Debug, Clone)]
+pub struct ServeOptions {
+    pub bind: String,
+    pub max_seq: usize,
+    pub cache_bytes: Option<usize>,
+    pub max_sessions: usize,
+    pub ngram_storage: NgramStorage,
+    pub ngram_preload: bool,
+    pub thinking: bool,
+    pub reasoning_effort: Option<String>,
+    pub queue: usize,
+    pub sampling: SamplingOverrides,
 }
 
-fn request_token_budget(prompt_tokens: usize, max_tokens: usize) -> Result<usize> {
-    prompt_tokens
-        .checked_add(max_tokens)
-        .and_then(|tokens| tokens.checked_add(1))
-        .context("request token count overflow")
-}
-
-#[derive(Serialize)]
-struct ChatResponse {
-    id: String,
-    object: &'static str,
-    created: u64,
-    model: &'static str,
-    choices: [Choice; 1],
-    usage: Usage,
-}
-
-#[derive(Serialize)]
-struct Choice {
-    index: usize,
-    message: Message,
-    finish_reason: &'static str,
-}
-
-#[derive(Serialize)]
-struct Usage {
-    prompt_tokens: usize,
-    completion_tokens: usize,
-    total_tokens: usize,
-    prompt_tokens_details: PromptTokensDetails,
-}
-
-#[derive(Serialize)]
-struct PromptTokensDetails {
-    cached_tokens: usize,
-}
+// --- HTTP plumbing -----------------------------------------------------------
 
 #[derive(Serialize)]
 struct ErrorEnvelope {
@@ -88,221 +84,573 @@ struct ErrorBody {
     kind: &'static str,
 }
 
-enum ApiError {
-    InvalidRequest(anyhow::Error),
-    Internal(anyhow::Error),
+fn error_json(kind: &'static str, message: impl Into<String>) -> Vec<u8> {
+    serde_json::to_vec(&ErrorEnvelope { error: ErrorBody { message: message.into(), kind } })
+        .unwrap_or_else(|_| b"{\"error\":{\"message\":\"error\"}}".to_vec())
 }
 
-impl ApiError {
-    fn invalid(error: anyhow::Error) -> Self {
-        Self::InvalidRequest(error)
-    }
-
-    fn internal(error: anyhow::Error) -> Self {
-        Self::Internal(error)
-    }
-
-    fn status(&self) -> StatusCode {
-        match self {
-            Self::InvalidRequest(_) => StatusCode(400),
-            Self::Internal(_) => StatusCode(500),
-        }
-    }
-
-    fn kind(&self) -> &'static str {
-        match self {
-            Self::InvalidRequest(_) => "invalid_request_error",
-            Self::Internal(_) => "server_error",
-        }
-    }
-
-    fn public_message(&self) -> String {
-        match self {
-            Self::InvalidRequest(error) => format!("{error:#}"),
-            Self::Internal(_) => "internal server error".to_string(),
-        }
-    }
-
-    fn source(&self) -> &anyhow::Error {
-        match self {
-            Self::InvalidRequest(error) | Self::Internal(error) => error,
-        }
+fn send_json<T: Serialize>(stream: TcpStream, status: u16, value: &T) {
+    let body = serde_json::to_vec(value).unwrap_or_default();
+    if let Err(error) = http::respond(stream, status, "application/json", &body) {
+        eprintln!("response error: {error:#}");
     }
 }
 
-type ApiResult<T> = std::result::Result<T, ApiError>;
+fn send_error(stream: TcpStream, status: u16, kind: &'static str, message: impl Into<String>) {
+    if let Err(error) = http::respond(stream, status, "application/json", &error_json(kind, message)) {
+        eprintln!("response error: {error:#}");
+    }
+}
+
+/// What the engine sends the responder thread for one request.
+enum Out {
+    Start { status: u16, content_type: &'static str },
+    Body(Vec<u8>),
+    End,
+}
+
+/// The engine's handle on a request's response.
+struct Sink {
+    tx: Sender<Out>,
+    cancelled: Arc<AtomicBool>,
+    started: bool,
+}
+
+impl Sink {
+    fn start(&mut self, status: u16, content_type: &'static str) {
+        if !self.started {
+            self.started = true;
+            let _ = self.tx.send(Out::Start { status, content_type });
+        }
+    }
+
+    fn send(&self, body: Vec<u8>) {
+        let _ = self.tx.send(Out::Body(body));
+    }
+
+    fn sse(&self, value: &Value) {
+        let mut line = b"data: ".to_vec();
+        line.extend_from_slice(serde_json::to_string(value).unwrap_or_default().as_bytes());
+        line.extend_from_slice(b"\n\n");
+        self.send(line);
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+
+    fn end(&self) {
+        let _ = self.tx.send(Out::End);
+    }
+}
+
+struct Job {
+    prepared: Prepared,
+    sink: Sink,
+    queued_at: Instant,
+}
+
+/// Relays one request's output from the engine to the client on the
+/// connection's own thread; a failed write or the client's EOF flags
+/// cancellation for the engine.
+fn relay(stream: TcpStream, rx: Receiver<Out>, cancelled: Arc<AtomicBool>) {
+    let (status, content_type) = match rx.recv() {
+        Ok(Out::Start { status, content_type }) => (status, content_type),
+        _ => {
+            send_error(stream, 500, "server_error", "internal server error");
+            return;
+        }
+    };
+    let mut response = match http::ChunkedResponse::start(stream, status, content_type, cancelled.clone()) {
+        Ok(response) => response,
+        Err(_) => {
+            cancelled.store(true, Ordering::Relaxed);
+            return;
+        }
+    };
+    while let Ok(message) = rx.recv() {
+        match message {
+            Out::Body(bytes) => {
+                if response.write_chunk(&bytes).is_err() {
+                    // Keep draining so the engine's sends never block.
+                    for _ in rx.iter() {}
+                    return;
+                }
+            }
+            Out::End => break,
+            Out::Start { .. } => {}
+        }
+    }
+    if let Err(error) = response.finish() {
+        eprintln!("response error: {error:#}");
+    }
+}
+
+// --- engine ------------------------------------------------------------------
 
 struct Engine<M: LanguageModel> {
     ctx: MetalContext,
     model: M,
-    generator: Generator,
+    generator: Arc<Generator>,
     sessions: SessionStore<M>,
     scratch: M::Scratch,
     max_seq: usize,
     next_id: u64,
 }
 
+/// Where a request's text ends up when not streaming.
+#[derive(Default)]
+struct Collected {
+    reasoning: String,
+    content: String,
+    tool_calls: Vec<ParsedToolCall>,
+}
+
 impl<M: LanguageModel> Engine<M> {
-    fn load(model_dir: &Path, max_seq: usize) -> Result<Self> {
+    fn load(model_dir: &Path, options: &ServeOptions, generator: Arc<Generator>) -> Result<Self> {
         let ctx = MetalContext::new()?;
-        let model = M::load(&ctx, model_dir)?;
+        let started = Instant::now();
+        let model = M::load(&ctx, model_dir, &LoadOptions { ngram_storage: options.ngram_storage })?;
+        eprintln!(
+            "loaded {} in {:.1}s ({:.1} GB resident)",
+            M::MODEL_ID,
+            started.elapsed().as_secs_f64(),
+            ctx.current_allocated() as f64 / 1e9
+        );
+        if options.ngram_preload {
+            let started = Instant::now();
+            let bytes = model.warm_storage()?;
+            if bytes > 0 {
+                eprintln!("preloaded {:.1} GB of paged weights in {:.1}s", bytes as f64 / 1e9, started.elapsed().as_secs_f64());
+            }
+        }
         let declared = model.max_position_embeddings();
-        let max_seq = if declared == 0 { max_seq } else { max_seq.min(declared) };
+        let mut max_seq = options.max_seq.min(MAX_SEQ);
+        if declared > 0 {
+            max_seq = max_seq.min(declared);
+        }
         ensure!(max_seq > 1, "max_seq must be at least 2");
-        let mut generator = Generator::from_model_dir(model_dir)?;
-        generator.add_stop_tokens(&model.eos_token_ids());
         let mut scratch = model.new_scratch_with_capacity(&ctx, max_seq)?;
         warm_up(&ctx, &model, &mut scratch)?;
+
+        let allocated = ctx.current_allocated();
+        let working_set = ctx.recommended_working_set();
+        let budget = match options.cache_bytes {
+            Some(b) => b,
+            None => working_set.saturating_sub(allocated).saturating_sub(BUDGET_MARGIN_BYTES).max(512 << 20),
+        };
+        let per_request = model.bytes_per_token() * max_seq;
+        eprintln!(
+            "memory: {:.1} GB allocated, {:.1} GB recommended working set, {:.1} GB session cache budget \
+             ({} B/token of context; a full {}-token request needs {:.1} GB)",
+            allocated as f64 / 1e9,
+            working_set as f64 / 1e9,
+            budget as f64 / 1e9,
+            model.bytes_per_token(),
+            max_seq,
+            per_request as f64 / 1e9,
+        );
+        if per_request > budget {
+            eprintln!(
+                "warning: a request using the whole {max_seq}-token context exceeds the cache budget; \
+                 lower --max-seq or raise --cache-bytes"
+            );
+        }
         Ok(Self {
             ctx,
             model,
             generator,
-            sessions: SessionStore::new(max_seq, SESSION_CACHE_ENTRIES),
+            sessions: SessionStore::new(budget, options.max_sessions, CHECKPOINTS_PER_SESSION),
             scratch,
             max_seq,
             next_id: 1,
         })
     }
 
-    fn validate_request(&self, request: &ChatRequest) -> Result<Vec<u32>> {
-        ensure!(
-            request.model == M::MODEL_ID,
-            "unknown model {:?}; this server exposes only {}",
-            request.model,
-            M::MODEL_ID
-        );
-        ensure!(!request.stream, "streaming is not supported");
-        ensure!(!request.messages.is_empty(), "messages must not be empty");
-        ensure!(
-            request.messages.last().is_some_and(|m| m.role == Role::User),
-            "the final message must have role=user"
-        );
-        ensure!(request.max_tokens > 0, "max_tokens must be greater than zero");
-
-        // The minimal API serves direct answers. The tokenizer's disabled-
-        // thinking history rewrite also keeps multi-turn prompts prefix-cacheable.
-        let prompt_ids =
-            self.generator.encode_chat(&request.messages, Thinking::Disabled)?;
-        ensure!(!prompt_ids.is_empty(), "chat template produced an empty prompt");
-        let request_tokens =
-            request_token_budget(prompt_ids.len(), request.max_tokens)?;
-        ensure!(
-            request_tokens <= self.max_seq,
-            "request needs {} tokens but server max_seq is {}",
-            request_tokens,
-            self.max_seq
-        );
-        Ok(prompt_ids)
+    fn serve(&mut self, job: Job) {
+        let mut sink = job.sink;
+        let stream = job.prepared.stream;
+        let kind = job.prepared.kind;
+        let queued = job.queued_at.elapsed();
+        let result = self.run(job.prepared, &mut sink);
+        if let Err(error) = result {
+            eprintln!("request failed: {error:#}");
+            if !sink.started {
+                sink.start(500, "application/json");
+                sink.send(error_json("server_error", "internal server error"));
+            } else if stream {
+                sink.sse(&json!({"error": {"message": "internal server error", "type": "server_error"}}));
+                sink.send(b"data: [DONE]\n\n".to_vec());
+            }
+        }
+        sink.end();
+        let _ = (kind, queued);
     }
 
-    fn complete(&mut self, request: ChatRequest) -> ApiResult<ChatResponse> {
-        let prompt_ids = self.validate_request(&request).map_err(ApiError::invalid)?;
-        self.complete_validated(request, prompt_ids).map_err(ApiError::internal)
-    }
+    fn run(&mut self, p: Prepared, sink: &mut Sink) -> Result<()> {
+        if sink.cancelled() {
+            return Ok(());
+        }
+        let Engine { ctx, model, generator, sessions, scratch, max_seq, next_id } = self;
+        ensure!(p.prompt.len() < *max_seq, "prompt too long for the server context");
+        let n = p.prompt.len();
+        let started = Instant::now();
+        let acquired = sessions.acquire(ctx, model, &p.prompt, p.cache_key.as_deref())?;
+        let mut session = acquired.session;
+        let reused = acquired.reused;
+        ensure!(reused < n, "session cache returned the whole prompt");
 
-    fn complete_validated(
-        &mut self,
-        request: ChatRequest,
-        prompt_ids: Vec<u32>,
-    ) -> Result<ChatResponse> {
-        let (mut session, cached_tokens) = self.sessions.acquire(
-            &self.ctx,
-            &self.model,
-            &prompt_ids,
-            request.prompt_cache_key.as_deref(),
-        )?;
-        let suffix = &prompt_ids[cached_tokens..];
-        ensure!(!suffix.is_empty(), "session cache returned an exact prompt match");
-        let generation = self.generator.generate(
-            &self.ctx,
-            &self.model,
-            &mut session.state,
-            &mut self.scratch,
-            suffix,
-            request.max_tokens,
-        )?;
-        let decode_fed = generation
-            .fed
-            .checked_sub(suffix.len())
-            .context("decode state advanced less than the prompt suffix")?;
-        ensure!(
-            decode_fed <= generation.tokens.len(),
-            "decode state advanced beyond returned greedy tokens"
-        );
-        session.tokens.extend_from_slice(suffix);
-        session.tokens.extend_from_slice(&generation.tokens[..decode_fed]);
-        ensure!(
-            session.state.pos() == session.tokens.len(),
-            "session token/state position mismatch"
-        );
-        self.sessions.release(session, request.prompt_cache_key.as_deref());
-        let finish_reason = if generation.stopped { "stop" } else { "length" };
-        let completion_tokens = generation.tokens.len();
+        // Prefix up to the last prompt token, then checkpoint there so an
+        // identical or extended prompt can resume without re-feeding it.
+        if reused < n - 1 {
+            model.prefill(ctx, &mut session.state, scratch, &p.prompt[reused..n - 1], None)?;
+        }
+        let snapshot = session.state.snapshot(ctx)?;
+        session.add_checkpoint(snapshot);
+        let prefix_secs = started.elapsed().as_secs_f64();
+
         let created = now();
-        let id = format!("chatcmpl-{}-{}", created, self.next_id);
-        self.next_id += 1;
-        Ok(ChatResponse {
-            id,
-            object: "chat.completion",
-            created,
-            model: M::MODEL_ID,
-            choices: [Choice {
-                index: 0,
-                message: Message::new_assistant(generation.text),
-                finish_reason,
-            }],
-            usage: Usage {
-                prompt_tokens: prompt_ids.len(),
-                completion_tokens,
-                total_tokens: prompt_ids.len() + completion_tokens,
-                prompt_tokens_details: PromptTokensDetails { cached_tokens },
+        let id = format!("{}-{}-{}", if p.kind == Kind::Chat { "chatcmpl" } else { "cmpl" }, created, *next_id);
+        *next_id += 1;
+        let tokenizer = generator.tokenizer();
+        let mut parser = OutputParser::new(
+            |ids: &[u32]| tokenizer.decode(ids, false),
+            ParserConfig {
+                thinking_open: p.thinking_open,
+                tools: p.tools.clone(),
+                stop_strings: p.stop_strings.clone(),
+                raw: p.kind == Kind::Completion,
             },
-        })
+        );
+        let mut collected = Collected::default();
+        let mut tool_index = 0usize;
+        if p.stream {
+            sink.start(200, "text/event-stream");
+            if p.kind == Kind::Chat {
+                sink.sse(&chunk(&id, created, M::MODEL_ID, json!({"role": "assistant", "content": ""}), None));
+            }
+        }
+        let mut deliver = |events: Vec<Event>, sink: &Sink| {
+            for event in events {
+                match event {
+                    Event::Reasoning(text) => {
+                        if p.stream {
+                            sink.sse(&chunk(&id, created, M::MODEL_ID, json!({"reasoning_content": text}), None));
+                        } else {
+                            collected.reasoning.push_str(&text);
+                        }
+                    }
+                    Event::Content(text) => {
+                        if p.stream {
+                            if p.kind == Kind::Chat {
+                                sink.sse(&chunk(&id, created, M::MODEL_ID, json!({"content": text}), None));
+                            } else {
+                                sink.sse(&text_chunk(&id, created, M::MODEL_ID, &text, None));
+                            }
+                        } else {
+                            collected.content.push_str(&text);
+                        }
+                    }
+                    Event::ToolCall(call) => {
+                        if p.stream {
+                            let delta = json!({"tool_calls": [{
+                                "index": tool_index,
+                                "id": call_id(&id, tool_index),
+                                "type": "function",
+                                "function": {"name": call.name, "arguments": call.arguments},
+                            }]});
+                            sink.sse(&chunk(&id, created, M::MODEL_ID, delta, None));
+                        } else {
+                            collected.tool_calls.push(call);
+                        }
+                        tool_index += 1;
+                    }
+                }
+            }
+        };
+
+        let options = GenerateOptions { max_tokens: p.max_tokens, sampling: &p.sampling, stop_tokens: &[] };
+        let decode_started = Instant::now();
+        let generation = generator.generate(
+            ctx,
+            model,
+            &mut session.state,
+            scratch,
+            &p.prompt[n - 1..],
+            &options,
+            &mut |token| {
+                let events = parser.push(token)?;
+                deliver(events, sink);
+                Ok(!sink.cancelled() && !parser.stopped)
+            },
+        )?;
+        let final_events = parser.finish();
+        deliver(final_events, sink);
+        let decode_secs = decode_started.elapsed().as_secs_f64();
+
+        // Bookkeeping: the state holds the prompt plus every generated token
+        // but the last (drawn, never fed).
+        let fed_generated = generation.tokens.len() - 1;
+        ensure!(
+            generation.fed == 1 + fed_generated,
+            "decode state advanced {} tokens for {} drawn",
+            generation.fed,
+            generation.tokens.len()
+        );
+        session.tokens.truncate(reused);
+        session.tokens.extend_from_slice(&p.prompt[reused..]);
+        session.tokens.extend_from_slice(&generation.tokens[..fed_generated]);
+        ensure!(session.state.pos() == session.tokens.len(), "session token/state position mismatch");
+        sessions.release(session, p.cache_key.as_deref());
+
+        let completion_tokens = generation.tokens.len();
+        let finish_reason = match generation.finish {
+            FinishReason::Length => "length",
+            _ if parser.tool_calls_emitted() > 0 => "tool_calls",
+            _ => "stop",
+        };
+        eprintln!(
+            "{}: {} prompt tokens ({} cached{}), {} generated, prefix {:.2}s, decode {:.2}s ({:.1} tok/s), finish={finish_reason}, sessions={} ({:.1}/{:.1} GB)",
+            id,
+            n,
+            reused,
+            if acquired.forked { ", forked" } else { "" },
+            completion_tokens,
+            prefix_secs,
+            decode_secs,
+            completion_tokens as f64 / decode_secs.max(1e-9),
+            sessions.len(),
+            sessions.used_bytes() as f64 / 1e9,
+            sessions.budget_bytes() as f64 / 1e9,
+        );
+        if sink.cancelled() {
+            return Ok(());
+        }
+        let usage = json!({
+            "prompt_tokens": n,
+            "completion_tokens": completion_tokens,
+            "total_tokens": n + completion_tokens,
+            "prompt_tokens_details": {"cached_tokens": reused},
+        });
+        if p.stream {
+            if p.kind == Kind::Chat {
+                sink.sse(&chunk(&id, created, M::MODEL_ID, json!({}), Some(finish_reason)));
+            } else {
+                sink.sse(&text_chunk(&id, created, M::MODEL_ID, "", Some(finish_reason)));
+            }
+            if p.include_usage {
+                sink.sse(&json!({
+                    "id": id,
+                    "object": if p.kind == Kind::Chat { "chat.completion.chunk" } else { "text_completion" },
+                    "created": created,
+                    "model": M::MODEL_ID,
+                    "choices": [],
+                    "usage": usage,
+                }));
+            }
+            sink.send(b"data: [DONE]\n\n".to_vec());
+        } else {
+            let body = if p.kind == Kind::Chat {
+                let mut message = json!({"role": "assistant", "content": collected.content});
+                if !collected.reasoning.is_empty() {
+                    message["reasoning_content"] = Value::String(collected.reasoning);
+                }
+                if !collected.tool_calls.is_empty() {
+                    if collected.content.is_empty() {
+                        message["content"] = Value::Null;
+                    }
+                    message["tool_calls"] = Value::Array(
+                        collected
+                            .tool_calls
+                            .iter()
+                            .enumerate()
+                            .map(|(i, call)| {
+                                json!({
+                                    "id": call_id(&id, i),
+                                    "type": "function",
+                                    "function": {"name": call.name, "arguments": call.arguments},
+                                })
+                            })
+                            .collect(),
+                    );
+                }
+                json!({
+                    "id": id,
+                    "object": "chat.completion",
+                    "created": created,
+                    "model": M::MODEL_ID,
+                    "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+                    "usage": usage,
+                })
+            } else {
+                json!({
+                    "id": id,
+                    "object": "text_completion",
+                    "created": created,
+                    "model": M::MODEL_ID,
+                    "choices": [{"index": 0, "text": collected.content, "finish_reason": finish_reason, "logprobs": null}],
+                    "usage": usage,
+                })
+            };
+            sink.start(200, "application/json");
+            sink.send(serde_json::to_vec(&body)?);
+        }
+        Ok(())
     }
 }
 
+fn call_id(request_id: &str, index: usize) -> String {
+    let digest = request_id.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+    format!("call_{:016x}{index:02}", digest)
+}
+
+fn chunk(id: &str, created: u64, model: &str, delta: Value, finish_reason: Option<&str>) -> Value {
+    json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+    })
+}
+
+fn text_chunk(id: &str, created: u64, model: &str, text: &str, finish_reason: Option<&str>) -> Value {
+    json!({
+        "id": id,
+        "object": "text_completion",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "text": text, "finish_reason": finish_reason, "logprobs": null}],
+    })
+}
+
 /// Compiles the Metal pipelines a short request needs by running a throwaway
-/// two-token prompt and one pipelined decode pair, so the first real request
-/// does not pay the shader compile (tens of seconds on the 48-layer model).
-/// Kernels only long contexts reach (sparse attention) still compile on first
-/// use.
-fn warm_up<M: LanguageModel>(
-    ctx: &MetalContext,
-    model: &M,
-    scratch: &mut M::Scratch,
-) -> Result<()> {
-    let started = std::time::Instant::now();
+/// two-token prompt and two decode steps, so the first real request does not
+/// pay the shader compile (tens of seconds on the 48-layer model). Kernels
+/// only long contexts reach (sparse attention) still compile on first use.
+fn warm_up<M: LanguageModel>(ctx: &MetalContext, model: &M, scratch: &mut M::Scratch) -> Result<()> {
+    let started = Instant::now();
+    let greedy = SamplingParams::greedy();
     let mut state = model.new_state(ctx, 4)?;
+    scratch.begin_request();
     // Two arbitrary in-vocabulary ids: the values do not matter, only that the
     // prefill and decode graphs get encoded once.
-    model.prefill(ctx, &mut state, scratch, &[1, 2])?;
-    let first = model.submit_decode_step(ctx, &mut state, scratch, 0, 1)?;
-    let second = model.submit_decode_step(ctx, &mut state, scratch, 1, 0)?;
-    first.wait()?;
-    second.wait()?;
+    model.prefill(ctx, &mut state, scratch, &[1, 2], Some(Draw { params: &greedy, step: 0 }))?;
+    for (step, (slot_in, slot_out)) in [(0, 1), (1, 0)].into_iter().enumerate() {
+        let token = scratch.next_token().view(slot_in, &[1])?.to_u32()?[0];
+        let encoded = model.encode_decode_step(ctx, &state, scratch, slot_in, slot_out, Draw { params: &greedy, step: step + 1 })?;
+        model.prepare_step_inputs(&mut state, scratch, token)?;
+        let pending = encoded.commit()?;
+        state.advance(1);
+        pending.wait()?;
+    }
+    // Snapshot/restore compile no shaders but exercise the blit path once.
+    let snapshot = state.snapshot(ctx)?;
+    state.restore(ctx, &snapshot)?;
     eprintln!("warm-up done in {:.1}s", started.elapsed().as_secs_f64());
     Ok(())
 }
 
+// --- startup -----------------------------------------------------------------
+
 /// The `model_type` a checkpoint's `config.json` declares.
 pub fn checkpoint_model_type(model_dir: &Path) -> Result<String> {
-    let path = model_dir.join("config.json");
-    let bytes =
-        std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-    let config: serde_json::Value =
-        serde_json::from_slice(&bytes).context("parsing config.json")?;
+    let config = read_config(model_dir)?;
     config
         .get("model_type")
         .and_then(|v| v.as_str())
         .map(str::to_string)
-        .with_context(|| format!("{} has no model_type", path.display()))
+        .with_context(|| format!("{} has no model_type", model_dir.join("config.json").display()))
+}
+
+fn read_config(model_dir: &Path) -> Result<Value> {
+    let path = model_dir.join("config.json");
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_slice(&bytes).context("parsing config.json")
+}
+
+/// `eos_token_id` from `config.json` (top level or `text_config`), int or list.
+fn checkpoint_eos_ids(model_dir: &Path) -> Result<Vec<u32>> {
+    let config = read_config(model_dir)?;
+    let value = config
+        .get("eos_token_id")
+        .or_else(|| config.get("text_config").and_then(|t| t.get("eos_token_id")));
+    Ok(match value {
+        Some(Value::Number(n)) => n.as_u64().map(|v| v as u32).into_iter().collect(),
+        Some(Value::Array(items)) => items.iter().filter_map(|v| v.as_u64()).map(|v| v as u32).collect(),
+        _ => Vec::new(),
+    })
+}
+
+/// Sampling defaults: `generation_config.json` over OpenAI's defaults, then
+/// the command-line overrides.
+fn sampling_defaults(model_dir: &Path, overrides: &SamplingOverrides) -> Result<SamplingParams> {
+    let mut params = SamplingParams {
+        temperature: 1.0,
+        top_k: 0,
+        top_p: 1.0,
+        min_p: 0.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        repetition_penalty: 1.0,
+        seed: 0,
+    };
+    let path = model_dir.join("generation_config.json");
+    if let Ok(bytes) = std::fs::read(&path) {
+        let cfg: Value = serde_json::from_slice(&bytes).context("parsing generation_config.json")?;
+        let f = |key: &str| cfg.get(key).and_then(Value::as_f64).map(|v| v as f32);
+        if cfg.get("do_sample").and_then(Value::as_bool) == Some(false) {
+            params.temperature = 0.0;
+        }
+        if let Some(t) = f("temperature") {
+            params.temperature = t;
+        }
+        if let Some(p) = f("top_p") {
+            params.top_p = p;
+        }
+        if let Some(k) = cfg.get("top_k").and_then(Value::as_u64) {
+            params.top_k = k as usize;
+        }
+        if let Some(m) = f("min_p") {
+            params.min_p = m;
+        }
+        if let Some(r) = f("repetition_penalty") {
+            params.repetition_penalty = r;
+        }
+        if let Some(p) = f("presence_penalty") {
+            params.presence_penalty = p;
+        }
+    }
+    if let Some(v) = overrides.temperature {
+        params.temperature = v;
+    }
+    if let Some(v) = overrides.top_k {
+        params.top_k = v;
+    }
+    if let Some(v) = overrides.top_p {
+        params.top_p = v;
+    }
+    if let Some(v) = overrides.min_p {
+        params.min_p = v;
+    }
+    if let Some(v) = overrides.presence_penalty {
+        params.presence_penalty = v;
+    }
+    if let Some(v) = overrides.frequency_penalty {
+        params.frequency_penalty = v;
+    }
+    if let Some(v) = overrides.repetition_penalty {
+        params.repetition_penalty = v;
+    }
+    params.validate()?;
+    Ok(params)
 }
 
 /// Serves the checkpoint at `model_dir` with the engine its `model_type` names.
-pub fn run(model_dir: &Path, bind: &str, max_seq: usize) -> Result<()> {
+pub fn run(model_dir: &Path, options: ServeOptions) -> Result<()> {
     match checkpoint_model_type(model_dir)?.as_str() {
-        "qwen3_5_moe" => run_with::<Qwen3_5Model>(model_dir, bind, max_seq),
-        "qwen4_exp" => run_with::<Qwen4ExpModel>(model_dir, bind, max_seq),
+        "qwen3_5_moe" => run_with::<Qwen3_5Model>(model_dir, options),
+        "qwen4_exp" => run_with::<Qwen4ExpModel>(model_dir, options),
         other => anyhow::bail!(
             "unsupported model_type {other:?}; lily serves qwen3_5_moe \
              (Qwen3.6-35B-A3B) and qwen4_exp (Qwen3.8-Flash-Next)"
@@ -310,112 +658,166 @@ pub fn run(model_dir: &Path, bind: &str, max_seq: usize) -> Result<()> {
     }
 }
 
-fn run_with<M: LanguageModel>(
-    model_dir: &Path,
-    bind: &str,
+/// Everything the HTTP thread needs without the engine.
+struct Front {
+    generator: Arc<Generator>,
+    defaults: Defaults,
     max_seq: usize,
-) -> Result<()> {
-    let address = bind
-        .to_socket_addrs()
-        .with_context(|| format!("resolving bind address {bind}"))?
-        .next()
-        .with_context(|| format!("bind address {bind} resolved to nothing"))?;
-    let server = Server::http(address)
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .with_context(|| format!("binding http://{bind}"))?;
-    let mut engine = Engine::<M>::load(model_dir, max_seq)?;
-    eprintln!("serving {} on http://{address}", M::MODEL_ID);
+    jobs: SyncSender<Job>,
+    ready: Arc<AtomicBool>,
+    fatal: Arc<Mutex<Option<String>>>,
+    model_id: &'static str,
+}
 
-    for mut request in server.incoming_requests() {
-        let result = dispatch(&mut engine, &mut request);
-        let response = match result {
-            Ok(response) => response,
-            Err(error) => {
-                if matches!(&error, ApiError::Internal(_)) {
-                    eprintln!("request failed: {:#}", error.source());
+fn run_with<M: LanguageModel + 'static>(model_dir: &Path, options: ServeOptions) -> Result<()> {
+    let address = options
+        .bind
+        .to_socket_addrs()
+        .with_context(|| format!("resolving bind address {}", options.bind))?
+        .next()
+        .with_context(|| format!("bind address {} resolved to nothing", options.bind))?;
+    let mut generator = Generator::from_model_dir(model_dir)?;
+    generator.add_stop_tokens(&checkpoint_eos_ids(model_dir)?);
+    let generator = Arc::new(generator);
+    let defaults = Defaults {
+        sampling: sampling_defaults(model_dir, &options.sampling)?,
+        thinking: options.thinking,
+        reasoning_effort: options.reasoning_effort.clone(),
+    };
+    eprintln!(
+        "defaults: temperature {} top_k {} top_p {} min_p {} repetition_penalty {} presence {} frequency {}; thinking {}{}",
+        defaults.sampling.temperature,
+        defaults.sampling.top_k,
+        defaults.sampling.top_p,
+        defaults.sampling.min_p,
+        defaults.sampling.repetition_penalty,
+        defaults.sampling.presence_penalty,
+        defaults.sampling.frequency_penalty,
+        if defaults.thinking { "on" } else { "off" },
+        defaults.reasoning_effort.as_deref().map(|e| format!(" (effort {e})")).unwrap_or_default(),
+    );
+    let max_seq = options.max_seq.min(MAX_SEQ);
+
+    let listener = TcpListener::bind(address).with_context(|| format!("binding http://{}", options.bind))?;
+    let (jobs, job_rx) = mpsc::sync_channel::<Job>(options.queue.max(1));
+    let ready = Arc::new(AtomicBool::new(false));
+    let fatal = Arc::new(Mutex::new(None));
+    {
+        let model_dir = model_dir.to_path_buf();
+        let options = options.clone();
+        let generator = generator.clone();
+        let ready = ready.clone();
+        let fatal = fatal.clone();
+        std::thread::Builder::new()
+            .name("lily-engine".into())
+            .spawn(move || {
+                let mut engine = match Engine::<M>::load(&model_dir, &options, generator) {
+                    Ok(engine) => engine,
+                    Err(error) => {
+                        eprintln!("engine failed to start: {error:#}");
+                        *fatal.lock().unwrap_or_else(|p| p.into_inner()) = Some(format!("{error:#}"));
+                        return;
+                    }
+                };
+                ready.store(true, Ordering::Release);
+                eprintln!("ready: serving {} on http://{address}", M::MODEL_ID);
+                while let Ok(job) = job_rx.recv() {
+                    engine.serve(job);
                 }
-                json_response(
-                    error.status(),
-                    &ErrorEnvelope {
-                        error: ErrorBody {
-                            message: error.public_message(),
-                            kind: error.kind(),
-                        },
-                    },
-                )?
+            })
+            .context("spawning the engine thread")?;
+    }
+    eprintln!("listening on http://{address} (loading model)");
+
+    let front = Arc::new(Front { generator, defaults, max_seq, jobs, ready, fatal, model_id: M::MODEL_ID });
+    for stream in listener.incoming() {
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("accept error: {error}");
+                continue;
             }
         };
-        if let Err(error) = request.respond(response) {
-            eprintln!("response error: {error}");
+        if let Some(fatal) = front.fatal.lock().unwrap_or_else(|p| p.into_inner()).clone() {
+            send_json(stream, 500, &json!({"error": {"message": fatal, "type": "server_error"}}));
+            std::process::exit(1);
+        }
+        let front = front.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("lily-http".into())
+            .spawn(move || handle(&front, stream))
+        {
+            eprintln!("failed to spawn connection thread: {error}");
         }
     }
     Ok(())
 }
 
-fn dispatch<M: LanguageModel>(
-    engine: &mut Engine<M>,
-    request: &mut Request,
-) -> ApiResult<Response<std::io::Cursor<Vec<u8>>>> {
-    let path = request.url().split('?').next().unwrap_or(request.url());
-    match (request.method(), path) {
-        (&Method::Get, "/health") => {
-            json_response(StatusCode(200), &serde_json::json!({"status": "ok"}))
-                .map_err(ApiError::internal)
+fn handle(front: &Front, mut stream: TcpStream) {
+    let request = match http::read_request(&mut stream, MAX_REQUEST_BYTES) {
+        Ok(request) => request,
+        Err(error) => {
+            send_error(stream, 400, "invalid_request_error", format!("{error:#}"));
+            return;
         }
-        (&Method::Get, "/v1/models") => json_response(
-            StatusCode(200),
-            &serde_json::json!({
-                "object": "list",
-                "data": [{
-                    "id": M::MODEL_ID,
-                    "object": "model",
-                    "created": 0,
-                    "owned_by": "lily"
-                }]
-            }),
-        )
-        .map_err(ApiError::internal),
-        (&Method::Post, "/v1/chat/completions") => {
-            let mut body = Vec::new();
-            request
-                .as_reader()
-                .take((MAX_REQUEST_BYTES + 1) as u64)
-                .read_to_end(&mut body)
-                .context("reading request body")
-                .map_err(ApiError::internal)?;
-            if body.len() > MAX_REQUEST_BYTES {
-                return Err(ApiError::invalid(anyhow::anyhow!(
-                    "request body exceeds {MAX_REQUEST_BYTES} bytes"
-                )));
+    };
+    let path = request.path.split('?').next().unwrap_or("").to_string();
+    let ready = front.ready.load(Ordering::Acquire);
+    match (request.method.as_str(), path.as_str()) {
+        ("GET", "/health") => {
+            if ready {
+                send_json(stream, 200, &json!({"status": "ok", "model": front.model_id}));
+            } else {
+                send_json(stream, 503, &json!({"status": "loading", "model": front.model_id}));
             }
-            let chat: ChatRequest = serde_json::from_slice(&body)
-                .context("parsing chat request")
-                .map_err(ApiError::invalid)?;
-            let response = engine.complete(chat)?;
-            json_response(StatusCode(200), &response).map_err(ApiError::internal)
         }
-        _ => json_response(
-            StatusCode(404),
-            &ErrorEnvelope {
-                error: ErrorBody {
-                    message: "not found".to_string(),
-                    kind: "invalid_request_error",
-                },
-            },
-        )
-        .map_err(ApiError::internal),
+        ("GET", "/v1/models") => send_json(
+            stream,
+            200,
+            &json!({
+                "object": "list",
+                "data": [{"id": front.model_id, "object": "model", "created": 0, "owned_by": "lily"}]
+            }),
+        ),
+        ("POST", "/v1/chat/completions" | "/v1/completions") => {
+            let prepared = if path == "/v1/chat/completions" {
+                serde_json::from_slice::<api::ChatRequest>(&request.body)
+                    .context("parsing the chat request")
+                    .and_then(|r| api::prepare_chat(r, front.generator.tokenizer(), &front.defaults, front.max_seq))
+            } else {
+                serde_json::from_slice::<api::CompletionRequest>(&request.body)
+                    .context("parsing the completion request")
+                    .and_then(|r| api::prepare_completion(r, front.generator.tokenizer(), &front.defaults, front.max_seq))
+            };
+            let prepared = match prepared {
+                Ok(p) => p,
+                Err(error) => {
+                    send_error(stream, 400, "invalid_request_error", format!("{error:#}"));
+                    return;
+                }
+            };
+            if !ready {
+                send_error(stream, 503, "server_error", "model is still loading");
+                return;
+            }
+            let (tx, rx) = mpsc::channel();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let job = Job { prepared, sink: Sink { tx, cancelled: cancelled.clone(), started: false }, queued_at: Instant::now() };
+            match front.jobs.try_send(job) {
+                Ok(()) => relay(stream, rx, cancelled),
+                Err(TrySendError::Full(_)) => {
+                    send_error(stream, 503, "server_error", "the request queue is full; retry later");
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    send_error(stream, 500, "server_error", "engine stopped");
+                }
+            }
+        }
+        (_, "/health" | "/v1/models" | "/v1/chat/completions" | "/v1/completions") => {
+            send_error(stream, 405, "invalid_request_error", "method not allowed");
+        }
+        _ => send_error(stream, 404, "invalid_request_error", "not found"),
     }
-}
-
-fn json_response<T: Serialize>(
-    status: StatusCode,
-    value: &T,
-) -> Result<Response<std::io::Cursor<Vec<u8>>>> {
-    let body = serde_json::to_vec(value)?;
-    let content_type =
-        Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
-            .map_err(|_| anyhow::anyhow!("invalid static content-type header"))?;
-    Ok(Response::from_data(body).with_status_code(status).with_header(content_type))
 }
 
 fn now() -> u64 {

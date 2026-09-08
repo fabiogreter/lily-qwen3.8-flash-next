@@ -1,55 +1,11 @@
-// Per-Layer (n-gram) Embedding kernels for Qwen3.8-Flash-Next: hashed n-gram
-// ids, the quantized table gather, the per-stream gate, and the dilated
+// Per-Layer (n-gram) Embedding kernels for Qwen3.8-Flash-Next: the quantized
+// table gather (ids are hashed on the host), the per-stream gate, and the dilated
 // depthwise conv that adds local context. Streams are laid out [rows, G*H].
 #include <metal_stdlib>
 using namespace metal;
 
 #define TG 256
 #define PLE_MAX_CONTEXT 16  // (kernel-1)*dilation entries the conv window holds
-
-// Hashed ids for M tokens. Head j hashes the current token with j/HPN + 1
-// preceding tokens; a preceding token is replaced by eos when an eos sits
-// between it and the current one (segments never mix). hist holds the two
-// tokens before tokens[0] (oldest first).
-kernel void ple_hash_ids(device const uint*  tokens  [[buffer(0)]],  // [M]
-                         device const uint*  hist    [[buffer(1)]],  // [2]
-                         device uint*        ids     [[buffer(2)]],  // [M, NH]
-                         device const ulong* mult    [[buffer(3)]],  // [ngram]
-                         device const uint*  sizes   [[buffer(4)]],  // [NH]
-                         device const uint*  offsets [[buffer(5)]],  // [NH]
-                         constant uint&      NH      [[buffer(6)]],
-                         constant uint&      HPN     [[buffer(7)]],
-                         constant uint&      eos     [[buffer(8)]],
-                         uint2 gid [[thread_position_in_grid]]) {
-    const uint j = gid.x;
-    const uint r = gid.y;
-    const uint t0 = tokens[r];
-    const uint p1 = r >= 1 ? tokens[r - 1] : hist[1];
-    const uint p2 = r >= 2 ? tokens[r - 2] : (r == 1 ? hist[1] : hist[0]);
-    const uint s1 = p1 == eos ? eos : p1;
-    const uint s2 = (p1 == eos || p2 == eos) ? eos : p2;
-    ulong mixed = ulong(t0) * mult[0];
-    mixed ^= ulong(s1) * mult[1];
-    if (j / HPN >= 1) {
-        mixed ^= ulong(s2) * mult[2];
-    }
-    ids[(ulong)r * NH + j] = uint(mixed % ulong(sizes[j])) + offsets[j];
-}
-
-// Advances the two-token history past M tokens.
-kernel void ple_hist_update(device const uint* tokens   [[buffer(0)]],
-                            device const uint* hist_in  [[buffer(1)]],
-                            device uint*       hist_out [[buffer(2)]],
-                            constant uint&     M        [[buffer(3)]],
-                            uint gid [[thread_position_in_grid]]) {
-    if (gid != 0) {
-        return;
-    }
-    const uint last = tokens[M - 1];
-    const uint prev = M >= 2 ? tokens[M - 2] : hist_in[1];
-    hist_out[0] = prev;
-    hist_out[1] = last;
-}
 
 // Dequantizes one Q4 code word to eight BF16 values.
 static inline void ple_store_word_q4(uint word, float s, float b,

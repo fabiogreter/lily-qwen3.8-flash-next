@@ -12,14 +12,14 @@ use std::path::Path;
 
 use anyhow::{Result, ensure};
 
-use crate::engine::{DecodeStateApi, LanguageModel, ScratchApi};
+use std::rc::Rc;
+
+use crate::engine::{DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, SnapshotApi};
 use crate::kernels::attention::{
     MAX_SEQ, k_norm_rope_scatter_decode, q_norm_rope_split_decode, rope_neox,
     scatter_kv, sdpa_decode, sdpa_prefill, sdpa_split_scratch_splits, split_q_gate,
 };
-use crate::kernels::elementwise::{
-    ARGMAX_GROUPS, argmax_f32, gather_row_bf16, sigmoid_mul_bf16,
-};
+use crate::kernels::elementwise::{gather_row_bf16, sigmoid_mul_bf16};
 use crate::kernels::gdn::{
     GDN_HEAD_DIM, GDN_STATE_DTYPE, GdnGate, GdnRegscanStaging, conv1d_prefill,
     conv1d_step, gated_rmsnorm, gdn_prefill, gdn_step_gated_fused,
@@ -29,10 +29,11 @@ use crate::kernels::hc::{
     silu_scaled_bf16,
 };
 use crate::kernels::norm::rmsnorm_bf16;
-use crate::kernels::ple::{self, PleHashTables};
+use crate::kernels::ple;
 use crate::kernels::qsa::{self, INDEXER_D, SparseSplitScratch};
+use crate::kernels::sample::{SamplerScratch, sample_f32};
 use crate::kernels::{quant, skinny};
-use crate::metal::{ComputePass, MetalContext, PendingPass};
+use crate::metal::{BlitCopy, ComputePass, EncodedPass, MetalContext};
 use crate::moe_ffn::{
     DecodeMoeIo, MoeDims, MoeScratch, PrefillMoeIo, PrefillMoeScratch, decode_moe,
     prefill_moe, prefix_rows, project_mat, project_stack_or_slices,
@@ -40,6 +41,7 @@ use crate::moe_ffn::{
 use crate::tensor::{DType, Tensor};
 
 use super::config::{GateAct, Qwen4ExpConfig};
+use super::ngram::{NgramHasher, NgramStorage, NgramTable, StagedRows};
 use super::weights::{
     self, AttnWeights, GdnWeights, HcWeights, Mixer, ModelWeights, PleWeights,
 };
@@ -54,6 +56,10 @@ const PREFILL_CHUNK: usize = 4096;
 /// Queries per sparse-attention sub-batch: bounds the `[QB, blocks]` score
 /// matrix and the split partials while keeping the GPU busy.
 const QSA_QUERY_BATCH: usize = 256;
+
+/// Per-token caches grow in steps of this many tokens (192 MiB of KV plus
+/// indexer keys per step), so a session's footprint follows its length.
+const CAPACITY_STEP: usize = 8192;
 
 fn moe_dims(cfg: &Qwen4ExpConfig) -> MoeDims {
     MoeDims {
@@ -71,7 +77,7 @@ pub struct Qwen4ExpModel {
     attn_scale: f32,
     gdn_scale: f32,
     gdn_gate: GdnGate,
-    ple_tables: Option<PleHashTables>,
+    hasher: Option<NgramHasher>,
 }
 
 enum LayerState {
@@ -93,36 +99,90 @@ enum LayerState {
     },
 }
 
-/// Per-Layer Embedding recurrent state: the two-token hash history and the
-/// dilated conv window, both double-buffered like the GDN conv windows.
+/// Per-Layer Embedding recurrent state: the two-token hash history (host
+/// side, since the host hashes) and the dilated conv window, double-buffered
+/// like the GDN conv windows.
 struct PleState {
-    hist: [Tensor; 2],
+    hist: [u32; 2],
     conv_windows: [Tensor; 2],
     eos: u32,
 }
 
 impl PleState {
-    fn reset(&self) -> Result<()> {
-        let eos = [self.eos, self.eos];
-        for h in &self.hist {
-            h.write_bytes(bytemuck::cast_slice(&eos))?;
-        }
+    fn reset(&mut self) {
+        self.hist = [self.eos, self.eos];
         for w in &self.conv_windows {
             w.zero_fill();
         }
-        Ok(())
     }
 }
 
 pub struct DecodeState {
     pub pos: usize,
-    max_seq: usize,
+    /// Tokens the per-token caches hold; grows in `CAPACITY_STEP`s.
+    capacity: usize,
     layers: Vec<LayerState>,
-    /// Which double-buffered window/history slot is current (all recurrent
-    /// layers advance in lockstep): prefill chunks read it, write the other,
-    /// then flip; decode steps update it in place.
+    /// Which double-buffered window slot is current (all recurrent layers
+    /// advance in lockstep): prefill chunks read it, write the other, then
+    /// flip; decode steps update it in place.
     conv_slot: usize,
     ple: Option<PleState>,
+    kv_heads: usize,
+    head_dim: usize,
+    ratio: usize,
+}
+
+/// The recurrent part of a [`DecodeState`] at one position: GDN states and
+/// conv windows, the PLE conv window and hash history.
+pub struct Snapshot {
+    pos: usize,
+    /// Per GDN layer, in layer order: `(state, conv_window)`.
+    gdn: Vec<(Tensor, Tensor)>,
+    ple: Option<([u32; 2], Tensor)>,
+}
+
+impl SnapshotApi for Snapshot {
+    fn pos(&self) -> usize {
+        self.pos
+    }
+
+    fn bytes(&self) -> usize {
+        self.gdn.iter().map(|(a, b)| a.byte_len() + b.byte_len()).sum::<usize>()
+            + self.ple.as_ref().map_or(0, |(_, w)| w.byte_len())
+    }
+}
+
+fn clone_tensor(ctx: &MetalContext, t: &Tensor) -> Result<Tensor> {
+    let out = Tensor::zeros(ctx, t.shape(), t.dtype())?;
+    ctx.blit_copy(&[BlitCopy { src: t, src_offset: 0, dst: &out, dst_offset: 0, len: t.byte_len() }])?;
+    Ok(out)
+}
+
+/// Copies the first `rows` rows of every `[heads, cap, d]` head block from
+/// `src` to `dst` (both bf16, possibly different capacities).
+fn head_block_copies<'t>(src: &'t Tensor, dst: &'t Tensor, rows: usize, out: &mut Vec<BlitCopy<'t>>) -> Result<()> {
+    let (heads, src_cap, d) = (src.shape()[0], src.shape()[1], src.shape()[2]);
+    let dst_cap = dst.shape()[1];
+    ensure!(rows <= src_cap && rows <= dst_cap && dst.shape()[0] == heads && dst.shape()[2] == d, "cache copy shape mismatch");
+    let row_bytes = d * src.dtype().size();
+    for h in 0..heads {
+        out.push(BlitCopy {
+            src,
+            src_offset: h * src_cap * row_bytes,
+            dst,
+            dst_offset: h * dst_cap * row_bytes,
+            len: rows * row_bytes,
+        });
+    }
+    Ok(())
+}
+
+/// Copies the first `rows` rows of a `[cap, d]` store.
+fn row_copy<'t>(src: &'t Tensor, dst: &'t Tensor, rows: usize, out: &mut Vec<BlitCopy<'t>>) -> Result<()> {
+    let rows = rows.min(src.shape()[0]).min(dst.shape()[0]);
+    let row_bytes = src.shape()[1] * src.dtype().size();
+    out.push(BlitCopy { src, src_offset: 0, dst, dst_offset: 0, len: rows * row_bytes });
+    Ok(())
 }
 
 impl DecodeState {
@@ -137,12 +197,29 @@ impl DecodeState {
                 conv_windows[1].zero_fill();
             }
         }
-        if let Some(ple) = &self.ple {
-            ple.reset()?;
+        if let Some(ple) = &mut self.ple {
+            ple.reset();
         }
         self.pos = 0;
         self.conv_slot = 0;
         Ok(())
+    }
+
+    fn attn_caches(ctx: &MetalContext, kv_heads: usize, head_dim: usize, ratio: usize, capacity: usize) -> Result<LayerState> {
+        Ok(LayerState::Attn {
+            k_cache: Tensor::zeros(ctx, &[kv_heads, capacity, head_dim], DType::BF16)?,
+            v_cache: Tensor::zeros(ctx, &[kv_heads, capacity, head_dim], DType::BF16)?,
+            idx_keys: Tensor::zeros(ctx, &[capacity, INDEXER_D], DType::BF16)?,
+            blk_keys: Tensor::zeros(ctx, &[(capacity / ratio).max(1), INDEXER_D], DType::BF16)?,
+        })
+    }
+
+    /// Per-token cache bytes for `capacity` tokens across all attention layers.
+    fn cache_bytes(&self, capacity: usize) -> usize {
+        let attn_layers = self.layers.iter().filter(|l| matches!(l, LayerState::Attn { .. })).count();
+        let per_token = 2 * self.kv_heads * self.head_dim * 2 + INDEXER_D * 2;
+        let blocks = (capacity / self.ratio).max(1) * INDEXER_D * 2;
+        attn_layers * (capacity * per_token + blocks)
     }
 }
 
@@ -189,7 +266,11 @@ impl QsaScratch {
 
 /// Single-token PLE intermediates.
 struct PleScratch {
+    /// U32 `[rows, heads]`: hashed row ids (resident table) or the
+    /// sequential ids of the staged rows (paged table).
     ids: Tensor,
+    /// Gathered rows for the paged table, at full capacity.
+    stage: Option<Rc<StagedRows>>,
     emb: Tensor,
     key: Tensor,
     key_n: Tensor,
@@ -200,12 +281,23 @@ struct PleScratch {
 }
 
 impl PleScratch {
-    fn new(ctx: &MetalContext, cfg: &Qwen4ExpConfig, rows: usize) -> Result<Self> {
+    fn new(ctx: &MetalContext, cfg: &Qwen4ExpConfig, rows: usize, table: &NgramTable) -> Result<Self> {
         let ple = cfg.ple.as_ref().expect("PLE scratch without PLE config");
         let (h, wide) = (cfg.hidden_size, cfg.hc_width());
         let bf = DType::BF16;
+        let heads = ple.ngram_heads();
+        let (ids, stage) = match table {
+            NgramTable::Resident(_) => (Tensor::zeros(ctx, &[rows, heads], DType::U32)?, None),
+            NgramTable::Paged(paged) => {
+                // Staged rows are gathered with their own sequential ids.
+                let seq: Vec<u32> = (0..(rows * heads) as u32).collect();
+                let ids = Tensor::from_bytes(ctx, bytemuck::cast_slice(&seq), &[rows, heads], DType::U32)?;
+                (ids, Some(Rc::new(StagedRows::new(ctx, paged, rows * heads)?)))
+            }
+        };
         Ok(Self {
-            ids: Tensor::zeros(ctx, &[rows, ple.ngram_heads()], DType::U32)?,
+            ids,
+            stage,
             emb: Tensor::zeros(ctx, &[rows, ple.embed_dim], bf)?,
             key: Tensor::zeros(ctx, &[rows, wide], bf)?,
             key_n: Tensor::zeros(ctx, &[rows, wide], bf)?,
@@ -219,6 +311,7 @@ impl PleScratch {
     fn rows(&self, m: usize) -> Result<Self> {
         Ok(Self {
             ids: prefix_rows(&self.ids, m)?,
+            stage: self.stage.clone(),
             emb: prefix_rows(&self.emb, m)?,
             key: prefix_rows(&self.key, m)?,
             key_n: prefix_rows(&self.key_n, m)?,
@@ -307,8 +400,8 @@ pub struct Scratch {
     logits: Tensor,
     sdpa_partials: Tensor,
     sdpa_stats: Tensor,
-    argmax_partials: Tensor,
-    /// Greedy tokens written by the in-graph argmax (`U32[2]`): two ping-pong
+    sampler: SamplerScratch,
+    /// Tokens written by the in-graph sampler (`U32[2]`): two ping-pong
     /// slots so the pipelined loop can host-read step N's token while the
     /// in-flight step N+1 writes the other slot.
     pub next_token: Tensor,
@@ -367,6 +460,7 @@ impl PrefillScratch {
         cfg: &Qwen4ExpConfig,
         capacity: usize,
         max_seq: usize,
+        table: Option<&NgramTable>,
     ) -> Result<Self> {
         ensure!(capacity > 0, "prefill scratch capacity must be nonzero");
         let m = capacity;
@@ -421,7 +515,7 @@ impl PrefillScratch {
             },
             moe: PrefillMoeScratch::new(ctx, &moe_dims(cfg), m)?,
             qsa: QsaScratch::new(ctx, cfg, max_seq, QSA_QUERY_BATCH.min(m))?,
-            ple: cfg.ple.as_ref().map(|_| PleScratch::new(ctx, cfg, m)).transpose()?,
+            ple: table.map(|t| PleScratch::new(ctx, cfg, m, t)).transpose()?,
         })
     }
 
@@ -483,6 +577,11 @@ impl PrefillScratch {
 
 impl Qwen4ExpModel {
     pub fn load(ctx: &MetalContext, dir: impl AsRef<Path>) -> Result<Self> {
+        Self::load_with(ctx, dir, NgramStorage::default())
+    }
+
+    /// Loads with the n-gram table `storage` of choice.
+    pub fn load_with(ctx: &MetalContext, dir: impl AsRef<Path>, storage: NgramStorage) -> Result<Self> {
         let config = Qwen4ExpConfig::from_model_dir(&dir)?;
         ensure!(
             config.linear_key_head_dim == GDN_HEAD_DIM
@@ -495,10 +594,9 @@ impl Qwen4ExpModel {
             "indexer head dim {} unsupported (kernels are compiled for {INDEXER_D})",
             config.indexer.head_dim
         );
-        let weights = weights::load(ctx, &dir, &config)?;
-        let ple_tables = match &config.ple {
-            Some(p) => Some(PleHashTables::new(
-                ctx,
+        let weights = weights::load(ctx, &dir, &config, storage)?;
+        let hasher = match &config.ple {
+            Some(p) => Some(NgramHasher::new(
                 &p.layer_multipliers,
                 &p.head_vocab_sizes,
                 &p.head_offsets,
@@ -513,11 +611,45 @@ impl Qwen4ExpModel {
         };
         let attn_scale = 1.0 / (config.head_dim as f32).sqrt();
         let gdn_scale = 1.0 / (config.linear_key_head_dim as f32).sqrt();
-        Ok(Self { config, weights, attn_scale, gdn_scale, gdn_gate, ple_tables })
+        Ok(Self { config, weights, attn_scale, gdn_scale, gdn_gate, hasher })
     }
 
-    pub fn new_state(&self, ctx: &MetalContext, max_seq: usize) -> Result<DecodeState> {
-        ensure!(max_seq <= MAX_SEQ, "max_seq {max_seq} exceeds kernel limit {MAX_SEQ}");
+    /// The n-gram table, when the checkpoint has a PLE layer.
+    fn ple_table(&self) -> Option<&NgramTable> {
+        self.weights.layers.iter().find_map(|l| l.ple.as_ref()).map(|p| &p.table)
+    }
+
+    /// Stages the n-gram rows for `tokens` following `hist` into `p`: hashed
+    /// ids for a resident table, the rows themselves for a paged one. The GPU
+    /// must not be reading `p`.
+    fn stage_ngram(&self, w: &PleWeights, p: &PleScratch, tokens: &[u32], hist: [u32; 2]) -> Result<()> {
+        let hasher = self.hasher.as_ref().expect("PLE weights without hasher");
+        let mut ids = Vec::with_capacity(tokens.len() * hasher.heads());
+        hasher.ids(tokens, hist, &mut ids);
+        match &w.table {
+            NgramTable::Resident(_) => p.ids.write_bytes(bytemuck::cast_slice(&ids)),
+            NgramTable::Paged(table) => {
+                let stage = p.stage.as_ref().expect("paged table without staging");
+                stage.fill(table, &ids)
+            }
+        }
+    }
+
+    /// Encodes the table gather for `rows` tokens into `p.emb`.
+    fn gather_ngram(&self, ctx: &MetalContext, pass: &ComputePass<'_>, w: &PleWeights, p: &PleScratch, rows: usize) -> Result<()> {
+        let heads = self.config.ple.as_ref().expect("PLE config").ngram_heads();
+        match &w.table {
+            NgramTable::Resident(table) => ple::ple_gather_q4(ctx, pass, table, &p.ids, heads, &p.emb),
+            NgramTable::Paged(_) => {
+                let stage = p.stage.as_ref().expect("paged table without staging");
+                let staged = stage.as_table(rows * heads)?;
+                ple::ple_gather_q4(ctx, pass, &staged, &p.ids, heads, &p.emb)
+            }
+        }
+    }
+
+    pub fn new_state(&self, ctx: &MetalContext, capacity: usize) -> Result<DecodeState> {
+        let capacity = round_capacity(capacity)?;
         let cfg = &self.config;
         let c = cfg.gdn_conv_channels();
         let kd = cfg.linear_conv_kernel_dim;
@@ -539,46 +671,36 @@ impl Qwen4ExpModel {
                         Tensor::zeros(ctx, &[c, kd - 1], DType::BF16)?,
                     ],
                 }),
-                Mixer::Attn(_) => Ok(LayerState::Attn {
-                    k_cache: Tensor::zeros(
-                        ctx,
-                        &[cfg.num_key_value_heads, max_seq, cfg.head_dim],
-                        DType::BF16,
-                    )?,
-                    v_cache: Tensor::zeros(
-                        ctx,
-                        &[cfg.num_key_value_heads, max_seq, cfg.head_dim],
-                        DType::BF16,
-                    )?,
-                    idx_keys: Tensor::zeros(ctx, &[max_seq, INDEXER_D], DType::BF16)?,
-                    blk_keys: Tensor::zeros(
-                        ctx,
-                        &[(max_seq / ratio).max(1), INDEXER_D],
-                        DType::BF16,
-                    )?,
-                }),
+                Mixer::Attn(_) => DecodeState::attn_caches(
+                    ctx,
+                    cfg.num_key_value_heads,
+                    cfg.head_dim,
+                    ratio,
+                    capacity,
+                ),
             })
             .collect::<Result<Vec<_>>>()?;
-        let ple = match &cfg.ple {
-            Some(p) => {
-                let s = p.conv_state_len();
-                let state = PleState {
-                    hist: [
-                        Tensor::zeros(ctx, &[2], DType::U32)?,
-                        Tensor::zeros(ctx, &[2], DType::U32)?,
-                    ],
-                    conv_windows: [
-                        Tensor::zeros(ctx, &[cfg.hc_width(), s], DType::BF16)?,
-                        Tensor::zeros(ctx, &[cfg.hc_width(), s], DType::BF16)?,
-                    ],
-                    eos: p.eos_token_id,
-                };
-                state.reset()?;
-                Some(state)
-            }
-            None => None,
-        };
-        Ok(DecodeState { pos: 0, max_seq, layers, conv_slot: 0, ple })
+        let ple = cfg.ple.as_ref().map(|p| {
+            let s = p.conv_state_len();
+            Ok::<_, anyhow::Error>(PleState {
+                hist: [p.eos_token_id, p.eos_token_id],
+                conv_windows: [
+                    Tensor::zeros(ctx, &[cfg.hc_width(), s], DType::BF16)?,
+                    Tensor::zeros(ctx, &[cfg.hc_width(), s], DType::BF16)?,
+                ],
+                eos: p.eos_token_id,
+            })
+        }).transpose()?;
+        Ok(DecodeState {
+            pos: 0,
+            capacity,
+            layers,
+            conv_slot: 0,
+            ple,
+            kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            ratio,
+        })
     }
 
     /// Scratch whose split-decode and sparse-attention buffers are sized for
@@ -654,14 +776,14 @@ impl Qwen4ExpModel {
             idx_qk: Tensor::zeros(ctx, &[(nh + 1) * INDEXER_D], bf)?,
             idx_q: Tensor::zeros(ctx, &[nh, INDEXER_D], bf)?,
             qsa: QsaScratch::new(ctx, cfg, capacity_tokens, 1)?,
-            ple: cfg.ple.as_ref().map(|_| PleScratch::new(ctx, cfg, 1)).transpose()?,
+            ple: self.ple_table().map(|t| PleScratch::new(ctx, cfg, 1, t)).transpose()?,
             gdn_in,
             attn_qkv,
             mlp_gu,
             logits: Tensor::zeros(ctx, &[cfg.vocab_size], DType::F32)?,
             sdpa_partials: Tensor::zeros(ctx, &[nq, splits, hd], DType::F32)?,
             sdpa_stats: Tensor::zeros(ctx, &[nq, splits, 2], DType::F32)?,
-            argmax_partials: Tensor::zeros(ctx, &[2 * ARGMAX_GROUPS], DType::U32)?,
+            sampler: SamplerScratch::new(ctx, cfg.vocab_size)?,
             next_token: Tensor::zeros(ctx, &[2], DType::U32)?,
             dequant: Tensor::zeros(ctx, &[dequant_numel], bf)?,
             moe: MoeScratch::new(ctx, &moe_dims(cfg))?,
@@ -669,53 +791,78 @@ impl Qwen4ExpModel {
         })
     }
 
-    /// Submits one decode step whose input token is read on-GPU from
-    /// `next_token[slot_in]` and whose argmax lands in `next_token[slot_out]`,
-    /// without waiting (the depth-2 pipelined primitive). `pos` advances at
-    /// encode time.
-    pub fn submit_decode_step<'a>(
+    /// Encodes one decode step reading `next_token[slot_in]` and drawing
+    /// into `next_token[slot_out]`, without committing (the caller stages
+    /// the token's n-gram rows first, then commits and advances `pos`).
+    pub fn encode_decode_step<'a>(
         &self,
         ctx: &'a MetalContext,
-        state: &mut DecodeState,
+        state: &DecodeState,
         s: &Scratch,
         slot_in: usize,
         slot_out: usize,
-    ) -> Result<PendingPass<'a>> {
+        draw: Draw<'_>,
+    ) -> Result<EncodedPass<'a>> {
         let pass = ctx.begin_concurrent()?;
-        self.encode_decode_step(ctx, &pass, state, s, slot_in, slot_out)?;
-        state.pos += 1;
-        pass.commit()
+        self.encode_decode_graph(ctx, &pass, state, s, slot_in, slot_out, draw)?;
+        pass.end()
+    }
+
+    /// Host work for the step consuming `token`: stage its n-gram rows and
+    /// advance the hash history.
+    pub fn prepare_step_inputs(&self, state: &mut DecodeState, s: &Scratch, token: u32) -> Result<()> {
+        if let (Some(pst), Some(p)) = (&mut state.ple, &s.ple) {
+            let w = self.weights.layers.iter().find_map(|l| l.ple.as_deref()).expect("PLE state without weights");
+            self.stage_ngram(w, p, &[token], pst.hist)?;
+            pst.hist = NgramHasher::advance(pst.hist, &[token]);
+        }
+        Ok(())
     }
 
     /// Runs the prompt in batches of `PREFILL_CHUNK` tokens, one command
-    /// buffer per chunk. Logits are produced for the final prompt token only.
+    /// buffer per chunk. With `draw`, the final token's logits are sampled
+    /// into `next_token[0]`.
     pub fn prefill(
         &self,
         ctx: &MetalContext,
         state: &mut DecodeState,
         s: &mut Scratch,
         tokens: &[u32],
+        draw: Option<Draw<'_>>,
     ) -> Result<()> {
         ensure!(!tokens.is_empty(), "empty prompt");
+        state.ensure_capacity(ctx, state.pos + tokens.len())?;
         let needed = tokens.len().min(PREFILL_CHUNK);
         let have = s.prefill.as_ref().map_or(0, |p| p.m);
         if have < needed {
             let target = needed.next_power_of_two().min(PREFILL_CHUNK);
             s.prefill = None;
-            s.prefill =
-                Some(PrefillScratch::new(ctx, &self.config, target, state.max_seq)?);
+            s.prefill = Some(PrefillScratch::new(
+                ctx,
+                &self.config,
+                target,
+                MAX_SEQ,
+                self.ple_table(),
+            )?);
         }
         let s = &*s;
         let capacity = s
             .prefill
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("prefill scratch missing after growth"))?;
+        let ple_w = self.weights.layers.iter().find_map(|l| l.ple.as_deref());
         let mut remaining = tokens.len();
         for chunk in tokens.chunks(PREFILL_CHUNK) {
             let ps = capacity.chunk(chunk)?;
+            if let (Some(w), Some(p), Some(pst)) = (ple_w, &ps.ple, &state.ple) {
+                self.stage_ngram(w, p, chunk, pst.hist)?;
+            }
             remaining -= chunk.len();
-            self.encode_prefill_chunk(ctx, state, s, &ps, remaining == 0)?;
+            self.encode_prefill_chunk(ctx, state, s, &ps, if remaining == 0 { draw } else { None })?;
             state.pos += chunk.len();
+            if let Some(pst) = &mut state.ple {
+                pst.hist = NgramHasher::advance(pst.hist, chunk);
+            }
             // The chunk's recurrent kernels wrote the other window buffers.
             state.conv_slot = 1 - state.conv_slot;
         }
@@ -730,11 +877,11 @@ impl Qwen4ExpModel {
         state: &DecodeState,
         s: &Scratch,
         ps: &PrefillScratch,
-        want_logits: bool,
+        draw: Option<Draw<'_>>,
     ) -> Result<()> {
         let pass = ctx.begin()?;
         let m = ps.m;
-        ensure!(state.pos + m <= state.max_seq, "sequence full ({})", state.max_seq);
+        ensure!(state.pos + m <= state.capacity, "sequence full ({})", state.capacity);
         let cfg = &self.config;
         let (h, g) = (cfg.hidden_size, cfg.hc_count);
         let pos = state.pos;
@@ -796,7 +943,7 @@ impl Qwen4ExpModel {
             hc_inject_bf16(ctx, &pass, &ps.hyper, &ps.branch_out, &ps.hc.inj, h, g)?;
         }
 
-        if want_logits {
+        if let Some(draw) = draw {
             // Only the last prompt token feeds decoding: pull its stream row
             // into the single-token scratch and reuse the decode head path.
             gather_row_bf16(ctx, &pass, &ps.hyper, &s.hyper, m - 1)?;
@@ -811,7 +958,7 @@ impl Qwen4ExpModel {
             // Slot 0 by convention: the pipelined loop's first decode step
             // consumes the prefill token from this slot.
             let out = s.next_token.view(0, &[1])?;
-            argmax_f32(ctx, &pass, &s.logits, &s.argmax_partials, &out)?;
+            sample_f32(ctx, &pass, &s.logits, &s.sampler, draw.params, draw.step, &out)?;
         }
         pass.commit_wait()
     }
@@ -864,17 +1011,8 @@ impl Qwen4ExpModel {
     ) -> Result<()> {
         let cfg = &self.config;
         let ple = cfg.ple.as_ref().expect("PLE weights without PLE config");
-        let tables = self.ple_tables.as_ref().expect("PLE weights without hash tables");
         let (h, g, eps) = (cfg.hidden_size, cfg.hc_count, cfg.rms_norm_eps);
-        ple::ple_hash_ids(ctx, pass, tables, &ps.ids, &pst.hist[conv_slot], &p.ids)?;
-        ple::ple_hist_update(
-            ctx,
-            pass,
-            &ps.ids,
-            &pst.hist[conv_slot],
-            &pst.hist[1 - conv_slot],
-        )?;
-        ple::ple_gather_q4(ctx, pass, &w.table, &p.ids, ple.ngram_heads(), &p.emb)?;
+        self.gather_ngram(ctx, pass, w, p, ps.m)?;
         project_mat(ctx, pass, &p.emb, &w.key_proj, &p.key, &s.dequant)?;
         project_mat(ctx, pass, &p.emb, &w.value_proj, &p.value, &s.dequant)?;
         rmsnorm_grouped_bf16(
@@ -1155,7 +1293,8 @@ impl Qwen4ExpModel {
     /// Encodes one concurrent-dispatch decode graph at `state.pos`. The
     /// concurrent encoder has no implicit dispatch ordering: `level_barrier`
     /// marks every true inter-level data edge.
-    fn encode_decode_step(
+    #[allow(clippy::too_many_arguments)]
+    fn encode_decode_graph(
         &self,
         ctx: &MetalContext,
         pass: &ComputePass<'_>,
@@ -1163,8 +1302,9 @@ impl Qwen4ExpModel {
         s: &Scratch,
         slot_in: usize,
         slot_out: usize,
+        draw: Draw<'_>,
     ) -> Result<()> {
-        ensure!(state.pos < state.max_seq, "sequence full ({})", state.max_seq);
+        ensure!(state.pos < state.capacity, "sequence full ({})", state.capacity);
         let cfg = &self.config;
         let (h, g) = (cfg.hidden_size, cfg.hc_count);
         let conv_slot = state.conv_slot;
@@ -1179,7 +1319,7 @@ impl Qwen4ExpModel {
             if let (Some(ple_w), Some(ple_s), Some(pst)) =
                 (&layer.ple, &s.ple, &state.ple)
             {
-                self.ple_decode(ctx, pass, ple_w, ple_s, pst, conv_slot, s, &ids)?;
+                self.ple_decode(ctx, pass, ple_w, ple_s, pst, conv_slot, s)?;
             }
 
             self.hc_read_decode(ctx, pass, &layer.attn_hc, s)?;
@@ -1234,7 +1374,7 @@ impl Qwen4ExpModel {
         quant::gemv_quant(ctx, pass, &self.weights.lm_head, &s.hc.mixed, &s.logits)?;
         pass.level_barrier(&[&s.logits])?;
         let out = s.next_token.view(slot_out, &[1])?;
-        argmax_f32(ctx, pass, &s.logits, &s.argmax_partials, &out)?;
+        sample_f32(ctx, pass, &s.logits, &s.sampler, draw.params, draw.step, &out)?;
         pass.level_barrier(&[&s.next_token])?;
         Ok(())
     }
@@ -1286,14 +1426,11 @@ impl Qwen4ExpModel {
         pst: &PleState,
         conv_slot: usize,
         s: &Scratch,
-        token: &Tensor,
     ) -> Result<()> {
         let cfg = &self.config;
         let ple = cfg.ple.as_ref().expect("PLE weights without PLE config");
-        let tables = self.ple_tables.as_ref().expect("PLE weights without hash tables");
         let (h, g, eps) = (cfg.hidden_size, cfg.hc_count, cfg.rms_norm_eps);
-        let hist = &pst.hist[conv_slot];
-        ple::ple_hash_ids(ctx, pass, tables, token, hist, &p.ids)?;
+        self.gather_ngram(ctx, pass, w, p, 1)?;
         rmsnorm_grouped_bf16(
             ctx,
             pass,
@@ -1305,11 +1442,7 @@ impl Qwen4ExpModel {
             eps,
             NORM_WEIGHT_BIAS,
         )?;
-        pass.level_barrier(&[&p.ids, &p.query_n])?;
-        // The history advances in place once the hash has consumed it.
-        ple::ple_hist_update(ctx, pass, token, hist, hist)?;
-        ple::ple_gather_q4(ctx, pass, &w.table, &p.ids, ple.ngram_heads(), &p.emb)?;
-        pass.level_barrier(&[&p.emb, hist])?;
+        pass.level_barrier(&[&p.emb, &p.query_n])?;
         quant::gemv_quant(ctx, pass, &w.key_proj, &p.emb, &p.key)?;
         quant::gemv_quant(ctx, pass, &w.value_proj, &p.emb, &p.value)?;
         pass.level_barrier(&[&p.key, &p.value])?;
@@ -1515,13 +1648,138 @@ impl Qwen4ExpModel {
     }
 }
 
+/// Rounds a requested capacity up to the growth step, within the kernel limit.
+fn round_capacity(tokens: usize) -> Result<usize> {
+    ensure!(tokens <= MAX_SEQ, "capacity {tokens} exceeds kernel limit {MAX_SEQ}");
+    Ok(tokens.max(1).div_ceil(CAPACITY_STEP).saturating_mul(CAPACITY_STEP).min(MAX_SEQ))
+}
+
 impl DecodeStateApi for DecodeState {
+    type Snapshot = Snapshot;
+
     fn pos(&self) -> usize {
         self.pos
     }
 
+    fn advance(&mut self, n: usize) {
+        self.pos += n;
+    }
+
     fn reset(&mut self) -> Result<()> {
         DecodeState::reset(self)
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn ensure_capacity(&mut self, ctx: &MetalContext, tokens: usize) -> Result<()> {
+        if tokens <= self.capacity {
+            return Ok(());
+        }
+        let capacity = round_capacity(tokens)?;
+        let (kv_heads, head_dim, ratio) = (self.kv_heads, self.head_dim, self.ratio);
+        for lstate in &mut self.layers {
+            if let LayerState::Attn { k_cache, v_cache, idx_keys, blk_keys } = lstate {
+                let LayerState::Attn {
+                    k_cache: k2,
+                    v_cache: v2,
+                    idx_keys: i2,
+                    blk_keys: b2,
+                } = DecodeState::attn_caches(ctx, kv_heads, head_dim, ratio, capacity)?
+                else {
+                    unreachable!()
+                };
+                let mut copies = Vec::new();
+                head_block_copies(k_cache, &k2, self.pos, &mut copies)?;
+                head_block_copies(v_cache, &v2, self.pos, &mut copies)?;
+                row_copy(idx_keys, &i2, self.pos, &mut copies)?;
+                row_copy(blk_keys, &b2, self.pos.div_ceil(ratio), &mut copies)?;
+                ctx.blit_copy(&copies)?;
+                drop(copies);
+                *k_cache = k2;
+                *v_cache = v2;
+                *idx_keys = i2;
+                *blk_keys = b2;
+            }
+        }
+        self.capacity = capacity;
+        Ok(())
+    }
+
+    fn bytes(&self) -> usize {
+        let recurrent: usize = self
+            .layers
+            .iter()
+            .map(|l| match l {
+                LayerState::Gdn { state, conv_windows } => {
+                    state.byte_len() + conv_windows[0].byte_len() + conv_windows[1].byte_len()
+                }
+                LayerState::Attn { .. } => 0,
+            })
+            .sum();
+        let ple = self.ple.as_ref().map_or(0, |p| 2 * p.conv_windows[0].byte_len());
+        recurrent + ple + self.cache_bytes(self.capacity)
+    }
+
+    fn snapshot(&self, ctx: &MetalContext) -> Result<Snapshot> {
+        let slot = self.conv_slot;
+        let mut gdn = Vec::new();
+        for lstate in &self.layers {
+            if let LayerState::Gdn { state, conv_windows } = lstate {
+                gdn.push((clone_tensor(ctx, state)?, clone_tensor(ctx, &conv_windows[slot])?));
+            }
+        }
+        let ple = match &self.ple {
+            Some(p) => Some((p.hist, clone_tensor(ctx, &p.conv_windows[slot])?)),
+            None => None,
+        };
+        Ok(Snapshot { pos: self.pos, gdn, ple })
+    }
+
+    fn restore(&mut self, ctx: &MetalContext, snapshot: &Snapshot) -> Result<()> {
+        ensure!(snapshot.pos <= self.capacity, "snapshot position {} exceeds capacity {}", snapshot.pos, self.capacity);
+        let mut copies = Vec::new();
+        let mut saved = snapshot.gdn.iter();
+        for lstate in &self.layers {
+            if let LayerState::Gdn { state, conv_windows } = lstate {
+                let (s, w) = saved.next().ok_or_else(|| anyhow::anyhow!("snapshot has too few GDN layers"))?;
+                copies.push(BlitCopy { src: s, src_offset: 0, dst: state, dst_offset: 0, len: state.byte_len() });
+                copies.push(BlitCopy { src: w, src_offset: 0, dst: &conv_windows[0], dst_offset: 0, len: w.byte_len() });
+            }
+        }
+        ensure!(saved.next().is_none(), "snapshot has too many GDN layers");
+        match (&mut self.ple, &snapshot.ple) {
+            (Some(p), Some((hist, w))) => {
+                p.hist = *hist;
+                copies.push(BlitCopy { src: w, src_offset: 0, dst: &p.conv_windows[0], dst_offset: 0, len: w.byte_len() });
+            }
+            (None, None) => {}
+            _ => anyhow::bail!("snapshot PLE state mismatch"),
+        }
+        ctx.blit_copy(&copies)?;
+        self.pos = snapshot.pos;
+        self.conv_slot = 0;
+        Ok(())
+    }
+
+    fn copy_prefix_from(&mut self, ctx: &MetalContext, from: &Self, tokens: usize) -> Result<()> {
+        ensure!(tokens <= from.pos, "source state has fed {} tokens, {tokens} requested", from.pos);
+        self.ensure_capacity(ctx, tokens)?;
+        let mut copies = Vec::new();
+        for (dst, src) in self.layers.iter().zip(&from.layers) {
+            if let (
+                LayerState::Attn { k_cache, v_cache, idx_keys, blk_keys },
+                LayerState::Attn { k_cache: k0, v_cache: v0, idx_keys: i0, blk_keys: b0 },
+            ) = (dst, src)
+            {
+                head_block_copies(k0, k_cache, tokens, &mut copies)?;
+                head_block_copies(v0, v_cache, tokens, &mut copies)?;
+                row_copy(i0, idx_keys, tokens, &mut copies)?;
+                row_copy(b0, blk_keys, tokens.div_ceil(self.ratio), &mut copies)?;
+            }
+        }
+        ctx.blit_copy(&copies)
     }
 }
 
@@ -1532,6 +1790,10 @@ impl ScratchApi for Scratch {
 
     fn logits(&self) -> &Tensor {
         &self.logits
+    }
+
+    fn begin_request(&self) {
+        self.sampler.reset_counts();
     }
 
     /// The block selection of the last sparse-attention decode step (query
@@ -1557,8 +1819,8 @@ impl LanguageModel for Qwen4ExpModel {
 
     const MODEL_ID: &'static str = "Qwen3.8-Flash-Next";
 
-    fn load(ctx: &MetalContext, dir: &Path) -> Result<Self> {
-        Qwen4ExpModel::load(ctx, dir)
+    fn load(ctx: &MetalContext, dir: &Path, options: &LoadOptions) -> Result<Self> {
+        Qwen4ExpModel::load_with(ctx, dir, options.ngram_storage)
     }
 
     fn max_position_embeddings(&self) -> usize {
@@ -1573,8 +1835,21 @@ impl LanguageModel for Qwen4ExpModel {
         self.config.vocab_size
     }
 
-    fn new_state(&self, ctx: &MetalContext, max_seq: usize) -> Result<DecodeState> {
-        Qwen4ExpModel::new_state(self, ctx, max_seq)
+    fn bytes_per_token(&self) -> usize {
+        let cfg = &self.config;
+        let attn_layers = cfg.layer_types.iter().filter(|t| matches!(t, super::config::LayerType::FullAttention)).count();
+        attn_layers * (2 * cfg.num_key_value_heads * cfg.head_dim * 2 + INDEXER_D * 2 + INDEXER_D * 2 / cfg.indexer.compress_ratio)
+    }
+
+    fn warm_storage(&self) -> Result<u64> {
+        match self.ple_table() {
+            Some(NgramTable::Paged(table)) => table.preload(),
+            _ => Ok(0),
+        }
+    }
+
+    fn new_state(&self, ctx: &MetalContext, capacity: usize) -> Result<DecodeState> {
+        Qwen4ExpModel::new_state(self, ctx, capacity)
     }
 
     fn new_scratch_with_capacity(
@@ -1591,18 +1866,24 @@ impl LanguageModel for Qwen4ExpModel {
         state: &mut DecodeState,
         scratch: &mut Scratch,
         tokens: &[u32],
+        draw: Option<Draw<'_>>,
     ) -> Result<()> {
-        Qwen4ExpModel::prefill(self, ctx, state, scratch, tokens)
+        Qwen4ExpModel::prefill(self, ctx, state, scratch, tokens, draw)
     }
 
-    fn submit_decode_step<'a>(
+    fn prepare_step_inputs(&self, state: &mut DecodeState, scratch: &Scratch, token: u32) -> Result<()> {
+        Qwen4ExpModel::prepare_step_inputs(self, state, scratch, token)
+    }
+
+    fn encode_decode_step<'a>(
         &self,
         ctx: &'a MetalContext,
-        state: &mut DecodeState,
+        state: &DecodeState,
         scratch: &Scratch,
         slot_in: usize,
         slot_out: usize,
-    ) -> Result<PendingPass<'a>> {
-        Qwen4ExpModel::submit_decode_step(self, ctx, state, scratch, slot_in, slot_out)
+        draw: Draw<'_>,
+    ) -> Result<EncodedPass<'a>> {
+        Qwen4ExpModel::encode_decode_step(self, ctx, state, scratch, slot_in, slot_out, draw)
     }
 }

@@ -191,6 +191,13 @@ impl Tensor {
         self.buf.contents().as_ptr() as usize + self.offset
     }
 
+    /// Host pointer to the first element (honouring the view offset). The
+    /// caller owns the GPU-idle requirement and the length.
+    pub fn contents_ptr(&self) -> *mut u8 {
+        // SAFETY: shared-storage buffer; `offset` is within the allocation.
+        unsafe { self.buf.contents().as_ptr().cast::<u8>().add(self.offset) }
+    }
+
     fn contents(&self) -> &[u8] {
         // SAFETY: shared-storage buffer holding at least offset + numel*size
         // bytes (checked at construction); the GPU is idle when hosts read

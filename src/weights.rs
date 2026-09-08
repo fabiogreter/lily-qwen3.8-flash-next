@@ -209,6 +209,16 @@ impl<'a> Loader<'a> {
 }
 
 impl Loader<'_> {
+    pub(crate) fn checkpoint(&self) -> &Checkpoint {
+        &self.ckpt
+    }
+
+    /// Records a tensor as used without reading it (for weights served from
+    /// the checkpoint files at runtime).
+    pub(crate) fn mark_consumed(&self, name: &str) {
+        self.consumed.borrow_mut().insert(name.to_string());
+    }
+
     /// Reads one tensor straight into a fresh shared-storage Metal buffer.
     pub(crate) fn tensor(&self, name: &str) -> Result<Tensor> {
         self.consumed.borrow_mut().insert(name.to_string());

@@ -10,6 +10,7 @@ pub mod norm;
 pub mod ple;
 pub mod qsa;
 pub mod quant;
+pub mod sample;
 pub mod skinny;
 
 pub fn u32_bytes(v: usize) -> [u8; 4] {

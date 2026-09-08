@@ -1,7 +1,8 @@
 //! Optional end-to-end greedy golden for the only supported checkpoint.
 
 use anyhow::{Context, Result};
-use lily::generate::Generator;
+use lily::generate::{GenerateOptions, Generator};
+use lily::kernels::sample::SamplingParams;
 use lily::metal::MetalContext;
 use lily::model::Qwen3_5Model;
 use serde::Deserialize;
@@ -34,13 +35,16 @@ fn qwen36_35b_greedy_matches_golden() -> Result<()> {
     let capacity = golden.prompt_token_ids.len() + expected.len() + 1;
     let mut state = model.new_state(&ctx, capacity)?;
     let mut scratch = model.new_scratch_with_capacity(&ctx, capacity)?;
+    let greedy = SamplingParams::greedy();
+    let options = GenerateOptions { max_tokens: expected.len(), sampling: &greedy, stop_tokens: &[] };
     let actual = generator.generate(
         &ctx,
         &model,
         &mut state,
         &mut scratch,
         &golden.prompt_token_ids,
-        expected.len(),
+        &options,
+        &mut |_| Ok(true),
     )?;
     assert_eq!(actual.tokens, expected);
     Ok(())

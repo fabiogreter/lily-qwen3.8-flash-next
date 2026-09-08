@@ -6,6 +6,8 @@
 
 pub mod config;
 pub mod model;
+pub mod ngram;
 pub mod weights;
 
 pub use model::{DecodeState, Qwen4ExpModel, Scratch};
+pub use ngram::NgramStorage;

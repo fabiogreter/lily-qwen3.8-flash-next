@@ -57,6 +57,16 @@ impl TensorMeta {
     pub fn byte_len(&self) -> usize {
         (self.end - self.start) as usize
     }
+
+    /// The shard file holding this tensor.
+    pub fn shard(&self) -> &Path {
+        &self.shard
+    }
+
+    /// Absolute byte offset of the tensor data within its shard file.
+    pub fn start(&self) -> u64 {
+        self.start
+    }
 }
 
 /// A single tensor's entry in a safetensors JSON header.

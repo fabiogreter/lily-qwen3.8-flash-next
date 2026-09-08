@@ -51,6 +51,24 @@ pub struct Tokenizer {
     /// Ids that end a turn: the tokenizer's `eos_token`, plus whatever the
     /// caller adds from the checkpoint config.
     stop_tokens: Vec<u32>,
+    /// The template drops the reasoning block from older assistant turns
+    /// (Qwen3.6), so [`Self::render_chat`] writes an empty one in under
+    /// nothink to keep histories prefix-cacheable. Newer templates
+    /// (`preserve_thinking`) keep every block themselves.
+    legacy_nothink_rewrite: bool,
+}
+
+/// Everything a chat prompt render needs, in the template's own vocabulary.
+pub struct ChatRender<'a> {
+    /// Messages as the template expects them (`role`, `content` text,
+    /// optional `reasoning_content` and `tool_calls` with object arguments).
+    pub messages: &'a [serde_json::Value],
+    /// OpenAI tool definitions, verbatim.
+    pub tools: Option<&'a [serde_json::Value]>,
+    pub enable_thinking: bool,
+    /// `low`, `medium` or `xhigh`; `None` leaves the template default.
+    pub reasoning_effort: Option<&'a str>,
+    pub preserve_thinking: Option<bool>,
 }
 
 impl Tokenizer {
@@ -79,6 +97,7 @@ impl Tokenizer {
             };
 
         let template = Self::load_template(dir, &config)?;
+        let legacy_nothink_rewrite = !template.contains("preserve_thinking");
         let mut env = Environment::new();
         // HF templates are written against Python's `str`; minijinja only
         // ships the Jinja builtins, so string methods arrive through this
@@ -105,7 +124,43 @@ impl Tokenizer {
             stop_tokens.push(id);
         }
 
-        Ok(Self { inner, env, stop_tokens })
+        Ok(Self { inner, env, stop_tokens, legacy_nothink_rewrite })
+    }
+
+    /// Renders one prompt through the checkpoint's template exactly as given.
+    pub fn render(&self, chat: &ChatRender<'_>) -> Result<String> {
+        if chat.messages.is_empty() {
+            bail!("empty conversation");
+        }
+        let template = self.env.get_template("chat")?;
+        let mut ctx = minijinja::value::Value::from_serialize(serde_json::json!({
+            "messages": chat.messages,
+            "tools": chat.tools,
+            "add_generation_prompt": true,
+            "enable_thinking": chat.enable_thinking,
+        }));
+        // Only pass the optional knobs when set, so the template's own
+        // `is undefined` defaults apply otherwise.
+        let mut extra = serde_json::Map::new();
+        if let Some(effort) = chat.reasoning_effort {
+            extra.insert("reasoning_effort".into(), serde_json::Value::String(effort.into()));
+        }
+        if let Some(flag) = chat.preserve_thinking {
+            extra.insert("preserve_thinking".into(), serde_json::Value::Bool(flag));
+        }
+        if !extra.is_empty() {
+            ctx = minijinja::context! { ..ctx, ..Value::from_serialize(serde_json::Value::Object(extra)) };
+        }
+        Ok(template.render(ctx)?)
+    }
+
+    /// Whether `id` is a special (control) token such as `<|im_end|>`.
+    pub fn is_special(&self, id: u32) -> bool {
+        self.inner
+            .get_added_vocabulary()
+            .get_added_tokens_decoder()
+            .get(&id)
+            .is_some_and(|t| t.special)
     }
 
     fn load_template(dir: &Path, config: &serde_json::Value) -> Result<String> {
@@ -181,15 +236,13 @@ impl Tokenizer {
             bail!("empty conversation");
         }
         let messages = self.template_messages(messages, thinking)?;
-
-        let template = self.env.get_template("chat")?;
-        let rendered = template.render(minijinja::context! {
-            messages => Value::from_serialize(&messages),
-            tools => Value::from_serialize(Vec::<serde_json::Value>::new()),
-            add_generation_prompt => true,
-            enable_thinking => thinking == Thinking::Enabled,
-        })?;
-        Ok(rendered)
+        self.render(&ChatRender {
+            messages: &messages,
+            tools: None,
+            enable_thinking: thinking == Thinking::Enabled,
+            reasoning_effort: None,
+            preserve_thinking: None,
+        })
     }
 
     /// The message list as the template should see it: content flattened to
@@ -212,7 +265,8 @@ impl Tokenizer {
             // last user message; only the earlier ones need the block written
             // in by hand. Setting `reasoning_content` to a string also stops
             // the template splitting `</think>` back out of the content.
-            let needs_block = thinking == Thinking::Disabled
+            let needs_block = self.legacy_nothink_rewrite
+                && thinking == Thinking::Disabled
                 && message.role == Role::Assistant
                 && last_query.is_some_and(|last| index <= last);
             if needs_block {

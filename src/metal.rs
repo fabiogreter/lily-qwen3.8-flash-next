@@ -13,7 +13,8 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLBarrierScope, MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder,
+    MTLCommandQueue,
     MTLCompileOptions, MTLComputeCommandEncoder, MTLComputePassDescriptor,
     MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLDispatchType,
     MTLLanguageVersion, MTLLibrary, MTLResourceOptions, MTLSize,
@@ -323,10 +324,16 @@ impl<'a> ComputePass<'a> {
     /// N+1 while the GPU runs step N (the queue executes them in submit
     /// order).
     pub fn commit(self) -> Result<PendingPass<'a>> {
+        self.end()?.commit()
+    }
+
+    /// Ends encoding without submitting. The host may still write shared
+    /// buffers the encoded kernels read (a decode step's per-token inputs)
+    /// before [`EncodedPass::commit`] hands the work to the GPU.
+    pub fn end(self) -> Result<EncodedPass<'a>> {
         self.encoder.borrow().endEncoding();
         self.ended.set(true);
-        self.cmd.commit();
-        Ok(PendingPass { _ctx: std::marker::PhantomData, cmd: self.cmd.clone() })
+        Ok(EncodedPass { _ctx: std::marker::PhantomData, cmd: self.cmd.clone() })
     }
 
     /// Ends encoding, submits the command buffer, and blocks until the GPU
@@ -337,6 +344,83 @@ impl<'a> ComputePass<'a> {
         self.cmd.commit();
         self.cmd.waitUntilCompleted();
         Ok(())
+    }
+}
+
+/// A fully encoded, not yet submitted command buffer.
+pub struct EncodedPass<'a> {
+    _ctx: std::marker::PhantomData<&'a MetalContext>,
+    cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+}
+
+impl<'a> EncodedPass<'a> {
+    /// Submits without blocking.
+    pub fn commit(self) -> Result<PendingPass<'a>> {
+        self.cmd.commit();
+        Ok(PendingPass { _ctx: std::marker::PhantomData, cmd: self.cmd })
+    }
+}
+
+/// One buffer-to-buffer copy for [`MetalContext::blit_copy`], in bytes.
+pub struct BlitCopy<'t> {
+    pub src: &'t Tensor,
+    pub src_offset: usize,
+    pub dst: &'t Tensor,
+    pub dst_offset: usize,
+    pub len: usize,
+}
+
+impl MetalContext {
+    /// Copies byte ranges between buffers on the GPU's blit engine and waits.
+    /// Used for session forks and recurrent-state checkpoints, where a few
+    /// hundred megabytes move at memory speed instead of through the host.
+    pub fn blit_copy(&self, copies: &[BlitCopy<'_>]) -> Result<()> {
+        if copies.is_empty() {
+            return Ok(());
+        }
+        let cmd = self
+            .queue
+            .commandBuffer()
+            .ok_or_else(|| anyhow!("failed to create command buffer"))?;
+        let blit = cmd
+            .blitCommandEncoder()
+            .ok_or_else(|| anyhow!("failed to create blit command encoder"))?;
+        for copy in copies {
+            let (src, src_base) = copy.src.binding();
+            let (dst, dst_base) = copy.dst.binding();
+            ensure!(
+                copy.src_offset + copy.len <= copy.src.byte_len()
+                    && copy.dst_offset + copy.len <= copy.dst.byte_len(),
+                "blit copy out of range"
+            );
+            if copy.len == 0 {
+                continue;
+            }
+            unsafe {
+                blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                    src,
+                    src_base + copy.src_offset,
+                    dst,
+                    dst_base + copy.dst_offset,
+                    copy.len,
+                );
+            }
+        }
+        blit.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+        Ok(())
+    }
+
+    /// Metal's advice on how much this process may keep resident on the GPU
+    /// (the wired limit in practice), in bytes.
+    pub fn recommended_working_set(&self) -> usize {
+        self.device.recommendedMaxWorkingSetSize() as usize
+    }
+
+    /// Bytes currently allocated on the device by this process.
+    pub fn current_allocated(&self) -> usize {
+        self.device.currentAllocatedSize()
     }
 }
 

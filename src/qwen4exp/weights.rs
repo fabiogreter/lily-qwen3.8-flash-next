@@ -5,6 +5,7 @@
 //! be consumed or explicitly skip-listed so a name-scheme drift fails loudly.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Result, ensure};
 
@@ -14,6 +15,7 @@ use crate::tensor::Tensor;
 use crate::weights::{LinearWeights, Loader, MlpWeights, MoeWeights, expect_shape};
 
 use super::config::{LayerType, Qwen4ExpConfig};
+use super::ngram::{self, NgramStorage, NgramTable, PagedTable};
 
 const PREFIX: &str = "model.language_model.";
 /// The converter drops these; listing them keeps `finish` tolerant of a
@@ -36,8 +38,9 @@ pub struct HcWeights {
 
 /// Per-layer n-gram embedding module.
 pub struct PleWeights {
-    /// `[padded_vocab, head_dim]` hashed n-gram table, all shards in one buffer.
-    pub table: LinearWeights,
+    /// `[padded_vocab, head_dim]` hashed n-gram table: resident in one GPU
+    /// buffer, or paged from the checkpoint files.
+    pub table: NgramTable,
     /// `[hc_count * h, embed_dim]`.
     pub key_proj: LinearWeights,
     /// `[h, embed_dim]`.
@@ -298,22 +301,49 @@ fn load_ple(
     loader: &Loader<'_>,
     p: &str,
     config: &Qwen4ExpConfig,
+    storage: NgramStorage,
 ) -> Result<PleWeights> {
     let ple = config.ple.as_ref().expect("PLE layer without PLE config");
     let h = config.hidden_size;
     let wide = config.hc_width();
     let pp = format!("{p}ple.");
-    let shard_names: Vec<String> = (0..ple.table_shards)
-        .map(|i| format!("{pp}ple_embedding.ngram_embedding.shard_{i}"))
-        .collect();
-    let shard_refs: Vec<&str> = shard_names.iter().map(String::as_str).collect();
-    let table = loader.linear_grouped(
-        &shard_refs,
-        ple.head_dim(),
-        ple.quantization.group_size,
-    )?;
-    table.expect_features(ple.padded_vocab_size, ple.head_dim(), "ngram table")?;
-    ensure!(table.bits == ple.quantization.bits, "ngram table bit width mismatch");
+    let shard_names = ngram::shard_bases(&pp, ple.table_shards);
+    let table = match storage {
+        NgramStorage::Resident => {
+            let shard_refs: Vec<&str> = shard_names.iter().map(String::as_str).collect();
+            let table = loader.linear_grouped(
+                &shard_refs,
+                ple.head_dim(),
+                ple.quantization.group_size,
+            )?;
+            table.expect_features(ple.padded_vocab_size, ple.head_dim(), "ngram table")?;
+            ensure!(table.bits == ple.quantization.bits, "ngram table bit width mismatch");
+            NgramTable::Resident(Box::new(table))
+        }
+        NgramStorage::Paged => {
+            ensure!(
+                ple.quantization.bits == PagedTable::BITS,
+                "paged n-gram table supports {}-bit tables only",
+                PagedTable::BITS
+            );
+            for base in &shard_names {
+                loader.mark_consumed(&format!("{base}.weight"));
+                loader.mark_consumed(&format!("{base}.scales"));
+                loader.mark_consumed(&format!("{base}.biases"));
+            }
+            let table =
+                PagedTable::open(loader.checkpoint(), &shard_names, ple.quantization.group_size)?;
+            ensure!(
+                table.rows() == ple.padded_vocab_size && table.width() == ple.head_dim(),
+                "ngram table is [{}, {}], expected [{}, {}]",
+                table.rows(),
+                table.width(),
+                ple.padded_vocab_size,
+                ple.head_dim()
+            );
+            NgramTable::Paged(Arc::new(table))
+        }
+    };
 
     let key_proj = loader.linear(&[&format!("{pp}key_proj")], ple.embed_dim)?;
     key_proj.expect_features(wide, ple.embed_dim, "ple key_proj")?;
@@ -347,6 +377,7 @@ pub fn load(
     ctx: &MetalContext,
     dir: impl AsRef<Path>,
     config: &Qwen4ExpConfig,
+    storage: NgramStorage,
 ) -> Result<ModelWeights> {
     let ckpt = Checkpoint::open(&dir)?;
     ensure!(
@@ -369,7 +400,7 @@ pub fn load(
         let p = format!("{PREFIX}layers.{idx}.");
         let ple = match &config.ple {
             Some(ple) if ple.layer == idx => {
-                Some(Box::new(load_ple(&loader, &p, config)?))
+                Some(Box::new(load_ple(&loader, &p, config, storage)?))
             }
             _ => None,
         };

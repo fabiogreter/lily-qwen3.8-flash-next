@@ -8,7 +8,8 @@ use std::time::Instant;
 use anyhow::{Context as _, Result, ensure};
 use clap::Parser;
 use lily::chat::Message;
-use lily::engine::{LanguageModel, ScratchApi};
+use lily::engine::{DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi};
+use lily::kernels::sample::SamplingParams;
 use lily::generate::{Generator, Thinking};
 use lily::metal::MetalContext;
 use lily::model::Qwen3_5Model;
@@ -74,7 +75,7 @@ fn top_k(logits: &[f32], k: usize) -> (Vec<u32>, Vec<f32>) {
 fn probe<M: LanguageModel>(cli: &Cli) -> Result<Record> {
     let ctx = MetalContext::new()?;
     let started = Instant::now();
-    let model = M::load(&ctx, &cli.model)?;
+    let model = M::load(&ctx, &cli.model, &LoadOptions::default())?;
     let load_seconds = started.elapsed().as_secs_f64();
     let mut generator = Generator::from_model_dir(&cli.model)?;
     generator.add_stop_tokens(&model.eos_token_ids());
@@ -95,7 +96,8 @@ fn probe<M: LanguageModel>(cli: &Cli) -> Result<Record> {
     let mut scratch = model.new_scratch_with_capacity(&ctx, max_seq)?;
 
     let started = Instant::now();
-    model.prefill(&ctx, &mut state, &mut scratch, &prompt)?;
+    let greedy = SamplingParams::greedy();
+    model.prefill(&ctx, &mut state, &mut scratch, &prompt, Some(Draw { params: &greedy, step: 0 }))?;
     let prefill_seconds = started.elapsed().as_secs_f64();
 
     let read_step = |scratch: &M::Scratch,
@@ -113,8 +115,18 @@ fn probe<M: LanguageModel>(cli: &Cli) -> Result<Record> {
     let mut slot = 0usize;
     for step in 1..=cli.max_tokens {
         // Synchronous steps: each one's logits are read before the next runs.
-        let pending =
-            model.submit_decode_step(&ctx, &mut state, &scratch, slot, 1 - slot)?;
+        let input = steps.last().map(|s: &Step| s.chosen).expect("prefill step");
+        let encoded = model.encode_decode_step(
+            &ctx,
+            &state,
+            &scratch,
+            slot,
+            1 - slot,
+            Draw { params: &greedy, step },
+        )?;
+        model.prepare_step_inputs(&mut state, &scratch, input)?;
+        let pending = encoded.commit()?;
+        state.advance(1);
         pending.wait()?;
         slot = 1 - slot;
         steps.push(read_step(&scratch, slot, prompt.len() - 1 + step)?);

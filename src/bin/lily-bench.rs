@@ -3,7 +3,9 @@ use std::time::Instant;
 
 use anyhow::{Result, ensure};
 use clap::Parser;
-use lily::engine::{LanguageModel, ScratchApi};
+use lily::engine::{DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi};
+use lily::kernels::sample::SamplingParams;
+use lily::metal::PendingPass;
 use lily::kernels::attention::MAX_SEQ;
 use lily::metal::MetalContext;
 use lily::model::Qwen3_5Model;
@@ -40,6 +42,30 @@ fn main() -> Result<()> {
     }
 }
 
+const GREEDY: SamplingParams = SamplingParams::greedy();
+
+fn draw(step: usize) -> Draw<'static> {
+    Draw { params: &GREEDY, step }
+}
+
+/// Encodes, prepares and commits one step (no lookahead): the warm-up cadence.
+fn submit_step<'a, M: LanguageModel>(
+    model: &M,
+    ctx: &'a MetalContext,
+    state: &mut M::State,
+    scratch: &M::Scratch,
+    slot_in: usize,
+    slot_out: usize,
+    step: usize,
+) -> Result<PendingPass<'a>> {
+    let token = scratch.next_token().view(slot_in, &[1])?.to_u32()?[0];
+    let encoded = model.encode_decode_step(ctx, state, scratch, slot_in, slot_out, draw(step))?;
+    model.prepare_step_inputs(state, scratch, token)?;
+    let pending = encoded.commit()?;
+    state.advance(1);
+    Ok(pending)
+}
+
 fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
     ensure!(cli.prompt_len > 0, "--prompt-len must be positive");
     ensure!(cli.decode_steps > 0, "--decode-steps must be positive");
@@ -51,7 +77,7 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
     ensure!(max_seq <= MAX_SEQ, "benchmark exceeds model window {MAX_SEQ}");
 
     let ctx = MetalContext::new()?;
-    let model = M::load(&ctx, &cli.model)?;
+    let model = M::load(&ctx, &cli.model, &LoadOptions::default())?;
     let vocab = u32::try_from(model.vocab_size())?;
     let token = |index: usize| (index as u32).wrapping_mul(2_654_435_761) % vocab;
     let prompt: Vec<u32> = (0..cli.prompt_len).map(token).collect();
@@ -62,22 +88,21 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
     // shape-specialized Metal pipeline before the measured state is created.
     {
         let mut warm_state = model.new_state(&ctx, cli.prompt_len + 2)?;
-        model.prefill(&ctx, &mut warm_state, &mut scratch, &prompt)?;
-        let first = model.submit_decode_step(&ctx, &mut warm_state, &scratch, 0, 1)?;
-        let lookahead =
-            model.submit_decode_step(&ctx, &mut warm_state, &scratch, 1, 0)?;
+        model.prefill(&ctx, &mut warm_state, &mut scratch, &prompt, Some(draw(0)))?;
+        let first = submit_step(&model, &ctx, &mut warm_state, &scratch, 0, 1, 1)?;
+        let lookahead = submit_step(&model, &ctx, &mut warm_state, &scratch, 1, 0, 2)?;
         first.wait()?;
         lookahead.wait()?;
     }
 
     let mut state = model.new_state(&ctx, max_seq)?;
     let prefill_start = Instant::now();
-    model.prefill(&ctx, &mut state, &mut scratch, &prompt)?;
+    model.prefill(&ctx, &mut state, &mut scratch, &prompt, Some(draw(0)))?;
 
-    // Depth-2 production decode: submit the next command buffer before
-    // waiting for the previous one, with generated ids remaining on the GPU.
+    // Production cadence: the next step is encoded while the previous one
+    // runs and committed as soon as its input token has been read back.
     // Submit the first decode before token delivery and cadence timing.
-    let mut pending = model.submit_decode_step(&ctx, &mut state, &scratch, 0, 1)?;
+    let mut pending = submit_step(&model, &ctx, &mut state, &scratch, 0, 1, 1)?;
     let first_token_id = scratch.next_token().view(0, &[1])?.to_u32()?[0];
     let prefill_secs = prefill_start.elapsed().as_secs_f64();
     let decode_start = Instant::now();
@@ -86,13 +111,15 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
     let mut completed_passes =
         if cli.gpu_timing { Vec::with_capacity(cli.decode_steps) } else { Vec::new() };
     let mut token_ids = Vec::with_capacity(cli.decode_steps);
+    let mut prepare_secs = Vec::with_capacity(cli.decode_steps);
     for index in 1..cli.decode_steps {
-        let next = model.submit_decode_step(
+        let encoded = model.encode_decode_step(
             &ctx,
-            &mut state,
+            &state,
             &scratch,
             index % 2,
             (index + 1) % 2,
+            draw(index + 1),
         )?;
         let completed = if cli.gpu_timing {
             Some(pending.wait_retain()?)
@@ -100,7 +127,13 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
             pending.wait()?;
             None
         };
-        token_ids.push(scratch.next_token().view(index % 2, &[1])?.to_u32()?[0]);
+        let token = scratch.next_token().view(index % 2, &[1])?.to_u32()?[0];
+        let prepare_started = Instant::now();
+        model.prepare_step_inputs(&mut state, &scratch, token)?;
+        prepare_secs.push(prepare_started.elapsed().as_secs_f64());
+        let next = encoded.commit()?;
+        state.advance(1);
+        token_ids.push(token);
         let delivered = Instant::now();
         decode_intervals
             .push(delivered.duration_since(previous_delivery).as_secs_f64());
@@ -110,13 +143,14 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
         previous_delivery = delivered;
         pending = next;
     }
-    // Submit the final lookahead inside the cadence timer, then drain it outside.
-    let lookahead = model.submit_decode_step(
+    // Encode the final lookahead inside the cadence timer, then drain it outside.
+    let encoded = model.encode_decode_step(
         &ctx,
-        &mut state,
+        &state,
         &scratch,
         cli.decode_steps % 2,
         (cli.decode_steps + 1) % 2,
+        draw(cli.decode_steps + 1),
     )?;
     let completed = if cli.gpu_timing {
         Some(pending.wait_retain()?)
@@ -124,7 +158,11 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
         pending.wait()?;
         None
     };
-    token_ids.push(scratch.next_token().view(cli.decode_steps % 2, &[1])?.to_u32()?[0]);
+    let token = scratch.next_token().view(cli.decode_steps % 2, &[1])?.to_u32()?[0];
+    model.prepare_step_inputs(&mut state, &scratch, token)?;
+    let lookahead = encoded.commit()?;
+    state.advance(1);
+    token_ids.push(token);
     let delivered = Instant::now();
     decode_intervals.push(delivered.duration_since(previous_delivery).as_secs_f64());
     if let Some(completed) = completed {
@@ -191,6 +229,10 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
         },
     });
     std::fs::write(&cli.json_out, serde_json::to_vec_pretty(&report)?)?;
+    prepare_secs.sort_by(f64::total_cmp);
+    if let Some(median) = prepare_secs.get(prepare_secs.len() / 2) {
+        eprintln!("host prepare per step: median {:.3} ms, max {:.3} ms", median * 1e3, prepare_secs.last().copied().unwrap_or(0.0) * 1e3);
+    }
     eprintln!(
         "prefill: {} tok in {:.6}s ({:.1} tok/s) | decode: {} steps in {:.6}s ({:.1} tok/s) | digest={token_digest:016x}",
         cli.prompt_len,
