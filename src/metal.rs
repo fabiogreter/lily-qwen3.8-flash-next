@@ -705,3 +705,7 @@ fn encode_dispatch(
 #[cfg(test)]
 #[path = "../tests/unit/metal.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests/unit/metal4.rs"]
+mod tests_metal4;
