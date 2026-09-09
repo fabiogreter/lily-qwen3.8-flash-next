@@ -71,7 +71,9 @@ the resident table's logits exactly.
 ## Requirements
 
 - Apple GPU family 10 or later (M5 and newer)
-- macOS 26 or later for Metal tensor operations
+- macOS 26 or later: the engine submits through the Metal 4 command queue
+  (`MTL4CommandQueue`, argument tables, residency sets) and the GEMMs use
+  Metal tensor operations
 - Rust 1.92, pinned by `rust-toolchain.toml` (this repo drives it through
   asdf's `rustup`; `.tool-versions` names the asdf shim version)
 - A converted checkpoint (see above), or upstream's
