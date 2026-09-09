@@ -47,6 +47,10 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 # every GPU module on `target_os = "macos"` so the crate still type-checks
 # elsewhere.
 [target.'cfg(target_os = "macos")'.dependencies]
+# `block2` builds the Objective-C block the Metal 4 commit feedback handler
+# needs (GPU errors and timestamps); the version is the one objc2-metal
+# already pulls in.
+block2 = "0.6.2"
 objc2 = "0.6.4"
 objc2-foundation = "0.3.2"
 objc2-metal = "0.3.2"

@@ -5,7 +5,7 @@ use half::bf16;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLBuffer;
 
-use crate::metal::{Buffer, MetalContext};
+use crate::metal::{Buffer, GpuBuffer, MetalContext};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DType {
@@ -201,7 +201,7 @@ impl Tensor {
     }
 
     /// Buffer and byte offset, the pair every kernel binding needs.
-    pub fn binding(&self) -> (&ProtocolObject<dyn MTLBuffer>, usize) {
+    pub fn binding(&self) -> (&GpuBuffer, usize) {
         (&self.buf, self.offset)
     }
 

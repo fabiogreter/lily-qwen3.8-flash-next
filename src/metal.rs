@@ -1,30 +1,68 @@
-//! Metal device context: pipeline compilation/caching, buffer allocation, and
-//! serial or concurrent compute passes that batch kernel dispatches into one
-//! command buffer.
+//! Metal device context on the Metal 4 command model: pipeline
+//! compilation/caching, buffer allocation with explicit residency, and serial
+//! or concurrent compute passes that batch kernel dispatches into command
+//! buffers submitted through an `MTL4CommandQueue`.
+//!
+//! What Metal 4 changes for the engine, and how this module absorbs it so the
+//! rest of the crate keeps the `ComputePass` API it always had:
+//!
+//! - **No implicit ordering or hazard tracking.** Dispatches in one encoder
+//!   run concurrently unless a barrier says otherwise, and consecutive command
+//!   buffers on a queue may overlap. Serial passes therefore place a barrier
+//!   after every dispatch, concurrent passes keep their explicit level
+//!   barriers, and every command buffer opens with a queue-stage barrier so a
+//!   pass sees the writes of the pass before it. All barriers flush caches
+//!   (`MTL4VisibilityOptions::Device`); the execution-only variant is not a
+//!   memory barrier.
+//! - **No `setBuffer`/`setBytes`.** Kernel arguments bind through an argument
+//!   table by GPU address. Inline params are copied into a per-pass arena
+//!   buffer and bound by address; kernel binding indices are unchanged.
+//! - **No residency tracking.** Every buffer the context allocates joins one
+//!   residency set attached to the queue and leaves it when dropped; the set
+//!   is re-committed before the next submission when membership changed.
+//! - **No completion API on command buffers.** Each submission is followed by
+//!   a queue-level signal on the context's fence event; waiting on a pass is
+//!   waiting on that counter. Errors and GPU timestamps arrive through the
+//!   commit feedback handler.
+//! - **Command memory is explicit.** Passes encode into a command allocator
+//!   from a pool; an allocator returns to the pool once its pass completed
+//!   (or was dropped un-committed). Command buffers are single-use.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::ops::Deref;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, ensure};
-use core::ffi::c_void;
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use block2::RcBlock;
 use core::ptr::NonNull;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBarrierScope, MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus,
-    MTLCommandEncoder, MTLCommandQueue,
-    MTLCompileOptions, MTLComputeCommandEncoder, MTLComputePassDescriptor,
-    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLDispatchType,
-    MTLEvent, MTLLanguageVersion, MTLLibrary, MTLResourceOptions, MTLSharedEvent, MTLSize,
+    MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer,
+    MTL4CommandEncoder, MTL4CommandQueue, MTL4CommitFeedback, MTL4CommitOptions,
+    MTL4ComputeCommandEncoder, MTL4VisibilityOptions, MTLAllocation, MTLBuffer,
+    MTLCompileOptions, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLEvent, MTLLanguageVersion, MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor,
+    MTLResourceOptions, MTLSharedEvent, MTLSize, MTLStages,
 };
 
 use crate::tensor::Tensor;
 
 pub type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
-pub type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
+
+/// A device buffer handle. Cloning shares the allocation; the allocation
+/// leaves the residency set when the last handle drops. Like the context
+/// that allocated it, a buffer stays on the thread it was created on (Metal
+/// buffers are not `Send` in these bindings, and never were here).
+pub type Buffer = Rc<GpuBuffer>;
+
+/// The commit feedback callback Metal invokes per command buffer.
+type FeedbackHandler = RcBlock<dyn Fn(NonNull<ProtocolObject<dyn MTL4CommitFeedback>>)>;
 
 pub struct Kernel {
     pub pipeline: Pipeline,
@@ -75,9 +113,36 @@ impl MslVersion {
 /// than a silent heap fallback, so the bound stays honest.
 const MAX_KERNEL_PARAMS: usize = 16;
 
+/// Metal's buffer-argument limit; also the argument table's size.
+const MAX_BUFFER_BINDINGS: usize = 31;
+
+/// Alignment of every inline param in the arena. Metal asks for 4 on Apple
+/// GPUs; 16 also satisfies the widest param type kernels take (`uint4`).
+const PARAM_ALIGN: usize = 16;
+
+/// First arena chunk; a pass that outgrows it gets a larger one appended.
+const ARENA_CHUNK: usize = 1 << 20;
+
+/// The stages compute passes run in. Copies go through the compute encoder
+/// too, so barriers cover both.
+fn compute_stages() -> MTLStages {
+    MTLStages::Dispatch | MTLStages::Blit
+}
+
 pub struct MetalContext {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
-    queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    queue: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
+    residency: Rc<Residency>,
+    pool: Rc<Pool>,
+    /// Completion counter: every submission ends with a queue-level signal
+    /// of the next value; waiting on a pass waits on its value.
+    fence: SharedEvent,
+    fence_value: AtomicU64,
+    /// Serializes submissions so fence values are signaled in order.
+    submit: Mutex<()>,
+    /// First GPU error the commit feedback reported, surfaced by the next
+    /// wait or commit.
+    fault: Arc<Fault>,
     /// Keyed by function name and MSL version.
     pipelines: Mutex<HashMap<(&'static str, MslVersion), Pipeline>>,
 }
@@ -87,9 +152,23 @@ impl MetalContext {
         let device = MTLCreateSystemDefaultDevice()
             .ok_or_else(|| anyhow!("no Metal device found"))?;
         let queue = device
-            .newCommandQueue()
-            .ok_or_else(|| anyhow!("failed to create command queue"))?;
-        let ctx = Self { device, queue, pipelines: Mutex::new(HashMap::new()) };
+            .newMTL4CommandQueue()
+            .ok_or_else(|| anyhow!("failed to create a Metal 4 command queue (macOS 26 or later is required)"))?;
+        let residency = Rc::new(Residency::new(&device)?);
+        queue.addResidencySet(&residency.set);
+        let fence = SharedEvent::new(&device)?;
+        let pool = Rc::new(Pool { device: device.clone(), residency: residency.clone(), free: RefCell::new(Vec::new()) });
+        let ctx = Self {
+            device,
+            queue,
+            residency,
+            pool,
+            fence,
+            fence_value: AtomicU64::new(0),
+            submit: Mutex::new(()),
+            fault: Arc::new(Fault::default()),
+            pipelines: Mutex::new(HashMap::new()),
+        };
         // The production GEMM paths use native Metal tensor units.
         let family = ctx.apple_gpu_family();
         ensure!(
@@ -162,18 +241,10 @@ impl MetalContext {
         Ok(Kernel { pipeline })
     }
 
-    /// Allocates a zero-initialized shared-storage buffer.
+    /// Allocates a zero-initialized shared-storage buffer and makes it
+    /// resident for the queue.
     pub fn new_buffer(&self, len: usize) -> Result<Buffer> {
-        let buf = self
-            .device
-            .newBufferWithLength_options(
-                len.max(1),
-                MTLResourceOptions::StorageModeShared,
-            )
-            .ok_or_else(|| anyhow!("failed to allocate {len}-byte buffer"))?;
-        // Metal does not guarantee new buffer contents; callers rely on zeros.
-        unsafe { core::ptr::write_bytes(buf.contents().as_ptr().cast::<u8>(), 0, len) };
-        Ok(buf)
+        self.residency.new_buffer(&self.device, len)
     }
 
     pub fn new_buffer_with_bytes(&self, bytes: &[u8]) -> Result<Buffer> {
@@ -189,43 +260,43 @@ impl MetalContext {
         Ok(buf)
     }
 
-    /// Starts a compute pass. Dispatches encoded on one pass execute serially
-    /// The serial compute pass used by prefill and utility kernels.
+    /// Number of allocations currently in the queue's residency set (every
+    /// live buffer this context allocated, plus the pool's arenas).
+    pub fn resident_allocations(&self) -> usize {
+        self.residency.set.allocationCount()
+    }
+
+    /// Starts a serial compute pass: dispatches execute in encode order (a
+    /// barrier follows each one). Used by prefill and utility kernels.
     pub fn begin(&self) -> Result<ComputePass<'_>> {
         self.begin_pass(false)
     }
 
+    /// A compute pass whose dispatches may overlap; the caller owns every
+    /// hazard via [`ComputePass::memory_barrier`] at dependency boundaries.
+    /// Used by the concurrent decode path.
+    pub fn begin_concurrent(&self) -> Result<ComputePass<'_>> {
+        self.begin_pass(true)
+    }
+
     fn begin_pass(&self, concurrent: bool) -> Result<ComputePass<'_>> {
-        let cmd = self
-            .queue
-            .commandBuffer()
-            .ok_or_else(|| anyhow!("failed to create command buffer"))?;
-        let encoder = new_encoder(&cmd, concurrent)?;
+        let slot = self.pool.take()?;
         Ok(ComputePass {
-            _ctx: std::marker::PhantomData,
-            cmd,
-            encoder: RefCell::new(encoder),
-            ended: Cell::new(false),
+            ctx: self,
+            program: RefCell::new(Vec::new()),
+            open: RefCell::new(None),
             concurrent,
             done: RefCell::new(None),
+            slot: RefCell::new(slot),
         })
     }
 
     /// A host/GPU synchronization point for [`ComputePass::wait_event`]: the
-    /// GPU blocks mid-pass until the host has signaled at least the awaited
-    /// value. Lets a pass be committed before all of its inputs exist.
+    /// GPU blocks between two command buffers until the host has signaled at
+    /// least the awaited value. Lets a pass be committed before all of its
+    /// inputs exist.
     pub fn new_shared_event(&self) -> Result<SharedEvent> {
-        let event = self.device.newSharedEvent().ok_or_else(|| anyhow!("failed to create shared event"))?;
-        Ok(SharedEvent { event })
-    }
-
-    /// A compute pass whose single encoder uses `MTLDispatchType::Concurrent` —
-    /// Metal drops the serial encoder's implicit ordering, so dispatches may
-    /// overlap and the caller owns every hazard via
-    /// [`ComputePass::memory_barrier`] at dependency boundaries. Used by the
-    /// concurrent decode path.
-    pub fn begin_concurrent(&self) -> Result<ComputePass<'_>> {
-        self.begin_pass(true)
+        SharedEvent::new(&self.device)
     }
 
     /// Highest supported Apple GPU family number (10 for M5-class with
@@ -241,19 +312,262 @@ impl MetalContext {
             })
             .unwrap_or(0)
     }
+
+    /// Metal's advice on how much this process may keep resident on the GPU
+    /// (the wired limit in practice), in bytes.
+    pub fn recommended_working_set(&self) -> usize {
+        self.device.recommendedMaxWorkingSetSize() as usize
+    }
+
+    /// Bytes currently allocated on the device by this process.
+    pub fn current_allocated(&self) -> usize {
+        self.device.currentAllocatedSize()
+    }
+
+    /// Copies byte ranges between buffers on the GPU and waits. Used for
+    /// session forks and recurrent-state checkpoints, where a few hundred
+    /// megabytes move at memory speed instead of through the host.
+    pub fn blit_copy(&self, copies: &[BlitCopy<'_>]) -> Result<()> {
+        if copies.is_empty() {
+            return Ok(());
+        }
+        let pass = self.begin()?;
+        for copy in copies {
+            ensure!(
+                copy.src_offset + copy.len <= copy.src.byte_len()
+                    && copy.dst_offset + copy.len <= copy.dst.byte_len(),
+                "blit copy out of range"
+            );
+            if copy.len == 0 {
+                continue;
+            }
+            let (src, src_base) = copy.src.binding();
+            let (dst, dst_base) = copy.dst.binding();
+            pass.copy_buffer(src, src_base + copy.src_offset, dst, dst_base + copy.dst_offset, copy.len)?;
+        }
+        pass.commit_wait()
+    }
+
+    /// Submits a pass's program in order and signals the fence after it.
+    /// Returns the fence value to wait for.
+    fn submit(&self, program: &[Item], feedback: &Arc<Feedback>) -> Result<u64> {
+        self.fault.check()?;
+        let _guard = self.submit.lock().map_err(|e| anyhow!("submit lock poisoned: {e}"))?;
+        self.residency.flush();
+        for item in program {
+            match item {
+                Item::Cmd(cmd) => {
+                    let options = MTL4CommitOptions::new();
+                    let handler = feedback.handler(&self.fault);
+                    // SAFETY: the block pointer is valid for the call; the
+                    // options object copies the block.
+                    unsafe { options.addFeedbackHandler(RcBlock::as_ptr(&handler)) };
+                    let mut ptr = NonNull::from(&**cmd);
+                    // SAFETY: one valid command buffer pointer, count 1.
+                    unsafe { self.queue.commit_count_options(NonNull::from(&mut ptr), 1, &options) };
+                }
+                Item::Wait(event, value) => self.queue.waitForEvent_value(event.as_event(), *value),
+                Item::Signal(event, value) => self.queue.signalEvent_value(event.as_event(), *value),
+            }
+        }
+        let value = self.fence_value.fetch_add(1, Ordering::AcqRel) + 1;
+        self.queue.signalEvent_value(self.fence.as_event(), value);
+        Ok(value)
+    }
+
+    /// Blocks until the fence reaches `value`, bailing early on a reported
+    /// GPU fault.
+    fn wait_fence(&self, value: u64) -> Result<()> {
+        while !self.fence.event.waitUntilSignaledValue_timeoutMS(value, 1000) {
+            self.fault.check()?;
+        }
+        self.fault.check()
+    }
 }
 
-fn new_encoder(
-    cmd: &ProtocolObject<dyn MTLCommandBuffer>,
-    concurrent: bool,
-) -> Result<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>> {
-    if concurrent {
-        let desc = MTLComputePassDescriptor::computePassDescriptor();
-        desc.setDispatchType(MTLDispatchType::Concurrent);
-        cmd.computeCommandEncoderWithDescriptor(&desc)
-            .ok_or_else(|| anyhow!("failed to create concurrent compute encoder"))
-    } else {
-        cmd.computeCommandEncoder().ok_or_else(|| anyhow!("failed to create compute command encoder"))
+/// The context's residency set plus the bookkeeping to re-commit it lazily.
+struct Residency {
+    set: Retained<ProtocolObject<dyn MTLResidencySet>>,
+    /// Membership changed since the last commit.
+    dirty: Cell<bool>,
+}
+
+impl Residency {
+    fn new(device: &ProtocolObject<dyn MTLDevice>) -> Result<Self> {
+        let desc = MTLResidencySetDescriptor::new();
+        // SAFETY: plain property set on a fresh descriptor.
+        unsafe { desc.setInitialCapacity(4096) };
+        let set = device
+            .newResidencySetWithDescriptor_error(&desc)
+            .map_err(|e| anyhow!("failed to create residency set: {e:?}"))?;
+        set.commit();
+        set.requestResidency();
+        Ok(Self { set, dirty: Cell::new(false) })
+    }
+
+    fn new_buffer(self: &Rc<Self>, device: &ProtocolObject<dyn MTLDevice>, len: usize) -> Result<Buffer> {
+        let raw = device
+            .newBufferWithLength_options(len.max(1), MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| anyhow!("failed to allocate {len}-byte buffer"))?;
+        // Metal does not guarantee new buffer contents; callers rely on zeros.
+        unsafe { core::ptr::write_bytes(raw.contents().as_ptr().cast::<u8>(), 0, len) };
+        let address = raw.gpuAddress();
+        self.set.addAllocation(ProtocolObject::<dyn MTLAllocation>::from_ref(&*raw));
+        self.dirty.set(true);
+        Ok(Rc::new(GpuBuffer { raw, address, residency: self.clone() }))
+    }
+
+    fn remove(&self, raw: &ProtocolObject<dyn MTLBuffer>) {
+        self.set.removeAllocation(ProtocolObject::<dyn MTLAllocation>::from_ref(raw));
+        // Commit now so the memory is released promptly (the set retains
+        // members until commit); additions wait for the next submission.
+        self.set.commit();
+        self.dirty.set(false);
+    }
+
+    /// Commits pending additions; called before every submission.
+    fn flush(&self) {
+        if self.dirty.replace(false) {
+            self.set.commit();
+        }
+    }
+}
+
+/// A device buffer that is resident for the context's queue while alive.
+/// Derefs to the underlying `MTLBuffer`.
+pub struct GpuBuffer {
+    raw: Retained<ProtocolObject<dyn MTLBuffer>>,
+    address: u64,
+    residency: Rc<Residency>,
+}
+
+impl GpuBuffer {
+    /// The buffer's GPU virtual address (what argument tables bind).
+    pub fn address(&self) -> u64 {
+        self.address
+    }
+}
+
+impl Deref for GpuBuffer {
+    type Target = ProtocolObject<dyn MTLBuffer>;
+    fn deref(&self) -> &Self::Target {
+        &self.raw
+    }
+}
+
+impl Drop for GpuBuffer {
+    fn drop(&mut self) {
+        self.residency.remove(&self.raw);
+    }
+}
+
+/// Command allocators (plus the params arena and argument table that live
+/// with them) recycled across passes.
+struct Pool {
+    device: Retained<ProtocolObject<dyn MTLDevice>>,
+    residency: Rc<Residency>,
+    free: RefCell<Vec<SlotInner>>,
+}
+
+impl Pool {
+    fn take(self: &Rc<Self>) -> Result<Slot> {
+        let recycled = self.free.borrow_mut().pop();
+        let inner = match recycled {
+            Some(inner) => inner,
+            None => {
+                let allocator = self
+                    .device
+                    .newCommandAllocator()
+                    .ok_or_else(|| anyhow!("failed to create a Metal 4 command allocator"))?;
+                let desc = MTL4ArgumentTableDescriptor::new();
+                desc.setMaxBufferBindCount(MAX_BUFFER_BINDINGS);
+                let table = self
+                    .device
+                    .newArgumentTableWithDescriptor_error(&desc)
+                    .map_err(|e| anyhow!("failed to create argument table: {e:?}"))?;
+                SlotInner { allocator, table, arena: Arena::default() }
+            }
+        };
+        Ok(Slot { inner: Some(inner), pool: self.clone() })
+    }
+
+    fn recycle(&self, mut inner: SlotInner) {
+        inner.allocator.reset();
+        inner.arena.reset();
+        self.free.borrow_mut().push(inner);
+    }
+}
+
+struct SlotInner {
+    allocator: Retained<ProtocolObject<dyn MTL4CommandAllocator>>,
+    table: Retained<ProtocolObject<dyn MTL4ArgumentTable>>,
+    arena: Arena,
+}
+
+/// A pool slot on loan to a pass; returns to the pool on drop. Holders that
+/// committed work must not drop it before the GPU finished (the allocator
+/// is reset on return).
+struct Slot {
+    inner: Option<SlotInner>,
+    pool: Rc<Pool>,
+}
+
+impl Slot {
+    fn get(&mut self) -> &mut SlotInner {
+        self.inner.as_mut().expect("slot in use")
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            self.pool.recycle(inner);
+        }
+    }
+}
+
+/// Bump allocator for inline kernel params, in shared buffers the GPU reads
+/// by address. Chunks stay allocated across passes; the cursor rewinds.
+#[derive(Default)]
+struct Arena {
+    chunks: Vec<Buffer>,
+    chunk: usize,
+    cursor: usize,
+}
+
+impl Arena {
+    fn reset(&mut self) {
+        self.chunk = 0;
+        self.cursor = 0;
+    }
+
+    fn push(&mut self, pool: &Pool, bytes: &[u8]) -> Result<u64> {
+        let len = bytes.len().max(1);
+        loop {
+            if let Some(chunk) = self.chunks.get(self.chunk) {
+                let start = self.cursor.next_multiple_of(PARAM_ALIGN);
+                if start + len <= chunk.length() {
+                    // SAFETY: shared-storage buffer; [start, start+len) is
+                    // within it and unused by any encoded dispatch of this
+                    // arena's current lease.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            bytes.as_ptr(),
+                            chunk.contents().as_ptr().cast::<u8>().add(start),
+                            bytes.len(),
+                        );
+                    }
+                    self.cursor = start + len;
+                    return Ok(chunk.address() + start as u64);
+                }
+                self.chunk += 1;
+                self.cursor = 0;
+                continue;
+            }
+            let size = ARENA_CHUNK.max(len.next_power_of_two()) << self.chunks.len().min(8);
+            let chunk = pool.residency.new_buffer(&pool.device, size)?;
+            self.chunks.push(chunk);
+        }
     }
 }
 
@@ -267,6 +581,11 @@ pub struct SharedEvent {
 }
 
 impl SharedEvent {
+    fn new(device: &ProtocolObject<dyn MTLDevice>) -> Result<Self> {
+        let event = device.newSharedEvent().ok_or_else(|| anyhow!("failed to create shared event"))?;
+        Ok(Self { event })
+    }
+
     /// Raises the counter to `value` (never lower it: a pass may be waiting
     /// for the current value).
     pub fn signal(&self, value: u64) {
@@ -288,24 +607,133 @@ impl SharedEvent {
     }
 }
 
+/// First GPU error reported through commit feedback, context-wide.
+#[derive(Default)]
+struct Fault {
+    message: Mutex<Option<String>>,
+}
+
+impl Fault {
+    fn record(&self, message: String) {
+        if let Ok(mut slot) = self.message.lock() {
+            slot.get_or_insert(message);
+        }
+    }
+
+    fn check(&self) -> Result<()> {
+        match self.message.lock() {
+            Ok(slot) => match &*slot {
+                Some(message) => bail!("Metal command buffer failed: {message}"),
+                None => Ok(()),
+            },
+            Err(e) => bail!("fault lock poisoned: {e}"),
+        }
+    }
+}
+
+/// Commit feedback for one pass: how many of its command buffers reported,
+/// their GPU time span, and any error.
+struct Feedback {
+    expected: usize,
+    state: Mutex<FeedbackState>,
+}
+
+#[derive(Default)]
+struct FeedbackState {
+    received: usize,
+    error: Option<String>,
+    gpu_start_secs: f64,
+    gpu_end_secs: f64,
+}
+
+impl Feedback {
+    fn new(expected: usize) -> Arc<Self> {
+        Arc::new(Self { expected, state: Mutex::new(FeedbackState::default()) })
+    }
+
+    fn handler(self: &Arc<Self>, fault: &Arc<Fault>) -> FeedbackHandler {
+        let feedback = self.clone();
+        let fault = fault.clone();
+        RcBlock::new(move |fb: NonNull<ProtocolObject<dyn MTL4CommitFeedback>>| {
+            // SAFETY: Metal hands a valid feedback object for the callback.
+            let fb = unsafe { fb.as_ref() };
+            let error = fb.error().map(|e| format!("{e:?}"));
+            let (start, end) = (fb.GPUStartTime(), fb.GPUEndTime());
+            if let Some(message) = &error {
+                fault.record(message.clone());
+            }
+            if let Ok(mut state) = feedback.state.lock() {
+                if state.received == 0 || start < state.gpu_start_secs {
+                    state.gpu_start_secs = start;
+                }
+                if end > state.gpu_end_secs {
+                    state.gpu_end_secs = end;
+                }
+                if state.error.is_none() {
+                    state.error = error;
+                }
+                state.received += 1;
+            }
+        })
+    }
+
+    /// Waits for every command buffer's feedback (it arrives shortly after
+    /// the fence) and returns the recorded span.
+    fn complete(&self) -> Result<FeedbackState> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let state = self.state.lock().map_err(|e| anyhow!("feedback lock poisoned: {e}"))?;
+                if state.received >= self.expected {
+                    return Ok(FeedbackState {
+                        received: state.received,
+                        error: state.error.clone(),
+                        gpu_start_secs: state.gpu_start_secs,
+                        gpu_end_secs: state.gpu_end_secs,
+                    });
+                }
+            }
+            ensure!(Instant::now() < deadline, "commit feedback did not arrive");
+            std::thread::sleep(Duration::from_micros(50));
+        }
+    }
+}
+
+/// One element of a pass's submission program.
+enum Item {
+    Cmd(Retained<ProtocolObject<dyn MTL4CommandBuffer>>),
+    Wait(SharedEvent, u64),
+    Signal(SharedEvent, u64),
+}
+
+struct OpenSegment {
+    cmd: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
+    encoder: Retained<ProtocolObject<dyn MTL4ComputeCommandEncoder>>,
+}
+
 pub struct ComputePass<'a> {
-    _ctx: std::marker::PhantomData<&'a MetalContext>,
-    cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
-    encoder: RefCell<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
-    ended: Cell<bool>,
+    ctx: &'a MetalContext,
+    /// Closed command buffers and the queue operations between them.
+    program: RefCell<Vec<Item>>,
+    /// The command buffer being encoded, opened lazily by the first command
+    /// after a queue operation.
+    open: RefCell<Option<OpenSegment>>,
     concurrent: bool,
     /// The event and value [`Self::signal_done`] encoded, if any.
     done: RefCell<Option<(SharedEvent, u64)>>,
+    // Declared last: command buffers must drop before their allocator is
+    // recycled.
+    slot: RefCell<Slot>,
 }
 
 impl Drop for ComputePass<'_> {
     fn drop(&mut self) {
-        // Metal asserts if an encoder is released mid-encoding; close it so an
-        // error path (`?` between dispatches) surfaces the error instead of
-        // trapping in the destructor. The unfinished command buffer is simply
-        // never committed.
-        if !self.ended.get() {
-            self.encoder.borrow().endEncoding();
+        // An error path (`?` between dispatches) leaves a segment open; close
+        // it so the encoder and command buffer are released cleanly. Nothing
+        // is committed.
+        if let Some(seg) = self.open.borrow_mut().take() {
+            seg.encoder.endEncoding();
+            seg.cmd.endCommandBuffer();
         }
     }
 }
@@ -321,36 +749,113 @@ pub enum Grid {
 }
 
 impl<'a> ComputePass<'a> {
+    /// Runs `f` on the open segment's encoder and argument table, opening a
+    /// command buffer first if none is.
+    fn with_encoder<R>(
+        &self,
+        f: impl FnOnce(&ProtocolObject<dyn MTL4ComputeCommandEncoder>, &mut SlotInner, &Pool) -> Result<R>,
+    ) -> Result<R> {
+        let mut open = self.open.borrow_mut();
+        let mut slot = self.slot.borrow_mut();
+        let inner = slot.get();
+        if open.is_none() {
+            let cmd = self
+                .ctx
+                .device
+                .newCommandBuffer()
+                .ok_or_else(|| anyhow!("failed to create a Metal 4 command buffer"))?;
+            cmd.beginCommandBufferWithAllocator(&inner.allocator);
+            let encoder = cmd
+                .computeCommandEncoder()
+                .ok_or_else(|| anyhow!("failed to create a Metal 4 compute encoder"))?;
+            // Consume everything earlier submissions wrote: Metal 4 does not
+            // order command buffers' memory effects on its own.
+            encoder.barrierAfterQueueStages_beforeStages_visibilityOptions(
+                compute_stages(),
+                compute_stages(),
+                MTL4VisibilityOptions::Device,
+            );
+            encoder.setArgumentTable(Some(&inner.table));
+            *open = Some(OpenSegment { cmd, encoder });
+        }
+        let seg = open.as_ref().expect("segment open");
+        f(&seg.encoder, inner, &self.ctx.pool)
+    }
+
+    /// Closes the open command buffer (if any) into the program.
+    fn close_segment(&self) {
+        if let Some(seg) = self.open.borrow_mut().take() {
+            seg.encoder.endEncoding();
+            seg.cmd.endCommandBuffer();
+            self.program.borrow_mut().push(Item::Cmd(seg.cmd));
+        }
+    }
+
     /// Encodes one kernel dispatch with a byte offset per buffer binding — used
     /// to bind slices of a larger buffer (e.g. the q/k/v thirds of the fused
     /// GDN projection). Offsets must be 4-byte aligned per Metal's rules.
     pub fn dispatch_at(
         &self,
         kernel: &Kernel,
-        buffers: &[(&ProtocolObject<dyn MTLBuffer>, usize)],
+        buffers: &[(&GpuBuffer, usize)],
         params: &[&[u8]],
         grid: Grid,
     ) -> Result<()> {
-        // Validate params before any encoder exists so an error can't leave an
-        // encoder open -- but into a stack array, not a Vec. This runs once per
-        // dispatch and a decode step submits hundreds of them, so the collect
-        // would be a malloc/free pair on the latency-sensitive host path.
         ensure!(
             params.len() <= MAX_KERNEL_PARAMS,
             "{} kernel params exceeds MAX_KERNEL_PARAMS ({MAX_KERNEL_PARAMS})",
             params.len()
         );
-        let mut param_buf =
-            [(NonNull::<c_void>::dangling(), 0usize); MAX_KERNEL_PARAMS];
-        for (slot, bytes) in param_buf.iter_mut().zip(params) {
-            let ptr = NonNull::new(bytes.as_ptr().cast::<c_void>().cast_mut())
-                .context("empty kernel param")?;
-            *slot = (ptr, bytes.len());
-        }
-        let param_ptrs = param_buf.get(..params.len()).context("param slice")?;
+        ensure!(
+            buffers.len() + params.len() <= MAX_BUFFER_BINDINGS,
+            "{} buffer bindings exceeds Metal's limit of {MAX_BUFFER_BINDINGS}",
+            buffers.len() + params.len()
+        );
+        let serial = !self.concurrent;
+        self.with_encoder(|encoder, inner, pool| {
+            encoder.setComputePipelineState(&kernel.pipeline);
+            for (i, (buf, offset)) in buffers.iter().enumerate() {
+                // SAFETY: the address lies within a resident buffer.
+                unsafe { inner.table.setAddress_atIndex(buf.address() + *offset as u64, i) };
+            }
+            for (i, bytes) in params.iter().enumerate() {
+                ensure!(!bytes.is_empty(), "empty kernel param");
+                let address = inner.arena.push(pool, bytes)?;
+                // SAFETY: the address lies within a resident arena chunk.
+                unsafe { inner.table.setAddress_atIndex(address, buffers.len() + i) };
+            }
+            let size = |(w, h, d): (usize, usize, usize)| MTLSize { width: w, height: h, depth: d };
+            match grid {
+                Grid::Threads { grid, threadgroup } => {
+                    encoder.dispatchThreads_threadsPerThreadgroup(size(grid), size(threadgroup));
+                }
+                Grid::Threadgroups { groups, threadgroup } => {
+                    encoder.dispatchThreadgroups_threadsPerThreadgroup(size(groups), size(threadgroup));
+                }
+            }
+            if serial {
+                encoder_barrier(encoder);
+            }
+            Ok(())
+        })
+    }
 
-        encode_dispatch(&self.encoder.borrow(), kernel, buffers, param_ptrs, grid);
-        Ok(())
+    /// Copies `len` bytes between buffers (any alignment), ordered like a
+    /// dispatch of this pass.
+    pub fn copy_buffer(&self, src: &GpuBuffer, src_offset: usize, dst: &GpuBuffer, dst_offset: usize, len: usize) -> Result<()> {
+        let serial = !self.concurrent;
+        self.with_encoder(|encoder, _inner, _pool| {
+            // SAFETY: ranges validated by the caller against the buffer sizes.
+            unsafe {
+                encoder.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                    src, src_offset, dst, dst_offset, len,
+                );
+            }
+            if serial {
+                encoder_barrier(encoder);
+            }
+            Ok(())
+        })
     }
 
     /// Orders one dependency level before the next on a concurrent encoder.
@@ -359,17 +864,15 @@ impl<'a> ComputePass<'a> {
     }
 
     /// Makes the GPU block here until the host has signaled `event` to at
-    /// least `value`. Everything encoded before completes first (the wait sits
-    /// between two encoders), so this also acts as a full barrier. The pass
-    /// can then be committed before the inputs read after this point exist;
-    /// the host writes them and signals. A pass committed with an unsatisfied
-    /// wait holds the whole queue, so every path after commit must signal
-    /// (or [`SharedEvent::release_all`]).
+    /// least `value`. Everything encoded before completes first (the wait
+    /// sits between two command buffers), so this also acts as a full
+    /// barrier. The pass can then be committed before the inputs read after
+    /// this point exist; the host writes them and signals. A pass committed
+    /// with an unsatisfied wait holds the whole queue, so every path after
+    /// commit must signal (or [`SharedEvent::release_all`]).
     pub fn wait_event(&self, event: &SharedEvent, value: u64) -> Result<()> {
-        self.encoder.borrow().endEncoding();
-        self.cmd.encodeWaitForEvent_value(event.as_event(), value);
-        let encoder = new_encoder(&self.cmd, self.concurrent)?;
-        *self.encoder.borrow_mut() = encoder;
+        self.close_segment();
+        self.program.borrow_mut().push(Item::Wait(event.clone(), value));
         Ok(())
     }
 
@@ -377,18 +880,21 @@ impl<'a> ComputePass<'a> {
     /// this point has completed (the host can wait on the event, or poll
     /// [`SharedEvent::signaled_value`], instead of on the whole pass).
     pub fn signal_event(&self, event: &SharedEvent, value: u64) -> Result<()> {
-        self.encoder.borrow().endEncoding();
-        self.cmd.encodeSignalEvent_value(event.as_event(), value);
-        let encoder = new_encoder(&self.cmd, self.concurrent)?;
-        *self.encoder.borrow_mut() = encoder;
+        self.close_segment();
+        self.program.borrow_mut().push(Item::Signal(event.clone(), value));
         Ok(())
     }
 
     /// Orders all prior dispatches' buffer writes before every subsequent
     /// dispatch — the dependency-level boundary for [`MetalContext::
-    /// begin_concurrent`] passes. Serial encoders safely ignore it.
+    /// begin_concurrent`] passes. Serial passes already order every dispatch.
     pub fn memory_barrier(&self) -> Result<()> {
-        self.encoder.borrow().memoryBarrierWithScope(MTLBarrierScope::Buffers);
+        if self.concurrent {
+            self.with_encoder(|encoder, _inner, _pool| {
+                encoder_barrier(encoder);
+                Ok(())
+            })?;
+        }
         Ok(())
     }
 
@@ -404,65 +910,82 @@ impl<'a> ComputePass<'a> {
     /// buffers the encoded kernels read (a decode step's per-token inputs)
     /// before [`EncodedPass::commit`] hands the work to the GPU.
     pub fn end(self) -> Result<EncodedPass<'a>> {
-        self.encoder.borrow().endEncoding();
-        self.ended.set(true);
-        Ok(EncodedPass { _ctx: std::marker::PhantomData, cmd: self.cmd.clone(), done: self.done.borrow().clone() })
+        self.close_segment();
+        let program = std::mem::take(&mut *self.program.borrow_mut());
+        let done = self.done.borrow().clone();
+        let slot = self.slot.replace(Slot { inner: None, pool: self.ctx.pool.clone() });
+        Ok(EncodedPass { ctx: self.ctx, program, done, slot })
     }
 
     /// Encodes, as the pass's last command, a GPU signal of `event` to
     /// `value`, and remembers it: [`PendingPass::wait_paced`] then polls the
     /// event (which the GPU writes directly) instead of blocking on the
-    /// command buffer, whose completion the host only learns of ~0.1 ms
-    /// later. Call after everything else is encoded.
+    /// fence. Call after everything else is encoded.
     pub fn signal_done(&self, event: &SharedEvent, value: u64) -> Result<()> {
         self.signal_event(event, value)?;
         *self.done.borrow_mut() = Some((event.clone(), value));
         Ok(())
     }
 
-    /// Ends encoding, submits the command buffer, and blocks until the GPU
-    /// finishes.
+    /// Ends encoding, submits, and blocks until the GPU finishes.
     pub fn commit_wait(self) -> Result<()> {
-        self.encoder.borrow().endEncoding();
-        self.ended.set(true);
-        self.cmd.commit();
-        self.cmd.waitUntilCompleted();
-        Ok(())
+        self.commit()?.wait()
     }
 }
 
-/// A fully encoded, not yet submitted command buffer.
+/// A full barrier between dispatches of one encoder, caches flushed.
+fn encoder_barrier(encoder: &ProtocolObject<dyn MTL4ComputeCommandEncoder>) {
+    encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+        compute_stages(),
+        compute_stages(),
+        MTL4VisibilityOptions::Device,
+    );
+}
+
+/// A fully encoded, not yet submitted pass.
 pub struct EncodedPass<'a> {
-    _ctx: std::marker::PhantomData<&'a MetalContext>,
-    cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    ctx: &'a MetalContext,
+    program: Vec<Item>,
     done: Option<(SharedEvent, u64)>,
+    slot: Slot,
 }
 
 impl<'a> EncodedPass<'a> {
     /// Submits without blocking.
     pub fn commit(self) -> Result<PendingPass<'a>> {
-        self.cmd.commit();
-        Ok(PendingPass { _ctx: std::marker::PhantomData, cmd: self.cmd, done: self.done })
+        let cmds = self.program.iter().filter(|item| matches!(item, Item::Cmd(_))).count();
+        let feedback = Feedback::new(cmds);
+        let fence_value = self.ctx.submit(&self.program, &feedback)?;
+        Ok(PendingPass {
+            ctx: self.ctx,
+            program: self.program,
+            fence_value,
+            done: self.done,
+            feedback,
+            slot: Some(self.slot),
+        })
     }
 
     /// Drops the context lifetime so the pass can be kept inside long-lived
     /// state (passes encoded ahead for several possible outcomes). The
     /// context must outlive it; [`DetachedPass::attach`] restores the tie.
     pub fn detach(self) -> DetachedPass {
-        DetachedPass { cmd: self.cmd, done: self.done }
+        DetachedPass { program: self.program, done: self.done, slot: self.slot }
     }
 }
 
 /// An [`EncodedPass`] held without its context lifetime; see
-/// [`EncodedPass::detach`].
+/// [`EncodedPass::detach`]. Dropping it un-committed returns its command
+/// memory to the pool.
 pub struct DetachedPass {
-    cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    program: Vec<Item>,
     done: Option<(SharedEvent, u64)>,
+    slot: Slot,
 }
 
 impl DetachedPass {
-    pub fn attach<'a>(self, _ctx: &'a MetalContext) -> EncodedPass<'a> {
-        EncodedPass { _ctx: std::marker::PhantomData, cmd: self.cmd, done: self.done }
+    pub fn attach<'a>(self, ctx: &'a MetalContext) -> EncodedPass<'a> {
+        EncodedPass { ctx, program: self.program, done: self.done, slot: self.slot }
     }
 }
 
@@ -475,67 +998,28 @@ pub struct BlitCopy<'t> {
     pub len: usize,
 }
 
-impl MetalContext {
-    /// Copies byte ranges between buffers on the GPU's blit engine and waits.
-    /// Used for session forks and recurrent-state checkpoints, where a few
-    /// hundred megabytes move at memory speed instead of through the host.
-    pub fn blit_copy(&self, copies: &[BlitCopy<'_>]) -> Result<()> {
-        if copies.is_empty() {
-            return Ok(());
-        }
-        let cmd = self
-            .queue
-            .commandBuffer()
-            .ok_or_else(|| anyhow!("failed to create command buffer"))?;
-        let blit = cmd
-            .blitCommandEncoder()
-            .ok_or_else(|| anyhow!("failed to create blit command encoder"))?;
-        for copy in copies {
-            let (src, src_base) = copy.src.binding();
-            let (dst, dst_base) = copy.dst.binding();
-            ensure!(
-                copy.src_offset + copy.len <= copy.src.byte_len()
-                    && copy.dst_offset + copy.len <= copy.dst.byte_len(),
-                "blit copy out of range"
-            );
-            if copy.len == 0 {
-                continue;
-            }
-            unsafe {
-                blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                    src,
-                    src_base + copy.src_offset,
-                    dst,
-                    dst_base + copy.dst_offset,
-                    copy.len,
-                );
-            }
-        }
-        blit.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
-        Ok(())
-    }
-
-    /// Metal's advice on how much this process may keep resident on the GPU
-    /// (the wired limit in practice), in bytes.
-    pub fn recommended_working_set(&self) -> usize {
-        self.device.recommendedMaxWorkingSetSize() as usize
-    }
-
-    /// Bytes currently allocated on the device by this process.
-    pub fn current_allocated(&self) -> usize {
-        self.device.currentAllocatedSize()
-    }
-}
-
 /// A committed-but-unawaited pass. Holding one while encoding the next pass
 /// is the decode pipelining primitive; hosts must not read buffers the
-/// pending pass writes until [`Self::wait`] returns.
+/// pending pass writes until [`Self::wait`] returns. Dropping it without
+/// waiting blocks until the GPU is done (its command memory is recycled).
 pub struct PendingPass<'a> {
-    _ctx: std::marker::PhantomData<&'a MetalContext>,
-    cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    ctx: &'a MetalContext,
+    /// Kept alive until completion.
+    program: Vec<Item>,
+    fence_value: u64,
     done: Option<(SharedEvent, u64)>,
+    feedback: Arc<Feedback>,
+    slot: Option<Slot>,
+}
+
+impl Drop for PendingPass<'_> {
+    fn drop(&mut self) {
+        if self.slot.is_some() {
+            let _ = self.ctx.wait_fence(self.fence_value);
+            self.program.clear();
+            self.slot = None;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -545,18 +1029,18 @@ pub struct PassTiming {
 }
 
 pub struct CompletedPass {
-    cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    feedback: Arc<Feedback>,
 }
 
 impl CompletedPass {
+    /// The pass's GPU time span, from commit feedback (which arrives shortly
+    /// after the pass's fence signal; this waits for it).
     pub fn timing(&self) -> Result<PassTiming> {
-        // A pass observed through its done signal may not have been marked
-        // completed by the driver yet; the timestamps need that.
-        self.cmd.waitUntilCompleted();
-        let timing = PassTiming {
-            gpu_start_secs: self.cmd.GPUStartTime(),
-            gpu_end_secs: self.cmd.GPUEndTime(),
-        };
+        let state = self.feedback.complete()?;
+        if let Some(error) = state.error {
+            bail!("Metal command buffer failed: {error}");
+        }
+        let timing = PassTiming { gpu_start_secs: state.gpu_start_secs, gpu_end_secs: state.gpu_end_secs };
         ensure!(
             timing.gpu_start_secs.is_finite()
                 && timing.gpu_end_secs.is_finite()
@@ -574,28 +1058,27 @@ impl PendingPass<'_> {
         self.wait_retain().map(|_| ())
     }
 
-    /// Blocks until completion while retaining the completed command buffer.
+    /// Blocks until completion while retaining the pass's feedback.
     /// Benchmarks query its GPU clock only after their cadence timer ends.
-    pub fn wait_retain(self) -> Result<CompletedPass> {
-        self.cmd.waitUntilCompleted();
+    pub fn wait_retain(mut self) -> Result<CompletedPass> {
+        self.ctx.wait_fence(self.fence_value)?;
         self.finished()
     }
 
     /// Like [`Self::wait`], paced: sleeps until `pacer` predicts the pass is
     /// about to finish, then polls the pass's done signal (see
-    /// [`ComputePass::signal_done`]) and returns within microseconds of it.
-    /// A blocked thread would learn of the completion ~0.1 ms later. Without
-    /// a done signal this is a plain blocking wait. Polling is capped so a
-    /// wrong prediction cannot pin a core; the pacer learns from the outcome.
+    /// [`ComputePass::signal_done`], falling back to the fence) and returns
+    /// within microseconds of it. A blocked thread would learn of the
+    /// completion later. Polling is capped so a wrong prediction cannot pin
+    /// a core; the pacer learns from the outcome.
     pub fn wait_paced(self, pacer: &mut Pacer) -> Result<()> {
         self.wait_retain_paced(pacer).map(|_| ())
     }
 
-    pub fn wait_retain_paced(self, pacer: &mut Pacer) -> Result<CompletedPass> {
-        let Some((event, value)) = self.done.clone() else {
-            let done = self.wait_retain()?;
-            pacer.end(Instant::now(), false);
-            return Ok(done);
+    pub fn wait_retain_paced(mut self, pacer: &mut Pacer) -> Result<CompletedPass> {
+        let (event, value) = match &self.done {
+            Some((event, value)) => (event.clone(), *value),
+            None => (self.ctx.fence.clone(), self.fence_value),
         };
         if let Some(wake_at) = pacer.wake_at() {
             let now = Instant::now();
@@ -608,21 +1091,27 @@ impl PendingPass<'_> {
             let spin_until = Instant::now() + SPIN_CAP;
             while event.signaled_value() < value {
                 if Instant::now() > spin_until {
-                    self.cmd.waitUntilCompleted();
+                    self.ctx.wait_fence(self.fence_value)?;
                     break;
                 }
                 std::hint::spin_loop();
             }
         }
         pacer.end(Instant::now(), overslept);
+        // The done event may lead the fence by the trailing signal; the
+        // command memory is only safe to reuse after the fence.
+        if self.done.is_some() {
+            self.ctx.wait_fence(self.fence_value)?;
+        }
         self.finished()
     }
 
-    fn finished(self) -> Result<CompletedPass> {
-        if self.cmd.status() == MTLCommandBufferStatus::Error {
-            anyhow::bail!("Metal command buffer failed: {:?}", self.cmd.error());
-        }
-        Ok(CompletedPass { cmd: self.cmd })
+    fn finished(&mut self) -> Result<CompletedPass> {
+        // Completed: release the command memory to the pool.
+        self.program.clear();
+        self.slot = None;
+        self.ctx.fault.check()?;
+        Ok(CompletedPass { feedback: self.feedback.clone() })
     }
 }
 
@@ -630,7 +1119,7 @@ impl PendingPass<'_> {
 const SPIN_CAP: Duration = Duration::from_millis(20);
 
 /// Predicts when a repeating GPU pass completes so the host can sleep until
-/// shortly before and then poll ([`PendingPass::wait_spinning`]). Tracks an
+/// shortly before and then poll ([`PendingPass::wait_paced`]). Tracks an
 /// exponential average of the interval between `begin` and `end` marks.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Pacer {
@@ -672,40 +1161,6 @@ impl Pacer {
     }
 }
 
-fn encode_dispatch(
-    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-    kernel: &Kernel,
-    buffers: &[(&ProtocolObject<dyn MTLBuffer>, usize)],
-    params: &[(NonNull<c_void>, usize)],
-    grid: Grid,
-) {
-    encoder.setComputePipelineState(&kernel.pipeline);
-    for (i, (buf, offset)) in buffers.iter().enumerate() {
-        unsafe { encoder.setBuffer_offset_atIndex(Some(buf), *offset, i) };
-    }
-    for (i, (ptr, len)) in params.iter().enumerate() {
-        unsafe { encoder.setBytes_length_atIndex(*ptr, *len, buffers.len() + i) };
-    }
-    let size =
-        |(w, h, d): (usize, usize, usize)| MTLSize { width: w, height: h, depth: d };
-    match grid {
-        Grid::Threads { grid, threadgroup } => {
-            encoder
-                .dispatchThreads_threadsPerThreadgroup(size(grid), size(threadgroup));
-        }
-        Grid::Threadgroups { groups, threadgroup } => {
-            encoder.dispatchThreadgroups_threadsPerThreadgroup(
-                size(groups),
-                size(threadgroup),
-            );
-        }
-    }
-}
-
 #[cfg(test)]
 #[path = "../tests/unit/metal.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "../tests/unit/metal4.rs"]
-mod tests_metal4;

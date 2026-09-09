@@ -228,3 +228,247 @@ fn event_handoff_latency() {
         );
     }
 }
+
+/// The Metal 4 semantics the transport leans on: the argument table's state
+/// is captured per dispatch (one table serves every dispatch of a pass), and
+/// inline params bound by address from the arena read back correctly for
+/// every type kernels take (`uint`, `float`, `uint4`).
+#[test]
+fn argument_table_binds_per_dispatch_and_params_read_back() {
+    const SRC: &str = "
+        kernel void combine(device const uint* a [[buffer(0)]], device uint* out [[buffer(1)]],
+                            constant uint& k [[buffer(2)]], constant uint4& v [[buffer(3)]],
+                            constant float& f [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
+            out[gid] = a[gid] * k + v.x + v.w + uint(f);
+        }";
+    let ctx = MetalContext::new().expect("metal context");
+    let kernel = ctx.pipeline("combine", SRC, MslVersion::V3_1).expect("kernel");
+    let n = 1000usize;
+    let a1 = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&(0..n as u32).collect::<Vec<_>>()), &[n], DType::U32).expect("a1");
+    let a2 = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&(0..n as u32).map(|i| 3 * i).collect::<Vec<_>>()), &[n], DType::U32).expect("a2");
+    let o1 = Tensor::zeros(&ctx, &[n], DType::U32).expect("o1");
+    let o2 = Tensor::zeros(&ctx, &[n], DType::U32).expect("o2");
+    let grid = Grid::Threads { grid: (n, 1, 1), threadgroup: (256, 1, 1) };
+    let u4 = |x: u32, w: u32| -> [u8; 16] {
+        let mut b = [0u8; 16];
+        b[..4].copy_from_slice(&x.to_ne_bytes());
+        b[12..].copy_from_slice(&w.to_ne_bytes());
+        b
+    };
+    for concurrent in [false, true] {
+        let pass = if concurrent { ctx.begin_concurrent() } else { ctx.begin() }.expect("pass");
+        pass.dispatch_at(&kernel, &[a1.binding(), o1.binding()], &[&3u32.to_ne_bytes(), &u4(1, 5), &2.0f32.to_ne_bytes()], grid).expect("d1");
+        pass.dispatch_at(&kernel, &[a2.binding(), o2.binding()], &[&7u32.to_ne_bytes(), &u4(2, 9), &4.0f32.to_ne_bytes()], grid).expect("d2");
+        pass.level_barrier(&[]).expect("barrier");
+        // In place, reading the first dispatch's result.
+        pass.dispatch_at(&kernel, &[o1.binding(), o1.binding()], &[&1u32.to_ne_bytes(), &u4(100, 0), &0.0f32.to_ne_bytes()], grid).expect("d3");
+        pass.commit_wait().expect("run");
+        let out1 = o1.to_u32().expect("o1");
+        let out2 = o2.to_u32().expect("o2");
+        for i in 0..n as u32 {
+            assert_eq!(out1[i as usize], i * 3 + 1 + 5 + 2 + 100, "o1[{i}] (concurrent={concurrent})");
+            assert_eq!(out2[i as usize], 3 * i * 7 + 2 + 9 + 4, "o2[{i}] (concurrent={concurrent})");
+        }
+    }
+}
+
+/// A serial pass orders every dispatch after the one before it (Metal 4
+/// encoders are concurrent unless told otherwise), and a concurrent pass
+/// does so at its level barriers.
+#[test]
+fn passes_order_dependent_dispatches() {
+    const SRC: &str = "
+        kernel void bump(device uint* x [[buffer(0)]], uint gid [[thread_position_in_grid]]) {
+            x[gid] = x[gid] + 1;
+        }";
+    let ctx = MetalContext::new().expect("metal context");
+    let kernel = ctx.pipeline("bump", SRC, MslVersion::V3_1).expect("kernel");
+    let n = 64usize;
+    let grid = Grid::Threads { grid: (n, 1, 1), threadgroup: (64, 1, 1) };
+    let steps = 300usize;
+    for concurrent in [false, true] {
+        let x = Tensor::zeros(&ctx, &[n], DType::U32).expect("x");
+        let pass = if concurrent { ctx.begin_concurrent() } else { ctx.begin() }.expect("pass");
+        for _ in 0..steps {
+            pass.dispatch_at(&kernel, &[x.binding()], &[], grid).expect("bump");
+            if concurrent {
+                pass.level_barrier(&[&x]).expect("barrier");
+            }
+        }
+        pass.commit_wait().expect("run");
+        assert!(x.to_u32().expect("x").iter().all(|&v| v == steps as u32), "concurrent={concurrent}");
+    }
+    // Across passes too: the next pass consumes the previous pass's writes.
+    let x = Tensor::zeros(&ctx, &[n], DType::U32).expect("x");
+    let mut pending = Vec::new();
+    for _ in 0..20 {
+        let pass = ctx.begin_concurrent().expect("pass");
+        pass.dispatch_at(&kernel, &[x.binding()], &[], grid).expect("bump");
+        pending.push(pass.commit().expect("commit"));
+    }
+    for p in pending {
+        p.wait().expect("wait");
+    }
+    assert!(x.to_u32().expect("x").iter().all(|&v| v == 20));
+}
+
+/// Buffers allocated after earlier passes were submitted are resident for
+/// the next one, and dropped buffers leave the residency set.
+#[test]
+fn residency_follows_buffer_lifetimes() {
+    let ctx = MetalContext::new().expect("metal context");
+    let n = 4096usize;
+    let src = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&(0..n as u32).collect::<Vec<_>>()), &[n], DType::U32).expect("src");
+    let before = ctx.resident_allocations();
+    let first = ctx.begin().expect("pass");
+    let scratch = Tensor::zeros(&ctx, &[n], DType::U32).expect("scratch");
+    copy_words(&ctx, &first, &src, &scratch).expect("copy");
+    let pending = first.commit().expect("commit");
+    // Allocated with a pass in flight; used by the next pass.
+    let late = Tensor::zeros(&ctx, &[n], DType::U32).expect("late");
+    assert_eq!(ctx.resident_allocations(), before + 2);
+    let second = ctx.begin().expect("pass");
+    copy_words(&ctx, &second, &scratch, &late).expect("copy");
+    pending.wait().expect("wait");
+    second.commit_wait().expect("run");
+    assert_eq!(late.to_u32().expect("late"), (0..n as u32).collect::<Vec<_>>());
+    drop(scratch);
+    drop(late);
+    assert_eq!(ctx.resident_allocations(), before);
+}
+
+/// An encoded pass that is never committed (a pre-encoded speculative
+/// variant that lost) returns its command memory without touching the GPU,
+/// and a pending pass dropped without a wait completes first.
+#[test]
+fn uncommitted_and_unawaited_passes_release_cleanly() {
+    let ctx = MetalContext::new().expect("metal context");
+    let n = 4096usize;
+    let src = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&(0..n as u32).collect::<Vec<_>>()), &[n], DType::U32).expect("src");
+    let dst = Tensor::zeros(&ctx, &[n], DType::U32).expect("dst");
+    for _ in 0..8 {
+        let pass = ctx.begin_concurrent().expect("pass");
+        copy_words(&ctx, &pass, &src, &dst).expect("copy");
+        let encoded = pass.end().expect("end").detach();
+        drop(encoded);
+    }
+    assert!(dst.to_u32().expect("dst").iter().all(|&v| v == 0));
+    let pass = ctx.begin_concurrent().expect("pass");
+    copy_words(&ctx, &pass, &src, &dst).expect("copy");
+    drop(pass.commit().expect("commit"));
+    assert_eq!(dst.to_u32().expect("dst"), (0..n as u32).collect::<Vec<_>>());
+}
+
+/// Costs of two Metal 4 bookkeeping paths the transport pays for: how long
+/// after the fence a pass's commit feedback arrives (what `timing()` waits
+/// for), and what committing the residency set costs with thousands of
+/// allocations in it (paid on the first submission after an allocation and
+/// on every buffer drop).
+#[test]
+#[ignore = "timing probe; run with --ignored --nocapture"]
+fn feedback_latency_and_residency_commit_cost() {
+    let ctx = MetalContext::new().expect("metal context");
+    let n = 4096usize;
+    let src = Tensor::zeros(&ctx, &[n], DType::U32).expect("src");
+    let dst = Tensor::zeros(&ctx, &[n], DType::U32).expect("dst");
+    let median = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    let mut latency = Vec::new();
+    for _ in 0..50 {
+        let pass = ctx.begin_concurrent().expect("pass");
+        copy_words(&ctx, &pass, &src, &dst).expect("copy");
+        let done = pass.commit().expect("commit").wait_retain().expect("wait");
+        let t0 = Instant::now();
+        done.timing().expect("timing");
+        latency.push(t0.elapsed().as_secs_f64() * 1e3);
+    }
+    eprintln!("commit feedback arrives {:.3} ms (median) after the fence, max {:.3} ms", median(&mut latency), latency.iter().cloned().fold(0.0, f64::max));
+
+    // Residency: grow the set to a model-sized population, then time the
+    // allocate -> first submission path and the drop path.
+    let mut population = Vec::new();
+    for _ in 0..4000 {
+        population.push(Tensor::zeros(&ctx, &[64], DType::U32).expect("buf"));
+    }
+    let pass = ctx.begin_concurrent().expect("pass");
+    copy_words(&ctx, &pass, &src, &dst).expect("copy");
+    pass.commit_wait().expect("run");
+    let mut add_then_submit = Vec::new();
+    let mut plain_submit = Vec::new();
+    let mut drop_cost = Vec::new();
+    for i in 0..40 {
+        let extra = Tensor::zeros(&ctx, &[64], DType::U32).expect("extra");
+        let pass = ctx.begin_concurrent().expect("pass");
+        copy_words(&ctx, &pass, &src, &dst).expect("copy");
+        let encoded = pass.end().expect("end");
+        let t0 = Instant::now();
+        let pending = encoded.commit().expect("commit");
+        add_then_submit.push(t0.elapsed().as_secs_f64() * 1e3);
+        pending.wait().expect("wait");
+        let pass = ctx.begin_concurrent().expect("pass");
+        copy_words(&ctx, &pass, &src, &dst).expect("copy");
+        let encoded = pass.end().expect("end");
+        let t0 = Instant::now();
+        let pending = encoded.commit().expect("commit");
+        plain_submit.push(t0.elapsed().as_secs_f64() * 1e3);
+        pending.wait().expect("wait");
+        let t0 = Instant::now();
+        drop(extra);
+        drop_cost.push(t0.elapsed().as_secs_f64() * 1e3);
+        if i == 0 {
+            eprintln!("residency set holds {} allocations", ctx.resident_allocations());
+        }
+    }
+    eprintln!(
+        "submit after an allocation {:.3} ms, plain submit {:.3} ms, buffer drop (remove + commit) {:.3} ms (medians, ~4000 resident allocations)",
+        median(&mut add_then_submit),
+        median(&mut plain_submit),
+        median(&mut drop_cost)
+    );
+}
+
+/// Wake-up latency of the blocking fence wait against polling the event, for
+/// a pass of about a millisecond: what every `commit_wait` (prefill chunks,
+/// blits) pays on top of the GPU time.
+#[test]
+#[ignore = "timing probe; run with --ignored --nocapture"]
+fn blocking_wait_latency() {
+    let ctx = MetalContext::new().expect("metal context");
+    let words = 64usize << 20; // 256 MiB copy, ~1 ms
+    let src = Tensor::zeros(&ctx, &[words], DType::U32).expect("src");
+    let dst = Tensor::zeros(&ctx, &[words], DType::U32).expect("dst");
+    let median = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    let mut blocking = Vec::new();
+    let mut spinning = Vec::new();
+    let mut gpu = Vec::new();
+    for i in 0..60 {
+        let pass = ctx.begin_concurrent().expect("pass");
+        copy_words(&ctx, &pass, &src, &dst).expect("copy");
+        let encoded = pass.end().expect("end");
+        let t0 = Instant::now();
+        let pending = encoded.commit().expect("commit");
+        let done = if i % 2 == 0 {
+            pending.wait_retain().expect("wait")
+        } else {
+            let mut pacer = Pacer::default();
+            pacer.begin(Instant::now());
+            pacer.end(Instant::now(), false); // estimate 0: poll from the start
+            pending.wait_retain_paced(&mut pacer).expect("wait")
+        };
+        let wall = t0.elapsed().as_secs_f64() * 1e3;
+        let t = done.timing().expect("timing");
+        gpu.push((t.gpu_end_secs - t.gpu_start_secs) * 1e3);
+        if i % 2 == 0 { blocking.push(wall) } else { spinning.push(wall) }
+    }
+    eprintln!(
+        "commit-to-return for a {:.3} ms pass: blocking wait {:.3} ms, polling {:.3} ms",
+        median(&mut gpu),
+        median(&mut blocking),
+        median(&mut spinning)
+    );
+}
