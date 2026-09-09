@@ -478,3 +478,53 @@ fn gather_kernels_match_dequant() {
         assert_eq!(&got[i * k..(i + 1) * k], &expected[..], "row {id}");
     }
 }
+
+/// Effective bandwidth of the dense Q4 GEMV alone: eight distinct 144 MiB
+/// matrices per pass (1.1 GiB, well past the system cache), best of several
+/// passes. Compare with `memory_bandwidth_probe` (raw peak) and the decode
+/// step's aggregate (bytes per step / GPU ms) to see where traffic is lost.
+#[test]
+#[ignore = "timing probe; run with --ignored --nocapture"]
+fn gemv_q4_bandwidth_probe() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(21);
+    let (n, k, mats) = (32768usize, 8192usize, 8usize);
+    let words = k / 8;
+    let groups = k / GROUP_SIZE;
+    let weights: Vec<QuantWeights> = (0..mats)
+        .map(|_| {
+            let codes: Vec<u32> = (0..n * words).map(|_| rng.r#gen()).collect();
+            let mut scale = |lo: f32, hi: f32| -> Vec<bf16> { (0..n * groups).map(|_| bf16::from_f32(rng.gen_range(lo..hi))).collect() };
+            QuantWeights {
+                codes: Tensor::from_bytes(&ctx, bytemuck::cast_slice(&codes), &[n, words], DType::U32).expect("codes"),
+                scales: Tensor::from_bytes(&ctx, bytemuck::cast_slice(&scale(0.01, 0.5)), &[n, groups], DType::BF16).expect("scales"),
+                biases: Tensor::from_bytes(&ctx, bytemuck::cast_slice(&scale(-2.0, 0.0)), &[n, groups], DType::BF16).expect("biases"),
+                group_size: GROUP_SIZE,
+                bits: 4,
+            }
+        })
+        .collect();
+    let per_matrix = (n * words * 4 + 2 * n * groups * 2) as f64;
+    let x: Vec<f32> = (0..k).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+    let tx = Tensor::from_f32_as_bf16(&ctx, &x, &[k]).expect("x");
+    let ys: Vec<Tensor> = (0..mats).map(|_| Tensor::zeros(&ctx, &[n], DType::BF16).expect("y")).collect();
+    let mut times = Vec::new();
+    for _ in 0..5 {
+        let pass = ctx.begin_concurrent().expect("pass");
+        for (w, y) in weights.iter().zip(&ys) {
+            gemv_quant(&ctx, &pass, w, &tx, y).expect("gemv");
+        }
+        let done = pass.commit().expect("commit").wait_retain().expect("wait");
+        let t = done.timing().expect("timing");
+        times.push(t.gpu_end_secs - t.gpu_start_secs);
+    }
+    times.sort_by(f64::total_cmp);
+    let (best, median) = (times[0], times[times.len() / 2]);
+    eprintln!(
+        "gemv q4 [{n} x {k}] x {mats}: {:.0} GB/s best, {:.0} GB/s median ({:.2} ms best for {:.2} GB)",
+        per_matrix * mats as f64 / best / 1e9,
+        per_matrix * mats as f64 / median / 1e9,
+        best * 1e3,
+        per_matrix * mats as f64 / 1e9
+    );
+}

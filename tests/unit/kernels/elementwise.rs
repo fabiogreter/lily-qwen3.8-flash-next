@@ -135,3 +135,50 @@ fn copy_words_copies_any_dtype_and_rejects_mismatch() {
     let pass = ctx.begin().expect("pass");
     assert!(copy_words(&ctx, &pass, &t_src, &short).is_err());
 }
+
+/// Raw unified-memory bandwidth from the GPU: a 4 GiB coalesced read and a
+/// 4 GiB copy, best of several passes. The number to hold the weight-streaming
+/// kernels against (the decode step's effective GB/s is bytes moved / GPU ms).
+#[test]
+#[ignore = "timing probe; run with --ignored --nocapture"]
+fn memory_bandwidth_probe() {
+    let ctx = MetalContext::new().expect("metal context");
+    let bytes = 4usize << 30;
+    let u4 = bytes / 16;
+    let per_thread = 16usize;
+    let threads = u4 / per_thread;
+    let src = Tensor::zeros(&ctx, &[bytes / 4], DType::U32).expect("src");
+    let dst = Tensor::zeros(&ctx, &[bytes / 4], DType::U32).expect("dst");
+    let out = Tensor::zeros(&ctx, &[1024], DType::U32).expect("out");
+    let grid = Grid::Threads { grid: (threads, 1, 1), threadgroup: (256, 1, 1) };
+    let per = u32_bytes(per_thread);
+    {
+        let fill = ctx.pipeline("bw_fill_u4", TEST_SOURCE, MslVersion::V3_1).expect("fill");
+        let pass = ctx.begin().expect("pass");
+        pass.dispatch_at(&fill, &[src.binding()], &[], Grid::Threads { grid: (u4, 1, 1), threadgroup: (256, 1, 1) }).expect("dispatch");
+        pass.commit_wait().expect("fill");
+    }
+    let read = ctx.pipeline("bw_read_u4", TEST_SOURCE, MslVersion::V3_1).expect("read");
+    let copy = ctx.pipeline("bw_copy_u4", TEST_SOURCE, MslVersion::V3_1).expect("copy");
+    for (name, kernel, traffic) in [("read", &read, bytes), ("copy", &copy, 2 * bytes)] {
+        let mut times = Vec::new();
+        for _ in 0..5 {
+            let pass = ctx.begin().expect("pass");
+            let second: &Tensor = if name == "read" { &out } else { &dst };
+            pass.dispatch_at(kernel, &[src.binding(), second.binding()], &[&per[..]], grid).expect("dispatch");
+            let done = pass.commit().expect("commit").wait_retain().expect("wait");
+            let t = done.timing().expect("timing");
+            times.push(t.gpu_end_secs - t.gpu_start_secs);
+        }
+        times.sort_by(f64::total_cmp);
+        let best = times[0];
+        let median = times[times.len() / 2];
+        eprintln!(
+            "bandwidth {name}: {:.0} GB/s best, {:.0} GB/s median ({} bytes of traffic, {:.1} ms best)",
+            traffic as f64 / best / 1e9,
+            traffic as f64 / median / 1e9,
+            traffic,
+            best * 1e3
+        );
+    }
+}

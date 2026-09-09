@@ -12,6 +12,7 @@ use std::path::Path;
 
 use anyhow::{Result, ensure};
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::engine::{DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, SnapshotApi};
@@ -33,7 +34,7 @@ use crate::kernels::ple;
 use crate::kernels::qsa::{self, INDEXER_D, SparseSplitScratch};
 use crate::kernels::sample::{SamplerScratch, SamplingParams, sample_f32};
 use crate::kernels::{quant, skinny};
-use crate::metal::{BlitCopy, ComputePass, EncodedPass, MetalContext};
+use crate::metal::{BlitCopy, ComputePass, DetachedPass, EncodedPass, MetalContext, Pacer, PendingPass, SharedEvent};
 use crate::moe_ffn::{
     DecodeMoeIo, MoeDims, MoeScratch, PrefillMoeIo, PrefillMoeScratch, decode_moe,
     prefill_moe, prefix_rows, project_mat, project_stack_or_slices,
@@ -99,7 +100,109 @@ pub(super) enum BatchMode<'p> {
     /// Speculative verification: a draw per row (`step0 + row` indexes the
     /// request's draws), recurrent states after each row recorded for
     /// rollback, no draft-head work (that follows once acceptance is known).
-    Verify { params: &'p SamplingParams, step0: usize },
+    /// With `park`, the pass waits on the scratch's step sync for that value
+    /// before its first host-staged input (the n-gram rows), so it can be
+    /// committed before the host has them.
+    Verify { params: &'p SamplingParams, step0: usize, park: Option<u64> },
+}
+
+/// Host/GPU handshake for parked passes: a pass committed before its
+/// per-token host inputs exist waits for `event >= value`; the host stages
+/// the inputs and releases it. Values only grow, one parked pass at a time.
+pub(super) struct StepSync {
+    pub(super) event: SharedEvent,
+    /// Diagnostics (`LILY_PROBE_ARRIVAL`): the GPU raises this to the parked
+    /// value right before it waits, so a host poller can time the arrival.
+    pub arrival: Option<SharedEvent>,
+    /// Diagnostics: raised right after the wait, when the GPU resumed.
+    pub resumed: Option<SharedEvent>,
+    /// Value the outstanding parked pass waits for; 0 when none.
+    armed: Cell<u64>,
+    last: Cell<u64>,
+    /// Completion predictors for the speculative loop's verify and draft
+    /// passes (sleep-then-poll waits).
+    pub(super) pace_verify: Cell<Pacer>,
+    pub(super) pace_draft: Cell<Pacer>,
+    /// Raised by the GPU at the end of every decode, verify and draft pass
+    /// (`done_last` is the last value handed out), for paced waits.
+    done: SharedEvent,
+    done_last: Cell<u64>,
+}
+
+impl StepSync {
+    fn new(ctx: &MetalContext) -> Result<Self> {
+        let probe = std::env::var_os("LILY_PROBE_ARRIVAL").is_some();
+        let arrival = if probe { Some(ctx.new_shared_event()?) } else { None };
+        let resumed = if probe { Some(ctx.new_shared_event()?) } else { None };
+        Ok(Self {
+            event: ctx.new_shared_event()?,
+            arrival,
+            resumed,
+            armed: Cell::new(0),
+            last: Cell::new(0),
+            pace_verify: Cell::new(Pacer::default()),
+            pace_draft: Cell::new(Pacer::default()),
+            done: ctx.new_shared_event()?,
+            done_last: Cell::new(0),
+        })
+    }
+
+    /// Encodes the pass's done signal as its last command.
+    pub(super) fn signal_done(&self, pass: &ComputePass<'_>) -> Result<()> {
+        let value = self.done_last.get() + 1;
+        self.done_last.set(value);
+        pass.signal_done(&self.done, value)
+    }
+
+    /// Encodes the parked wait (and the arrival probe when enabled).
+    pub(super) fn encode_wait(&self, pass: &ComputePass<'_>, value: u64) -> Result<()> {
+        if let Some(arrival) = &self.arrival {
+            pass.signal_event(arrival, value)?;
+        }
+        pass.wait_event(&self.event, value)?;
+        if let Some(resumed) = &self.resumed {
+            pass.signal_event(resumed, value)?;
+        }
+        Ok(())
+    }
+
+    /// The value [`Self::arm`] will hand out next (for encoding a pass ahead
+    /// of its commit).
+    pub(super) fn peek(&self) -> u64 {
+        self.last.get() + 1
+    }
+
+    /// Claims the value the next parked pass waits for.
+    pub(super) fn arm(&self) -> Result<u64> {
+        ensure!(self.armed.get() == 0, "a decode step is already parked");
+        let value = self.last.get() + 1;
+        self.last.set(value);
+        self.armed.set(value);
+        Ok(value)
+    }
+
+    /// Releases the parked pass, if any.
+    pub(super) fn release(&self) -> Result<()> {
+        let value = self.armed.take();
+        if value != 0 {
+            self.event.signal(value);
+        }
+        Ok(())
+    }
+
+    /// Releases whatever is parked when dropped: for error paths, so a
+    /// committed pass never blocks the queue forever.
+    pub(super) fn release_on_drop(&self) -> ReleaseOnDrop<'_> {
+        ReleaseOnDrop(self)
+    }
+}
+
+pub(super) struct ReleaseOnDrop<'s>(&'s StepSync);
+
+impl Drop for ReleaseOnDrop<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.release();
+    }
 }
 
 fn moe_dims(cfg: &Qwen4ExpConfig) -> MoeDims {
@@ -168,6 +271,22 @@ pub(super) struct SpecPending {
     /// The trunk's draw per row.
     pub(super) sampled: Vec<u32>,
     pub(super) uses_penalties: bool,
+    /// Passes encoded while the verify pass ran, one per possible accepted
+    /// count (index = accepted): the draft pass and the next verify pass.
+    /// Empty when there was no room to encode them ahead.
+    pub(super) prepared: Vec<Prepared>,
+}
+
+/// The two passes that follow a verify pass, encoded ahead for one accepted
+/// count. Only the host-written inputs (the head's ids, the next pending
+/// token) remain to be filled in before they are committed.
+pub(super) struct Prepared {
+    pub(super) draft: DetachedPass,
+    pub(super) verify: DetachedPass,
+    /// The step-sync value the verify pass waits for.
+    pub(super) park: u64,
+    /// Drafts the pair was encoded for.
+    pub(super) drafts: usize,
 }
 
 impl PleState {
@@ -563,6 +682,20 @@ pub struct Scratch {
     pub(super) prefill: Option<PrefillScratch>,
     /// Speculative-decoding intermediates (models with a draft head).
     pub(super) spec: Option<SpecScratch>,
+    /// Handshake for passes committed ahead of their host inputs.
+    pub(super) sync: StepSync,
+}
+
+impl Scratch {
+    /// The arrival probe event (`LILY_PROBE_ARRIVAL`), for benchmarks.
+    pub fn arrival_probe(&self) -> Option<&SharedEvent> {
+        self.sync.arrival.as_ref()
+    }
+
+    /// The resumed probe event (`LILY_PROBE_ARRIVAL`), for benchmarks.
+    pub fn resumed_probe(&self) -> Option<&SharedEvent> {
+        self.sync.resumed.as_ref()
+    }
 }
 
 /// What a verify pass records so a draft pass can roll the recurrent state
@@ -989,6 +1122,7 @@ impl Qwen4ExpModel {
         .max()
         .unwrap_or(0);
         Ok(Scratch {
+            sync: StepSync::new(ctx)?,
             x: Tensor::zeros(ctx, &[h], bf)?,
             hyper: Tensor::zeros(ctx, &[wide], bf)?,
             hc: HcScratch::new(ctx, cfg, 1)?,
@@ -1048,8 +1182,12 @@ impl Qwen4ExpModel {
     }
 
     /// Encodes one decode step reading `next_token[slot_in]` and drawing
-    /// into `next_token[slot_out]`, without committing (the caller stages
-    /// the token's n-gram rows first, then commits and advances `pos`).
+    /// into `next_token[slot_out]`, without committing. Without `park` the
+    /// caller stages the token's n-gram rows first, then commits and advances
+    /// `pos`. With `park` (a value from [`StepSync::arm`]) the pass waits on
+    /// the step sync right before the n-gram gather, so it can be committed
+    /// at once and released after staging.
+    #[allow(clippy::too_many_arguments)]
     pub fn encode_decode_step<'a>(
         &self,
         ctx: &'a MetalContext,
@@ -1058,10 +1196,11 @@ impl Qwen4ExpModel {
         slot_in: usize,
         slot_out: usize,
         draw: Draw<'_>,
+        park: Option<u64>,
     ) -> Result<EncodedPass<'a>> {
         ensure!(state.spec.is_none(), "decode step during a pending speculative step");
         let pass = ctx.begin_concurrent()?;
-        self.encode_decode_graph(ctx, &pass, state, s, slot_in, slot_out, draw)?;
+        self.encode_decode_graph(ctx, &pass, state, s, slot_in, slot_out, draw, park)?;
         pass.end()
     }
 
@@ -1179,6 +1318,11 @@ impl Qwen4ExpModel {
             if matches!(lstate, LayerState::Gdn { .. }) {
                 gdn_index += 1;
             }
+            if let (Some(_), BatchMode::Verify { park: Some(value), .. }) = (&ple, &mode) {
+                // The n-gram rows are the only host-staged input; everything
+                // before this point ran while the host staged them.
+                s.sync.encode_wait(&pass, *value)?;
+            }
             self.block_batched(ctx, &pass, layer, lstate, &ps.hyper, pos, conv_slot, s, ps, ple, capture.as_ref())?;
         }
 
@@ -1203,7 +1347,7 @@ impl Qwen4ExpModel {
                     self.mtp_catch_up(ctx, &pass, mtp, mst, pos, s, ps)?;
                 }
             }
-            BatchMode::Verify { params, step0 } => {
+            BatchMode::Verify { params, step0, .. } => {
                 let sp = s.spec.as_ref().ok_or_else(|| anyhow::anyhow!("verify pass without spec scratch"))?;
                 self.hc_read_batched(ctx, &pass, &self.weights.final_mixer, &ps.hyper, s, ps)?;
                 let logits = prefix_rows(&sp.logits, m)?;
@@ -1219,6 +1363,7 @@ impl Qwen4ExpModel {
                 }
             }
         }
+        s.sync.signal_done(&pass)?;
         pass.end()
     }
 
@@ -1671,6 +1816,7 @@ impl Qwen4ExpModel {
         slot_in: usize,
         slot_out: usize,
         draw: Draw<'_>,
+        park: Option<u64>,
     ) -> Result<()> {
         ensure!(state.pos < state.capacity, "sequence full ({})", state.capacity);
         let cfg = &self.config;
@@ -1687,6 +1833,12 @@ impl Qwen4ExpModel {
             if let (Some(ple_w), Some(ple_s), Some(pst)) =
                 (&layer.ple, &s.ple, &state.ple)
             {
+                if let Some(value) = park {
+                    // First use of host-staged data: the n-gram rows. The
+                    // embedding and the layers above ran while the host
+                    // read the token and staged them.
+                    s.sync.encode_wait(pass, value)?;
+                }
                 self.ple_decode(ctx, pass, ple_w, ple_s, pst, conv_slot, s)?;
             }
 
@@ -1744,7 +1896,7 @@ impl Qwen4ExpModel {
         let out = s.next_token.view(slot_out, &[1])?;
         sample_f32(ctx, pass, &s.logits, &s.sampler, draw.params, draw.step, &out)?;
         pass.level_barrier(&[&s.next_token])?;
-        Ok(())
+        s.sync.signal_done(pass)
     }
 
     /// Single-row hyper-connection read: `s.hyper` → `s.hc.mixed` (+ `inj`).
@@ -2167,6 +2319,14 @@ impl ScratchApi for Scratch {
         &self.next_token
     }
 
+    fn arrival_probe(&self) -> Option<&SharedEvent> {
+        Scratch::arrival_probe(self)
+    }
+
+    fn resumed_probe(&self) -> Option<&SharedEvent> {
+        Scratch::resumed_probe(self)
+    }
+
     fn logits(&self) -> &Tensor {
         &self.logits
     }
@@ -2316,7 +2476,35 @@ impl LanguageModel for Qwen4ExpModel {
         slot_out: usize,
         draw: Draw<'_>,
     ) -> Result<EncodedPass<'a>> {
-        Qwen4ExpModel::encode_decode_step(self, ctx, state, scratch, slot_in, slot_out, draw)
+        Qwen4ExpModel::encode_decode_step(self, ctx, state, scratch, slot_in, slot_out, draw, None)
+    }
+
+    fn supports_parking(&self) -> bool {
+        true
+    }
+
+    fn encode_parked_step<'a>(
+        &self,
+        ctx: &'a MetalContext,
+        state: &DecodeState,
+        scratch: &Scratch,
+        slot_in: usize,
+        slot_out: usize,
+        draw: Draw<'_>,
+    ) -> Result<EncodedPass<'a>> {
+        let value = scratch.sync.arm()?;
+        match Qwen4ExpModel::encode_decode_step(self, ctx, state, scratch, slot_in, slot_out, draw, Some(value)) {
+            Ok(pass) => Ok(pass),
+            Err(e) => {
+                // Nothing was committed; free the claimed value.
+                scratch.sync.release()?;
+                Err(e)
+            }
+        }
+    }
+
+    fn release_parked(&self, scratch: &Scratch) -> Result<()> {
+        scratch.sync.release()
     }
 
     fn max_drafts(&self) -> usize {
@@ -2336,9 +2524,9 @@ impl LanguageModel for Qwen4ExpModel {
         drafts: &[u32],
         params: &SamplingParams,
         step0: usize,
-        ahead: Option<EncodedPass<'a>>,
+        parked: Option<PendingPass<'a>>,
     ) -> Result<Vec<u32>> {
-        Qwen4ExpModel::verify(self, ctx, state, scratch, pending, drafts, params, step0, ahead)
+        Qwen4ExpModel::verify(self, ctx, state, scratch, pending, drafts, params, step0, parked)
     }
 
     fn finish_speculation<'a>(
@@ -2349,7 +2537,7 @@ impl LanguageModel for Qwen4ExpModel {
         accepted: usize,
         next: Option<crate::engine::NextStep<'_>>,
         drafts: usize,
-    ) -> Result<(Vec<u32>, Option<EncodedPass<'a>>)> {
+    ) -> Result<(Vec<u32>, Option<PendingPass<'a>>)> {
         Qwen4ExpModel::finish_speculation(self, ctx, state, scratch, accepted, next, drafts)
     }
 }

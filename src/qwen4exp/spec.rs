@@ -13,6 +13,8 @@
 //! distribution for its prefix; the drafts only decide how many rows a pass
 //! can confirm.
 
+use std::time::Instant;
+
 use anyhow::{Result, ensure};
 
 use crate::engine::{DecodeStateApi, NextStep};
@@ -23,7 +25,7 @@ use crate::metal::{EncodedPass, MetalContext, PendingPass};
 use crate::moe_ffn::{prefix_rows, project_mat};
 use crate::tensor::Tensor;
 
-use super::model::{BatchMode, DecodeState, LayerState, MAX_DRAFTS, Qwen4ExpModel, Scratch, SpecPending};
+use super::model::{BatchMode, DecodeState, LayerState, MAX_DRAFTS, Prepared, Qwen4ExpModel, Scratch, SpecPending};
 use super::ngram::NgramHasher;
 
 const GREEDY: SamplingParams = SamplingParams::greedy();
@@ -51,7 +53,7 @@ impl Qwen4ExpModel {
         drafts: &[u32],
         params: &SamplingParams,
         step0: usize,
-        ahead: Option<EncodedPass<'a>>,
+        parked: Option<PendingPass<'a>>,
     ) -> Result<Vec<u32>> {
         ensure!(state.spec.is_none(), "verify while a speculative step is pending");
         ensure!(drafts.len() <= MAX_DRAFTS, "{} drafts exceed {MAX_DRAFTS}", drafts.len());
@@ -60,25 +62,50 @@ impl Qwen4ExpModel {
         tokens.push(pending);
         tokens.extend_from_slice(drafts);
         let m = tokens.len();
-        if ahead.is_none() {
-            self.ensure_room(ctx, state, s, m)?;
+        let k = drafts.len();
+        // Room for this pass, the passes encoded ahead for the step after it
+        // (a verify of 1 + k rows at any of m positions, plus the head's
+        // chained rows), and the step after that, so a parked pass (which
+        // cannot grow the caches) still finds room to encode ahead. Growing is
+        // only possible when nothing runs: the unparked case.
+        let ahead_rows = 2 * (1 + k);
+        if parked.is_none() {
+            self.ensure_room(ctx, state, s, m + ahead_rows)?;
         }
+        let can_prepare = k > 0 && state.pos + m + ahead_rows + MAX_DRAFTS <= state.capacity();
         let s = &*s;
+        // Whatever happens below, a parked pass must be let go.
+        let _release = parked.as_ref().map(|_| s.sync.release_on_drop());
         let capacity = s.prefill.as_ref().expect("prefill scratch just ensured");
-        // The token-dependent inputs: ids and n-gram rows. A pass encoded
-        // ahead reads them only once committed.
-        let ps = capacity.chunk(&tokens)?;
+        // The token-dependent inputs. A parked pass is already running with
+        // ids the draft pass wrote; only the n-gram rows are staged here, read
+        // after its wait. Otherwise both are written now and the pass encoded.
+        let ps = if parked.is_some() { capacity.rows(m)? } else { capacity.chunk(&tokens)? };
         let ple_w = self.weights.layers.iter().find_map(|l| l.ple.as_deref());
         if let (Some(w), Some(p), Some(pst)) = (ple_w, &ps.ple, &state.ple) {
             self.stage_ngram(w, p, &tokens, pst.hist)?;
         }
         let pos_before = state.pos;
         let hist_before = state.ple.as_ref().map(|p| p.hist);
-        let encoded = match ahead {
-            Some(pass) => pass,
-            None => self.encode_batch(ctx, state, s, &ps, BatchMode::Verify { params, step0 })?,
+        let committed = match parked {
+            Some(pass) => {
+                s.sync.release()?;
+                pass
+            }
+            None => {
+                let pass = self.encode_batch(ctx, state, s, &ps, BatchMode::Verify { params, step0, park: None })?.commit()?;
+                let mut pace = s.sync.pace_verify.get();
+                pace.begin(Instant::now());
+                s.sync.pace_verify.set(pace);
+                pass
+            }
         };
-        let done = encoded.commit()?.wait_retain()?;
+        // While the GPU verifies, encode what follows for every possible
+        // outcome; finish_speculation then only fills in tokens and commits.
+        let prepared = if can_prepare { self.prepare_variants(ctx, state, s, m, k, params, step0)? } else { Vec::new() };
+        let mut pace = s.sync.pace_verify.get();
+        let done = committed.wait_retain_paced(&mut pace)?;
+        s.sync.pace_verify.set(pace);
         if std::env::var_os("LILY_PROFILE").is_some() {
             let t = done.timing()?;
             eprintln!("profile verify m={m}: gpu {:.2} ms", (t.gpu_end_secs - t.gpu_start_secs) * 1e3);
@@ -90,8 +117,60 @@ impl Qwen4ExpModel {
         }
         state.conv_slot = 1 - state.conv_slot;
         let sampled = s.spec.as_ref().expect("spec scratch").verify_tokens.to_u32()?[..m].to_vec();
-        state.spec = Some(SpecPending { pos_before, hist_before, tokens, sampled: sampled.clone(), uses_penalties: params.uses_penalties() });
+        state.spec = Some(SpecPending {
+            pos_before,
+            hist_before,
+            tokens,
+            sampled: sampled.clone(),
+            uses_penalties: params.uses_penalties(),
+            prepared,
+        });
         Ok(sampled)
+    }
+
+    /// Encodes, for each accepted count `a` in `0..m` of the running verify
+    /// pass, the draft pass (rollback to `a`, head catch-up over rows `0..=a`,
+    /// `k` chained drafts, next ids) and the next verify pass (1 + k rows at
+    /// the position after `a`, parked on the step sync). The state is shown
+    /// to the encoders as it will be after the verify pass; nothing is
+    /// committed and the inputs written by the host (head ids, pending token)
+    /// are filled in at commit time.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_variants(
+        &self,
+        ctx: &MetalContext,
+        state: &mut DecodeState,
+        s: &Scratch,
+        m: usize,
+        k: usize,
+        params: &SamplingParams,
+        step0: usize,
+    ) -> Result<Vec<Prepared>> {
+        let wide = self.config.hc_width();
+        let capacity = s.prefill.as_ref().ok_or_else(|| anyhow::anyhow!("prefill scratch missing"))?;
+        let (pos_before, conv_before) = (state.pos, state.conv_slot);
+        let park = s.sync.peek();
+        let mut prepared = Vec::with_capacity(m);
+        let result = (|| -> Result<()> {
+            state.conv_slot = 1 - conv_before;
+            for a in 0..m {
+                state.pos = pos_before + a + 1;
+                let hidden = capacity.hyper.view(0, &[a + 1, wide])?;
+                let keep = capacity.hyper.view(a * wide, &[wide])?;
+                let rollback = (a + 1 < m).then_some((a, m));
+                let next_ids = capacity.ids.view(1, &[k])?;
+                let draft = self.encode_draft(ctx, state, s, &hidden, a + 1, pos_before, Some(&keep), rollback, k, Some(&next_ids))?.detach();
+                let ps = capacity.rows(1 + k)?;
+                let mode = BatchMode::Verify { params, step0: step0 + a + 1, park: Some(park) };
+                let verify = self.encode_batch(ctx, state, s, &ps, mode)?.detach();
+                prepared.push(Prepared { draft, verify, park, drafts: k });
+            }
+            Ok(())
+        })();
+        state.pos = pos_before;
+        state.conv_slot = conv_before;
+        result?;
+        Ok(prepared)
     }
 
     /// See [`crate::engine::LanguageModel::finish_speculation`].
@@ -103,8 +182,9 @@ impl Qwen4ExpModel {
         accepted: usize,
         next: Option<NextStep<'_>>,
         drafts: usize,
-    ) -> Result<(Vec<u32>, Option<EncodedPass<'a>>)> {
-        let pending = state.spec.take().ok_or_else(|| anyhow::anyhow!("finish_speculation without a verify pass"))?;
+    ) -> Result<(Vec<u32>, Option<PendingPass<'a>>)> {
+        let entered = Instant::now();
+        let mut pending = state.spec.take().ok_or_else(|| anyhow::anyhow!("finish_speculation without a verify pass"))?;
         let m = pending.tokens.len();
         ensure!(accepted < m, "accepted {accepted} of {} drafts", m - 1);
         let wide = self.config.hc_width();
@@ -122,35 +202,90 @@ impl Qwen4ExpModel {
             }
         }
 
-        // The next verify pass (1 + drafts rows) needs room before its graph
-        // is encoded; growing now keeps the GPU-idle requirement (the draft
-        // pass has not been committed yet).
-        let want = if next.is_some() { drafts } else { 0 };
-        if want > 0 {
-            self.ensure_room(ctx, state, s, 1 + want)?;
-        }
-
         // The head's rows: trunk hiddens 0..=accepted of the verify pass (still
         // in the prefill scratch), paired with the tokens that followed them.
-        let capacity = s.prefill.as_ref().ok_or_else(|| anyhow::anyhow!("prefill scratch missing"))?;
+        let want = if next.is_some() { drafts } else { 0 };
         let rows = accepted + usize::from(next.is_some());
         let mut tokens: Vec<u32> = pending.tokens[1..=accepted].to_vec();
         tokens.extend(next.map(|n| n.token));
-        let hidden = capacity.hyper.view(0, &[rows.max(1), wide])?;
-        let keep = capacity.hyper.view(accepted * wide, &[wide])?;
-        let rollback = (accepted + 1 < m).then_some((accepted, m));
-        let committed = self.encode_draft(ctx, state, s, &hidden, &tokens, pending.pos_before, Some(&keep), rollback, want)?;
-        // While the GPU drafts, encode the verify pass that follows: its graph
-        // depends only on the row count and position, not on the drafts.
+
         let ahead = match next {
-            Some(n) if want > 0 => {
-                let ps = capacity.rows(1 + want)?;
-                Some(self.encode_batch(ctx, state, s, &ps, BatchMode::Verify { params: n.params, step0: n.step0 })?)
+            Some(n) if want > 0 && pending.prepared.len() == m && pending.prepared[accepted].drafts == want => {
+                Some((n, pending.prepared.swap_remove(accepted)))
             }
             _ => None,
         };
-        let proposals = self.collect_drafts(s, committed, rows, want, rollback.is_some())?;
-        Ok((proposals, ahead))
+        let (committed, parked) = match ahead {
+            Some((n, prep)) => {
+                // Encoded ahead: fill in the pending token (the draft pass
+                // writes the drafts after it) and the head's ids, commit both.
+                let s = &*s;
+                let capacity = s.prefill.as_ref().ok_or_else(|| anyhow::anyhow!("prefill scratch missing"))?;
+                capacity.ids.view(0, &[1])?.write_bytes(bytemuck::cast_slice(&[n.token]))?;
+                let committed = self.commit_draft(s, prep.draft.attach(ctx), &tokens)?;
+                let value = s.sync.arm()?;
+                ensure!(value == prep.park, "step sync value {value} does not match the prepared pass ({})", prep.park);
+                match prep.verify.attach(ctx).commit() {
+                    Ok(pass) => (committed, Some(pass)),
+                    Err(e) => {
+                        s.sync.release()?;
+                        return Err(e);
+                    }
+                }
+            }
+            None => {
+                // Nothing (fitting) encoded ahead, or the generation ends
+                // here: encode now. The next verify pass (1 + drafts rows)
+                // needs room before its graph is encoded; growing now keeps
+                // the GPU-idle requirement (nothing has been committed yet).
+                if want > 0 {
+                    self.ensure_room(ctx, state, s, 1 + want)?;
+                }
+                let s = &*s;
+                let capacity = s.prefill.as_ref().ok_or_else(|| anyhow::anyhow!("prefill scratch missing"))?;
+                let hidden = capacity.hyper.view(0, &[rows.max(1), wide])?;
+                let keep = capacity.hyper.view(accepted * wide, &[wide])?;
+                let rollback = (accepted + 1 < m).then_some((accepted, m));
+                let next_ids = match next {
+                    Some(n) if want > 0 => {
+                        capacity.ids.view(0, &[1])?.write_bytes(bytemuck::cast_slice(&[n.token]))?;
+                        Some(capacity.ids.view(1, &[want])?)
+                    }
+                    _ => None,
+                };
+                let encoded = self.encode_draft(ctx, state, s, &hidden, rows, pending.pos_before, Some(&keep), rollback, want, next_ids.as_ref())?;
+                let committed = self.commit_draft(s, encoded, &tokens)?;
+                let parked = match next {
+                    Some(n) if want > 0 => {
+                        let ps = capacity.rows(1 + want)?;
+                        let value = s.sync.arm()?;
+                        let mode = BatchMode::Verify { params: n.params, step0: n.step0, park: Some(value) };
+                        match self.encode_batch(ctx, state, s, &ps, mode).and_then(|pass| pass.commit()) {
+                            Ok(pass) => Some(pass),
+                            Err(e) => {
+                                s.sync.release()?;
+                                return Err(e);
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                (committed, parked)
+            }
+        };
+        drop(pending.prepared);
+        let s = &*s;
+        if std::env::var_os("LILY_PROFILE").is_some() {
+            eprintln!("profile host finish: both passes committed {:.2} ms after entry", entered.elapsed().as_secs_f64() * 1e3);
+        }
+        let proposals = self.collect_drafts(s, committed, rows, want, accepted + 1 < m)?;
+        if parked.is_some() {
+            // The parked verify pass started when the draft pass finished.
+            let mut pace = s.sync.pace_verify.get();
+            pace.begin(Instant::now());
+            s.sync.pace_verify.set(pace);
+        }
+        Ok((proposals, parked))
     }
 
     /// See [`crate::engine::LanguageModel::draft_initial`].
@@ -168,13 +303,16 @@ impl Qwen4ExpModel {
         let drafts = drafts.min(MAX_DRAFTS);
         self.ensure_room(ctx, state, s, 1 + drafts)?;
         let hidden = state.mtp.as_ref().ok_or_else(|| anyhow::anyhow!("no draft head state"))?.hidden.view(0, &[1, wide])?;
-        let committed = self.encode_draft(ctx, state, s, &hidden, &[first], state.pos - 1, None, None, drafts)?;
+        let encoded = self.encode_draft(ctx, state, s, &hidden, 1, state.pos - 1, None, None, drafts, None)?;
+        let committed = self.commit_draft(s, encoded, &[first])?;
         self.collect_drafts(s, committed, 1, drafts, false)
     }
 
     /// Waits for a committed draft pass and reads its proposals.
     fn collect_drafts(&self, s: &Scratch, committed: PendingPass<'_>, rows: usize, drafts: usize, rollback: bool) -> Result<Vec<u32>> {
-        let done = committed.wait_retain()?;
+        let mut pace = s.sync.pace_draft.get();
+        let done = committed.wait_retain_paced(&mut pace)?;
+        s.sync.pace_draft.set(pace);
         if std::env::var_os("LILY_PROFILE").is_some() {
             let t = done.timing()?;
             eprintln!("profile draft rows={rows} drafts={drafts} rollback={rollback}: gpu {:.2} ms", (t.gpu_end_secs - t.gpu_start_secs) * 1e3);
@@ -186,11 +324,26 @@ impl Qwen4ExpModel {
         Ok(sp.draft_tokens.to_u32()?[..drafts].to_vec())
     }
 
-    /// Encodes and commits the draft pass without waiting: optional rollback
-    /// of the recurrent state to `accepted` of `m` verified rows, the head's
-    /// catch-up over `tokens` (following `hidden` rows, head positions from
-    /// `pos0`), `keep` copied into the state's hidden, and `drafts` chained
-    /// proposals into the spec scratch.
+    /// Writes the head's catch-up ids (`tokens`, one per row the pass was
+    /// encoded for) and commits a draft pass encoded by [`Self::encode_draft`].
+    fn commit_draft<'a>(&self, s: &Scratch, encoded: EncodedPass<'a>, tokens: &[u32]) -> Result<PendingPass<'a>> {
+        if !tokens.is_empty() {
+            let sp = s.spec.as_ref().ok_or_else(|| anyhow::anyhow!("no spec scratch"))?;
+            sp.mtp_ids.view(0, &[tokens.len()])?.write_bytes(bytemuck::cast_slice(tokens))?;
+        }
+        let mut pace = s.sync.pace_draft.get();
+        pace.begin(Instant::now());
+        s.sync.pace_draft.set(pace);
+        encoded.commit()
+    }
+
+    /// Encodes the draft pass without committing: optional rollback of the
+    /// recurrent state to `accepted` of `m` verified rows, the head's
+    /// catch-up over `rows` rows (`hidden` rows paired with the ids
+    /// [`Self::commit_draft`] writes, head positions from `pos0`), `keep`
+    /// copied into the state's hidden, and `drafts` chained proposals into
+    /// the spec scratch, also copied into `next_ids` (the next verify pass's
+    /// ids after its pending token) when given.
     #[allow(clippy::too_many_arguments)]
     fn encode_draft<'a>(
         &self,
@@ -198,24 +351,21 @@ impl Qwen4ExpModel {
         state: &DecodeState,
         s: &Scratch,
         hidden: &Tensor,
-        tokens: &[u32],
+        rows: usize,
         pos0: usize,
         keep: Option<&Tensor>,
         rollback: Option<(usize, usize)>,
         drafts: usize,
-    ) -> Result<PendingPass<'a>> {
+        next_ids: Option<&Tensor>,
+    ) -> Result<EncodedPass<'a>> {
         let cfg = &self.config;
         let wide = cfg.hc_width();
         let mtp = self.weights.mtp.as_ref().ok_or_else(|| anyhow::anyhow!("no draft head"))?;
         let mst = state.mtp.as_ref().ok_or_else(|| anyhow::anyhow!("no draft head state"))?;
         let sp = s.spec.as_ref().ok_or_else(|| anyhow::anyhow!("no spec scratch"))?;
         let capacity = s.prefill.as_ref().ok_or_else(|| anyhow::anyhow!("prefill scratch missing"))?;
-        let rows = tokens.len();
         ensure!(rows <= MAX_DRAFTS + 1, "too many catch-up rows");
         ensure!(drafts == 0 || rows > 0, "drafts need a row to follow");
-        if rows > 0 {
-            sp.mtp_ids.view(0, &[rows])?.write_bytes(bytemuck::cast_slice(&tokens[..rows]))?;
-        }
 
         let pass = ctx.begin_concurrent()?;
         if let Some((accepted, m)) = rollback {
@@ -264,8 +414,12 @@ impl Qwen4ExpModel {
                         last = hyper.view(0, &[1, wide])?;
                     }
                 }
+                if let Some(ids) = next_ids {
+                    copy_words(ctx, &pass, &sp.draft_tokens.view(0, &[drafts])?, ids)?;
+                }
             }
         }
-        pass.commit()
+        s.sync.signal_done(&pass)?;
+        pass.end()
     }
 }

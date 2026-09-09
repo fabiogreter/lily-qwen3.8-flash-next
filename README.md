@@ -15,6 +15,7 @@ build step.
 
 Reports, with measurement contract:
 
+- [2026-09-09: the per-token host round trip, parked passes, bandwidth probes](docs/2026-09-09-host-round-trip-report.md)
 - [2026-09-08: phase 3, speculative decoding and the disk tier](docs/2026-09-08-phase3-speculation-disk-report.md)
   (98 tok/s greedy with two drafts against 76 plain; evicted sessions resume from disk)
 - [2026-09-08: phase 2, the server and its memory](docs/2026-09-08-phase2-server-report.md)

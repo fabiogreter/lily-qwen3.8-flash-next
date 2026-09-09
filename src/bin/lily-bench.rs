@@ -1,4 +1,6 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Result, ensure};
@@ -6,7 +8,7 @@ use clap::Parser;
 use lily::engine::{DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi};
 use lily::generate::speculate;
 use lily::kernels::sample::SamplingParams;
-use lily::metal::PendingPass;
+use lily::metal::{EncodedPass, Pacer, PendingPass};
 use lily::kernels::attention::MAX_SEQ;
 use lily::metal::MetalContext;
 use lily::model::Qwen3_5Model;
@@ -52,6 +54,27 @@ fn main() -> Result<()> {
 
 const GREEDY: SamplingParams = SamplingParams::greedy();
 
+/// Host time in seconds on the clock Metal's `GPUStartTime`/`GPUEndTime`
+/// use (mach_absolute_time), so host and GPU marks can be subtracted.
+fn host_secs() -> f64 {
+    #[repr(C)]
+    struct Timebase {
+        numer: u32,
+        denom: u32,
+    }
+    unsafe extern "C" {
+        fn mach_absolute_time() -> u64;
+        fn mach_timebase_info(info: *mut Timebase) -> i32;
+    }
+    let mut tb = Timebase { numer: 0, denom: 0 };
+    // SAFETY: plain libSystem calls with a valid out-pointer.
+    let ticks = unsafe {
+        mach_timebase_info(&mut tb);
+        mach_absolute_time()
+    };
+    ticks as f64 * tb.numer as f64 / tb.denom as f64 * 1e-9
+}
+
 fn draw(step: usize) -> Draw<'static> {
     Draw { params: &GREEDY, step }
 }
@@ -72,6 +95,57 @@ fn submit_step<'a, M: LanguageModel>(
     let pending = encoded.commit()?;
     state.advance(1);
     Ok(pending)
+}
+
+/// Stages step `index` (reading slot `index % 2`): committed and parked, or
+/// merely encoded, depending on the protocol.
+#[allow(clippy::type_complexity)]
+fn stage_next<'a, M: LanguageModel>(
+    model: &M,
+    ctx: &'a MetalContext,
+    state: &mut M::State,
+    scratch: &M::Scratch,
+    index: usize,
+    parking: bool,
+) -> Result<(Option<PendingPass<'a>>, Option<EncodedPass<'a>>)> {
+    let draw = draw(index + 1);
+    if parking {
+        let pass = model.encode_parked_step(ctx, state, scratch, index % 2, (index + 1) % 2, draw)?.commit()?;
+        state.advance(1);
+        Ok((Some(pass), None))
+    } else {
+        Ok((None, Some(model.encode_decode_step(ctx, state, scratch, index % 2, (index + 1) % 2, draw)?)))
+    }
+}
+
+/// Reads the token of the completed step `index`, stages its inputs and lets
+/// the next step go: releases the parked pass or commits the encoded one.
+fn deliver<'a, M: LanguageModel>(
+    model: &M,
+    state: &mut M::State,
+    scratch: &M::Scratch,
+    index: usize,
+    parked: Option<PendingPass<'a>>,
+    encoded: Option<EncodedPass<'a>>,
+    prepare_secs: &mut Vec<f64>,
+) -> Result<(u32, PendingPass<'a>)> {
+    let token = scratch.next_token().view(index % 2, &[1])?.to_u32()?[0];
+    let prepare_started = Instant::now();
+    model.prepare_step_inputs(state, scratch, token)?;
+    prepare_secs.push(prepare_started.elapsed().as_secs_f64());
+    let next = match (parked, encoded) {
+        (Some(pass), _) => {
+            model.release_parked(scratch)?;
+            pass
+        }
+        (None, Some(encoded)) => {
+            let pass = encoded.commit()?;
+            state.advance(1);
+            pass
+        }
+        (None, None) => anyhow::bail!("no next step staged"),
+    };
+    Ok((token, next))
 }
 
 fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
@@ -116,8 +190,11 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
     model.prefill(&ctx, &mut state, &mut scratch, &prompt, Some(draw(0)))?;
 
     // Production cadence: the next step is encoded while the previous one
-    // runs and committed as soon as its input token has been read back.
+    // runs. With parking (the server's protocol) it is also committed right
+    // away and released once its input token has been read back and staged;
+    // otherwise it is committed at that point.
     // Submit the first decode before token delivery and cadence timing.
+    let parking = model.supports_parking();
     let mut pending = submit_step(&model, &ctx, &mut state, &scratch, 0, 1, 1)?;
     let first_token_id = scratch.next_token().view(0, &[1])?.to_u32()?[0];
     let prefill_secs = prefill_start.elapsed().as_secs_f64();
@@ -128,27 +205,48 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
         if cli.gpu_timing { Vec::with_capacity(cli.decode_steps) } else { Vec::new() };
     let mut token_ids = Vec::with_capacity(cli.decode_steps);
     let mut prepare_secs = Vec::with_capacity(cli.decode_steps);
+    // (woke after the previous pass, released/committed the next one), Metal clock.
+    let mut host_marks: Vec<(f64, f64)> = Vec::with_capacity(cli.decode_steps);
+    // LILY_PROBE_ARRIVAL: a poller records when each parked pass reaches its
+    // wait and when it resumed (the model raises two events around the wait).
+    let arrivals: Arc<Mutex<Vec<(u64, f64)>>> = Arc::new(Mutex::new(Vec::new()));
+    let stop_poller = Arc::new(AtomicBool::new(false));
+    let resumes: Arc<Mutex<Vec<(u64, f64)>>> = Arc::new(Mutex::new(Vec::new()));
+    let poller = scratch.arrival_probe().cloned().zip(scratch.resumed_probe().cloned()).map(|(arrival, resumed)| {
+        let (arrivals, resumes, stop) = (Arc::clone(&arrivals), Arc::clone(&resumes), Arc::clone(&stop_poller));
+        std::thread::spawn(move || {
+            let (mut last_a, mut last_r) = (arrival.signaled_value(), resumed.signaled_value());
+            while !stop.load(Ordering::Relaxed) {
+                let a = arrival.signaled_value();
+                if a != last_a {
+                    arrivals.lock().expect("arrivals").push((a, host_secs()));
+                    last_a = a;
+                }
+                let r = resumed.signaled_value();
+                if r != last_r {
+                    resumes.lock().expect("resumes").push((r, host_secs()));
+                    last_r = r;
+                }
+                std::hint::spin_loop();
+            }
+        })
+    });
+    let mut pacer = Pacer::default();
+    pacer.begin(Instant::now());
     for index in 1..cli.decode_steps {
-        let encoded = model.encode_decode_step(
-            &ctx,
-            &state,
-            &scratch,
-            index % 2,
-            (index + 1) % 2,
-            draw(index + 1),
-        )?;
+        let (parked, encoded) = stage_next(&model, &ctx, &mut state, &scratch, index, parking)?;
         let completed = if cli.gpu_timing {
-            Some(pending.wait_retain()?)
+            Some(pending.wait_retain_paced(&mut pacer)?)
         } else {
-            pending.wait()?;
+            pending.wait_paced(&mut pacer)?;
             None
         };
-        let token = scratch.next_token().view(index % 2, &[1])?.to_u32()?[0];
-        let prepare_started = Instant::now();
-        model.prepare_step_inputs(&mut state, &scratch, token)?;
-        prepare_secs.push(prepare_started.elapsed().as_secs_f64());
-        let next = encoded.commit()?;
-        state.advance(1);
+        pacer.begin(Instant::now());
+        let woke = if cli.gpu_timing { host_secs() } else { 0.0 };
+        let (token, next) = deliver(&model, &mut state, &scratch, index, parked, encoded, &mut prepare_secs)?;
+        if cli.gpu_timing {
+            host_marks.push((woke, host_secs()));
+        }
         token_ids.push(token);
         let delivered = Instant::now();
         decode_intervals
@@ -159,25 +257,15 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
         previous_delivery = delivered;
         pending = next;
     }
-    // Encode the final lookahead inside the cadence timer, then drain it outside.
-    let encoded = model.encode_decode_step(
-        &ctx,
-        &state,
-        &scratch,
-        cli.decode_steps % 2,
-        (cli.decode_steps + 1) % 2,
-        draw(cli.decode_steps + 1),
-    )?;
+    // Stage the final lookahead inside the cadence timer, then drain it outside.
+    let (parked, encoded) = stage_next(&model, &ctx, &mut state, &scratch, cli.decode_steps, parking)?;
     let completed = if cli.gpu_timing {
         Some(pending.wait_retain()?)
     } else {
         pending.wait()?;
         None
     };
-    let token = scratch.next_token().view(cli.decode_steps % 2, &[1])?.to_u32()?[0];
-    model.prepare_step_inputs(&mut state, &scratch, token)?;
-    let lookahead = encoded.commit()?;
-    state.advance(1);
+    let (token, lookahead) = deliver(&model, &mut state, &scratch, cli.decode_steps, parked, encoded, &mut prepare_secs)?;
     token_ids.push(token);
     let delivered = Instant::now();
     decode_intervals.push(delivered.duration_since(previous_delivery).as_secs_f64());
@@ -191,6 +279,12 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
         lookahead.wait()?;
         None
     };
+    stop_poller.store(true, Ordering::Relaxed);
+    if let Some(poller) = poller {
+        let _ = poller.join();
+    }
+    let arrival_marks: Vec<(u64, f64)> = arrivals.lock().expect("arrivals").clone();
+    let resume_marks: Vec<(u64, f64)> = resumes.lock().expect("resumes").clone();
 
     // Diagnostic timestamp queries are intentionally outside the production
     // cadence timer. The default path retains no completed command buffers.
@@ -220,7 +314,7 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
             "prompt_len": cli.prompt_len,
             "prompt_kind": "u32_golden_ratio_hash_mod_vocab",
             "decode_steps": cli.decode_steps,
-            "decode_mode": "production_depth2_concurrent",
+            "decode_mode": if parking { "production_depth2_parked" } else { "production_depth2_concurrent" },
             "gpu_timing_diagnostic": cli.gpu_timing,
         },
         "results": {
@@ -234,6 +328,18 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
                 "tok_s": cli.decode_steps as f64 / decode_secs,
                 "step_wall_secs": decode_intervals,
                 "gpu_passes": gpu_passes,
+                "host_marks": host_marks.iter().map(|(woke, committed)| serde_json::json!({
+                    "woke_secs": woke,
+                    "committed_secs": committed,
+                })).collect::<Vec<_>>(),
+                "arrival_marks": arrival_marks.iter().map(|(value, secs)| serde_json::json!({
+                    "value": value,
+                    "secs": secs,
+                })).collect::<Vec<_>>(),
+                "resume_marks": resume_marks.iter().map(|(value, secs)| serde_json::json!({
+                    "value": value,
+                    "secs": secs,
+                })).collect::<Vec<_>>(),
                 "lookahead_gpu_pass": lookahead_gpu.map(|gpu| serde_json::json!({
                     "start_secs": gpu.gpu_start_secs,
                     "end_secs": gpu.gpu_end_secs,

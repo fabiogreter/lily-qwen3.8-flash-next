@@ -8,7 +8,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::kernels::sample::SamplingParams;
-use crate::metal::{EncodedPass, MetalContext};
+use crate::metal::{EncodedPass, MetalContext, PendingPass, SharedEvent};
 use crate::tensor::Tensor;
 
 /// A copy of the recurrent part of a decode state (everything that is not a
@@ -83,6 +83,17 @@ pub trait DecodeStateApi: Sized {
 
 /// Per-engine intermediates.
 pub trait ScratchApi {
+    /// Diagnostics: an event the GPU raises when a parked step reaches its
+    /// wait (`LILY_PROBE_ARRIVAL`), if the model provides one.
+    fn arrival_probe(&self) -> Option<&SharedEvent> {
+        None
+    }
+
+    /// Diagnostics: an event the GPU raises right after that wait.
+    fn resumed_probe(&self) -> Option<&SharedEvent> {
+        None
+    }
+
     /// `U32[2]`: the ping-pong slots the in-graph sampler writes tokens to.
     fn next_token(&self) -> &Tensor;
     /// `F32[vocab]`: the logits of the most recent step (prefill leaves the
@@ -201,6 +212,40 @@ pub trait LanguageModel: Sized {
         draw: Draw<'_>,
     ) -> Result<EncodedPass<'a>>;
 
+    /// Whether [`Self::encode_parked_step`] is available: the model can take a
+    /// decode step that is committed before its per-token host inputs exist
+    /// and blocks on the GPU until [`Self::release_parked`].
+    fn supports_parking(&self) -> bool {
+        false
+    }
+
+    /// Like [`Self::encode_decode_step`], but meant to be committed right
+    /// away: the pass parks on the GPU where it first reads what
+    /// [`Self::prepare_step_inputs`] stages, until [`Self::release_parked`].
+    /// This takes the command-buffer submission latency off the per-token
+    /// critical path. One parked step at a time; the caller commits it and
+    /// calls [`DecodeStateApi::advance`], later stages the inputs and
+    /// releases it. A committed parked pass holds the queue until released.
+    fn encode_parked_step<'a>(
+        &self,
+        ctx: &'a MetalContext,
+        state: &Self::State,
+        scratch: &Self::Scratch,
+        slot_in: usize,
+        slot_out: usize,
+        draw: Draw<'_>,
+    ) -> Result<EncodedPass<'a>> {
+        let _ = (ctx, state, scratch, slot_in, slot_out, draw);
+        anyhow::bail!("this model cannot park decode steps")
+    }
+
+    /// Lets the parked pass continue; its staged inputs must be in place.
+    /// No-op when nothing is parked.
+    fn release_parked(&self, scratch: &Self::Scratch) -> Result<()> {
+        let _ = scratch;
+        Ok(())
+    }
+
     // --- speculative decoding (models with a draft head) ------------------
 
     /// Draft tokens per step the model can propose; `0` when it has no draft
@@ -226,9 +271,10 @@ pub trait LanguageModel: Sized {
     /// Feeds `pending` and `drafts` in one batched pass and draws one token
     /// per row (draw `step0 + row` of the request), waiting for the GPU. The
     /// state is then mid-step: it has fed every row, and must be completed
-    /// with [`Self::finish_speculation`] before anything else. `ahead` is the
-    /// pass [`Self::finish_speculation`] may have encoded for exactly these
-    /// arguments; the model fills in the token-dependent inputs and commits it.
+    /// with [`Self::finish_speculation`] before anything else. `parked` is the
+    /// pass [`Self::finish_speculation`] may have committed for exactly these
+    /// arguments, parked on the GPU until its host inputs exist; the model
+    /// stages them and releases it.
     #[allow(clippy::too_many_arguments)]
     fn verify<'a>(
         &self,
@@ -239,18 +285,19 @@ pub trait LanguageModel: Sized {
         drafts: &[u32],
         params: &SamplingParams,
         step0: usize,
-        ahead: Option<EncodedPass<'a>>,
+        parked: Option<PendingPass<'a>>,
     ) -> Result<Vec<u32>> {
-        let _ = (ctx, state, scratch, pending, drafts, params, step0, ahead);
+        let _ = (ctx, state, scratch, pending, drafts, params, step0, parked);
         anyhow::bail!("this model has no draft head")
     }
 
     /// Completes a verify pass: keeps `pending` plus the first `accepted`
     /// drafts as fed (rolling the state back past the rest) and, when `next`
     /// is given, proposes up to `drafts` tokens following it. Returns the
-    /// proposals (empty when `next` is `None`) and, when it could encode it
-    /// while the GPU drafted, the next verify pass for `(params, step0)` in
-    /// `next`, to hand back to [`Self::verify`]. Waits for the GPU.
+    /// proposals (empty when `next` is `None`) and, when it could, the next
+    /// verify pass for `(params, step0)` in `next`, already committed and
+    /// parked behind the draft pass, to hand back to [`Self::verify`]. Waits
+    /// for the GPU.
     fn finish_speculation<'a>(
         &self,
         ctx: &'a MetalContext,
@@ -259,7 +306,7 @@ pub trait LanguageModel: Sized {
         accepted: usize,
         next: Option<NextStep<'_>>,
         drafts: usize,
-    ) -> Result<(Vec<u32>, Option<EncodedPass<'a>>)> {
+    ) -> Result<(Vec<u32>, Option<PendingPass<'a>>)> {
         let _ = (ctx, state, scratch, accepted, next, drafts);
         anyhow::bail!("this model has no draft head")
     }

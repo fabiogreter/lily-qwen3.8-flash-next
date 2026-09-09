@@ -429,11 +429,13 @@ impl<M: LanguageModel> Engine<M> {
         deliver(final_events, sink);
         let decode_secs = decode_started.elapsed().as_secs_f64();
 
-        // Bookkeeping: the state holds the prompt plus every generated token
-        // but the last (drawn, never fed).
-        let fed_generated = generation.tokens.len() - 1;
+        // Bookkeeping: the state holds the prompt plus the generated tokens
+        // that were fed: all but the last (drawn, never fed), or all of them
+        // when a parked step consumed the final one. `fed` counts the last
+        // prompt token too.
+        let fed_generated = generation.fed.checked_sub(1).ok_or_else(|| anyhow::anyhow!("decode state did not advance"))?;
         ensure!(
-            generation.fed == 1 + fed_generated,
+            fed_generated + 1 == generation.tokens.len() || fed_generated == generation.tokens.len(),
             "decode state advanced {} tokens for {} drawn",
             generation.fed,
             generation.tokens.len()

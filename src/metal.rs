@@ -5,6 +5,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use core::ffi::c_void;
@@ -13,11 +14,11 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBarrierScope, MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder,
-    MTLCommandQueue,
+    MTLBarrierScope, MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus,
+    MTLCommandEncoder, MTLCommandQueue,
     MTLCompileOptions, MTLComputeCommandEncoder, MTLComputePassDescriptor,
     MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLDispatchType,
-    MTLLanguageVersion, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLEvent, MTLLanguageVersion, MTLLibrary, MTLResourceOptions, MTLSharedEvent, MTLSize,
 };
 
 use crate::tensor::Tensor;
@@ -191,19 +192,31 @@ impl MetalContext {
     /// Starts a compute pass. Dispatches encoded on one pass execute serially
     /// The serial compute pass used by prefill and utility kernels.
     pub fn begin(&self) -> Result<ComputePass<'_>> {
+        self.begin_pass(false)
+    }
+
+    fn begin_pass(&self, concurrent: bool) -> Result<ComputePass<'_>> {
         let cmd = self
             .queue
             .commandBuffer()
             .ok_or_else(|| anyhow!("failed to create command buffer"))?;
-        let encoder = cmd
-            .computeCommandEncoder()
-            .ok_or_else(|| anyhow!("failed to create compute command encoder"))?;
+        let encoder = new_encoder(&cmd, concurrent)?;
         Ok(ComputePass {
             _ctx: std::marker::PhantomData,
             cmd,
             encoder: RefCell::new(encoder),
             ended: Cell::new(false),
+            concurrent,
+            done: RefCell::new(None),
         })
+    }
+
+    /// A host/GPU synchronization point for [`ComputePass::wait_event`]: the
+    /// GPU blocks mid-pass until the host has signaled at least the awaited
+    /// value. Lets a pass be committed before all of its inputs exist.
+    pub fn new_shared_event(&self) -> Result<SharedEvent> {
+        let event = self.device.newSharedEvent().ok_or_else(|| anyhow!("failed to create shared event"))?;
+        Ok(SharedEvent { event })
     }
 
     /// A compute pass whose single encoder uses `MTLDispatchType::Concurrent` —
@@ -212,21 +225,7 @@ impl MetalContext {
     /// [`ComputePass::memory_barrier`] at dependency boundaries. Used by the
     /// concurrent decode path.
     pub fn begin_concurrent(&self) -> Result<ComputePass<'_>> {
-        let cmd = self
-            .queue
-            .commandBuffer()
-            .ok_or_else(|| anyhow!("failed to create command buffer"))?;
-        let desc = MTLComputePassDescriptor::computePassDescriptor();
-        desc.setDispatchType(MTLDispatchType::Concurrent);
-        let encoder = cmd
-            .computeCommandEncoderWithDescriptor(&desc)
-            .ok_or_else(|| anyhow!("failed to create concurrent compute encoder"))?;
-        Ok(ComputePass {
-            _ctx: std::marker::PhantomData,
-            cmd,
-            encoder: RefCell::new(encoder),
-            ended: Cell::new(false),
-        })
+        self.begin_pass(true)
     }
 
     /// Highest supported Apple GPU family number (10 for M5-class with
@@ -244,11 +243,59 @@ impl MetalContext {
     }
 }
 
+fn new_encoder(
+    cmd: &ProtocolObject<dyn MTLCommandBuffer>,
+    concurrent: bool,
+) -> Result<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>> {
+    if concurrent {
+        let desc = MTLComputePassDescriptor::computePassDescriptor();
+        desc.setDispatchType(MTLDispatchType::Concurrent);
+        cmd.computeCommandEncoderWithDescriptor(&desc)
+            .ok_or_else(|| anyhow!("failed to create concurrent compute encoder"))
+    } else {
+        cmd.computeCommandEncoder().ok_or_else(|| anyhow!("failed to create compute command encoder"))
+    }
+}
+
+/// A monotonically signaled counter shared by host and GPU
+/// (`MTLSharedEvent`). The GPU waits for `signaled_value >= v` where a pass
+/// asked for it; the host raises the value once the awaited inputs are in
+/// place. Waits are released in order, so callers use increasing values.
+#[derive(Clone)]
+pub struct SharedEvent {
+    event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+}
+
+impl SharedEvent {
+    /// Raises the counter to `value` (never lower it: a pass may be waiting
+    /// for the current value).
+    pub fn signal(&self, value: u64) {
+        self.event.setSignaledValue(value);
+    }
+
+    pub fn signaled_value(&self) -> u64 {
+        self.event.signaledValue()
+    }
+
+    /// Releases every pending and future wait, for error paths that would
+    /// otherwise leave a committed pass blocked on the GPU forever.
+    pub fn release_all(&self) {
+        self.event.setSignaledValue(u64::MAX);
+    }
+
+    fn as_event(&self) -> &ProtocolObject<dyn MTLEvent> {
+        ProtocolObject::from_ref(&*self.event)
+    }
+}
+
 pub struct ComputePass<'a> {
     _ctx: std::marker::PhantomData<&'a MetalContext>,
     cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     encoder: RefCell<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
     ended: Cell<bool>,
+    concurrent: bool,
+    /// The event and value [`Self::signal_done`] encoded, if any.
+    done: RefCell<Option<(SharedEvent, u64)>>,
 }
 
 impl Drop for ComputePass<'_> {
@@ -311,6 +358,32 @@ impl<'a> ComputePass<'a> {
         self.memory_barrier()
     }
 
+    /// Makes the GPU block here until the host has signaled `event` to at
+    /// least `value`. Everything encoded before completes first (the wait sits
+    /// between two encoders), so this also acts as a full barrier. The pass
+    /// can then be committed before the inputs read after this point exist;
+    /// the host writes them and signals. A pass committed with an unsatisfied
+    /// wait holds the whole queue, so every path after commit must signal
+    /// (or [`SharedEvent::release_all`]).
+    pub fn wait_event(&self, event: &SharedEvent, value: u64) -> Result<()> {
+        self.encoder.borrow().endEncoding();
+        self.cmd.encodeWaitForEvent_value(event.as_event(), value);
+        let encoder = new_encoder(&self.cmd, self.concurrent)?;
+        *self.encoder.borrow_mut() = encoder;
+        Ok(())
+    }
+
+    /// Makes the GPU raise `event` to `value` once everything encoded before
+    /// this point has completed (the host can wait on the event, or poll
+    /// [`SharedEvent::signaled_value`], instead of on the whole pass).
+    pub fn signal_event(&self, event: &SharedEvent, value: u64) -> Result<()> {
+        self.encoder.borrow().endEncoding();
+        self.cmd.encodeSignalEvent_value(event.as_event(), value);
+        let encoder = new_encoder(&self.cmd, self.concurrent)?;
+        *self.encoder.borrow_mut() = encoder;
+        Ok(())
+    }
+
     /// Orders all prior dispatches' buffer writes before every subsequent
     /// dispatch — the dependency-level boundary for [`MetalContext::
     /// begin_concurrent`] passes. Serial encoders safely ignore it.
@@ -333,7 +406,18 @@ impl<'a> ComputePass<'a> {
     pub fn end(self) -> Result<EncodedPass<'a>> {
         self.encoder.borrow().endEncoding();
         self.ended.set(true);
-        Ok(EncodedPass { _ctx: std::marker::PhantomData, cmd: self.cmd.clone() })
+        Ok(EncodedPass { _ctx: std::marker::PhantomData, cmd: self.cmd.clone(), done: self.done.borrow().clone() })
+    }
+
+    /// Encodes, as the pass's last command, a GPU signal of `event` to
+    /// `value`, and remembers it: [`PendingPass::wait_paced`] then polls the
+    /// event (which the GPU writes directly) instead of blocking on the
+    /// command buffer, whose completion the host only learns of ~0.1 ms
+    /// later. Call after everything else is encoded.
+    pub fn signal_done(&self, event: &SharedEvent, value: u64) -> Result<()> {
+        self.signal_event(event, value)?;
+        *self.done.borrow_mut() = Some((event.clone(), value));
+        Ok(())
     }
 
     /// Ends encoding, submits the command buffer, and blocks until the GPU
@@ -351,13 +435,34 @@ impl<'a> ComputePass<'a> {
 pub struct EncodedPass<'a> {
     _ctx: std::marker::PhantomData<&'a MetalContext>,
     cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    done: Option<(SharedEvent, u64)>,
 }
 
 impl<'a> EncodedPass<'a> {
     /// Submits without blocking.
     pub fn commit(self) -> Result<PendingPass<'a>> {
         self.cmd.commit();
-        Ok(PendingPass { _ctx: std::marker::PhantomData, cmd: self.cmd })
+        Ok(PendingPass { _ctx: std::marker::PhantomData, cmd: self.cmd, done: self.done })
+    }
+
+    /// Drops the context lifetime so the pass can be kept inside long-lived
+    /// state (passes encoded ahead for several possible outcomes). The
+    /// context must outlive it; [`DetachedPass::attach`] restores the tie.
+    pub fn detach(self) -> DetachedPass {
+        DetachedPass { cmd: self.cmd, done: self.done }
+    }
+}
+
+/// An [`EncodedPass`] held without its context lifetime; see
+/// [`EncodedPass::detach`].
+pub struct DetachedPass {
+    cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    done: Option<(SharedEvent, u64)>,
+}
+
+impl DetachedPass {
+    pub fn attach<'a>(self, _ctx: &'a MetalContext) -> EncodedPass<'a> {
+        EncodedPass { _ctx: std::marker::PhantomData, cmd: self.cmd, done: self.done }
     }
 }
 
@@ -430,6 +535,7 @@ impl MetalContext {
 pub struct PendingPass<'a> {
     _ctx: std::marker::PhantomData<&'a MetalContext>,
     cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    done: Option<(SharedEvent, u64)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -444,6 +550,9 @@ pub struct CompletedPass {
 
 impl CompletedPass {
     pub fn timing(&self) -> Result<PassTiming> {
+        // A pass observed through its done signal may not have been marked
+        // completed by the driver yet; the timestamps need that.
+        self.cmd.waitUntilCompleted();
         let timing = PassTiming {
             gpu_start_secs: self.cmd.GPUStartTime(),
             gpu_end_secs: self.cmd.GPUEndTime(),
@@ -462,15 +571,104 @@ impl CompletedPass {
 impl PendingPass<'_> {
     /// Blocks until the GPU finishes this pass.
     pub fn wait(self) -> Result<()> {
-        self.cmd.waitUntilCompleted();
-        Ok(())
+        self.wait_retain().map(|_| ())
     }
 
     /// Blocks until completion while retaining the completed command buffer.
     /// Benchmarks query its GPU clock only after their cadence timer ends.
     pub fn wait_retain(self) -> Result<CompletedPass> {
         self.cmd.waitUntilCompleted();
+        self.finished()
+    }
+
+    /// Like [`Self::wait`], paced: sleeps until `pacer` predicts the pass is
+    /// about to finish, then polls the pass's done signal (see
+    /// [`ComputePass::signal_done`]) and returns within microseconds of it.
+    /// A blocked thread would learn of the completion ~0.1 ms later. Without
+    /// a done signal this is a plain blocking wait. Polling is capped so a
+    /// wrong prediction cannot pin a core; the pacer learns from the outcome.
+    pub fn wait_paced(self, pacer: &mut Pacer) -> Result<()> {
+        self.wait_retain_paced(pacer).map(|_| ())
+    }
+
+    pub fn wait_retain_paced(self, pacer: &mut Pacer) -> Result<CompletedPass> {
+        let Some((event, value)) = self.done.clone() else {
+            let done = self.wait_retain()?;
+            pacer.end(Instant::now(), false);
+            return Ok(done);
+        };
+        if let Some(wake_at) = pacer.wake_at() {
+            let now = Instant::now();
+            if wake_at > now {
+                std::thread::sleep(wake_at - now);
+            }
+        }
+        let overslept = event.signaled_value() >= value;
+        if !overslept {
+            let spin_until = Instant::now() + SPIN_CAP;
+            while event.signaled_value() < value {
+                if Instant::now() > spin_until {
+                    self.cmd.waitUntilCompleted();
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+        }
+        pacer.end(Instant::now(), overslept);
+        self.finished()
+    }
+
+    fn finished(self) -> Result<CompletedPass> {
+        if self.cmd.status() == MTLCommandBufferStatus::Error {
+            anyhow::bail!("Metal command buffer failed: {:?}", self.cmd.error());
+        }
         Ok(CompletedPass { cmd: self.cmd })
+    }
+}
+
+/// Longest a paced wait polls before falling back to a blocking wait.
+const SPIN_CAP: Duration = Duration::from_millis(20);
+
+/// Predicts when a repeating GPU pass completes so the host can sleep until
+/// shortly before and then poll ([`PendingPass::wait_spinning`]). Tracks an
+/// exponential average of the interval between `begin` and `end` marks.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Pacer {
+    began: Option<Instant>,
+    ema_secs: Option<f64>,
+}
+
+impl Pacer {
+    /// How far ahead of the predicted completion to wake: covers sleep
+    /// overshoot and prediction error at the cost of that much polling.
+    pub const MARGIN: Duration = Duration::from_micros(1500);
+
+    /// Marks the start of an interval (the pass will run from about now).
+    pub fn begin(&mut self, now: Instant) {
+        self.began = Some(now);
+    }
+
+    /// When to wake for the pass begun last: `None` until an estimate exists.
+    pub fn wake_at(&self) -> Option<Instant> {
+        let (began, ema) = (self.began?, self.ema_secs?);
+        let predicted = began + Duration::from_secs_f64(ema);
+        Some(predicted.checked_sub(Self::MARGIN).unwrap_or(began))
+    }
+
+    /// Marks completion and folds the interval into the estimate. When the
+    /// waiter `overslept` (the pass was already done on wake-up) the true
+    /// completion time is unknown, so the estimate only shrinks; it grows
+    /// again from observed completions. This keeps a too-long estimate from
+    /// feeding on the late wake-ups it causes.
+    pub fn end(&mut self, now: Instant, overslept: bool) {
+        if let Some(began) = self.began.take() {
+            let secs = now.duration_since(began).as_secs_f64();
+            self.ema_secs = Some(match (self.ema_secs, overslept) {
+                (Some(ema), true) => (0.85 * ema).min(secs),
+                (Some(ema), false) => 0.7 * ema + 0.3 * secs,
+                (None, _) => secs,
+            });
+        }
     }
 }
 
@@ -503,3 +701,7 @@ fn encode_dispatch(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/metal.rs"]
+mod tests;

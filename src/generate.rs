@@ -13,7 +13,9 @@ use anyhow::{Result, ensure};
 use crate::chat::Conversation;
 use crate::engine::{DecodeStateApi, Draw, LanguageModel, NextStep, ScratchApi};
 use crate::kernels::sample::SamplingParams;
-use crate::metal::MetalContext;
+use std::time::Instant;
+
+use crate::metal::{EncodedPass, MetalContext, Pacer, PendingPass};
 pub use crate::tokenizer::Thinking;
 use crate::tokenizer::Tokenizer;
 
@@ -84,11 +86,13 @@ pub fn speculate<M: LanguageModel>(
     ensure!(tokens.len() == 1, "speculation starts right after the first draw");
     let (mut drafted, mut accepted) = (0usize, 0usize);
     let mut proposals = model.draft_initial(ctx, state, scratch, tokens[0], k)?;
-    let mut ahead = None;
+    // The next verify pass, committed by finish_speculation and parked on the
+    // GPU until verify stages its n-gram rows.
+    let mut parked: Option<PendingPass<'_>> = None;
     loop {
         let pending = *tokens.last().expect("tokens is never empty");
         let step0 = tokens.len();
-        let sampled = model.verify(ctx, state, scratch, pending, &proposals, params, step0, ahead.take())?;
+        let sampled = model.verify(ctx, state, scratch, pending, &proposals, params, step0, parked.take())?;
         // Row j confirms draft j when its draw equals it; the first row that
         // does not (or the row after the last draft) supplies the fresh token.
         let mut kept = 0usize;
@@ -116,9 +120,9 @@ pub fn speculate<M: LanguageModel>(
             }
             None => {
                 let next = NextStep { token: sampled[kept], params, step0: tokens.len() };
-                let (next_proposals, next_ahead) = model.finish_speculation(ctx, state, scratch, kept, Some(next), k)?;
+                let (next_proposals, next_parked) = model.finish_speculation(ctx, state, scratch, kept, Some(next), k)?;
                 proposals = next_proposals;
-                ahead = next_ahead;
+                parked = next_parked;
             }
         }
     }
@@ -225,12 +229,23 @@ impl Generator {
             .pos()
             .checked_sub(pos_before)
             .ok_or_else(|| anyhow::anyhow!("decode state moved backwards"))?;
-        ensure!(fed == prompt_ids.len() + tokens.len() - 1, "state fed {fed} tokens for {} prompt and {} drawn", prompt_ids.len(), tokens.len());
+        // The last drawn token is fed only when a parked step consumed it.
+        let drawn = prompt_ids.len() + tokens.len();
+        ensure!(fed == drawn - 1 || fed == drawn, "state fed {fed} tokens for {} prompt and {} drawn", prompt_ids.len(), tokens.len());
         Ok(Generation { tokens, finish, fed, drafted, accepted })
     }
 
     /// The pipelined loop proper. `tokens` holds the tokens drawn so far, the
     /// last of which is the input of the next step; returns why it stopped.
+    ///
+    /// Two protocols, chosen by [`LanguageModel::supports_parking`]. Parking:
+    /// step N+1 is encoded and committed while step N runs and waits on the
+    /// GPU for its host inputs; once N's token is read and staged it is
+    /// released, so the command-buffer submission never sits between two
+    /// steps. When the generation stops with a step parked, that step runs
+    /// anyway (fed with the final token, which a continued conversation wants
+    /// in the state). Without parking the next step is only encoded ahead and
+    /// committed after staging.
     #[allow(clippy::too_many_arguments)]
     fn decode_loop<M: LanguageModel>(
         &self,
@@ -247,59 +262,101 @@ impl Generator {
         let read_slot = |slot: usize| -> Result<u32> {
             Ok(scratch.next_token().view(slot, &[1])?.to_u32()?[0])
         };
+        let parking = model.supports_parking();
+        // On any error a parked pass must not be left blocking the queue.
+        let _release = ReleaseOnExit { model, scratch };
         // The slot holding the next step's input token.
         let mut slot_in = 0usize;
-        // A step encoded ahead of time: reads `slot_in`, writes the other
-        // slot, at the state's current position.
-        let mut ahead = None;
+        // A step encoded ahead of time (reads `slot_in`, writes the other
+        // slot, at the state's current position): parked and committed, or
+        // merely encoded.
+        let mut parked: Option<PendingPass<'_>> = None;
+        let mut ahead: Option<EncodedPass<'_>> = None;
+        // Sleep-then-poll waits: the step interval is regular enough to
+        // predict, and polling wakes ~0.1 ms sooner than a blocked thread.
+        let mut pacer = Pacer::default();
         while tokens.len() < options.max_tokens {
             let input = *tokens.last().expect("tokens holds the prefill draw");
-            // The GPU is idle here (every committed pass has been waited on),
-            // so the caches may grow. An encoded-ahead pass would reference
-            // the old buffers and is discarded.
+            // The GPU is idle here (every committed pass has been waited on
+            // and nothing was parked past the capacity), so the caches may
+            // grow. An encoded-ahead pass would reference the old buffers
+            // and is discarded.
             if state.pos() >= state.capacity() {
+                ensure!(parked.is_none(), "parked step beyond the state's capacity");
                 ahead = None;
                 state.ensure_capacity(ctx, state.pos() + 1)?;
             }
             let step = tokens.len();
-            let encoded = match ahead.take() {
-                Some(pass) => pass,
-                None => model.encode_decode_step(
-                    ctx,
-                    state,
-                    scratch,
-                    slot_in,
-                    1 - slot_in,
-                    Draw { params, step },
-                )?,
+            let pending = match parked.take() {
+                Some(pass) => {
+                    model.prepare_step_inputs(state, scratch, input)?;
+                    model.release_parked(scratch)?;
+                    pass
+                }
+                None => {
+                    let encoded = match ahead.take() {
+                        Some(pass) => pass,
+                        None => model.encode_decode_step(ctx, state, scratch, slot_in, 1 - slot_in, Draw { params, step })?,
+                    };
+                    model.prepare_step_inputs(state, scratch, input)?;
+                    let pass = encoded.commit()?;
+                    state.advance(1);
+                    pacer.begin(Instant::now());
+                    pass
+                }
             };
-            model.prepare_step_inputs(state, scratch, input)?;
-            let pending = encoded.commit()?;
-            state.advance(1);
             // Encode the following step while this one runs, when there will
             // be one and the caches already have room for it.
             if tokens.len() + 1 < options.max_tokens && state.pos() < state.capacity() {
-                ahead = Some(model.encode_decode_step(
-                    ctx,
-                    state,
-                    scratch,
-                    1 - slot_in,
-                    slot_in,
-                    Draw { params, step: step + 1 },
-                )?);
+                let draw = Draw { params, step: step + 1 };
+                if parking {
+                    let pass = model.encode_parked_step(ctx, state, scratch, 1 - slot_in, slot_in, draw)?.commit()?;
+                    state.advance(1);
+                    parked = Some(pass);
+                } else {
+                    ahead = Some(model.encode_decode_step(ctx, state, scratch, 1 - slot_in, slot_in, draw)?);
+                }
             }
-            pending.wait()?;
+            pending.wait_paced(&mut pacer)?;
+            // A parked step started running the moment this one finished.
+            if parked.is_some() {
+                pacer.begin(Instant::now());
+            }
             slot_in = 1 - slot_in;
             let drawn = read_slot(slot_in)?;
             tokens.push(drawn);
-            if is_stop(drawn) {
-                return Ok(FinishReason::StopToken);
-            }
-            if !on_token(drawn)? {
-                return Ok(FinishReason::Callback);
+            let finish = if is_stop(drawn) {
+                Some(FinishReason::StopToken)
+            } else if !on_token(drawn)? {
+                Some(FinishReason::Callback)
+            } else {
+                None
+            };
+            if let Some(finish) = finish {
+                if let Some(pass) = parked.take() {
+                    // Already committed and counted as fed: let it consume
+                    // the final token rather than leave the queue blocked.
+                    model.prepare_step_inputs(state, scratch, drawn)?;
+                    model.release_parked(scratch)?;
+                    pass.wait()?;
+                }
+                return Ok(finish);
             }
         }
         Ok(FinishReason::Length)
+    }
+}
+
+/// Releases a parked decode step when the loop exits early (an error), so
+/// the committed pass cannot hold the command queue forever.
+struct ReleaseOnExit<'m, M: LanguageModel> {
+    model: &'m M,
+    scratch: &'m M::Scratch,
+}
+
+impl<M: LanguageModel> Drop for ReleaseOnExit<'_, M> {
+    fn drop(&mut self) {
+        let _ = self.model.release_parked(self.scratch);
     }
 }
 
