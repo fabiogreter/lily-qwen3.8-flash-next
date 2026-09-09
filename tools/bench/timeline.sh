@@ -254,7 +254,13 @@ if [ "$dry_run" != 1 ]; then
         i=$((i + 1))
     done
     echo "== summary"
-    python3 "$root/tools/bench/summarize.py" --root "$out_root" --write "$root/docs/performance-timeline.md"
+    if [ "$out_root" = "$root/docs/bench" ]; then
+        python3 "$root/tools/bench/summarize.py" --root "$out_root" --write "$root/docs/performance-timeline.md"
+    else
+        # Side-by-side runs elsewhere (an A/B pair) are not part of the
+        # timeline; print their tables instead of rewriting the document.
+        python3 "$root/tools/bench/summarize.py" --root "$out_root"
+    fi
     i=0
     while [ $i -lt $n ]; do
         echo "records: ${c_out[$i]}"
