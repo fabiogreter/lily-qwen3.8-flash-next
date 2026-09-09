@@ -11,3 +11,6 @@ bench-results/
 *.gputrace
 
 .DS_Store
+
+# powermetrics capture for tools/bench/gpu_freq.py, taken by hand
+gpu-power.log

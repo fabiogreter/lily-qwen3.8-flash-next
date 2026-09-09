@@ -23,6 +23,9 @@ Reports, with measurement contract:
 - upstream, Qwen3.6-35B-A3B: [2026-09-01: MLX 0.31.2](docs/2026-09-01-performance-mlx-0.31.2.md),
   [2026-09-02: MLX 0.32.2](docs/2026-09-02-performance-mlx-0.32.2.md)
 
+Performance over time, one fixed matrix per commit: [performance timeline](docs/performance-timeline.md)
+(records in `docs/bench/`, produced on demand by `tools/bench/timeline.sh`).
+
 Design notes: [phase 2 design](docs/phase2-server-design.md),
 [checkpoint format](docs/qwen38-flash-next-checkpoint-format.md).
 

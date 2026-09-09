@@ -55,3 +55,23 @@ Result on the 4-layer model, prompt "The capital of Switzerland is", 8 greedy
 steps: against the dequantized weights lily agrees at 9/9 positions with a
 worst shared-id logit gap of 0.26; against the raw bf16 weights 7/9, the rest
 being quantization error.
+
+## bench/timeline.sh and bench/summarize.py
+
+The performance timeline (`docs/performance-timeline.md`). `timeline.sh` runs
+the fixed `lily-bench` matrix (1K / 8K / 32K prompts, 0 and 2 drafts, 96
+tokens, 3 repeats) at one or more commits (`--commit <rev>`, older commits are
+built in worktrees under `target/timeline/`, `HEAD` is the working tree),
+writes every run's JSON, a `.env.txt` snapshot (swap, paging, thermal level)
+and a `run.json` into `docs/bench/<date>-<sha>/`, and calls `summarize.py` to
+regenerate the tables. Several commits are interleaved per repeat so drift
+affects them equally; `--cooldown SEC` idles between runs. Run it by hand on
+mains power; it refuses to start on battery unless told `--allow-battery`, and
+nothing runs it automatically. About 10 minutes per commit. `summarize.py`
+needs only the system `python3`; both work with macOS bash 3.2.
+
+```sh
+tools/bench/timeline.sh --note "what changed"                        # working tree
+tools/bench/timeline.sh --commit f5b3317 --commit HEAD --cooldown 20  # compare two commits
+tools/bench/timeline.sh --dry-run --commit HEAD                       # print the commands only
+```
