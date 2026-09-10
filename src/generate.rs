@@ -93,6 +93,9 @@ pub fn speculate<M: LanguageModel>(
         let pending = *tokens.last().expect("tokens is never empty");
         let step0 = tokens.len();
         let (sampled, draft) = model.verify(ctx, state, scratch, pending, &proposals, params, step0, parked.take(), k)?;
+        if std::env::var_os("LILY_TRACE_SPEC").is_some() {
+            eprintln!("trace step0={step0} pending={pending} proposals={proposals:?} sampled={sampled:?}");
+        }
         // Row j confirms draft j when its draw equals it; the first row that
         // does not (or the row after the last draft) supplies the fresh token.
         let mut kept = 0usize;

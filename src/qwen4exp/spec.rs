@@ -245,7 +245,7 @@ impl Qwen4ExpModel {
                     let wide = self.config.hc_width();
                     let hidden = capacity.hyper.view(0, &[1, wide])?;
                     let keep = capacity.hyper.view(accepted * wide, &[wide])?;
-                    self.encode_draft(ctx, state, s, &hidden, 0, pending.pos_before, Some(&keep), Some((accepted, m)), 0, None)?.commit()?.wait()?;
+                    self.encode_draft(ctx, state, s, &hidden, 0, 0, pending.pos_before, Some(&keep), Some((accepted, m)), 0, None)?.commit()?.wait()?;
                 }
                 (Vec::new(), None)
             }
@@ -321,7 +321,7 @@ impl Qwen4ExpModel {
         let drafts = drafts.min(MAX_DRAFTS);
         self.ensure_room(ctx, state, s, 1 + drafts)?;
         let hidden = state.mtp.as_ref().ok_or_else(|| anyhow::anyhow!("no draft head state"))?.hidden.view(0, &[1, wide])?;
-        let encoded = self.encode_draft(ctx, state, s, &hidden, 1, state.pos - 1, None, None, drafts, None)?;
+        let encoded = self.encode_draft(ctx, state, s, &hidden, 1, 0, state.pos - 1, None, None, drafts, None)?;
         let sp = s.spec.as_ref().ok_or_else(|| anyhow::anyhow!("no spec scratch"))?;
         sp.mtp_ids.view(0, &[1])?.write_bytes(bytemuck::cast_slice(&[first]))?;
         let mut pace = s.sync.pace_draft.get();
@@ -471,17 +471,20 @@ impl Qwen4ExpModel {
     /// of the recurrent state to `accepted` of `m` verified rows, the head's
     /// catch-up over `rows` rows (`hidden` rows paired with the ids in the
     /// spec scratch's `mtp_ids`, head positions from `pos0`), `keep` copied
-    /// into the state's hidden, and `drafts` chained proposals into the spec
-    /// scratch, also copied into `next_ids` when given. Used for the first
-    /// proposals of a request and for rolling back past the GPU's count.
+    /// into the state's hidden, and `drafts` chained proposals from the
+    /// residual of catch-up row `chain_row` (chain positions follow it) into
+    /// the spec scratch, also copied into `next_ids` when given. Used for the
+    /// first proposals of a request, for rolling back past the GPU's count,
+    /// and as the reference the GPU-selected pass is tested against.
     #[allow(clippy::too_many_arguments)]
-    fn encode_draft<'a>(
+    pub(super) fn encode_draft<'a>(
         &self,
         ctx: &'a MetalContext,
         state: &DecodeState,
         s: &Scratch,
         hidden: &Tensor,
         rows: usize,
+        chain_row: usize,
         pos0: usize,
         keep: Option<&Tensor>,
         rollback: Option<(usize, usize)>,
@@ -495,7 +498,7 @@ impl Qwen4ExpModel {
         let sp = s.spec.as_ref().ok_or_else(|| anyhow::anyhow!("no spec scratch"))?;
         let capacity = s.prefill.as_ref().ok_or_else(|| anyhow::anyhow!("prefill scratch missing"))?;
         ensure!(rows <= MAX_DRAFTS + 1, "too many catch-up rows");
-        ensure!(drafts == 0 || rows > 0, "drafts need a row to follow");
+        ensure!(drafts == 0 || chain_row < rows, "drafts need a catch-up row to follow");
 
         let pass = ctx.begin_concurrent()?;
         if let Some((accepted, m)) = rollback {
@@ -527,7 +530,7 @@ impl Qwen4ExpModel {
             if drafts > 0 {
                 let hyper = ps.mtp_hyper.as_ref().expect("draft head scratch");
                 let ps1 = capacity.rows(1)?;
-                let mut last = hyper.view((rows - 1) * wide, &[1, wide])?;
+                let mut last = hyper.view(chain_row * wide, &[1, wide])?;
                 for i in 0..drafts {
                     // Head: mixer over the last residual row, shared LM head, argmax.
                     self.hc_read_batched(ctx, &pass, &mtp.mixer, &last, s, &ps1)?;
@@ -540,7 +543,7 @@ impl Qwen4ExpModel {
                     if i + 1 < drafts {
                         // Chain: the head's own residual stands in for the trunk
                         // hidden of the token it just proposed.
-                        self.mtp_block(ctx, &pass, mtp, mst, &last, &out, AttnPos::host(pos0 + rows + i), s, &ps1)?;
+                        self.mtp_block(ctx, &pass, mtp, mst, &last, &out, AttnPos::host(pos0 + chain_row + 1 + i), s, &ps1)?;
                         last = hyper.view(0, &[1, wide])?;
                     }
                 }
@@ -553,3 +556,7 @@ impl Qwen4ExpModel {
         pass.end()
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/qwen4exp/spec.rs"]
+mod tests;

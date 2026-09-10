@@ -52,7 +52,7 @@ use super::weights::{
 
 /// Every RMSNorm in this model is zero-centered: gain = 1 + weight. (The GDN
 /// GatedNorm is the exception and uses a plain gain.)
-const NORM_WEIGHT_BIAS: f32 = 1.0;
+pub(super) const NORM_WEIGHT_BIAS: f32 = 1.0;
 
 /// Prompt tokens processed by one prefill command buffer.
 const PREFILL_CHUNK: usize = 4096;
