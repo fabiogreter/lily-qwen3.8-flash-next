@@ -398,6 +398,7 @@ impl Qwen4ExpModel {
             .collect::<Result<_>>()?;
 
         let pass = ctx.begin_concurrent()?;
+        pass.set_label("draft");
         let draws = sp.verify_tokens.view(0, &[m])?;
         spec_accept(ctx, &pass, &draws, &capacity.ids.view(0, &[m])?, ctrl, pos0, ratio, chain)?;
         pass.level_barrier(&[ctrl])?;
@@ -501,6 +502,7 @@ impl Qwen4ExpModel {
         ensure!(drafts == 0 || chain_row < rows, "drafts need a catch-up row to follow");
 
         let pass = ctx.begin_concurrent()?;
+        pass.set_label("draft");
         if let Some((accepted, m)) = rollback {
             let heads = cfg.linear_num_value_heads;
             let per_state = heads * GDN_HEAD_DIM * GDN_HEAD_DIM;

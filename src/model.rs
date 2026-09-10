@@ -495,6 +495,7 @@ impl Qwen3_5Model {
         draw: Draw<'_>,
     ) -> Result<EncodedPass<'a>> {
         let pass = ctx.begin_concurrent()?;
+        pass.set_label("decode");
         self.encode_decode_graph(ctx, &pass, state, s, slot_in, slot_out, draw)?;
         pass.end()
     }
@@ -552,6 +553,7 @@ impl Qwen3_5Model {
         draw: Option<Draw<'_>>,
     ) -> Result<()> {
         let pass = ctx.begin()?;
+        pass.set_label("prefill");
         let m = ps.m;
         ensure!(state.pos + m <= state.capacity, "sequence full ({})", state.capacity);
         let cfg = &self.config;

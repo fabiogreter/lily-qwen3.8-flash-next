@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -8,6 +9,7 @@ use clap::Parser;
 use lily::engine::{DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi};
 use lily::generate::speculate;
 use lily::kernels::sample::SamplingParams;
+use lily::metal::profile::{self, PassProfile};
 use lily::metal::{EncodedPass, Pacer, PendingPass};
 use lily::kernels::attention::MAX_SEQ;
 use lily::metal::MetalContext;
@@ -33,6 +35,12 @@ struct Cli {
     /// checkpoint's draft head instead of the pipelined one-token loop.
     #[arg(long, default_value_t = 0)]
     drafts: usize,
+    /// Per-kernel GPU profile: runs the transport in its profile mode (one
+    /// command buffer per dispatch) and prints, per pass label, GPU ms per
+    /// pass by kernel. Wall-clock results under this flag are not comparable
+    /// to a normal run; the per-kernel times are the point.
+    #[arg(long, default_value_t = false)]
+    kernel_profile: bool,
     #[arg(long)]
     json_out: PathBuf,
 }
@@ -77,6 +85,65 @@ fn host_secs() -> f64 {
 
 fn draw(step: usize) -> Draw<'static> {
     Draw { params: &GREEDY, step }
+}
+
+/// Aggregates the recorded pass profiles by label and kernel: calls and GPU
+/// ms per pass, share of the summed kernel time (sorted by time), then the
+/// summed kernel time and the mean pass span per pass. Every label has one
+/// pass per step of its kind (decode, verify, draft), so "per pass" reads as
+/// "per step". Prints the tables and returns them for the JSON report.
+fn kernel_profile_report(passes: &[PassProfile]) -> serde_json::Value {
+    let mut labels: Vec<&'static str> = Vec::new();
+    for pass in passes {
+        if !labels.contains(&pass.label) {
+            labels.push(pass.label);
+        }
+    }
+    let mut tables = Vec::with_capacity(labels.len());
+    for label in labels {
+        let group: Vec<&PassProfile> = passes.iter().filter(|pass| pass.label == label).collect();
+        let count = group.len() as f64;
+        let mut by_kernel: HashMap<&'static str, (usize, f64)> = HashMap::new();
+        let (mut dispatches, mut kernel_secs, mut span_secs) = (0usize, 0.0f64, 0.0f64);
+        for pass in &group {
+            span_secs += pass.span_secs;
+            for sample in &pass.kernels {
+                dispatches += 1;
+                kernel_secs += sample.gpu_secs;
+                let entry = by_kernel.entry(sample.name).or_insert((0, 0.0));
+                entry.0 += 1;
+                entry.1 += sample.gpu_secs;
+            }
+        }
+        let mut rows: Vec<(&str, usize, f64)> = by_kernel.into_iter().map(|(name, (calls, secs))| (name, calls, secs)).collect();
+        rows.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(b.0)));
+        let share = |secs: f64| if kernel_secs > 0.0 { 100.0 * secs / kernel_secs } else { 0.0 };
+        eprintln!("kernel profile [{label}]: {} passes, {:.1} dispatches/pass", group.len(), dispatches as f64 / count);
+        eprintln!("  {:>9}  {:>6}  {:>10}  kernel", "ms/pass", "share", "calls/pass");
+        for (name, calls, secs) in &rows {
+            eprintln!("  {:>9.3}  {:>5.1}%  {:>10.1}  {name}", secs / count * 1e3, share(*secs), *calls as f64 / count);
+        }
+        eprintln!(
+            "  kernels sum {:.3} ms/pass | mean pass span {:.3} ms/pass | between command buffers {:.3} ms/pass",
+            kernel_secs / count * 1e3,
+            span_secs / count * 1e3,
+            (span_secs - kernel_secs) / count * 1e3
+        );
+        tables.push(serde_json::json!({
+            "label": label,
+            "passes": group.len(),
+            "dispatches_per_pass": dispatches as f64 / count,
+            "kernel_sum_ms_per_pass": kernel_secs / count * 1e3,
+            "pass_span_ms_per_pass": span_secs / count * 1e3,
+            "kernels": rows.iter().map(|(name, calls, secs)| serde_json::json!({
+                "kernel": name,
+                "calls_per_pass": *calls as f64 / count,
+                "ms_per_pass": secs / count * 1e3,
+                "share_pct": share(*secs),
+            })).collect::<Vec<_>>(),
+        }));
+    }
+    serde_json::Value::Array(tables)
 }
 
 /// Encodes, prepares and commits one step (no lookahead): the warm-up cadence.
@@ -158,7 +225,7 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("benchmark token budget overflow"))?;
     ensure!(max_seq <= MAX_SEQ, "benchmark exceeds model window {MAX_SEQ}");
 
-    let ctx = MetalContext::new()?;
+    let ctx = if cli.kernel_profile { MetalContext::new_with_profile(true)? } else { MetalContext::new()? };
     let model = M::load(&ctx, &cli.model, &LoadOptions { mtp_drafts: cli.drafts, ..LoadOptions::default() })?;
     if cli.drafts > 0 {
         return bench_speculative(cli, &ctx, &model);
@@ -183,6 +250,10 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
         let lookahead = submit_step(&model, &ctx, &mut warm_state, &scratch, 1, 0, 2)?;
         first.wait()?;
         lookahead.wait()?;
+    }
+    if ctx.profiling() {
+        // The tables cover the measured passes only.
+        profile::take();
     }
 
     let mut state = model.new_state(&ctx, max_seq)?;
@@ -299,6 +370,7 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
     }
     let lookahead_gpu =
         lookahead_completed.map(|completed| completed.timing()).transpose()?;
+    let kernel_profile = ctx.profiling().then(|| kernel_profile_report(&profile::take()));
     let token_digest = fnv1a(&token_ids);
 
     let report = serde_json::json!({
@@ -316,6 +388,7 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
             "decode_steps": cli.decode_steps,
             "decode_mode": if parking { "production_depth2_parked" } else { "production_depth2_concurrent" },
             "gpu_timing_diagnostic": cli.gpu_timing,
+            "kernel_profile_diagnostic": ctx.profiling(),
         },
         "results": {
             "prefill": {
@@ -347,6 +420,7 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
                 })),
                 "token_digest": format!("{token_digest:016x}"),
                 "token_ids": token_ids,
+                "kernel_profile": kernel_profile,
             },
         },
     });
@@ -391,13 +465,18 @@ fn bench_speculative<M: LanguageModel>(cli: &Cli, ctx: &MetalContext, model: &M)
     };
     // Warm-up compiles the pipelines for every shape the loop uses.
     run(4)?;
+    if ctx.profiling() {
+        // The tables cover the measured run only.
+        profile::take();
+    }
     let (prefill_secs, decode_secs, drafted, accepted, tokens) = run(cli.decode_steps)?;
+    let kernel_profile = ctx.profiling().then(|| kernel_profile_report(&profile::take()));
     let generated = tokens.len() - 1;
     let digest = fnv1a(&tokens[1..]);
     let report = serde_json::json!({
         "schema_version": 1,
         "meta": {"engine": "lily", "model_id": M::MODEL_ID, "harness": "src/bin/lily-bench.rs", "crate_version": env!("CARGO_PKG_VERSION")},
-        "workload": {"prompt_len": cli.prompt_len, "decode_steps": cli.decode_steps, "decode_mode": format!("speculative_{}_drafts", cli.drafts)},
+        "workload": {"prompt_len": cli.prompt_len, "decode_steps": cli.decode_steps, "decode_mode": format!("speculative_{}_drafts", cli.drafts), "kernel_profile_diagnostic": ctx.profiling()},
         "results": {
             "prefill": {"wall_secs": prefill_secs, "tok_s": cli.prompt_len as f64 / prefill_secs},
             "decode": {
@@ -408,6 +487,7 @@ fn bench_speculative<M: LanguageModel>(cli: &Cli, ctx: &MetalContext, model: &M)
                 "accepted": accepted,
                 "token_digest": format!("{digest:016x}"),
                 "token_ids": &tokens[1..],
+                "kernel_profile": kernel_profile,
             },
         },
     });

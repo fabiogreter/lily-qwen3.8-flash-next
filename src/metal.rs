@@ -27,6 +27,10 @@
 //! - **Command memory is explicit.** Passes encode into a command allocator
 //!   from a pool; an allocator returns to the pool once its pass completed
 //!   (or was dropped un-committed). Command buffers are single-use.
+//! - **Per-kernel profile mode** (`LILY_KERNEL_PROFILE=1` or
+//!   [`MetalContext::new_with_profile`]): every dispatch is closed into its own
+//!   command buffer so the commit feedback's GPU start/end times apply to that
+//!   one kernel; see [`profile`]. Off by default, and then free.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -66,6 +70,8 @@ type FeedbackHandler = RcBlock<dyn Fn(NonNull<ProtocolObject<dyn MTL4CommitFeedb
 
 pub struct Kernel {
     pub pipeline: Pipeline,
+    /// The kernel function's name (the per-kernel profile's key).
+    pub name: &'static str,
 }
 
 impl Kernel {
@@ -129,6 +135,53 @@ fn compute_stages() -> MTLStages {
     MTLStages::Dispatch | MTLStages::Blit
 }
 
+/// Per-kernel GPU timing. In profile mode ([`MetalContext::new_with_profile`],
+/// or `LILY_KERNEL_PROFILE=1` at [`MetalContext::new`]) every dispatch of a
+/// pass is closed into its own command buffer, so the commit feedback's GPU
+/// start/end times measure that one kernel. Each completed pass's breakdown
+/// is recorded process-wide until [`take`] drains it; nothing is recorded
+/// otherwise. The mode changes the work's shape (one command buffer per
+/// dispatch instead of one per pass, no encoder barriers), so wall time and
+/// pass spans under it are not production numbers; the per-kernel times are.
+pub mod profile {
+    use std::sync::Mutex;
+
+    /// Label of passes nobody named through [`super::ComputePass::set_label`].
+    pub const UNLABELED: &str = "(unlabeled)";
+
+    /// One dispatch's GPU time.
+    #[derive(Clone, Debug)]
+    pub struct KernelSample {
+        pub name: &'static str,
+        pub gpu_secs: f64,
+    }
+
+    /// One completed pass: its label, its dispatches in encode order (copies
+    /// appear as `copy_buffer`), and its GPU span from the first command
+    /// buffer's start to the last one's end. The span minus the summed
+    /// samples is time between command buffers: the profile mode's own cost
+    /// plus whatever gaps exist without it (a parked pass's wait included).
+    #[derive(Clone, Debug)]
+    pub struct PassProfile {
+        pub label: &'static str,
+        pub span_secs: f64,
+        pub kernels: Vec<KernelSample>,
+    }
+
+    static PASSES: Mutex<Vec<PassProfile>> = Mutex::new(Vec::new());
+
+    pub(super) fn record(pass: PassProfile) {
+        if let Ok(mut passes) = PASSES.lock() {
+            passes.push(pass);
+        }
+    }
+
+    /// Drains every pass profile recorded so far (in completion order).
+    pub fn take() -> Vec<PassProfile> {
+        PASSES.lock().map(|mut passes| std::mem::take(&mut *passes)).unwrap_or_default()
+    }
+}
+
 pub struct MetalContext {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
@@ -145,10 +198,20 @@ pub struct MetalContext {
     fault: Arc<Fault>,
     /// Keyed by function name and MSL version.
     pipelines: Mutex<HashMap<(&'static str, MslVersion), Pipeline>>,
+    /// Per-kernel profile mode; see [`profile`].
+    profile: bool,
 }
 
 impl MetalContext {
+    /// A context on the system default device; the per-kernel profile mode
+    /// is on when `LILY_KERNEL_PROFILE` is set to anything but `0`.
     pub fn new() -> Result<Self> {
+        let profile = std::env::var_os("LILY_KERNEL_PROFILE").is_some_and(|v| !v.is_empty() && v != "0");
+        Self::new_with_profile(profile)
+    }
+
+    /// Like [`Self::new`], with the per-kernel profile mode chosen explicitly.
+    pub fn new_with_profile(profile: bool) -> Result<Self> {
         let device = MTLCreateSystemDefaultDevice()
             .ok_or_else(|| anyhow!("no Metal device found"))?;
         let queue = device
@@ -168,6 +231,7 @@ impl MetalContext {
             submit: Mutex::new(()),
             fault: Arc::new(Fault::default()),
             pipelines: Mutex::new(HashMap::new()),
+            profile,
         };
         // The production GEMM paths use native Metal tensor units.
         let family = ctx.apple_gpu_family();
@@ -181,6 +245,11 @@ impl MetalContext {
 
     pub fn device(&self) -> &ProtocolObject<dyn MTLDevice> {
         &self.device
+    }
+
+    /// Whether the per-kernel profile mode is on; see [`profile`].
+    pub fn profiling(&self) -> bool {
+        self.profile
     }
 
     /// Compiles MSL source through the framework's compiler (the same
@@ -230,7 +299,7 @@ impl MetalContext {
             .lock()
             .map_err(|e| anyhow!("pipeline cache lock poisoned: {e}"))?;
         if let Some(p) = cache.get(&(fn_name, version)) {
-            return Ok(Kernel { pipeline: p.clone() });
+            return Ok(Kernel { pipeline: p.clone(), name: fn_name });
         }
 
         let library = self
@@ -238,7 +307,7 @@ impl MetalContext {
             .with_context(|| format!("for {fn_name}"))?;
         let pipeline = self.pipeline_from_library(&library, fn_name)?;
         cache.insert((fn_name, version), pipeline.clone());
-        Ok(Kernel { pipeline })
+        Ok(Kernel { pipeline, name: fn_name })
     }
 
     /// Allocates a zero-initialized shared-storage buffer and makes it
@@ -287,6 +356,9 @@ impl MetalContext {
             open: RefCell::new(None),
             concurrent,
             done: RefCell::new(None),
+            label: Cell::new(profile::UNLABELED),
+            names: RefCell::new(Vec::new()),
+            segment_kernel: Cell::new(None),
             slot: RefCell::new(slot),
         })
     }
@@ -354,11 +426,13 @@ impl MetalContext {
         self.fault.check()?;
         let _guard = self.submit.lock().map_err(|e| anyhow!("submit lock poisoned: {e}"))?;
         self.residency.flush();
+        let mut index = 0usize;
         for item in program {
             match item {
                 Item::Cmd(cmd) => {
                     let options = MTL4CommitOptions::new();
-                    let handler = feedback.handler(&self.fault);
+                    let handler = feedback.handler(&self.fault, index);
+                    index += 1;
                     // SAFETY: the block pointer is valid for the call; the
                     // options object copies the block.
                     unsafe { options.addFeedbackHandler(RcBlock::as_ptr(&handler)) };
@@ -632,10 +706,20 @@ impl Fault {
 }
 
 /// Commit feedback for one pass: how many of its command buffers reported,
-/// their GPU time span, and any error.
+/// their GPU time span, and any error. In profile mode also each command
+/// buffer's own span, recorded as a [`profile::PassProfile`] once the last
+/// handler has run (handlers may arrive out of order).
 struct Feedback {
     expected: usize,
+    profile: Option<ProfileInfo>,
     state: Mutex<FeedbackState>,
+}
+
+/// What the profile needs besides the timestamps: the pass's label and the
+/// kernel of each command buffer, by submission index.
+struct ProfileInfo {
+    label: &'static str,
+    names: Vec<&'static str>,
 }
 
 #[derive(Default)]
@@ -644,14 +728,17 @@ struct FeedbackState {
     error: Option<String>,
     gpu_start_secs: f64,
     gpu_end_secs: f64,
+    /// Profile mode only: (start, end) per command buffer, by submission index.
+    spans: Vec<(f64, f64)>,
 }
 
 impl Feedback {
-    fn new(expected: usize) -> Arc<Self> {
-        Arc::new(Self { expected, state: Mutex::new(FeedbackState::default()) })
+    fn new(expected: usize, profile: Option<ProfileInfo>) -> Arc<Self> {
+        let spans = if profile.is_some() { vec![(0.0, 0.0); expected] } else { Vec::new() };
+        Arc::new(Self { expected, profile, state: Mutex::new(FeedbackState { spans, ..FeedbackState::default() }) })
     }
 
-    fn handler(self: &Arc<Self>, fault: &Arc<Fault>) -> FeedbackHandler {
+    fn handler(self: &Arc<Self>, fault: &Arc<Fault>, index: usize) -> FeedbackHandler {
         let feedback = self.clone();
         let fault = fault.clone();
         RcBlock::new(move |fb: NonNull<ProtocolObject<dyn MTL4CommitFeedback>>| {
@@ -672,7 +759,25 @@ impl Feedback {
                 if state.error.is_none() {
                     state.error = error;
                 }
+                if let Some(span) = state.spans.get_mut(index) {
+                    *span = (start, end);
+                }
                 state.received += 1;
+                if state.received == feedback.expected
+                    && let Some(info) = &feedback.profile
+                {
+                    let kernels = info
+                        .names
+                        .iter()
+                        .zip(&state.spans)
+                        .map(|(name, (start, end))| profile::KernelSample { name, gpu_secs: end - start })
+                        .collect();
+                    profile::record(profile::PassProfile {
+                        label: info.label,
+                        span_secs: state.gpu_end_secs - state.gpu_start_secs,
+                        kernels,
+                    });
+                }
             }
         })
     }
@@ -690,6 +795,7 @@ impl Feedback {
                         error: state.error.clone(),
                         gpu_start_secs: state.gpu_start_secs,
                         gpu_end_secs: state.gpu_end_secs,
+                        spans: Vec::new(),
                     });
                 }
             }
@@ -721,6 +827,13 @@ pub struct ComputePass<'a> {
     concurrent: bool,
     /// The event and value [`Self::signal_done`] encoded, if any.
     done: RefCell<Option<(SharedEvent, u64)>>,
+    /// Name for the per-kernel profile ([`Self::set_label`]).
+    label: Cell<&'static str>,
+    /// Profile mode only: the kernel of each closed command buffer, in
+    /// program order (one dispatch per command buffer).
+    names: RefCell<Vec<&'static str>>,
+    /// Profile mode only: the kernel dispatched into the open segment.
+    segment_kernel: Cell<Option<&'static str>>,
     // Declared last: command buffers must drop before their allocator is
     // recycled.
     slot: RefCell<Slot>,
@@ -802,7 +915,25 @@ impl<'a> ComputePass<'a> {
             seg.encoder.endEncoding();
             seg.cmd.endCommandBuffer();
             self.program.borrow_mut().push(Item::Cmd(seg.cmd));
+            if self.ctx.profile {
+                self.names.borrow_mut().push(self.segment_kernel.take().unwrap_or("(no dispatch)"));
+            }
         }
+    }
+
+    /// Profile mode: the open segment holds exactly the dispatch `name`;
+    /// close it so the command buffer's GPU span is that dispatch's.
+    fn close_profiled_dispatch(&self, name: &'static str) {
+        if self.ctx.profile {
+            self.segment_kernel.set(Some(name));
+            self.close_segment();
+        }
+    }
+
+    /// Names the pass in the per-kernel profile ([`profile`]); no effect on
+    /// what it executes.
+    pub fn set_label(&self, label: &'static str) {
+        self.label.set(label);
     }
 
     /// Encodes one kernel dispatch with a byte offset per buffer binding — used
@@ -886,7 +1017,9 @@ impl<'a> ComputePass<'a> {
                 encoder_barrier(encoder);
             }
             Ok(())
-        })
+        })?;
+        self.close_profiled_dispatch(kernel.name);
+        Ok(())
     }
 
     /// Copies `len` bytes between buffers (any alignment), ordered like a
@@ -904,7 +1037,9 @@ impl<'a> ComputePass<'a> {
                 encoder_barrier(encoder);
             }
             Ok(())
-        })
+        })?;
+        self.close_profiled_dispatch("copy_buffer");
+        Ok(())
     }
 
     /// Orders one dependency level before the next on a concurrent encoder.
@@ -938,7 +1073,11 @@ impl<'a> ComputePass<'a> {
     /// dispatch — the dependency-level boundary for [`MetalContext::
     /// begin_concurrent`] passes. Serial passes already order every dispatch.
     pub fn memory_barrier(&self) -> Result<()> {
-        if self.concurrent {
+        // In profile mode every dispatch sits in its own command buffer, each
+        // opening with a queue-stage barrier that already orders it after all
+        // earlier work; an encoder barrier here would only open an otherwise
+        // empty command buffer.
+        if self.concurrent && !self.ctx.profile {
             self.with_encoder(|encoder, _inner, _pool| {
                 encoder_barrier(encoder);
                 Ok(())
@@ -963,7 +1102,8 @@ impl<'a> ComputePass<'a> {
         let program = std::mem::take(&mut *self.program.borrow_mut());
         let done = self.done.borrow().clone();
         let slot = self.slot.replace(Slot { inner: None, pool: self.ctx.pool.clone() });
-        Ok(EncodedPass { ctx: self.ctx, program, done, slot })
+        let names = std::mem::take(&mut *self.names.borrow_mut());
+        Ok(EncodedPass { ctx: self.ctx, program, done, slot, label: self.label.get(), names })
     }
 
     /// Encodes, as the pass's last command, a GPU signal of `event` to
@@ -997,29 +1137,32 @@ pub struct EncodedPass<'a> {
     program: Vec<Item>,
     done: Option<(SharedEvent, u64)>,
     slot: Slot,
+    label: &'static str,
+    /// Profile mode only: one kernel name per `Item::Cmd`.
+    names: Vec<&'static str>,
 }
 
 impl<'a> EncodedPass<'a> {
     /// Submits without blocking.
     pub fn commit(self) -> Result<PendingPass<'a>> {
-        let cmds = self.program.iter().filter(|item| matches!(item, Item::Cmd(_))).count();
-        let feedback = Feedback::new(cmds);
-        let fence_value = self.ctx.submit(&self.program, &feedback)?;
-        Ok(PendingPass {
-            ctx: self.ctx,
-            program: self.program,
-            fence_value,
-            done: self.done,
-            feedback,
-            slot: Some(self.slot),
-        })
+        let EncodedPass { ctx, program, done, slot, label, names } = self;
+        let cmds = program.iter().filter(|item| matches!(item, Item::Cmd(_))).count();
+        let profile = if ctx.profile {
+            ensure!(names.len() == cmds, "profile: {} kernel names for {cmds} command buffers", names.len());
+            Some(ProfileInfo { label, names })
+        } else {
+            None
+        };
+        let feedback = Feedback::new(cmds, profile);
+        let fence_value = ctx.submit(&program, &feedback)?;
+        Ok(PendingPass { ctx, program, fence_value, done, feedback, slot: Some(slot) })
     }
 
     /// Drops the context lifetime so the pass can be kept inside long-lived
     /// state (passes encoded ahead for several possible outcomes). The
     /// context must outlive it; [`DetachedPass::attach`] restores the tie.
     pub fn detach(self) -> DetachedPass {
-        DetachedPass { program: self.program, done: self.done, slot: self.slot }
+        DetachedPass { program: self.program, done: self.done, slot: self.slot, label: self.label, names: self.names }
     }
 }
 
@@ -1030,11 +1173,13 @@ pub struct DetachedPass {
     program: Vec<Item>,
     done: Option<(SharedEvent, u64)>,
     slot: Slot,
+    label: &'static str,
+    names: Vec<&'static str>,
 }
 
 impl DetachedPass {
     pub fn attach<'a>(self, ctx: &'a MetalContext) -> EncodedPass<'a> {
-        EncodedPass { ctx, program: self.program, done: self.done, slot: self.slot }
+        EncodedPass { ctx, program: self.program, done: self.done, slot: self.slot, label: self.label, names: self.names }
     }
 }
 
@@ -1160,6 +1305,12 @@ impl PendingPass<'_> {
         self.program.clear();
         self.slot = None;
         self.ctx.fault.check()?;
+        if self.ctx.profile {
+            // The pass's breakdown is recorded by its last feedback handler,
+            // shortly after the fence; wait for it so `profile::take` after a
+            // wait includes this pass.
+            self.feedback.complete()?;
+        }
         Ok(CompletedPass { feedback: self.feedback.clone() })
     }
 }

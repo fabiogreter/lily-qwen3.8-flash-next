@@ -312,6 +312,65 @@ fn passes_order_dependent_dispatches() {
     assert!(x.to_u32().expect("x").iter().all(|&v| v == 20));
 }
 
+/// Profile mode: every dispatch (and buffer copy) of a pass lands in the
+/// recorded breakdown under its kernel name with a positive GPU time, in order,
+/// under the pass's label; results are unchanged, and the pass's span covers
+/// its dispatches.
+#[test]
+fn profile_mode_records_every_dispatch() {
+    const SRC: &str = "
+        kernel void bump(device uint* x [[buffer(0)]], uint gid [[thread_position_in_grid]]) {
+            x[gid] = x[gid] + 1;
+        }";
+    let ctx = MetalContext::new_with_profile(true).expect("metal context");
+    assert!(ctx.profiling());
+    let kernel = ctx.pipeline("bump", SRC, MslVersion::V3_1).expect("kernel");
+    assert_eq!(kernel.name, "bump");
+    let n = 4096usize;
+    let grid = Grid::Threads { grid: (n, 1, 1), threadgroup: (256, 1, 1) };
+    let x = Tensor::zeros(&ctx, &[n], DType::U32).expect("x");
+    let y = Tensor::zeros(&ctx, &[n], DType::U32).expect("y");
+    let label = "unit-test-profile";
+    for concurrent in [false, true] {
+        let pass = if concurrent { ctx.begin_concurrent() } else { ctx.begin() }.expect("pass");
+        pass.set_label(label);
+        for _ in 0..3 {
+            pass.dispatch_at(&kernel, &[x.binding()], &[], grid).expect("bump");
+            pass.level_barrier(&[&x]).expect("barrier");
+        }
+        copy_words(&ctx, &pass, &x, &y).expect("copy kernel");
+        let ((xb, xo), (yb, yo)) = (x.binding(), y.binding());
+        pass.copy_buffer(xb, xo, yb, yo, n * 4).expect("copy");
+        pass.commit_wait().expect("run");
+    }
+    assert!(y.to_u32().expect("y").iter().all(|&v| v == 6));
+
+    let recorded: Vec<_> = profile::take().into_iter().filter(|p| p.label == label).collect();
+    assert_eq!(recorded.len(), 2, "one profile per committed pass");
+    for pass in &recorded {
+        let names: Vec<&str> = pass.kernels.iter().map(|k| k.name).collect();
+        assert_eq!(names, ["bump", "bump", "bump", "copy_u32", "copy_buffer"]);
+        let sum: f64 = pass.kernels.iter().map(|k| k.gpu_secs).sum();
+        for k in &pass.kernels {
+            assert!(k.gpu_secs > 0.0 && k.gpu_secs.is_finite(), "{}: {} s", k.name, k.gpu_secs);
+        }
+        assert!(pass.span_secs >= sum, "span {} s covers the kernels {} s", pass.span_secs, sum);
+    }
+    assert!(profile::take().iter().all(|p| p.label != label), "take drains");
+
+    // Off by default: nothing is recorded, the same work still runs.
+    let plain = MetalContext::new_with_profile(false).expect("metal context");
+    assert!(!plain.profiling());
+    let kernel = plain.pipeline("bump", SRC, MslVersion::V3_1).expect("kernel");
+    let z = Tensor::zeros(&plain, &[n], DType::U32).expect("z");
+    let pass = plain.begin_concurrent().expect("pass");
+    pass.set_label(label);
+    pass.dispatch_at(&kernel, &[z.binding()], &[], grid).expect("bump");
+    pass.commit_wait().expect("run");
+    assert!(z.to_u32().expect("z").iter().all(|&v| v == 1));
+    assert!(profile::take().iter().all(|p| p.label != label));
+}
+
 /// Buffers allocated after earlier passes were submitted are resident for
 /// the next one, and dropped buffers leave the residency set.
 #[test]

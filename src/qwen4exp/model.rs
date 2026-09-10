@@ -1236,6 +1236,7 @@ impl Qwen4ExpModel {
     ) -> Result<EncodedPass<'a>> {
         ensure!(state.spec.is_none(), "decode step during a pending speculative step");
         let pass = ctx.begin_concurrent()?;
+        pass.set_label("decode");
         self.encode_decode_graph(ctx, &pass, state, s, slot_in, slot_out, draw, park)?;
         pass.end()
     }
@@ -1327,6 +1328,7 @@ impl Qwen4ExpModel {
         let pos = state.pos;
         let conv_slot = state.conv_slot;
         let verify = matches!(mode, BatchMode::Verify { .. });
+        pass.set_label(if verify { "verify" } else { "prefill" });
         if verify {
             ensure!(m <= MAX_DRAFTS + 1, "verify batch of {m} rows exceeds {}", MAX_DRAFTS + 1);
         }
