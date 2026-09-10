@@ -32,6 +32,8 @@ use crate::kernels::hc::{
 use crate::kernels::norm::rmsnorm_bf16;
 use crate::kernels::ple;
 use crate::kernels::qsa::{self, INDEXER_D, SparseSplitScratch};
+use crate::kernels::spec::ctrl_words;
+use crate::kernels::{Arg, Pos};
 use crate::kernels::sample::{SamplerScratch, SamplingParams, sample_f32};
 use crate::kernels::{quant, skinny};
 use crate::metal::{BlitCopy, ComputePass, DetachedPass, EncodedPass, MetalContext, Pacer, PendingPass, SharedEvent};
@@ -271,17 +273,21 @@ pub(super) struct SpecPending {
     /// The trunk's draw per row.
     pub(super) sampled: Vec<u32>,
     pub(super) uses_penalties: bool,
-    /// Passes encoded while the verify pass ran, one per possible accepted
-    /// count (index = accepted): the draft pass and the next verify pass.
-    /// Empty when there was no room to encode them ahead.
+    /// Proposals the draft pass behind the verify pass chains.
+    pub(super) chain: usize,
+    /// Next verify passes encoded while the verify pass ran, one per possible
+    /// accepted count (index = accepted). Empty when there was no room to
+    /// encode them ahead.
     pub(super) prepared: Vec<Prepared>,
+    /// GPU end time of the verify pass (`LILY_PROFILE` only), for the gap to
+    /// the draft pass.
+    pub(super) verify_gpu_end: Option<f64>,
 }
 
-/// The two passes that follow a verify pass, encoded ahead for one accepted
-/// count. Only the host-written inputs (the head's ids, the next pending
-/// token) remain to be filled in before they are committed.
+/// The verify pass that follows a draft pass, encoded ahead for one accepted
+/// count. Its ids are written on the GPU by the draft pass; it only needs
+/// committing (parked on the step sync).
 pub(super) struct Prepared {
-    pub(super) draft: DetachedPass,
     pub(super) verify: DetachedPass,
     /// The step-sync value the verify pass waits for.
     pub(super) park: u64,
@@ -716,6 +722,11 @@ pub(super) struct SpecScratch {
     pub(super) draft_tokens: Tensor,
     /// U32 `[MAX_DRAFTS + 1]`: host-written tokens for the head's catch-up rows.
     pub(super) mtp_ids: Tensor,
+    /// U32 control block the GPU fills with the accepted count and what
+    /// follows from it (`kernels::spec`), read by the draft pass's dispatches.
+    pub(super) ctrl: Tensor,
+    /// bf16 `[1, G*H]`: the head residual row the chain continues from.
+    pub(super) chain_in: Tensor,
 }
 
 impl SpecScratch {
@@ -734,7 +745,32 @@ impl SpecScratch {
             verify_tokens: Tensor::zeros(ctx, &[rows], DType::U32)?,
             draft_tokens: Tensor::zeros(ctx, &[MAX_DRAFTS], DType::U32)?,
             mtp_ids: Tensor::zeros(ctx, &[rows], DType::U32)?,
+            ctrl: Tensor::zeros(ctx, &[ctrl_words(MAX_DRAFTS)], DType::U32)?,
+            chain_in: Tensor::zeros(ctx, &[1, cfg.hc_width()], DType::BF16)?,
         })
+    }
+}
+
+/// Where a batched attention pass runs: the position of its first row and,
+/// when the GPU supplies that position, the indexer block the pass completes
+/// (block index and 0/1 count), written earlier in the same pass. A
+/// GPU-supplied position is limited to single-row passes whose position range
+/// spans less than one indexer block, so at most one block completes.
+#[derive(Clone, Copy)]
+pub(super) struct AttnPos<'t> {
+    pub(super) pos: Pos<'t>,
+    block: Option<(&'t Tensor, &'t Tensor)>,
+}
+
+impl<'t> AttnPos<'t> {
+    pub(super) fn host(pos: usize) -> Self {
+        Self { pos: Pos::host(pos), block: None }
+    }
+
+    /// `pos` (a U32 word in `min..=max`), `block` and `count`: the words a
+    /// `kernels::spec::spec_accept` dispatch wrote for this row.
+    pub(super) fn gpu(pos: &'t Tensor, min: usize, max: usize, block: &'t Tensor, count: &'t Tensor) -> Self {
+        Self { pos: Pos::gpu(pos, min, max), block: Some((block, count)) }
     }
 }
 
@@ -1585,7 +1621,7 @@ impl Qwen4ExpModel {
         blk_keys: &Tensor,
         pos: usize,
     ) -> Result<()> {
-        self.attn_batched_theta(ctx, pass, w, s, ps, k_cache, v_cache, idx_keys, blk_keys, pos, self.config.rope_parameters.rope_theta)
+        self.attn_batched_theta(ctx, pass, w, s, ps, k_cache, v_cache, idx_keys, blk_keys, AttnPos::host(pos), self.config.rope_parameters.rope_theta)
     }
 
     /// The attention branch over `ps.hc.mixed` at positions `pos..pos+m`
@@ -1603,7 +1639,7 @@ impl Qwen4ExpModel {
         v_cache: &Tensor,
         idx_keys: &Tensor,
         blk_keys: &Tensor,
-        pos: usize,
+        at: AttnPos<'_>,
         theta: f32,
     ) -> Result<()> {
         let cfg = &self.config;
@@ -1612,6 +1648,7 @@ impl Qwen4ExpModel {
         let m = ps.m;
         let idx = &cfg.indexer;
         let (nq, hd) = (cfg.num_attention_heads, cfg.head_dim);
+        let pos = at.pos;
 
         project_stack_or_slices(
             ctx,
@@ -1633,10 +1670,25 @@ impl Qwen4ExpModel {
         rmsnorm_bf16(ctx, pass, &ps.q, &w.q_norm, &ps.q, eps, NORM_WEIGHT_BIAS)?;
         rope_neox(ctx, pass, &ps.k_new, cfg.num_key_value_heads, rot, pos, theta)?;
         // Block keys for every block this chunk completes.
-        let first_block = pos / idx.compress_ratio;
-        let complete = (pos + m) / idx.compress_ratio;
-        if complete > first_block {
-            qsa::qsa_block_keys(ctx, pass, idx_keys, &w.indexer.k_norm, blk_keys, idx.compress_ratio, first_block, complete - first_block, rot, theta, eps)?;
+        let ratio = idx.compress_ratio;
+        match (pos.arg, at.block) {
+            (Arg::Const(p), _) => {
+                let first_block = p / ratio;
+                let complete = (p + m) / ratio;
+                if complete > first_block {
+                    qsa::qsa_block_keys(ctx, pass, idx_keys, &w.indexer.k_norm, blk_keys, ratio, first_block, complete - first_block, rot, theta, eps)?;
+                }
+            }
+            (Arg::Gpu(_), Some((block, count))) => {
+                // The GPU decided whether this row completes a block; the
+                // dispatch is sized for one block and gated by its count word.
+                ensure!(m == 1 && pos.max - pos.min < ratio, "a GPU-supplied position needs a single row within one indexer block");
+                let first_min = pos.min / ratio;
+                if (pos.max + 1) / ratio > first_min {
+                    qsa::qsa_block_keys(ctx, pass, idx_keys, &w.indexer.k_norm, blk_keys, ratio, Pos::gpu(block, first_min, pos.max / ratio), Pos::gpu(count, 0, 1), rot, theta, eps)?;
+                }
+            }
+            (Arg::Gpu(_), None) => anyhow::bail!("a GPU-supplied position needs its block words"),
         }
         pass.level_barrier(&[&ps.q, &ps.k_new, blk_keys])?;
         rope_neox(ctx, pass, &ps.q, nq, rot, pos, theta)?;
@@ -1644,16 +1696,18 @@ impl Qwen4ExpModel {
         scatter_kv(ctx, pass, v_cache, &ps.v_new, pos)?;
         pass.level_barrier(&[&ps.q, k_cache, v_cache])?;
 
-        if pos + m <= idx.dense_limit() {
+        if pos.max + m <= idx.dense_limit() {
             // Every query sees at most the budget: the selection is the whole
             // causal window, so the dense kernel is exact.
             sdpa_prefill(ctx, pass, &ps.q, k_cache, v_cache, &ps.attn_o, pos, self.attn_scale)?;
         } else {
+            // (Exact below the dense limit too: fewer visible blocks than the
+            // budget means all of them are selected.)
             let qb_cap = ps.qsa.n_sel.numel();
             for q0 in (0..m).step_by(qb_cap) {
                 let qb = qb_cap.min(m - q0);
-                let base = pos + q0;
-                let nb_max = qsa::visible_blocks(base + qb - 1, idx.compress_ratio);
+                let base = pos.offset(q0)?;
+                let nb_max = qsa::visible_blocks(base.max + qb - 1, idx.compress_ratio);
                 let idx_q = ps.idx_q.view(q0 * idx.n_heads * INDEXER_D, &[qb, idx.n_heads, INDEXER_D])?;
                 let q = ps.q.view(q0 * nq * hd, &[qb, nq, hd])?;
                 let out = ps.attn_o.view(q0 * nq * hd, &[qb, nq, hd])?;
@@ -1721,7 +1775,7 @@ impl Qwen4ExpModel {
             let ids = if pos > 0 { ps.ids.view(0, &[m])? } else { ps.ids.view(1, &[m - 1])? };
             pass.level_barrier(&[hidden_in])?;
             let ps_rows = ps.rows(rows)?;
-            self.mtp_block(ctx, pass, mtp, mst, &hidden_in.view(0, &[rows, wide])?, &ids, pos0, s, &ps_rows)?;
+            self.mtp_block(ctx, pass, mtp, mst, &hidden_in.view(0, &[rows, wide])?, &ids, AttnPos::host(pos0), s, &ps_rows)?;
         }
         // The chunk's last trunk hidden pairs with the next token, whenever
         // it arrives. (Ordered after the reads above by the block's barriers,
@@ -1744,7 +1798,7 @@ impl Qwen4ExpModel {
         mst: &MtpState,
         hidden: &Tensor,
         ids: &Tensor,
-        pos0: usize,
+        pos0: AttnPos<'_>,
         s: &Scratch,
         ps: &PrefillScratch,
     ) -> Result<()> {
@@ -2525,8 +2579,9 @@ impl LanguageModel for Qwen4ExpModel {
         params: &SamplingParams,
         step0: usize,
         parked: Option<PendingPass<'a>>,
-    ) -> Result<Vec<u32>> {
-        Qwen4ExpModel::verify(self, ctx, state, scratch, pending, drafts, params, step0, parked)
+        next_drafts: usize,
+    ) -> Result<(Vec<u32>, PendingPass<'a>)> {
+        Qwen4ExpModel::verify(self, ctx, state, scratch, pending, drafts, params, step0, parked, next_drafts)
     }
 
     fn finish_speculation<'a>(
@@ -2536,8 +2591,8 @@ impl LanguageModel for Qwen4ExpModel {
         scratch: &mut Scratch,
         accepted: usize,
         next: Option<crate::engine::NextStep<'_>>,
-        drafts: usize,
+        draft: PendingPass<'a>,
     ) -> Result<(Vec<u32>, Option<PendingPass<'a>>)> {
-        Qwen4ExpModel::finish_speculation(self, ctx, state, scratch, accepted, next, drafts)
+        Qwen4ExpModel::finish_speculation(self, ctx, state, scratch, accepted, next, draft)
     }
 }

@@ -2,8 +2,8 @@
 
 use anyhow::{Result, ensure};
 
-use crate::kernels::u32_bytes;
-use crate::metal::{ComputePass, Grid, MetalContext, MslVersion};
+use crate::kernels::{Pos, u32_bytes};
+use crate::metal::{ComputePass, Grid, MetalContext, MslVersion, Param};
 use crate::tensor::{DType, Tensor};
 
 /// Hard kernel limit; checkpoint and CLI limits may be lower.
@@ -74,30 +74,31 @@ pub fn sdpa_split_scratch_splits(capacity_tokens: usize) -> usize {
 /// In-place partial NeoX RoPE over `[M, heads, D]`; token `m` rotates at
 /// position `base_pos + m` (decode is the M=1 case).
 #[allow(clippy::too_many_arguments)]
-pub fn rope_neox(
+pub fn rope_neox<'t>(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
     x: &Tensor,
     heads: usize,
     rot: usize,
-    base_pos: usize,
+    base_pos: impl Into<Pos<'t>>,
     theta: f32,
 ) -> Result<()> {
+    let base_pos = base_pos.into();
     let d = *x.shape().last().ok_or_else(|| anyhow::anyhow!("rope on 0-d tensor"))?;
     ensure!(x.numel().is_multiple_of(heads * d), "x not a multiple of heads*D");
     let m = x.numel() / (heads * d);
     ensure!(rot.is_multiple_of(2) && rot <= d, "rotary dim {rot} invalid for D {d}");
     let pipeline = ctx.pipeline("rope_neox_bf16", SOURCE, MslVersion::V3_1)?;
     let pairs = heads * rot / 2;
-    pass.dispatch_at(
+    pass.dispatch_with(
         &pipeline,
         &[x.binding()],
         &[
-            &u32_bytes(d),
-            &u32_bytes(rot),
-            &u32_bytes(base_pos),
-            &theta.to_ne_bytes(),
-            &u32_bytes(heads * d),
+            Param::U32(d as u32),
+            Param::U32(rot as u32),
+            base_pos.param(),
+            Param::F32(theta),
+            Param::U32((heads * d) as u32),
         ],
         Grid::Threads { grid: (pairs, m, 1), threadgroup: (256.min(pairs), 1, 1) },
     )
@@ -126,13 +127,14 @@ pub fn split_q_gate(
 
 /// Appends M tokens' per-head rows (`[M, KVH, D]`) into `cache`
 /// (`[KVH, max_seq, D]`) at positions `base_pos..base_pos + M`.
-pub fn scatter_kv(
+pub fn scatter_kv<'t>(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
     cache: &Tensor,
     rows: &Tensor,
-    base_pos: usize,
+    base_pos: impl Into<Pos<'t>>,
 ) -> Result<()> {
+    let base_pos = base_pos.into();
     let (kvh, max_seq, d) = (cache.shape()[0], cache.shape()[1], cache.shape()[2]);
     ensure!(
         rows.numel().is_multiple_of(kvh * d),
@@ -141,14 +143,15 @@ pub fn scatter_kv(
     );
     let m = rows.numel() / (kvh * d);
     ensure!(
-        base_pos + m <= max_seq,
-        "positions {base_pos}+{m} exceed max_seq {max_seq}"
+        base_pos.max + m <= max_seq,
+        "positions {}+{m} exceed max_seq {max_seq}",
+        base_pos.max
     );
     let pipeline = ctx.pipeline("scatter_kv_bf16", SOURCE, MslVersion::V3_1)?;
-    pass.dispatch_at(
+    pass.dispatch_with(
         &pipeline,
         &[cache.binding(), rows.binding()],
-        &[&u32_bytes(d), &u32_bytes(max_seq), &u32_bytes(base_pos), &u32_bytes(kvh)],
+        &[Param::U32(d as u32), Param::U32(max_seq as u32), base_pos.param(), Param::U32(kvh as u32)],
         Grid::Threads { grid: (m * kvh * d, 1, 1), threadgroup: (256, 1, 1) },
     )
 }
@@ -234,16 +237,17 @@ pub fn k_norm_rope_scatter_decode(
 /// positions `0..base_len + m + 1` (the chunk's own K/V must already be
 /// scattered).
 #[allow(clippy::too_many_arguments)]
-pub fn sdpa_prefill(
+pub fn sdpa_prefill<'t>(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
     q: &Tensor,
     k_cache: &Tensor,
     v_cache: &Tensor,
     out: &Tensor,
-    base_len: usize,
+    base_len: impl Into<Pos<'t>>,
     scale: f32,
 ) -> Result<()> {
+    let base_len = base_len.into();
     let (kvh, max_seq, d) =
         (k_cache.shape()[0], k_cache.shape()[1], k_cache.shape()[2]);
     ensure!(q.shape().len() == 3 && q.shape()[2] == d, "q must be [M, NQ, D]");
@@ -252,7 +256,7 @@ pub fn sdpa_prefill(
     ensure!(nq.is_multiple_of(kvh), "NQ {nq} not a multiple of KVH {kvh}");
     ensure!(d <= 256, "head dim {d} > 256 unsupported");
     ensure!(
-        base_len + m <= max_seq && max_seq <= MAX_SEQ,
+        base_len.max + m <= max_seq && max_seq <= MAX_SEQ,
         "chunk exceeds kernel MAX_SEQ"
     );
     ensure!(v_cache.shape() == k_cache.shape(), "k/v cache shape mismatch");
@@ -262,18 +266,18 @@ pub fn sdpa_prefill(
         "head dim {d} is not the compiled flash-attention head dim {FA_D}"
     );
     let pipeline = ctx.pipeline(SDPA_PREFILL_KERNEL, SOURCE, MslVersion::V4_0)?;
-    pass.dispatch_at(
+    pass.dispatch_with(
         &pipeline,
         &[q.binding(), k_cache.binding(), v_cache.binding(), out.binding()],
         &[
-            &u32_bytes(max_seq),
-            &u32_bytes(base_len),
-            &u32_bytes(m),
-            &u32_bytes(nq),
-            &u32_bytes(nq / kvh),
-            &scale.to_ne_bytes(),
-            &u32_bytes(1), // parallel softmax
-            &u32_bytes(0), // ascending query blocks
+            Param::U32(max_seq as u32),
+            base_len.param(),
+            Param::U32(m as u32),
+            Param::U32(nq as u32),
+            Param::U32((nq / kvh) as u32),
+            Param::F32(scale),
+            Param::U32(1), // parallel softmax
+            Param::U32(0), // ascending query blocks
         ],
         Grid::Threadgroups {
             // Geometry must match the selected query tile and simdgroup count.

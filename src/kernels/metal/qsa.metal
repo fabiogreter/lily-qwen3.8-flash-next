@@ -102,6 +102,7 @@ kernel void qsa_block_keys_bf16(device const bfloat* cache [[buffer(0)]],  // [m
                                 constant uint&       rot   [[buffer(6)]],
                                 constant float&      theta [[buffer(7)]],
                                 constant float&      eps   [[buffer(8)]],
+                                constant uint&       count [[buffer(9)]],  // blocks to build (grid may exceed it)
                                 uint tg   [[threadgroup_position_in_grid]],
                                 uint tid  [[thread_index_in_threadgroup]],
                                 uint sg   [[simdgroup_index_in_threadgroup]],
@@ -110,6 +111,9 @@ kernel void qsa_block_keys_bf16(device const bfloat* cache [[buffer(0)]],  // [m
     threadgroup float inv_rms;
     threadgroup bfloat normed[TG];
 
+    if (tg >= count) {
+        return;  // uniform per threadgroup: no barrier is skipped unevenly
+    }
     const uint b = first_block + tg;
     float pooled = 0.0f;
     for (uint i = 0; i < ratio; ++i) {

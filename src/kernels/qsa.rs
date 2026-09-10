@@ -5,8 +5,8 @@
 use anyhow::{Result, ensure};
 
 use crate::kernels::attention;
-use crate::kernels::u32_bytes;
-use crate::metal::{ComputePass, Grid, MetalContext, MslVersion};
+use crate::kernels::{Pos, u32_bytes};
+use crate::metal::{ComputePass, Grid, MetalContext, MslVersion, Param};
 use crate::tensor::{DType, Tensor};
 
 const SOURCE: &str = include_str!("metal/qsa.metal");
@@ -38,7 +38,7 @@ pub fn sparse_splits(k_max: usize, ratio: usize) -> usize {
 
 /// `q[m, h, :] = rope(rmsnorm(qk[m, h*D..]) * (1 + w))` at position `base_pos + m`.
 #[allow(clippy::too_many_arguments)]
-pub fn qsa_prep_q(
+pub fn qsa_prep_q<'t>(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
     qk: &Tensor,
@@ -46,10 +46,11 @@ pub fn qsa_prep_q(
     q: &Tensor,
     n_heads: usize,
     rot: usize,
-    base_pos: usize,
+    base_pos: impl Into<Pos<'t>>,
     theta: f32,
     eps: f32,
 ) -> Result<()> {
+    let base_pos = base_pos.into();
     let d = INDEXER_D;
     ensure!(
         qk.dtype() == DType::BF16 && qk.numel().is_multiple_of((n_heads + 1) * d),
@@ -66,30 +67,31 @@ pub fn qsa_prep_q(
     );
     ensure!(rot.is_multiple_of(2) && rot <= d, "bad rotary dim {rot}");
     let pipeline = ctx.pipeline("qsa_prep_q_bf16", SOURCE, MslVersion::V3_1)?;
-    pass.dispatch_at(
+    pass.dispatch_with(
         &pipeline,
         &[qk.binding(), w.binding(), q.binding()],
         &[
-            &u32_bytes(d),
-            &u32_bytes(n_heads),
-            &u32_bytes(rot),
-            &u32_bytes(base_pos),
-            &theta.to_ne_bytes(),
-            &eps.to_ne_bytes(),
+            Param::U32(d as u32),
+            Param::U32(n_heads as u32),
+            Param::U32(rot as u32),
+            base_pos.param(),
+            Param::F32(theta),
+            Param::F32(eps),
         ],
         Grid::Threadgroups { groups: (m * n_heads, 1, 1), threadgroup: (d, 1, 1) },
     )
 }
 
 /// Appends the raw indexer keys of `qk` (`[M, (NH+1)*D]`) to `cache` (`[max_seq, D]`).
-pub fn qsa_scatter_keys(
+pub fn qsa_scatter_keys<'t>(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
     qk: &Tensor,
     cache: &Tensor,
     n_heads: usize,
-    base_pos: usize,
+    base_pos: impl Into<Pos<'t>>,
 ) -> Result<()> {
+    let base_pos = base_pos.into();
     let d = INDEXER_D;
     ensure!(
         qk.dtype() == DType::BF16 && qk.numel().is_multiple_of((n_heads + 1) * d),
@@ -102,32 +104,35 @@ pub fn qsa_scatter_keys(
             && cache.dtype() == DType::BF16,
         "cache must be BF16 [max_seq, D]"
     );
-    ensure!(base_pos + m <= cache.shape()[0], "indexer key cache overflow");
+    ensure!(base_pos.max + m <= cache.shape()[0], "indexer key cache overflow");
     let pipeline = ctx.pipeline("qsa_scatter_keys_bf16", SOURCE, MslVersion::V3_1)?;
-    pass.dispatch_at(
+    pass.dispatch_with(
         &pipeline,
         &[qk.binding(), cache.binding()],
-        &[&u32_bytes(d), &u32_bytes(n_heads), &u32_bytes(base_pos)],
+        &[Param::U32(d as u32), Param::U32(n_heads as u32), base_pos.param()],
         Grid::Threads { grid: (d, m, 1), threadgroup: (d, 1, 1) },
     )
 }
 
-/// Builds block keys `first_block .. first_block + count` from the raw-key cache.
+/// Builds block keys `first_block .. first_block + count` from the raw-key
+/// cache. Both may be GPU-supplied (bounded): the grid covers the largest
+/// count and threadgroups past the actual count exit.
 #[allow(clippy::too_many_arguments)]
-pub fn qsa_block_keys(
+pub fn qsa_block_keys<'t>(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
     cache: &Tensor,
     w: &Tensor,
     blocks: &Tensor,
     ratio: usize,
-    first_block: usize,
-    count: usize,
+    first_block: impl Into<Pos<'t>>,
+    count: impl Into<Pos<'t>>,
     rot: usize,
     theta: f32,
     eps: f32,
 ) -> Result<()> {
-    if count == 0 {
+    let (first_block, count) = (first_block.into(), count.into());
+    if count.max == 0 {
         return Ok(());
     }
     let d = INDEXER_D;
@@ -142,34 +147,35 @@ pub fn qsa_block_keys(
         "blocks must be BF16 [max_blocks, D]"
     );
     ensure!(
-        (first_block + count) * ratio <= cache.shape()[0],
+        (first_block.max + count.max) * ratio <= cache.shape()[0],
         "block keys read past the cache"
     );
-    ensure!(first_block + count <= blocks.shape()[0], "block key store overflow");
+    ensure!(first_block.max + count.max <= blocks.shape()[0], "block key store overflow");
     ensure!(
         w.numel() == d && w.dtype() == DType::BF16,
         "k norm weight must be BF16 [D]"
     );
     let pipeline = ctx.pipeline("qsa_block_keys_bf16", SOURCE, MslVersion::V3_1)?;
-    pass.dispatch_at(
+    pass.dispatch_with(
         &pipeline,
         &[cache.binding(), w.binding(), blocks.binding()],
         &[
-            &u32_bytes(d),
-            &u32_bytes(ratio),
-            &u32_bytes(first_block),
-            &u32_bytes(rot),
-            &theta.to_ne_bytes(),
-            &eps.to_ne_bytes(),
+            Param::U32(d as u32),
+            Param::U32(ratio as u32),
+            first_block.param(),
+            Param::U32(rot as u32),
+            Param::F32(theta),
+            Param::F32(eps),
+            count.param(),
         ],
-        Grid::Threadgroups { groups: (count, 1, 1), threadgroup: (d, 1, 1) },
+        Grid::Threadgroups { groups: (count.max, 1, 1), threadgroup: (d, 1, 1) },
     )
 }
 
 /// `scores[qi, b]` for every block visible to query `qi` at `base_pos + qi`;
 /// `nb_max` is the score row stride (blocks visible to the last query).
 #[allow(clippy::too_many_arguments)]
-pub fn qsa_scores(
+pub fn qsa_scores<'t>(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
     q: &Tensor,
@@ -177,9 +183,10 @@ pub fn qsa_scores(
     scores: &Tensor,
     n_heads: usize,
     nb_max: usize,
-    base_pos: usize,
+    base_pos: impl Into<Pos<'t>>,
     ratio: usize,
 ) -> Result<()> {
+    let base_pos = base_pos.into();
     let d = INDEXER_D;
     ensure!(n_heads <= 4, "scores kernel stages at most 4 indexer heads");
     ensure!(
@@ -197,16 +204,16 @@ pub fn qsa_scores(
     );
     let inv_sqrt_d = 1.0 / (d as f32).sqrt();
     let pipeline = ctx.pipeline("qsa_scores_f32", SOURCE, MslVersion::V3_1)?;
-    pass.dispatch_at(
+    pass.dispatch_with(
         &pipeline,
         &[q.binding(), blocks.binding(), scores.binding()],
         &[
-            &u32_bytes(d),
-            &u32_bytes(n_heads),
-            &u32_bytes(nb_max),
-            &u32_bytes(base_pos),
-            &u32_bytes(ratio),
-            &inv_sqrt_d.to_ne_bytes(),
+            Param::U32(d as u32),
+            Param::U32(n_heads as u32),
+            Param::U32(nb_max as u32),
+            base_pos.param(),
+            Param::U32(ratio as u32),
+            Param::F32(inv_sqrt_d),
         ],
         Grid::Threadgroups {
             groups: (nb_max.div_ceil(TG), qb, 1),
@@ -218,7 +225,7 @@ pub fn qsa_scores(
 /// Top-`k_max` visible blocks per query (ascending block order) into `sel`
 /// (`U32 [QB, k_max]`) with counts in `n_sel` (`U32 [QB]`).
 #[allow(clippy::too_many_arguments)]
-pub fn qsa_select_blocks(
+pub fn qsa_select_blocks<'t>(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
     scores: &Tensor,
@@ -226,10 +233,11 @@ pub fn qsa_select_blocks(
     n_sel: &Tensor,
     qb: usize,
     nb_max: usize,
-    base_pos: usize,
+    base_pos: impl Into<Pos<'t>>,
     ratio: usize,
     k_max: usize,
 ) -> Result<()> {
+    let base_pos = base_pos.into();
     ensure!(
         scores.numel() >= qb * nb_max && scores.dtype() == DType::F32,
         "scores must be F32 [QB, nb_max]"
@@ -243,14 +251,14 @@ pub fn qsa_select_blocks(
         "n_sel must be U32 [QB]"
     );
     let pipeline = ctx.pipeline("qsa_select_blocks", SOURCE, MslVersion::V3_1)?;
-    pass.dispatch_at(
+    pass.dispatch_with(
         &pipeline,
         &[scores.binding(), sel.binding(), n_sel.binding()],
         &[
-            &u32_bytes(nb_max),
-            &u32_bytes(base_pos),
-            &u32_bytes(ratio),
-            &u32_bytes(k_max),
+            Param::U32(nb_max as u32),
+            base_pos.param(),
+            Param::U32(ratio as u32),
+            Param::U32(k_max as u32),
         ],
         Grid::Threadgroups { groups: (qb, 1, 1), threadgroup: (SELECT_TG, 1, 1) },
     )
@@ -267,7 +275,7 @@ pub struct SparseSplitScratch<'a> {
 /// position `base_pos + qi`) over their selected blocks plus tail, writing
 /// `out` (`[QB, NQ, D]`).
 #[allow(clippy::too_many_arguments)]
-pub fn qsa_attention(
+pub fn qsa_attention<'t>(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
     q: &Tensor,
@@ -280,9 +288,10 @@ pub fn qsa_attention(
     qb: usize,
     k_max: usize,
     ratio: usize,
-    base_pos: usize,
+    base_pos: impl Into<Pos<'t>>,
     scale: f32,
 ) -> Result<()> {
+    let base_pos = base_pos.into();
     let (kvh, max_seq, d) =
         (k_cache.shape()[0], k_cache.shape()[1], k_cache.shape()[2]);
     ensure!(d == ATTN_D, "sparse attention is compiled for head dim {ATTN_D}, got {d}");
@@ -306,7 +315,7 @@ pub fn qsa_attention(
         n_sel.numel() >= qb && n_sel.dtype() == DType::U32,
         "n_sel must be U32 [QB]"
     );
-    ensure!(base_pos + qb <= max_seq, "queries exceed the cache");
+    ensure!(base_pos.max + qb <= max_seq, "queries exceed the cache");
     let splits = sparse_splits(k_max, ratio);
     ensure!(
         scratch.partials.numel() >= qb * nq * splits * d
@@ -319,7 +328,7 @@ pub fn qsa_attention(
         "sparse stats scratch too small"
     );
     let stage1 = ctx.pipeline("qsa_attn_split_bf16", SOURCE, MslVersion::V3_1)?;
-    pass.dispatch_at(
+    pass.dispatch_with(
         &stage1,
         &[
             q.binding(),
@@ -331,15 +340,15 @@ pub fn qsa_attention(
             scratch.stats.binding(),
         ],
         &[
-            &u32_bytes(d),
-            &u32_bytes(max_seq),
-            &u32_bytes(group),
-            &u32_bytes(splits),
-            &u32_bytes(k_max),
-            &u32_bytes(ratio),
-            &u32_bytes(base_pos),
-            &scale.to_ne_bytes(),
-            &u32_bytes(nq),
+            Param::U32(d as u32),
+            Param::U32(max_seq as u32),
+            Param::U32(group as u32),
+            Param::U32(splits as u32),
+            Param::U32(k_max as u32),
+            Param::U32(ratio as u32),
+            base_pos.param(),
+            Param::F32(scale),
+            Param::U32(nq as u32),
         ],
         Grid::Threadgroups { groups: (kvh, splits, qb), threadgroup: (TG, 1, 1) },
     )?;

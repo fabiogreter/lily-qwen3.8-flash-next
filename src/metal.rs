@@ -738,6 +738,20 @@ impl Drop for ComputePass<'_> {
     }
 }
 
+/// One inline kernel argument (a `constant T&` in MSL) of a dispatch.
+#[derive(Clone, Copy)]
+pub enum Param<'p> {
+    /// A host constant, copied into the pass's params arena.
+    Bytes(&'p [u8]),
+    /// A host `uint` constant.
+    U32(u32),
+    /// A host `float` constant.
+    F32(f32),
+    /// The word at this byte offset of a resident buffer, read by the GPU
+    /// when the dispatch runs (so a kernel earlier in the pass may set it).
+    Gpu(&'p GpuBuffer, usize),
+}
+
 /// How to map work items onto the GPU for one dispatch.
 #[derive(Clone, Copy)]
 pub enum Grid {
@@ -794,11 +808,36 @@ impl<'a> ComputePass<'a> {
     /// Encodes one kernel dispatch with a byte offset per buffer binding — used
     /// to bind slices of a larger buffer (e.g. the q/k/v thirds of the fused
     /// GDN projection). Offsets must be 4-byte aligned per Metal's rules.
+    /// Every param is a host constant; see [`Self::dispatch_with`] for params
+    /// the GPU supplies.
     pub fn dispatch_at(
         &self,
         kernel: &Kernel,
         buffers: &[(&GpuBuffer, usize)],
         params: &[&[u8]],
+        grid: Grid,
+    ) -> Result<()> {
+        ensure!(
+            params.len() <= MAX_KERNEL_PARAMS,
+            "{} kernel params exceeds MAX_KERNEL_PARAMS ({MAX_KERNEL_PARAMS})",
+            params.len()
+        );
+        let mut args = [Param::U32(0); MAX_KERNEL_PARAMS];
+        for (arg, bytes) in args.iter_mut().zip(params) {
+            *arg = Param::Bytes(bytes);
+        }
+        self.dispatch_with(kernel, buffers, &args[..params.len()], grid)
+    }
+
+    /// Like [`Self::dispatch_at`], with each param either a host constant or
+    /// the address of a word in a resident buffer, read when the dispatch
+    /// runs: a kernel earlier in the pass (ordered by the pass's barriers) may
+    /// have written it. Params bind at indices `buffers.len()..`.
+    pub fn dispatch_with(
+        &self,
+        kernel: &Kernel,
+        buffers: &[(&GpuBuffer, usize)],
+        params: &[Param<'_>],
         grid: Grid,
     ) -> Result<()> {
         ensure!(
@@ -818,10 +857,20 @@ impl<'a> ComputePass<'a> {
                 // SAFETY: the address lies within a resident buffer.
                 unsafe { inner.table.setAddress_atIndex(buf.address() + *offset as u64, i) };
             }
-            for (i, bytes) in params.iter().enumerate() {
-                ensure!(!bytes.is_empty(), "empty kernel param");
-                let address = inner.arena.push(pool, bytes)?;
-                // SAFETY: the address lies within a resident arena chunk.
+            for (i, param) in params.iter().enumerate() {
+                let address = match param {
+                    Param::Bytes(bytes) => {
+                        ensure!(!bytes.is_empty(), "empty kernel param");
+                        inner.arena.push(pool, bytes)?
+                    }
+                    Param::U32(v) => inner.arena.push(pool, &v.to_ne_bytes())?,
+                    Param::F32(v) => inner.arena.push(pool, &v.to_ne_bytes())?,
+                    Param::Gpu(buf, offset) => {
+                        ensure!(offset.is_multiple_of(4) && *offset + 4 <= buf.length(), "GPU param at byte {offset} is not a word of its buffer");
+                        buf.address() + *offset as u64
+                    }
+                };
+                // SAFETY: the address lies within a resident arena chunk or buffer.
                 unsafe { inner.table.setAddress_atIndex(address, buffers.len() + i) };
             }
             let size = |(w, h, d): (usize, usize, usize)| MTLSize { width: w, height: h, depth: d };

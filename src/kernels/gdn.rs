@@ -2,8 +2,8 @@
 
 use anyhow::{Result, ensure};
 
-use crate::kernels::u32_bytes;
-use crate::metal::{ComputePass, Grid, MetalContext, MslVersion};
+use crate::kernels::{Pos, u32_bytes};
+use crate::metal::{ComputePass, Grid, MetalContext, MslVersion, Param};
 use crate::tensor::{DType, Tensor};
 
 /// Compiled GDN key/value head dimension.
@@ -291,18 +291,19 @@ pub fn gdn_prefill_mid(
 /// followed `window_in`: `window_out` (`[C, S]`, may not alias `window_in`)
 /// gets the last `S` entries of `window_in ++ x[..n]`. `x` is `[M, C]` with
 /// `n <= M`; `S` is the window length (GDN: `KD-1`, PLE: `(KD-1)*dilation`).
-pub fn conv_window_rollback(
+pub fn conv_window_rollback<'t>(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
     window_in: &Tensor,
     x: &Tensor,
     window_out: &Tensor,
-    n: usize,
+    n: impl Into<Pos<'t>>,
 ) -> Result<()> {
+    let n = n.into();
     ensure!(window_in.shape().len() == 2 && x.shape().len() == 2, "window must be [C, S] and x [M, C]");
     let (c, s) = (window_in.shape()[0], window_in.shape()[1]);
     ensure!(window_out.shape() == [c, s], "window_out shape {:?} != [{c}, {s}]", window_out.shape());
-    ensure!(x.shape()[1] == c && n <= x.shape()[0], "x {:?} does not hold {n} rows of {c} channels", x.shape());
+    ensure!(x.shape()[1] == c && n.max <= x.shape()[0], "x {:?} does not hold {} rows of {c} channels", x.shape(), n.max);
     for t in [window_in, x, window_out] {
         ensure!(t.dtype() == DType::BF16, "conv window rollback expects BF16");
     }
@@ -310,10 +311,10 @@ pub fn conv_window_rollback(
     let (out_buf, out_off) = window_out.binding();
     ensure!(!(std::ptr::eq(in_buf, out_buf) && in_off == out_off), "window buffers must be distinct");
     let pipeline = ctx.pipeline("conv_window_rollback_bf16", SOURCE, MslVersion::V3_1)?;
-    pass.dispatch_at(
+    pass.dispatch_with(
         &pipeline,
         &[window_in.binding(), x.binding(), window_out.binding()],
-        &[&u32_bytes(c), &u32_bytes(s), &u32_bytes(n)],
+        &[Param::U32(c as u32), Param::U32(s as u32), n.param()],
         Grid::Threads { grid: (c, 1, 1), threadgroup: (256.min(c), 1, 1) },
     )
 }

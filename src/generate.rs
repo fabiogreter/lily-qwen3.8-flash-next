@@ -92,7 +92,7 @@ pub fn speculate<M: LanguageModel>(
     loop {
         let pending = *tokens.last().expect("tokens is never empty");
         let step0 = tokens.len();
-        let sampled = model.verify(ctx, state, scratch, pending, &proposals, params, step0, parked.take())?;
+        let (sampled, draft) = model.verify(ctx, state, scratch, pending, &proposals, params, step0, parked.take(), k)?;
         // Row j confirms draft j when its draw equals it; the first row that
         // does not (or the row after the last draft) supplies the fresh token.
         let mut kept = 0usize;
@@ -115,12 +115,12 @@ pub fn speculate<M: LanguageModel>(
         accepted += kept;
         match finish {
             Some(finish) => {
-                model.finish_speculation(ctx, state, scratch, kept, None, 0)?;
+                model.finish_speculation(ctx, state, scratch, kept, None, draft)?;
                 return Ok(Speculated { finish, drafted, accepted });
             }
             None => {
                 let next = NextStep { token: sampled[kept], params, step0: tokens.len() };
-                let (next_proposals, next_parked) = model.finish_speculation(ctx, state, scratch, kept, Some(next), k)?;
+                let (next_proposals, next_parked) = model.finish_speculation(ctx, state, scratch, kept, Some(next), draft)?;
                 proposals = next_proposals;
                 parked = next_parked;
             }
