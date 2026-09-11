@@ -695,3 +695,214 @@ fn router_pipeline_matches_host() {
         }
     }
 }
+
+/// Dispatches the reference router kernels (the repeated-argmax versions in
+/// tests/metal/moe_test.metal): F32 `[E]` or BF16 `[m, E]` logits.
+fn router_ref(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    logits: &Tensor,
+    indices: &Tensor,
+    scores: &Tensor,
+    renorm: bool,
+) -> Result<()> {
+    let rows = logits.shape().len() == 2;
+    let (m, e) =
+        if rows { (logits.shape()[0], logits.shape()[1]) } else { (1, logits.numel()) };
+    let k = indices.numel() / m;
+    let tg = e.clamp(32, 256).next_multiple_of(32);
+    let name = if rows { "moe_router_topk_rows_ref" } else { "moe_router_topk_ref" };
+    let pipeline = ctx.pipeline(name, TEST_SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[logits.binding(), indices.binding(), scores.binding()],
+        &[&u32_bytes(e), &u32_bytes(k), &u32_bytes(renorm as usize)],
+        Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (tg, 1, 1) },
+    )
+}
+
+/// Router logits of one style: dense random values, values on a coarse grid
+/// (many exact ties, including ties for the last selected slot), or random
+/// values with a third of the entries at -inf (more -inf than open slots for
+/// the small shapes, so -inf entries get selected in id order). Entry 0 is
+/// always finite so the renormalized softmax has a finite maximum.
+fn router_logits(rng: &mut StdRng, n: usize, style: &str) -> Vec<f32> {
+    let mut v: Vec<f32> = match style {
+        "random" => random_vec(rng, n, -4.0, 4.0),
+        "ties" => (0..n).map(|_| rng.gen_range(-6i32..=6) as f32 * 0.5).collect(),
+        "neg_inf" => (0..n)
+            .map(|_| {
+                if rng.gen_range(0..3) == 0 {
+                    f32::NEG_INFINITY
+                } else {
+                    rng.gen_range(-4.0..4.0)
+                }
+            })
+            .collect(),
+        other => panic!("unknown logits style {other}"),
+    };
+    if !v[0].is_finite() {
+        v[0] = 0.5;
+    }
+    v
+}
+
+/// The register-selection router kernels against the repeated-argmax
+/// reference they replaced: bit-identical indices and scores (both the
+/// renormalized and the full-softmax path) over random inputs, exact ties
+/// (lowest expert id wins, on every rank) and -inf logits, for every
+/// instantiation (E <= 256, 512, 1024) and both the F32 vector and the
+/// BF16 row kernels.
+#[test]
+fn router_topk_is_bit_identical_to_reference() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(77);
+    let trials = 12;
+    for (e, k) in
+        [(512usize, 10usize), (256, 8), (1024, 16), (33, 4), (8, 2), (64, 16), (300, 7)]
+    {
+        for renorm in [true, false] {
+            for style in ["random", "ties", "neg_inf"] {
+                // F32 vector kernel, one dispatch pair per trial.
+                let mut cases = Vec::new();
+                let pass = ctx.begin().expect("pass");
+                for _ in 0..trials {
+                    let logits = router_logits(&mut rng, e, style);
+                    let t = Tensor::from_f32(&ctx, &logits, &[e]).expect("logits");
+                    let mk = || {
+                        (
+                            Tensor::zeros(&ctx, &[k], DType::U32).expect("idx"),
+                            Tensor::zeros(&ctx, &[k], DType::F32).expect("scores"),
+                        )
+                    };
+                    let (ri, rs) = mk();
+                    let (ni, ns) = mk();
+                    router_ref(&ctx, &pass, &t, &ri, &rs, renorm).expect("ref");
+                    moe_router_topk(&ctx, &pass, &t, &ni, &ns, renorm).expect("new");
+                    // `t` must outlive the commit: a dropped buffer can be
+                    // reused (and written) while the pass still reads it.
+                    cases.push((t, ri, rs, ni, ns));
+                }
+                pass.commit_wait().expect("commit");
+                for (trial, (_t, ri, rs, ni, ns)) in cases.iter().enumerate() {
+                    let tag =
+                        format!("E={e} k={k} renorm={renorm} {style} trial {trial}");
+                    assert_eq!(
+                        ni.to_u32().expect("idx"),
+                        ri.to_u32().expect("idx"),
+                        "indices {tag}"
+                    );
+                    let bits = |t: &Tensor| -> Vec<u32> {
+                        t.to_f32()
+                            .expect("scores")
+                            .iter()
+                            .map(|x| x.to_bits())
+                            .collect()
+                    };
+                    assert_eq!(bits(ns), bits(rs), "scores {tag}");
+                }
+
+                // BF16 row kernel, m rows per dispatch.
+                let m = 3;
+                let mut cases = Vec::new();
+                let pass = ctx.begin().expect("pass");
+                for _ in 0..trials {
+                    let logits = router_logits(&mut rng, m * e, style);
+                    let t = Tensor::from_f32_as_bf16(&ctx, &logits, &[m, e])
+                        .expect("logits");
+                    let mk = || {
+                        (
+                            Tensor::zeros(&ctx, &[m, k], DType::U32).expect("idx"),
+                            Tensor::zeros(&ctx, &[m, k], DType::F32).expect("scores"),
+                        )
+                    };
+                    let (ri, rs) = mk();
+                    let (ni, ns) = mk();
+                    router_ref(&ctx, &pass, &t, &ri, &rs, renorm).expect("ref rows");
+                    moe_router_topk_rows(&ctx, &pass, &t, &ni, &ns, renorm)
+                        .expect("new rows");
+                    cases.push((t, ri, rs, ni, ns));
+                }
+                pass.commit_wait().expect("commit");
+                for (trial, (_t, ri, rs, ni, ns)) in cases.iter().enumerate() {
+                    let tag = format!(
+                        "rows E={e} k={k} renorm={renorm} {style} trial {trial}"
+                    );
+                    assert_eq!(
+                        ni.to_u32().expect("idx"),
+                        ri.to_u32().expect("idx"),
+                        "indices {tag}"
+                    );
+                    let bits = |t: &Tensor| -> Vec<u32> {
+                        t.to_f32()
+                            .expect("scores")
+                            .iter()
+                            .map(|x| x.to_bits())
+                            .collect()
+                    };
+                    assert_eq!(bits(ns), bits(rs), "scores {tag}");
+                }
+            }
+        }
+    }
+}
+
+/// Kernel-level timing of the router top-k at the model's shape (E = 512,
+/// K = 10, renormalized) against the reference kernel, on a concurrent pass
+/// with a level barrier after every dispatch (the graph's shape: the
+/// selection gates the expert gathers). Prints µs per dispatch; run with
+/// `cargo test --release -- --ignored --nocapture router_topk_timing`.
+#[test]
+#[ignore = "timing only"]
+fn router_topk_timing() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(78);
+    let (e, k) = (512usize, 10usize);
+    let iters = 512;
+    let time = |name: &str, f: &dyn Fn(&ComputePass<'_>)| {
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let pass = ctx.begin_concurrent().expect("pass");
+            for _ in 0..iters {
+                f(&pass);
+            }
+            let start = std::time::Instant::now();
+            pass.commit_wait().expect("commit");
+            best = best.min(start.elapsed().as_secs_f64() * 1e6 / iters as f64);
+        }
+        eprintln!("{name}: {best:.2} us per dispatch (best of 3)");
+    };
+    let logits = random_vec(&mut rng, e, -4.0, 4.0);
+    let t = Tensor::from_f32(&ctx, &logits, &[e]).expect("logits");
+    let idx = Tensor::zeros(&ctx, &[k], DType::U32).expect("idx");
+    let sc = Tensor::zeros(&ctx, &[k], DType::F32).expect("scores");
+    for renorm in [true, false] {
+        time(&format!("reference f32 [E] renorm={renorm}"), &|pass| {
+            router_ref(&ctx, pass, &t, &idx, &sc, renorm).unwrap();
+            pass.level_barrier(&[&idx, &sc]).unwrap();
+        });
+        time(&format!("register  f32 [E] renorm={renorm}"), &|pass| {
+            moe_router_topk(&ctx, pass, &t, &idx, &sc, renorm).unwrap();
+            pass.level_barrier(&[&idx, &sc]).unwrap();
+        });
+    }
+    for m in [1usize, 3] {
+        let logits = random_vec(&mut rng, m * e, -4.0, 4.0);
+        let t = Tensor::from_f32_as_bf16(&ctx, &logits, &[m, e]).expect("logits");
+        let idx = Tensor::zeros(&ctx, &[m, k], DType::U32).expect("idx");
+        let sc = Tensor::zeros(&ctx, &[m, k], DType::F32).expect("scores");
+        time(&format!("reference bf16 rows m={m}"), &|pass| {
+            router_ref(&ctx, pass, &t, &idx, &sc, true).unwrap();
+            pass.level_barrier(&[&idx, &sc]).unwrap();
+        });
+        time(&format!("register  bf16 rows m={m}"), &|pass| {
+            moe_router_topk_rows(&ctx, pass, &t, &idx, &sc, true).unwrap();
+            pass.level_barrier(&[&idx, &sc]).unwrap();
+        });
+    }
+    // The floor: a trivial one-threadgroup dispatch plus the level barrier.
+    time("floor (fill_zero_u32 [K] + barrier)", &|pass| {
+        fill_zero_u32(&ctx, pass, &idx).unwrap();
+        pass.level_barrier(&[&idx]).unwrap();
+    });
+}

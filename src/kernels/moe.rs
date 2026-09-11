@@ -1,6 +1,6 @@
 //! GPU-resident sparse-MoE routing, expert projection, and combine kernels.
 
-use anyhow::{Result, ensure};
+use anyhow::{Result, bail, ensure};
 
 use crate::kernels::u32_bytes;
 use crate::metal::{ComputePass, Grid, MetalContext, MslVersion};
@@ -36,14 +36,37 @@ pub fn moe_router_topk(
         scores.numel() == k && scores.dtype() == DType::F32,
         "scores must be F32 [k]"
     );
-    let tg = e.clamp(32, 256).next_multiple_of(32);
-    let pipeline = ctx.pipeline("moe_router_topk", SOURCE, MslVersion::V3_1)?;
+    let pipeline = ctx.pipeline(router_kernel(e, false)?, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
         &[logits.binding(), indices.binding(), scores.binding()],
         &[&u32_bytes(e), &u32_bytes(k), &u32_bytes(renorm as usize)],
-        Grid::Threadgroups { groups: (1, 1, 1), threadgroup: (tg, 1, 1) },
+        Grid::Threadgroups {
+            groups: (1, 1, 1),
+            threadgroup: (router_threadgroup(e, renorm), 1, 1),
+        },
     )
+}
+
+/// The router kernel instantiated for `e` logits: one simdgroup selects, each
+/// lane holding `EPL` experts in registers (`E <= 32 * EPL`).
+fn router_kernel(e: usize, rows: bool) -> Result<&'static str> {
+    Ok(match (e.div_ceil(32), rows) {
+        (0..=8, false) => "moe_router_topk_e8",
+        (0..=8, true) => "moe_router_topk_rows_e8",
+        (9..=16, false) => "moe_router_topk_e16",
+        (9..=16, true) => "moe_router_topk_rows_e16",
+        (17..=32, false) => "moe_router_topk_e32",
+        (17..=32, true) => "moe_router_topk_rows_e32",
+        _ => bail!("router top-k supports at most {MAX_E} logits (got {e})"),
+    })
+}
+
+/// Threads per router threadgroup: the raw-logit (renorm) path is one
+/// simdgroup; the full-softmax path keeps its strided reduction over up to
+/// 256 threads (its probabilities depend on that reduction order).
+fn router_threadgroup(e: usize, renorm: bool) -> usize {
+    if renorm { 32 } else { e.clamp(32, 256).next_multiple_of(32) }
 }
 
 /// Fused Q4 gate/up gather GEMV with SwiGLU output.
@@ -324,13 +347,15 @@ pub fn moe_router_topk_rows(
         scores.numel() == m * k && scores.dtype() == DType::F32,
         "scores must be F32 [m, k]"
     );
-    let tg = e.clamp(32, 256).next_multiple_of(32);
-    let pipeline = ctx.pipeline("moe_router_topk_rows", SOURCE, MslVersion::V3_1)?;
+    let pipeline = ctx.pipeline(router_kernel(e, true)?, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
         &[logits.binding(), indices.binding(), scores.binding()],
         &[&u32_bytes(e), &u32_bytes(k), &u32_bytes(renorm as usize)],
-        Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (tg, 1, 1) },
+        Grid::Threadgroups {
+            groups: (m, 1, 1),
+            threadgroup: (router_threadgroup(e, renorm), 1, 1),
+        },
     )
 }
 
