@@ -13,22 +13,33 @@ to a full OpenAI-compatible API:
 The Metal kernels compile from source at runtime; there is no offline shader
 build step.
 
-Reports, with measurement contract:
+Reports, with measurement contract (newest first):
 
-- [2026-09-09: the per-token host round trip, parked passes, bandwidth probes](docs/2026-09-09-host-round-trip-report.md)
+- [2026-09-11: an opencode agent session against the server](docs/2026-09-11-opencode-session-report.md)
+  (100 requests, 94.9% of prompt tokens served from the session cache, disk restores, two concurrent sessions)
+- [2026-09-11: per-kernel profile and the fusion work it picked](docs/2026-09-11-kernel-profile-and-fusion-report.md)
+  (profiler mode, decode/verify/draft breakdowns, fused hyper-connection read, router top-k, small-m MoE fusion)
+- [2026-09-10: the accepted count decided on the GPU](docs/2026-09-10-gpu-accepted-count-report.md)
+  (draft pass committed behind the verify pass, GPU-supplied positions, the one-draft-in-ninety route effect)
+- [2026-09-09: the per-token host round trip, parked passes, bandwidth probes, Metal 4 port](docs/2026-09-09-host-round-trip-report.md)
 - [2026-09-08: phase 3, speculative decoding and the disk tier](docs/2026-09-08-phase3-speculation-disk-report.md)
-  (98 tok/s greedy with two drafts against 76 plain; evicted sessions resume from disk)
+  (98 tok/s greedy with two drafts against 76 plain at that commit; evicted sessions resume from disk)
 - [2026-09-08: phase 2, the server and its memory](docs/2026-09-08-phase2-server-report.md)
   (71 GB resident, 32 GB table in the page cache, decode 78 tok/s greedy / 62 to 75 sampling)
 - [2026-09-07: Qwen3.8-Flash-Next engine on the M5 Max](docs/2026-09-07-performance-qwen38-flash-next.md)
+  (first numbers: 82 tok/s decode, 1 949 tok/s prefill at 1K, correctness against the HF reference)
 - upstream, Qwen3.6-35B-A3B: [2026-09-01: MLX 0.31.2](docs/2026-09-01-performance-mlx-0.31.2.md),
   [2026-09-02: MLX 0.32.2](docs/2026-09-02-performance-mlx-0.32.2.md)
 
 Performance over time, one fixed matrix per commit: [performance timeline](docs/performance-timeline.md)
-(records in `docs/bench/`, produced on demand by `tools/bench/timeline.sh`).
+(records in `docs/bench/`, produced on demand by `tools/bench/timeline.sh`; the interleaved A/B pairs live in
+`docs/bench/ab-*/`, the GPU clock trace of the first series in `docs/bench/2026-09-09-interleaved-gpu-clocks.md`).
 
 Design notes: [phase 2 design](docs/phase2-server-design.md),
 [checkpoint format](docs/qwen38-flash-next-checkpoint-format.md).
+
+Upstream's own account of the engine this fork started from: Perplexity,
+[Optimizing On-Device Inference for Apple Silicon](https://www.perplexity.ai/hub/blog/optimizing-on-device-inference-for-apple-silicon).
 
 ## Qwen3.8-Flash-Next
 
@@ -37,7 +48,8 @@ Gated DeltaNet / Qwen Sparse Attention (3:1) with 512-expert MoE, a 4-stream
 gated residual (hyper-connections), a hashed n-gram embedding at layer 2 with
 a 51B-parameter table, and a QSA indexer that selects 512 blocks of 4 tokens
 per query once the context exceeds 2 051 tokens. Everything the model needs
-is implemented; the vision tower and the MTP head are dropped.
+is implemented; the vision tower is dropped, and the multi-token-prediction
+head is converted separately and drives speculative decoding.
 
 The checkpoint is produced by `tools/convert/convert_qwen38_flash_next.py`
 from the raw Hugging Face BF16 weights: affine 4-bit / group 64 for experts,
@@ -48,8 +60,9 @@ draft head (`--mtp-only` appends it to an existing conversion).
 
 **Speculative decoding.** With the draft head converted, the server verifies
 the head's proposals in batched trunk passes (`--mtp-drafts`, default 2): on
-the M5 Max greedy decoding runs at 98 tok/s instead of 76, with about 80% of
-drafts accepted on code and prose. Outputs do not depend on the draft count;
+the M5 Max greedy decoding runs at 117 tok/s instead of 87 at a 1K prompt and
+98 instead of 80 at 8K (timeline row `7fb89bf`, synthetic prompt), with 66 to
+80% of drafts accepted on real code and prose. Outputs do not depend on the draft count;
 the usage block reports `completion_tokens_details` with accepted and rejected
 drafts. Sampling with temperature accepts fewer drafts (the head drafts
 greedily) and gains less.
