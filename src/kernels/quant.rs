@@ -111,7 +111,8 @@ pub fn moe_tile_mroute_table() -> MoeTilePolicy {
     MoeTilePolicy
 }
 
-fn check_quant(w: &QuantWeights) -> Result<(usize, usize)> {
+/// Validates a quantized weight for the GEMV kernels; returns `(out, in)`.
+pub(crate) fn check_quant(w: &QuantWeights) -> Result<(usize, usize)> {
     let (n, k) = (w.out_features(), w.in_features());
     ensure!(matches!(w.bits, 4 | 8), "unsupported bit width {}", w.bits);
     // A uint4 block must not cross a quantization group.

@@ -26,8 +26,8 @@ use crate::kernels::gdn::{
     conv1d_step, gated_rmsnorm, gdn_prefill_mid, gdn_step_gated_fused,
 };
 use crate::kernels::hc::{
-    hc_broadcast_bf16, hc_inject_bf16, hc_mix_bf16, rmsnorm_grouped_bf16,
-    silu_scaled_bf16,
+    hc_broadcast_bf16, hc_inject_bf16, hc_mix_bf16, hc_read_down_q8, hc_read_up_mix_q8,
+    rmsnorm_grouped_bf16, silu_scaled_bf16,
 };
 use crate::kernels::norm::rmsnorm_bf16;
 use crate::kernels::ple;
@@ -598,7 +598,9 @@ impl PleScratch {
     }
 }
 
-/// Hyper-connection read intermediates for `rows` tokens.
+/// Hyper-connection read intermediates for `rows` tokens. The single-row
+/// decode read (`hc_read_decode`) is fused and only touches `down`, `inj`,
+/// `inv_rms` and `mixed`; the batched read writes every buffer.
 pub(super) struct HcScratch {
     /// `[rows, G*H]` normed streams.
     pub(super) hn: Tensor,
@@ -611,6 +613,9 @@ pub(super) struct HcScratch {
     pub(super) mixed: Tensor,
     /// `[rows, G]` write-gate logits.
     inj: Tensor,
+    /// `[G]` F32 stream RMS reciprocals handed from the fused down kernel to
+    /// the fused up kernel (decode only).
+    inv_rms: Tensor,
 }
 
 impl HcScratch {
@@ -624,6 +629,7 @@ impl HcScratch {
             up: Tensor::zeros(ctx, &[rows, wide], bf)?,
             mixed: Tensor::zeros(ctx, &[rows, h], bf)?,
             inj: Tensor::zeros(ctx, &[rows, g], bf)?,
+            inv_rms: Tensor::zeros(ctx, &[g], DType::F32)?,
         })
     }
 
@@ -635,6 +641,7 @@ impl HcScratch {
             up: prefix_rows(&self.up, m)?,
             mixed: prefix_rows(&self.mixed, m)?,
             inj: prefix_rows(&self.inj, m)?,
+            inv_rms: self.inv_rms.clone(),
         })
     }
 }
@@ -1956,7 +1963,11 @@ impl Qwen4ExpModel {
     }
 
     /// Single-row hyper-connection read: `s.hyper` → `s.hc.mixed` (+ `inj`).
-    /// Leaves `mixed`/`inj` ordered for the caller.
+    /// Two fused dispatches (norm + down/inject GEMV; SiLU + up GEMV + mix)
+    /// standing in for the six-kernel batched read; the down half keeps the
+    /// normalized stream in f32 where the batched path rounds it to bf16, so
+    /// the two differ at bf16 rounding level. Leaves `mixed`/`inj` ordered
+    /// for the caller.
     fn hc_read_decode(
         &self,
         ctx: &MetalContext,
@@ -1966,29 +1977,35 @@ impl Qwen4ExpModel {
     ) -> Result<()> {
         let cfg = &self.config;
         let (h, g) = (cfg.hidden_size, cfg.hc_count);
-        let inv_g = 1.0 / g as f32;
-        rmsnorm_grouped_bf16(
+        hc_read_down_q8(
             ctx,
             pass,
             &s.hyper,
             &hc.norm,
-            &s.hc.hn,
+            &hc.down,
+            hc.inject.as_ref(),
+            &s.hc.down,
+            &s.hc.inj,
+            &s.hc.inv_rms,
             h,
             g,
             cfg.rms_norm_eps,
             NORM_WEIGHT_BIAS,
         )?;
-        pass.level_barrier(&[&s.hc.hn])?;
-        quant::gemv_quant(ctx, pass, &hc.down, &s.hc.hn, &s.hc.down)?;
-        if let Some(inject) = &hc.inject {
-            quant::gemv_quant(ctx, pass, inject, &s.hc.hn, &s.hc.inj)?;
-        }
-        pass.level_barrier(&[&s.hc.down, &s.hc.inj])?;
-        silu_scaled_bf16(ctx, pass, &s.hc.down, &s.hc.act, inv_g)?;
-        pass.level_barrier(&[&s.hc.act])?;
-        quant::gemv_quant(ctx, pass, &hc.up, &s.hc.act, &s.hc.up)?;
-        pass.level_barrier(&[&s.hc.up])?;
-        hc_mix_bf16(ctx, pass, &s.hc.up, &s.hc.hn, &s.hc.mixed, h, g)?;
+        pass.level_barrier(&[&s.hc.down, &s.hc.inj, &s.hc.inv_rms])?;
+        hc_read_up_mix_q8(
+            ctx,
+            pass,
+            &hc.up,
+            &s.hc.down,
+            &s.hyper,
+            &hc.norm,
+            &s.hc.inv_rms,
+            &s.hc.mixed,
+            h,
+            g,
+            NORM_WEIGHT_BIAS,
+        )?;
         pass.level_barrier(&[&s.hc.mixed])
     }
 
