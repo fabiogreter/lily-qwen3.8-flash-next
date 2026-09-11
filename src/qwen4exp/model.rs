@@ -26,7 +26,8 @@ use crate::kernels::gdn::{
     conv1d_step, gated_rmsnorm, gdn_prefill_mid, gdn_step_gated_fused,
 };
 use crate::kernels::hc::{
-    hc_broadcast_bf16, hc_inject_bf16, hc_mix_bf16, hc_read_down_q8, hc_read_up_mix_q8,
+    HC_FUSED_MAX_ROWS, fused_read_supported, hc_broadcast_bf16, hc_inject_bf16, hc_mix_bf16,
+    hc_read_down_q8, hc_read_down_q8_rows, hc_read_up_mix_q8, hc_read_up_mix_q8_rows,
     rmsnorm_grouped_bf16, silu_scaled_bf16,
 };
 use crate::kernels::norm::rmsnorm_bf16;
@@ -68,6 +69,9 @@ const CAPACITY_STEP: usize = 8192;
 /// Most draft tokens a speculative step may verify at once (the spec scratch
 /// is sized for it).
 pub const MAX_DRAFTS: usize = 3;
+// Every verify pass (MAX_DRAFTS + 1 rows) and every draft-head batch takes
+// the fused hyper-connection read.
+const _: () = assert!(MAX_DRAFTS < HC_FUSED_MAX_ROWS);
 
 /// How the batched (multi-row) graph is encoded: the serial encoder orders
 /// every dispatch implicitly; the concurrent one runs a dependency level's
@@ -598,9 +602,11 @@ impl PleScratch {
     }
 }
 
-/// Hyper-connection read intermediates for `rows` tokens. The single-row
-/// decode read (`hc_read_decode`) is fused and only touches `down`, `inj`,
-/// `inv_rms` and `mixed`; the batched read writes every buffer.
+/// Hyper-connection read intermediates for `rows` tokens. The fused decode
+/// read (`hc_read_decode`) only touches `down`, `inj`, `inv_rms` and
+/// `mixed`; the fused small-batch read (`hc_read_batched`, up to
+/// `HC_FUSED_MAX_ROWS` rows) also writes `act`; the unfused batched read of
+/// larger chunks writes every buffer.
 pub(super) struct HcScratch {
     /// `[rows, G*H]` normed streams.
     pub(super) hn: Tensor,
@@ -613,8 +619,8 @@ pub(super) struct HcScratch {
     pub(super) mixed: Tensor,
     /// `[rows, G]` write-gate logits.
     inj: Tensor,
-    /// `[G]` F32 stream RMS reciprocals handed from the fused down kernel to
-    /// the fused up kernel (decode only).
+    /// `[rows, G]` F32 stream RMS reciprocals handed from the fused down
+    /// kernel to the fused up kernel.
     inv_rms: Tensor,
 }
 
@@ -629,7 +635,7 @@ impl HcScratch {
             up: Tensor::zeros(ctx, &[rows, wide], bf)?,
             mixed: Tensor::zeros(ctx, &[rows, h], bf)?,
             inj: Tensor::zeros(ctx, &[rows, g], bf)?,
-            inv_rms: Tensor::zeros(ctx, &[g], DType::F32)?,
+            inv_rms: Tensor::zeros(ctx, &[rows, g], DType::F32)?,
         })
     }
 
@@ -641,7 +647,7 @@ impl HcScratch {
             up: prefix_rows(&self.up, m)?,
             mixed: prefix_rows(&self.mixed, m)?,
             inj: prefix_rows(&self.inj, m)?,
-            inv_rms: self.inv_rms.clone(),
+            inv_rms: prefix_rows(&self.inv_rms, m)?,
         })
     }
 }
@@ -1474,7 +1480,11 @@ impl Qwen4ExpModel {
     }
 
     /// `hyper` `[m, G*H]` → `ps.hc.mixed` `[m, H]` (and the write-gate logits
-    /// when the block has an inject weight). Leaves `mixed`/`inj` ordered.
+    /// when the block has an inject weight). Up to `HC_FUSED_MAX_ROWS` rows
+    /// (the verify pass, the draft head) take the two fused kernels of the
+    /// decode read, so those rows compute the read exactly as decode does;
+    /// larger chunks (prefill) take the six-kernel skinny/GEMM chain. Leaves
+    /// `mixed`/`inj` ordered.
     pub(super) fn hc_read_batched(
         &self,
         ctx: &MetalContext,
@@ -1486,6 +1496,39 @@ impl Qwen4ExpModel {
     ) -> Result<()> {
         let cfg = &self.config;
         let (h, g) = (cfg.hidden_size, cfg.hc_count);
+        if ps.m <= HC_FUSED_MAX_ROWS && fused_read_supported(&hc.down, &hc.up, hc.inject.as_ref(), h, g) {
+            hc_read_down_q8_rows(
+                ctx,
+                pass,
+                hyper,
+                &hc.norm,
+                &hc.down,
+                hc.inject.as_ref(),
+                &ps.hc.down,
+                &ps.hc.inj,
+                &ps.hc.inv_rms,
+                &ps.hc.act,
+                h,
+                g,
+                cfg.rms_norm_eps,
+                NORM_WEIGHT_BIAS,
+            )?;
+            pass.level_barrier(&[&ps.hc.down, &ps.hc.inj, &ps.hc.inv_rms, &ps.hc.act])?;
+            hc_read_up_mix_q8_rows(
+                ctx,
+                pass,
+                &hc.up,
+                &ps.hc.act,
+                hyper,
+                &hc.norm,
+                &ps.hc.inv_rms,
+                &ps.hc.mixed,
+                h,
+                g,
+                NORM_WEIGHT_BIAS,
+            )?;
+            return pass.level_barrier(&[&ps.hc.mixed]);
+        }
         let inv_g = 1.0 / g as f32;
         rmsnorm_grouped_bf16(ctx, pass, hyper, &hc.norm, &ps.hc.hn, h, g, cfg.rms_norm_eps, NORM_WEIGHT_BIAS)?;
         pass.level_barrier(&[&ps.hc.hn])?;

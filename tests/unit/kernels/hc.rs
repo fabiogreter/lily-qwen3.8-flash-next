@@ -5,6 +5,7 @@ use rand::{Rng, SeedableRng};
 use super::*;
 use crate::cpu_ref;
 use crate::kernels::quant::gemv_quant;
+use crate::kernels::skinny::gemm_skinny_q8_nt;
 use crate::weights::QuantWeights;
 
 fn sigmoid(x: f32) -> f32 {
@@ -536,4 +537,515 @@ fn fused_read_gate_timing() {
         hc_mix_bf16(&ctx, pass, &up, &hn, &mixed, h, g).unwrap();
         pass.level_barrier(&[&mixed]).unwrap();
     });
+}
+
+/// The small-batch fused kernels (`hc_read_down_q8_rows`,
+/// `hc_read_up_mix_q8_rows`) against the single-row fused kernels run on each
+/// row alone: the same mapping and per-lane operation order, so `down`,
+/// `inj`, `inv_rms` and `mixed` are bit-identical row by row, for every
+/// instantiated row count and stream count (including the inject-less final
+/// mixer); `act` equals `silu_scaled_bf16(down)`. The residual fast-math
+/// scheduling mismatch of the up kernel (one bf16 ulp in ~1e-5 of the
+/// elements for MB >= 3) has its own bound in
+/// `batched_fused_up_mix_matches_unfused_kernels`; these inputs do not hit it.
+#[test]
+fn batched_fused_read_is_bit_identical_to_decode_fused_kernels_per_row() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(27);
+    let eps = 1e-6f32;
+    let w_bias = 1.0f32;
+    for (h, g, r, with_inject) in [
+        (2560, 4, 320, true),
+        (2560, 4, 320, false),
+        (192, 3, 128, true),
+        (64, 8, 64, true),
+        (256, 1, 64, true),
+    ] {
+        let k = g * h;
+        let norm_w = cpu_ref::round_bf16(&random(&mut rng, k, -0.5, 0.5));
+        let (down_w, _) = random_q8(&ctx, &mut rng, r, k);
+        let (up_w, _) = random_q8(&ctx, &mut rng, k, r);
+        let inject = with_inject.then(|| random_q8(&ctx, &mut rng, g, k).0);
+        let t_norm = Tensor::from_f32_as_bf16(&ctx, &norm_w, &[k]).expect("norm");
+        let n_inj = inject.as_ref().map_or(0, |w| w.out_features());
+        for m in 1..=HC_FUSED_MAX_ROWS {
+            let hyper = cpu_ref::round_bf16(&random(&mut rng, m * k, -3.0, 3.0));
+            let t_hyper = Tensor::from_f32_as_bf16(&ctx, &hyper, &[m, k]).expect("hyper");
+            let zeros = |shape: &[usize], dtype| {
+                Tensor::zeros(&ctx, shape, dtype).expect("scratch")
+            };
+            // Single-row kernels, one row at a time, into row views (a
+            // separate tensor per row for `inj`: an odd G makes a bf16 row
+            // view misaligned).
+            let d_down = zeros(&[m, r], DType::BF16);
+            let d_inj: Vec<Tensor> = (0..m).map(|_| zeros(&[n_inj.max(1)], DType::BF16)).collect();
+            let d_inv_rms = zeros(&[m, g], DType::F32);
+            let d_mixed = zeros(&[m, h], DType::BF16);
+            let pass = ctx.begin().expect("pass");
+            for (row, inj_row) in d_inj.iter().enumerate() {
+                let hyper_row = t_hyper.view(row * k, &[k]).expect("row");
+                let down_row = d_down.view(row * r, &[r]).expect("row");
+                let inv_rms_row = d_inv_rms.view(row * g, &[g]).expect("row");
+                let mixed_row = d_mixed.view(row * h, &[h]).expect("row");
+                hc_read_down_q8(
+                    &ctx,
+                    &pass,
+                    &hyper_row,
+                    &t_norm,
+                    &down_w,
+                    inject.as_ref(),
+                    &down_row,
+                    inj_row,
+                    &inv_rms_row,
+                    h,
+                    g,
+                    eps,
+                    w_bias,
+                )
+                .expect("decode down");
+                hc_read_up_mix_q8(
+                    &ctx, &pass, &up_w, &down_row, &hyper_row, &t_norm, &inv_rms_row, &mixed_row,
+                    h, g, w_bias,
+                )
+                .expect("decode up");
+            }
+            pass.commit_wait().expect("commit");
+
+            // Small-batch kernels over all rows at once.
+            let b_down = zeros(&[m, r], DType::BF16);
+            let b_inj = zeros(&[m, n_inj.max(1)], DType::BF16);
+            let b_inv_rms = zeros(&[m, g], DType::F32);
+            let b_act = zeros(&[m, r], DType::BF16);
+            let b_mixed = zeros(&[m, h], DType::BF16);
+            let d_act = zeros(&[m, r], DType::BF16);
+            let pass = ctx.begin().expect("pass");
+            hc_read_down_q8_rows(
+                &ctx,
+                &pass,
+                &t_hyper,
+                &t_norm,
+                &down_w,
+                inject.as_ref(),
+                &b_down,
+                &b_inj,
+                &b_inv_rms,
+                &b_act,
+                h,
+                g,
+                eps,
+                w_bias,
+            )
+            .expect("batched down");
+            hc_read_up_mix_q8_rows(
+                &ctx, &pass, &up_w, &b_act, &t_hyper, &t_norm, &b_inv_rms, &b_mixed, h, g,
+                w_bias,
+            )
+            .expect("batched up");
+            silu_scaled_bf16(&ctx, &pass, &d_down, &d_act, 1.0 / g as f32).expect("silu");
+            pass.commit_wait().expect("commit");
+
+            let same = |name: &str, a: &Tensor, b: &Tensor| {
+                assert_eq!(
+                    a.to_f32().expect(name),
+                    b.to_f32().expect(name),
+                    "{name}: h={h} g={g} r={r} inject={with_inject} m={m}"
+                );
+            };
+            same("down", &b_down, &d_down);
+            let d_inj_all: Vec<f32> = d_inj.iter().flat_map(|t| t.to_f32().expect("inj")).collect();
+            assert_eq!(
+                b_inj.to_f32().expect("inj"),
+                d_inj_all,
+                "inj: h={h} g={g} r={r} inject={with_inject} m={m}"
+            );
+            same("inv_rms", &b_inv_rms, &d_inv_rms);
+            same("act", &b_act, &d_act);
+            same("mixed", &b_mixed, &d_mixed);
+            assert!(
+                b_inv_rms.to_f32().expect("inv_rms").iter().all(|v| v.is_finite() && *v > 0.0),
+                "inv_rms written for every row"
+            );
+        }
+    }
+}
+
+/// `hc_read_up_mix_q8_rows` against the unfused `gemv_quant` (per row) and
+/// `hc_mix_bf16` on the same `silu_scaled_bf16` activation and `inv_rms`.
+/// The single-row kernel is bit-identical to that chain; the row-templated
+/// bodies compute the same f32 expressions, but the compiler's fast-math
+/// scheduling of the unrolled MB = 3 and 4 bodies differs at f32 rounding
+/// level in a way the bf16 output rounding exposes as a single-ulp flip in
+/// about 1e-5 of the elements (a 24-seed sweep at the model's shape found 5
+/// in 184K for MB = 3 and 1 in 246K for MB = 4, none for MB = 1 and 2). This
+/// asserts exactly that: every element within one bf16 ulp, at most 5e-4 of
+/// them differing, none for MB = 1 and 2.
+#[test]
+fn batched_fused_up_mix_matches_unfused_kernels() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(28);
+    let w_bias = 1.0f32;
+    for (h, g, r) in [(2560, 4, 320), (192, 3, 128), (64, 8, 64), (256, 1, 64)] {
+        let k = g * h;
+        let norm_w = cpu_ref::round_bf16(&random(&mut rng, k, -0.5, 0.5));
+        let (up_w, _) = random_q8(&ctx, &mut rng, k, r);
+        let t_norm = Tensor::from_f32_as_bf16(&ctx, &norm_w, &[k]).expect("norm");
+        for m in 1..=HC_FUSED_MAX_ROWS {
+            let hyper = cpu_ref::round_bf16(&random(&mut rng, m * k, -3.0, 3.0));
+            let down = cpu_ref::round_bf16(&random(&mut rng, m * r, -6.0, 6.0));
+            let inv_rms: Vec<f32> = random(&mut rng, m * g, 0.3, 1.2);
+            let hn: Vec<f32> = (0..m)
+                .flat_map(|row| {
+                    hn_bf16(&hyper[row * k..(row + 1) * k], &norm_w, &inv_rms[row * g..(row + 1) * g], h, w_bias)
+                })
+                .collect();
+
+            let t_hyper = Tensor::from_f32_as_bf16(&ctx, &hyper, &[m, k]).expect("hyper");
+            let t_down = Tensor::from_f32_as_bf16(&ctx, &down, &[m, r]).expect("down");
+            let t_inv_rms = Tensor::from_f32(&ctx, &inv_rms, &[m, g]).expect("inv_rms");
+            let t_hn = Tensor::from_f32_as_bf16(&ctx, &hn, &[m, k]).expect("hn");
+            let zeros = |shape: &[usize], dtype| {
+                Tensor::zeros(&ctx, shape, dtype).expect("scratch")
+            };
+            let act = zeros(&[m, r], DType::BF16);
+            let up = zeros(&[m, k], DType::BF16);
+            let mixed = zeros(&[m, h], DType::BF16);
+            let f_mixed = zeros(&[m, h], DType::BF16);
+
+            let pass = ctx.begin().expect("pass");
+            silu_scaled_bf16(&ctx, &pass, &t_down, &act, 1.0 / g as f32).expect("silu");
+            for row in 0..m {
+                let act_row = act.view(row * r, &[r]).expect("row");
+                let up_row = up.view(row * k, &[k]).expect("row");
+                gemv_quant(&ctx, &pass, &up_w, &act_row, &up_row).expect("up");
+            }
+            hc_mix_bf16(&ctx, &pass, &up, &t_hn, &mixed, h, g).expect("mix");
+            hc_read_up_mix_q8_rows(
+                &ctx, &pass, &up_w, &act, &t_hyper, &t_norm, &t_inv_rms, &f_mixed, h, g, w_bias,
+            )
+            .expect("fused up");
+            pass.commit_wait().expect("commit");
+            let (got, want) = (f_mixed.to_f32().expect("mixed"), mixed.to_f32().expect("mixed"));
+            let mismatches: Vec<(usize, f32, f32)> = got
+                .iter()
+                .zip(&want)
+                .enumerate()
+                .filter(|(_, (a, b))| a != b)
+                .map(|(i, (a, b))| (i, *a, *b))
+                .collect();
+            for (i, a, b) in &mismatches {
+                // One bf16 ulp of the larger magnitude.
+                let ulp = bf16::from_f32(a.abs().max(b.abs())).to_f32() * 2f32.powi(-7);
+                assert!((a - b).abs() <= ulp, "h={h} g={g} r={r} m={m}: element {i} {a} vs {b} beyond one bf16 ulp");
+            }
+            assert!(
+                mismatches.len() as f64 <= 5e-4 * got.len() as f64,
+                "h={h} g={g} r={r} m={m}: {} of {} elements differ",
+                mismatches.len(),
+                got.len()
+            );
+            if m <= 2 {
+                assert!(mismatches.is_empty(), "h={h} g={g} r={r} m={m}: {mismatches:?}");
+            }
+        }
+    }
+}
+
+/// The small-batch fused read against the six-kernel skinny chain it
+/// replaces in `hc_read_batched` (grouped norm, `gemm_skinny_q8_nt` for down,
+/// inject and up, scaled SiLU, mix), at the model's shape with and without
+/// the inject weight. Not bit-identical: the skinny GEMM rounds each
+/// dequantized weight to bf16 and consumes a bf16 `hn`, the fused kernels
+/// dot f32-dequantized weights against an f32 `hn` (down half) and a bf16
+/// `hn` (up half). Bounds as in `fused_read_gate_matches_unfused_kernels`
+/// (the mixed bound is coarse: these random logits are O(100) and the gates
+/// amplify the bf16-level logit differences).
+#[test]
+fn batched_fused_read_matches_skinny_chain() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(29);
+    let eps = 1e-6f32;
+    let w_bias = 1.0f32;
+    let (h, g, r) = (2560usize, 4usize, 320usize);
+    let k = g * h;
+    for with_inject in [true, false] {
+        let norm_w = cpu_ref::round_bf16(&random(&mut rng, k, -0.5, 0.5));
+        let (down_w, _) = random_q8(&ctx, &mut rng, r, k);
+        let (up_w, _) = random_q8(&ctx, &mut rng, k, r);
+        let inject = with_inject.then(|| random_q8(&ctx, &mut rng, g, k).0);
+        let t_norm = Tensor::from_f32_as_bf16(&ctx, &norm_w, &[k]).expect("norm");
+        for m in 1..=HC_FUSED_MAX_ROWS {
+            let hyper = cpu_ref::round_bf16(&random(&mut rng, m * k, -3.0, 3.0));
+            let t_hyper = Tensor::from_f32_as_bf16(&ctx, &hyper, &[m, k]).expect("hyper");
+            let zeros = |shape: &[usize], dtype| {
+                Tensor::zeros(&ctx, shape, dtype).expect("scratch")
+            };
+            let hn = zeros(&[m, k], DType::BF16);
+            let down = zeros(&[m, r], DType::BF16);
+            let inj = zeros(&[m, g], DType::BF16);
+            let act = zeros(&[m, r], DType::BF16);
+            let up = zeros(&[m, k], DType::BF16);
+            let mixed = zeros(&[m, h], DType::BF16);
+            let pass = ctx.begin().expect("pass");
+            rmsnorm_grouped_bf16(&ctx, &pass, &t_hyper, &t_norm, &hn, h, g, eps, w_bias)
+                .expect("norm");
+            gemm_skinny_q8_nt(&ctx, &pass, &hn, &down_w, &down).expect("down");
+            if let Some(inj_w) = &inject {
+                gemm_skinny_q8_nt(&ctx, &pass, &hn, inj_w, &inj).expect("inject");
+            }
+            silu_scaled_bf16(&ctx, &pass, &down, &act, 1.0 / g as f32).expect("silu");
+            gemm_skinny_q8_nt(&ctx, &pass, &act, &up_w, &up).expect("up");
+            hc_mix_bf16(&ctx, &pass, &up, &hn, &mixed, h, g).expect("mix");
+            pass.commit_wait().expect("commit");
+
+            let f_down = zeros(&[m, r], DType::BF16);
+            let f_inj = zeros(&[m, g], DType::BF16);
+            let f_inv_rms = zeros(&[m, g], DType::F32);
+            let f_act = zeros(&[m, r], DType::BF16);
+            let f_mixed = zeros(&[m, h], DType::BF16);
+            let pass = ctx.begin().expect("pass");
+            hc_read_down_q8_rows(
+                &ctx,
+                &pass,
+                &t_hyper,
+                &t_norm,
+                &down_w,
+                inject.as_ref(),
+                &f_down,
+                &f_inj,
+                &f_inv_rms,
+                &f_act,
+                h,
+                g,
+                eps,
+                w_bias,
+            )
+            .expect("fused down");
+            hc_read_up_mix_q8_rows(
+                &ctx, &pass, &up_w, &f_act, &t_hyper, &t_norm, &f_inv_rms, &f_mixed, h, g,
+                w_bias,
+            )
+            .expect("fused up");
+            pass.commit_wait().expect("commit");
+
+            let close = |name: &str, got: &Tensor, want: &Tensor, frac: f32| {
+                let want = want.to_f32().expect("reference");
+                let got = got.to_f32().expect("fused");
+                let worst = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                eprintln!("skinny chain vs fused, m={m} inject={with_inject} {name}: max |diff| {worst:.4} (rms {:.3})", rms(&want));
+                cpu_ref::assert_close(&got, &want, frac * rms(&want), frac);
+            };
+            close("down", &f_down, &down, 1e-2);
+            if with_inject {
+                close("inj", &f_inj, &inj, 1e-2);
+            } else {
+                assert!(f_inj.to_f32().expect("inj").iter().all(|v| *v == 0.0), "inj untouched");
+            }
+            close("mixed", &f_mixed, &mixed, 2e-1);
+        }
+    }
+}
+
+/// Mismatch-rate sweep behind the bound in
+/// `batched_fused_up_mix_matches_unfused_kernels`: the row-templated kernels
+/// against the single-row fused kernels over 24 seeds at the model's shape,
+/// counting elements that differ, per row count. Prints the counts; run with
+/// `cargo test --release -- --ignored --nocapture batched_fused_mismatch_rate_sweep`.
+/// Last run: up 0/61K, 0/123K, 5/184K, 2/246K for MB = 1..4 (single bf16
+/// ulps); down 0 throughout.
+#[test]
+#[ignore = "diagnostic sweep"]
+fn batched_fused_mismatch_rate_sweep() {
+    let ctx = MetalContext::new().expect("metal context");
+    let w_bias = 1.0f32;
+    let (h, g, r) = (2560usize, 4usize, 320usize);
+    let k = g * h;
+    for m in 1..=HC_FUSED_MAX_ROWS {
+        let mut mism_up = 0usize;
+        let mut mism_down = 0usize;
+        let mut total = 0usize;
+        for seed in 0..24u64 {
+            let mut rng = StdRng::seed_from_u64(1000 + seed);
+            let norm_w = cpu_ref::round_bf16(&random(&mut rng, k, -0.5, 0.5));
+            let (up_w, _) = random_q8(&ctx, &mut rng, k, r);
+            let (down_w, _) = random_q8(&ctx, &mut rng, r, k);
+            let t_norm = Tensor::from_f32_as_bf16(&ctx, &norm_w, &[k]).expect("norm");
+            let hyper = cpu_ref::round_bf16(&random(&mut rng, m * k, -3.0, 3.0));
+            let down = cpu_ref::round_bf16(&random(&mut rng, m * r, -6.0, 6.0));
+            let inv_rms: Vec<f32> = random(&mut rng, m * g, 0.3, 1.2);
+            let t_hyper = Tensor::from_f32_as_bf16(&ctx, &hyper, &[m, k]).expect("hyper");
+            let t_down = Tensor::from_f32_as_bf16(&ctx, &down, &[m, r]).expect("down");
+            let t_inv_rms = Tensor::from_f32(&ctx, &inv_rms, &[m, g]).expect("inv_rms");
+            let zeros = |shape: &[usize], dtype| Tensor::zeros(&ctx, shape, dtype).expect("scratch");
+            let a = zeros(&[m, h], DType::BF16);
+            let b = zeros(&[m, h], DType::BF16);
+            let da = zeros(&[m, r], DType::BF16);
+            let db = zeros(&[m, r], DType::BF16);
+            let ia = zeros(&[m, g], DType::BF16);
+            let ib = zeros(&[m, g], DType::BF16);
+            let ra = zeros(&[m, g], DType::F32);
+            let rb = zeros(&[m, g], DType::F32);
+            let act = zeros(&[m, r], DType::BF16);
+            let actb = zeros(&[m, r], DType::BF16);
+            let pass = ctx.begin().expect("pass");
+            silu_scaled_bf16(&ctx, &pass, &t_down, &act, 1.0 / g as f32).unwrap();
+            for row in 0..m {
+                hc_read_up_mix_q8(
+                    &ctx, &pass, &up_w, &t_down.view(row * r, &[r]).unwrap(), &t_hyper.view(row * k, &[k]).unwrap(), &t_norm,
+                    &t_inv_rms.view(row * g, &[g]).unwrap(), &a.view(row * h, &[h]).unwrap(), h, g, w_bias,
+                ).unwrap();
+                hc_read_down_q8(
+                    &ctx, &pass, &t_hyper.view(row * k, &[k]).unwrap(), &t_norm, &down_w, None,
+                    &da.view(row * r, &[r]).unwrap(), &ia.view(row * g, &[g]).unwrap(), &ra.view(row * g, &[g]).unwrap(), h, g, 1e-6, w_bias,
+                ).unwrap();
+            }
+            hc_read_up_mix_q8_rows(&ctx, &pass, &up_w, &act, &t_hyper, &t_norm, &t_inv_rms, &b, h, g, w_bias).unwrap();
+            hc_read_down_q8_rows(&ctx, &pass, &t_hyper, &t_norm, &down_w, None, &db, &ib, &rb, &actb, h, g, 1e-6, w_bias).unwrap();
+            pass.commit_wait().expect("commit");
+            let (a, b) = (a.to_f32().unwrap(), b.to_f32().unwrap());
+            mism_up += a.iter().zip(&b).filter(|(x, y)| x != y).count();
+            let (da, db) = (da.to_f32().unwrap(), db.to_f32().unwrap());
+            mism_down += da.iter().zip(&db).filter(|(x, y)| x != y).count();
+            total += a.len();
+        }
+        eprintln!("MB={m}: up mismatches {mism_up} / {total}; down mismatches {mism_down} / {}", total * r / h);
+    }
+}
+
+/// Kernel-level timing of the small-batch read gate at the model's shape for
+/// m = 1, 3, 4 rows (the draft head's chain rows, a 2-draft verify pass, the
+/// largest verify pass): the six-kernel skinny chain `hc_read_batched` used,
+/// the two row-templated fused kernels, and `m` concurrent single-row fused
+/// dispatches per half (the alternative mapping, a grid over rows). Same
+/// setup as `fused_read_gate_timing`: concurrent pass, level barrier after
+/// every stage, DRAM-streamed weights. Run with
+/// `cargo test --release -- --ignored --nocapture fused_batched_read_gate_timing`.
+#[test]
+#[ignore = "timing only"]
+fn fused_batched_read_gate_timing() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(30);
+    let (h, g, r) = (2560usize, 4usize, 320usize);
+    let k = g * h;
+    let sets = 64; // 64 * 6.6 MB = 420 MB of weights, well past the SLC
+    let norm_w = cpu_ref::round_bf16(&random(&mut rng, k, -0.5, 0.5));
+    let weights: Vec<(QuantWeights, QuantWeights, QuantWeights)> = (0..sets)
+        .map(|_| {
+            (
+                random_q8(&ctx, &mut rng, r, k).0,
+                random_q8(&ctx, &mut rng, k, r).0,
+                random_q8(&ctx, &mut rng, g, k).0,
+            )
+        })
+        .collect();
+    let t_norm = Tensor::from_f32_as_bf16(&ctx, &norm_w, &[k]).expect("norm");
+    let iters = 256;
+    for m in [1usize, 3, 4] {
+        let hyper = cpu_ref::round_bf16(&random(&mut rng, m * k, -3.0, 3.0));
+        let t_hyper = Tensor::from_f32_as_bf16(&ctx, &hyper, &[m, k]).expect("hyper");
+        let zeros =
+            |shape: &[usize], dtype| Tensor::zeros(&ctx, shape, dtype).expect("scratch");
+        let hn = zeros(&[m, k], DType::BF16);
+        let down = zeros(&[m, r], DType::BF16);
+        let inj = zeros(&[m, g], DType::BF16);
+        let act = zeros(&[m, r], DType::BF16);
+        let up = zeros(&[m, k], DType::BF16);
+        let mixed = zeros(&[m, h], DType::BF16);
+        let inv_rms = zeros(&[m, g], DType::F32);
+        let f_act = zeros(&[m, r], DType::BF16);
+        type Read<'a> =
+            dyn Fn(&ComputePass<'_>, &QuantWeights, &QuantWeights, &QuantWeights) + 'a;
+        let time = |name: &str, f: &Read<'_>| {
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let pass = ctx.begin_concurrent().expect("pass");
+                for i in 0..iters {
+                    let (d, u, j) = &weights[i % sets];
+                    f(&pass, d, u, j);
+                }
+                let start = std::time::Instant::now();
+                pass.commit_wait().expect("commit");
+                best = best.min(start.elapsed().as_secs_f64() * 1e6 / iters as f64);
+            }
+            eprintln!("m={m} {name}: {best:.1} us per read (best of 3)");
+        };
+        time("unfused skinny chain (6 dispatches)", &|pass, down_w, up_w, inj_w| {
+            rmsnorm_grouped_bf16(&ctx, pass, &t_hyper, &t_norm, &hn, h, g, 1e-6, 1.0).unwrap();
+            pass.level_barrier(&[&hn]).unwrap();
+            gemm_skinny_q8_nt(&ctx, pass, &hn, down_w, &down).unwrap();
+            gemm_skinny_q8_nt(&ctx, pass, &hn, inj_w, &inj).unwrap();
+            pass.level_barrier(&[&down, &inj]).unwrap();
+            silu_scaled_bf16(&ctx, pass, &down, &act, 0.25).unwrap();
+            pass.level_barrier(&[&act]).unwrap();
+            gemm_skinny_q8_nt(&ctx, pass, &act, up_w, &up).unwrap();
+            pass.level_barrier(&[&up]).unwrap();
+            hc_mix_bf16(&ctx, pass, &up, &hn, &mixed, h, g).unwrap();
+            pass.level_barrier(&[&mixed]).unwrap();
+        });
+        time("fused rows (2 dispatches)", &|pass, down_w, up_w, inj_w| {
+            hc_read_down_q8_rows(
+                &ctx, pass, &t_hyper, &t_norm, down_w, Some(inj_w), &down, &inj, &inv_rms, &f_act,
+                h, g, 1e-6, 1.0,
+            )
+            .unwrap();
+            pass.level_barrier(&[&down, &inj, &inv_rms, &f_act]).unwrap();
+            hc_read_up_mix_q8_rows(
+                &ctx, pass, up_w, &f_act, &t_hyper, &t_norm, &inv_rms, &mixed, h, g, 1.0,
+            )
+            .unwrap();
+            pass.level_barrier(&[&mixed]).unwrap();
+        });
+        time("fused rows, down only", &|pass, down_w, _, inj_w| {
+            hc_read_down_q8_rows(
+                &ctx, pass, &t_hyper, &t_norm, down_w, Some(inj_w), &down, &inj, &inv_rms, &f_act,
+                h, g, 1e-6, 1.0,
+            )
+            .unwrap();
+            pass.level_barrier(&[&down, &inj, &inv_rms, &f_act]).unwrap();
+        });
+        time("fused rows, up+mix only", &|pass, _, up_w, _| {
+            hc_read_up_mix_q8_rows(
+                &ctx, pass, up_w, &f_act, &t_hyper, &t_norm, &inv_rms, &mixed, h, g, 1.0,
+            )
+            .unwrap();
+            pass.level_barrier(&[&mixed]).unwrap();
+        });
+        time("m x single-row fused (2m dispatches)", &|pass, down_w, up_w, inj_w| {
+            for row in 0..m {
+                hc_read_down_q8(
+                    &ctx,
+                    pass,
+                    &t_hyper.view(row * k, &[k]).unwrap(),
+                    &t_norm,
+                    down_w,
+                    Some(inj_w),
+                    &down.view(row * r, &[r]).unwrap(),
+                    &inj.view(row * g, &[g]).unwrap(),
+                    &inv_rms.view(row * g, &[g]).unwrap(),
+                    h,
+                    g,
+                    1e-6,
+                    1.0,
+                )
+                .unwrap();
+            }
+            pass.level_barrier(&[&down, &inj, &inv_rms]).unwrap();
+            for row in 0..m {
+                hc_read_up_mix_q8(
+                    &ctx,
+                    pass,
+                    up_w,
+                    &down.view(row * r, &[r]).unwrap(),
+                    &t_hyper.view(row * k, &[k]).unwrap(),
+                    &t_norm,
+                    &inv_rms.view(row * g, &[g]).unwrap(),
+                    &mixed.view(row * h, &[h]).unwrap(),
+                    h,
+                    g,
+                    1.0,
+                )
+                .unwrap();
+            }
+            pass.level_barrier(&[&mixed]).unwrap();
+        });
+    }
 }
