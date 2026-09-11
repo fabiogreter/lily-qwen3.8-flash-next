@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Rendered by tools/service/lily-service.sh; @PLACEHOLDERS@ are filled in at install. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>@LABEL@</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@LILY_BIN@</string>
+        <string>--model</string>
+        <string>@MODEL_DIR@</string>
+        <string>--bind</string>
+        <string>@BIND@</string>
+        <string>--max-seq</string>
+        <string>@MAX_SEQ@</string>
+        <string>--idle-unload</string>
+        <string>@IDLE_UNLOAD@</string>
+@EXTRA_ARGS@    </array>
+
+    <!-- Start at login and keep running, but only restart when the server
+         did not exit cleanly: a crash or a failed load (exit 1) brings it
+         back; a stop through SIGTERM (exit 0) stays down until the next
+         `start` or login. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <!-- Seconds between restarts (launchd's default is 10): a failing load
+         costs seconds of I/O each time, so do not spin on it. -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <!-- Seconds between launchd's SIGTERM and its SIGKILL: the server gives
+         a running request 10 s, then spills the resident sessions to disk. -->
+    <key>ExitTimeOut</key>
+    <integer>90</integer>
+
+    <!-- Interactive: no CPU or I/O throttling (the man page says jobs
+         without a ProcessType get "light resource limits"). -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>WorkingDirectory</key>
+    <string>@WORKDIR@</string>
+    <key>StandardOutPath</key>
+    <string>@LOG_DIR@/server.log</string>
+    <key>StandardErrorPath</key>
+    <string>@LOG_DIR@/server.log</string>
+</dict>
+</plist>

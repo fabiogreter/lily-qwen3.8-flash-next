@@ -233,6 +233,17 @@ disk tier so the prefix caches survive the restart, and the process exits 0.
 A load that fails exits 1 so a supervisor restarts the server with its
 backoff instead of leaving a server up that can never answer.
 
+### Running as a service
+
+`tools/service/lily-service.sh install` renders a launchd agent
+(`~/Library/LaunchAgents/com.lily.server.plist`) that starts the server at
+login on `127.0.0.1:8000` with `--max-seq 131072 --idle-unload 30m`, restarts
+it after a crash or a failed load (a clean stop stays down), and logs to
+`~/Library/Logs/lily/server.log`. `status`, `logs`, `stop`, `start`, `restart`
+and `uninstall` do what they say; see
+[tools/service/README.md](tools/service/README.md) for the plist keys and the
+environment variables that change the flags.
+
 ## Tests
 
 ```sh

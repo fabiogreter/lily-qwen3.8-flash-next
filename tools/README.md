@@ -75,3 +75,10 @@ tools/bench/timeline.sh --note "what changed"                        # working t
 tools/bench/timeline.sh --commit f5b3317 --commit HEAD --cooldown 20  # compare two commits
 tools/bench/timeline.sh --dry-run --commit HEAD                       # print the commands only
 ```
+
+## service/lily-service.sh
+
+Not Python: a bash script and a launchd plist template that run the server as
+a per-user agent (start at login, restart after a crash or a failed load,
+`--idle-unload 30m`). `install`, `uninstall`, `start`, `stop`, `restart`,
+`status`, `logs`; see `service/README.md`.
