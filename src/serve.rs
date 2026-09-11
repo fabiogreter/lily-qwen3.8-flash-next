@@ -6,6 +6,13 @@
 //! the engine's output to the socket, so a slow or vanished client never
 //! stalls the decode loop; its write failure cancels the generation at the
 //! next token.
+//!
+//! The engine thread also owns the model's lifetime: with `--idle-unload`
+//! it spills the resident sessions to the disk tier and drops the whole
+//! engine (weights, scratch, caches, Metal context, the n-gram mapping) once
+//! no request has run for that long, and loads it again for the next request,
+//! which waits instead of failing. SIGTERM/SIGINT stop the listener, give the
+//! running request a bounded grace, spill the sessions and exit 0.
 
 pub mod api;
 pub mod disk;
@@ -14,12 +21,12 @@ mod session;
 pub mod stream;
 pub mod tools;
 
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, ensure};
 use serde::Serialize;
@@ -43,6 +50,29 @@ const CHECKPOINTS_PER_SESSION: usize = 3;
 /// Left free below the device's recommended working set when the cache
 /// budget is derived automatically.
 const BUDGET_MARGIN_BYTES: usize = 2 << 30;
+/// How long a running request may keep going after a stop signal before it
+/// is cancelled at its next token.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+/// How long the listener waits for connection threads to finish writing
+/// their responses after the engine stopped.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(3);
+
+/// Parses `3d`, `12h`, `90m`, `45s` or a bare number of seconds.
+pub fn parse_duration_secs(text: &str) -> Result<u64> {
+    let text = text.trim();
+    let (digits, unit) = text
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .map_or((text, ""), |i| text.split_at(i));
+    let value: f64 = digits.parse().with_context(|| format!("invalid duration {text:?}"))?;
+    let scale = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "s" => 1.0,
+        "m" => 60.0,
+        "h" => 3600.0,
+        "d" => 86_400.0,
+        other => anyhow::bail!("unknown duration unit {other:?} (use s, m, h or d)"),
+    };
+    Ok((value * scale) as u64)
+}
 
 /// Sampling defaults from the command line; unset fields fall back to the
 /// checkpoint's `generation_config.json`, then to OpenAI's defaults.
@@ -79,6 +109,129 @@ pub struct ServeOptions {
     pub reasoning_effort: Option<String>,
     pub queue: usize,
     pub sampling: SamplingOverrides,
+    /// Seconds without a request after which the engine is unloaded (0: never).
+    pub idle_unload_secs: u64,
+}
+
+// --- lifecycle ---------------------------------------------------------------
+
+/// Where the engine is in its life, as `/health` reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum State {
+    /// The first load; requests are refused with 503.
+    Loading = 0,
+    /// Loaded and serving.
+    Ready = 1,
+    /// Unloaded after the idle timeout; the next request reloads it.
+    Idle = 2,
+    /// Loading again for a request that is waiting.
+    Reloading = 3,
+    /// A stop signal arrived; new requests are refused with 503.
+    Stopping = 4,
+}
+
+impl State {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            State::Loading => "loading",
+            State::Ready => "ready",
+            State::Idle => "idle",
+            State::Reloading => "reloading",
+            State::Stopping => "stopping",
+        }
+    }
+
+    /// Whether the server takes requests in this state (they may have to
+    /// wait for a reload).
+    pub fn accepting(self) -> bool {
+        matches!(self, State::Ready | State::Idle | State::Reloading)
+    }
+
+    /// The `/health` status code and `status` field. `ok`/`loading` keep the
+    /// meaning they had before idle unloading existed: a client that only
+    /// looks at the code sees 200 whenever a request would be served.
+    pub fn health(self) -> (u16, &'static str) {
+        match self {
+            State::Loading => (503, "loading"),
+            State::Ready | State::Idle | State::Reloading => (200, "ok"),
+            State::Stopping => (503, "stopping"),
+        }
+    }
+}
+
+/// The engine's state, shared between the engine thread and the HTTP threads.
+pub struct Lifecycle {
+    state: AtomicU8,
+}
+
+impl Lifecycle {
+    pub fn new(state: State) -> Self {
+        Self { state: AtomicU8::new(state as u8) }
+    }
+
+    pub fn set(&self, state: State) {
+        self.state.store(state as u8, Ordering::Release);
+    }
+
+    pub fn get(&self) -> State {
+        match self.state.load(Ordering::Acquire) {
+            0 => State::Loading,
+            1 => State::Ready,
+            2 => State::Idle,
+            3 => State::Reloading,
+            _ => State::Stopping,
+        }
+    }
+}
+
+/// The idle-unload clock: how long the engine may wait for the next request
+/// before it is worth unloading.
+pub struct IdleTimer {
+    timeout: Option<Duration>,
+    last_active: Instant,
+}
+
+impl IdleTimer {
+    /// `timeout_secs == 0` never unloads.
+    pub fn new(timeout_secs: u64, now: Instant) -> Self {
+        Self { timeout: (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs)), last_active: now }
+    }
+
+    /// Records activity (a request just finished, or the engine just loaded).
+    pub fn touch(&mut self, now: Instant) {
+        self.last_active = now;
+    }
+
+    /// How long to wait for the next request before the engine counts as
+    /// idle: `None` when it never does, zero when it already is.
+    pub fn remaining(&self, now: Instant) -> Option<Duration> {
+        let timeout = self.timeout?;
+        Some(timeout.saturating_sub(now.saturating_duration_since(self.last_active)))
+    }
+
+    pub fn expired(&self, now: Instant) -> bool {
+        self.remaining(now) == Some(Duration::ZERO)
+    }
+}
+
+/// Stop coordination: `requested` closes the door (no new requests, the
+/// engine winds down after the running one); `cancel` is raised once the
+/// grace period is over and stops the running request at its next token.
+#[derive(Default)]
+struct Shutdown {
+    requested: AtomicBool,
+    cancel: AtomicBool,
+}
+
+impl Shutdown {
+    fn requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+
+    fn cancel(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
 }
 
 // --- HTTP plumbing -----------------------------------------------------------
@@ -161,6 +314,23 @@ struct Job {
     queued_at: Instant,
 }
 
+impl Job {
+    /// Answers the request without running it.
+    fn reject(self, status: u16, message: &str) {
+        let mut sink = self.sink;
+        sink.start(status, "application/json");
+        sink.send(error_json("server_error", message));
+        sink.end();
+    }
+}
+
+/// What the HTTP threads (and the stop handler) send the engine thread.
+enum Cmd {
+    Job(Job),
+    /// Wakes the engine so it notices a stop request; carries nothing.
+    Wake,
+}
+
 /// Relays one request's output from the engine to the client on the
 /// connection's own thread; a failed write or the client's EOF flags
 /// cancellation for the engine.
@@ -211,6 +381,7 @@ struct Engine<M: LanguageModel> {
     max_seq: usize,
     drafts: usize,
     next_id: u64,
+    shutdown: Arc<Shutdown>,
 }
 
 /// Where a request's text ends up when not streaming.
@@ -222,7 +393,13 @@ struct Collected {
 }
 
 impl<M: LanguageModel> Engine<M> {
-    fn load(model_dir: &Path, options: &ServeOptions, generator: Arc<Generator>) -> Result<Self> {
+    fn load(
+        model_dir: &Path,
+        options: &ServeOptions,
+        generator: Arc<Generator>,
+        shutdown: Arc<Shutdown>,
+        next_id: u64,
+    ) -> Result<Self> {
         let ctx = MetalContext::new()?;
         let started = Instant::now();
         let model = M::load(&ctx, model_dir, &LoadOptions { ngram_storage: options.ngram_storage, mtp_drafts: options.mtp_drafts })?;
@@ -304,8 +481,40 @@ impl<M: LanguageModel> Engine<M> {
             scratch,
             max_seq,
             drafts,
-            next_id: 1,
+            next_id,
+            shutdown,
         })
+    }
+
+    /// Takes the engine down: every resident session goes to the disk tier
+    /// (or is lost when there is none), then the scratch, the sessions, the
+    /// model and finally the Metal context are dropped, which releases the
+    /// GPU buffers and the n-gram mapping. Returns the request counter so
+    /// ids stay unique across a reload.
+    fn unload(self, reason: &str) -> u64 {
+        let started = Instant::now();
+        let Engine { ctx, model, generator: _, mut sessions, scratch, next_id, .. } = self;
+        let resident = ctx.current_allocated();
+        let (spilled, dropped) = sessions.spill_all(&ctx);
+        let spill_secs = started.elapsed().as_secs_f64();
+        drop(scratch);
+        drop(sessions);
+        drop(model);
+        // Only the context's own arenas may remain here; anything else
+        // would be a buffer something outside the engine still holds.
+        let left = ctx.current_allocated();
+        let allocations = ctx.resident_allocations();
+        drop(ctx);
+        eprintln!(
+            "{reason}: unloaded {} in {:.1}s ({:.1} GB was resident; {spilled} sessions spilled to disk, \
+             {dropped} dropped, in {spill_secs:.1}s; {:.2} GB in {allocations} pool allocations \
+             released with the context)",
+            M::MODEL_ID,
+            started.elapsed().as_secs_f64(),
+            resident as f64 / 1e9,
+            left as f64 / 1e9,
+        );
+        next_id
     }
 
     fn serve(&mut self, job: Job) {
@@ -332,7 +541,7 @@ impl<M: LanguageModel> Engine<M> {
         if sink.cancelled() {
             return Ok(());
         }
-        let Engine { ctx, model, generator, sessions, scratch, max_seq, drafts, next_id } = self;
+        let Engine { ctx, model, generator, sessions, scratch, max_seq, drafts, next_id, shutdown } = self;
         ensure!(p.prompt.len() < *max_seq, "prompt too long for the server context");
         let n = p.prompt.len();
         let started = Instant::now();
@@ -422,7 +631,7 @@ impl<M: LanguageModel> Engine<M> {
             &mut |token| {
                 let events = parser.push(token)?;
                 deliver(events, sink);
-                Ok(!sink.cancelled() && !parser.stopped)
+                Ok(!sink.cancelled() && !parser.stopped && !shutdown.cancel())
             },
         )?;
         let final_events = parser.finish();
@@ -474,6 +683,18 @@ impl<M: LanguageModel> Engine<M> {
             sessions.disk().map(|d| format!(", disk {} ({:.1} GB)", d.len(), d.used_bytes() as f64 / 1e9)).unwrap_or_default(),
         );
         if sink.cancelled() {
+            return Ok(());
+        }
+        if shutdown.cancel() {
+            // Stopped by the server, not the client: say so instead of
+            // handing out a truncated answer as a finished one.
+            if !sink.started {
+                sink.start(503, "application/json");
+                sink.send(error_json("server_error", "the server is shutting down"));
+            } else if p.stream {
+                sink.sse(&json!({"error": {"message": "the server is shutting down", "type": "server_error"}}));
+                sink.send(b"data: [DONE]\n\n".to_vec());
+            }
             return Ok(());
         }
         let mut usage = json!({
@@ -704,9 +925,12 @@ fn sampling_defaults(model_dir: &Path, overrides: &SamplingOverrides) -> Result<
 
 /// Serves the checkpoint at `model_dir` with the engine its `model_type` names.
 pub fn run(model_dir: &Path, options: ServeOptions) -> Result<()> {
+    // Before any other thread exists, so they all inherit the mask and the
+    // stop signals only ever reach the thread that waits for them.
+    let signals = signal::Signals::block()?;
     match checkpoint_model_type(model_dir)?.as_str() {
-        "qwen3_5_moe" => run_with::<Qwen3_5Model>(model_dir, options),
-        "qwen4_exp" => run_with::<Qwen4ExpModel>(model_dir, options),
+        "qwen3_5_moe" => run_with::<Qwen3_5Model>(model_dir, options, signals),
+        "qwen4_exp" => run_with::<Qwen4ExpModel>(model_dir, options, signals),
         other => anyhow::bail!(
             "unsupported model_type {other:?}; lily serves qwen3_5_moe \
              (Qwen3.6-35B-A3B) and qwen4_exp (Qwen3.8-Flash-Next)"
@@ -719,13 +943,128 @@ struct Front {
     generator: Arc<Generator>,
     defaults: Defaults,
     max_seq: usize,
-    jobs: SyncSender<Job>,
-    ready: Arc<AtomicBool>,
-    fatal: Arc<Mutex<Option<String>>>,
+    jobs: SyncSender<Cmd>,
+    lifecycle: Arc<Lifecycle>,
+    shutdown: Arc<Shutdown>,
+    /// Connection threads still running (the listener waits for them a
+    /// little at shutdown so responses in flight get written).
+    connections: Arc<AtomicUsize>,
     model_id: &'static str,
+    idle_unload_secs: u64,
 }
 
-fn run_with<M: LanguageModel + 'static>(model_dir: &Path, options: ServeOptions) -> Result<()> {
+/// The engine thread's body: the first load, then requests until a stop is
+/// requested, with the idle unload and reload in between. Exits the process
+/// with status 1 when a load fails, so a supervisor restarts it (with its
+/// backoff) instead of leaving a server up that can never answer.
+fn engine_loop<M: LanguageModel>(
+    model_dir: &Path,
+    options: &ServeOptions,
+    generator: Arc<Generator>,
+    rx: Receiver<Cmd>,
+    lifecycle: &Lifecycle,
+    shutdown: Arc<Shutdown>,
+    address: SocketAddr,
+) {
+    let fatal = |what: &str, error: anyhow::Error, rx: &Receiver<Cmd>| -> ! {
+        eprintln!("{what}: {error:#}");
+        lifecycle.set(State::Stopping);
+        while let Ok(Cmd::Job(job)) = rx.try_recv() {
+            job.reject(500, "the model failed to load");
+        }
+        std::process::exit(1)
+    };
+    let mut engine = match Engine::<M>::load(model_dir, options, generator.clone(), shutdown.clone(), 1) {
+        Ok(engine) => Some(engine),
+        Err(error) => fatal("engine failed to start", error, &rx),
+    };
+    let mut next_id = 1;
+    lifecycle.set(State::Ready);
+    eprintln!(
+        "ready: serving {} on http://{address}{}",
+        M::MODEL_ID,
+        if options.idle_unload_secs > 0 {
+            format!(" (unloading after {} idle)", describe_secs(options.idle_unload_secs))
+        } else {
+            String::new()
+        }
+    );
+    let mut idle = IdleTimer::new(options.idle_unload_secs, Instant::now());
+    while !shutdown.requested() {
+        // An unloaded engine has nothing to time out; wait for a request.
+        let wait = engine.as_ref().and_then(|_| idle.remaining(Instant::now()));
+        let cmd = match wait {
+            None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            Some(wait) => rx.recv_timeout(wait),
+        };
+        match cmd {
+            Ok(Cmd::Job(job)) => {
+                if shutdown.requested() {
+                    job.reject(503, "the server is shutting down");
+                    break;
+                }
+                if engine.is_none() {
+                    lifecycle.set(State::Reloading);
+                    let started = Instant::now();
+                    match Engine::<M>::load(model_dir, options, generator.clone(), shutdown.clone(), next_id) {
+                        Ok(loaded) => {
+                            eprintln!("reloaded {} in {:.1}s for a waiting request", M::MODEL_ID, started.elapsed().as_secs_f64());
+                            engine = Some(loaded);
+                            lifecycle.set(State::Ready);
+                        }
+                        Err(error) => {
+                            job.reject(500, "the model failed to reload");
+                            fatal("engine failed to reload", error, &rx);
+                        }
+                    }
+                }
+                engine.as_mut().expect("engine loaded").serve(job);
+                idle.touch(Instant::now());
+            }
+            Ok(Cmd::Wake) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                if let Some(loaded) = engine.take_if(|_| idle.expired(Instant::now())) {
+                    next_id = loaded.unload(&format!("idle for {}", describe_secs(options.idle_unload_secs)));
+                    lifecycle.set(State::Idle);
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    lifecycle.set(State::Stopping);
+    let mut refused = 0usize;
+    while let Ok(Cmd::Job(job)) = rx.try_recv() {
+        job.reject(503, "the server is shutting down");
+        refused += 1;
+    }
+    if refused > 0 {
+        eprintln!("stopping: refused {refused} queued requests");
+    }
+    if let Some(loaded) = engine {
+        loaded.unload("stopping");
+    }
+}
+
+fn describe_secs(secs: u64) -> String {
+    match secs {
+        s if s % 3600 == 0 => format!("{}h", s / 3600),
+        s if s % 60 == 0 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
+}
+
+/// The address a client on this machine reaches the listener at (a bind to
+/// the unspecified address is reachable on loopback).
+fn loopback_of(address: SocketAddr) -> SocketAddr {
+    let ip = match address.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    SocketAddr::new(ip, address.port())
+}
+
+fn run_with<M: LanguageModel + 'static>(model_dir: &Path, options: ServeOptions, signals: signal::Signals) -> Result<()> {
     let address = options
         .bind
         .to_socket_addrs()
@@ -755,38 +1094,60 @@ fn run_with<M: LanguageModel + 'static>(model_dir: &Path, options: ServeOptions)
     let max_seq = options.max_seq.min(MAX_SEQ);
 
     let listener = TcpListener::bind(address).with_context(|| format!("binding http://{}", options.bind))?;
-    let (jobs, job_rx) = mpsc::sync_channel::<Job>(options.queue.max(1));
-    let ready = Arc::new(AtomicBool::new(false));
-    let fatal = Arc::new(Mutex::new(None));
-    {
+    let (jobs, job_rx) = mpsc::sync_channel::<Cmd>(options.queue.max(1));
+    let lifecycle = Arc::new(Lifecycle::new(State::Loading));
+    let shutdown = Arc::new(Shutdown::default());
+    let engine_thread = {
         let model_dir = model_dir.to_path_buf();
         let options = options.clone();
         let generator = generator.clone();
-        let ready = ready.clone();
-        let fatal = fatal.clone();
+        let lifecycle = lifecycle.clone();
+        let shutdown = shutdown.clone();
         std::thread::Builder::new()
             .name("lily-engine".into())
-            .spawn(move || {
-                let mut engine = match Engine::<M>::load(&model_dir, &options, generator) {
-                    Ok(engine) => engine,
-                    Err(error) => {
-                        eprintln!("engine failed to start: {error:#}");
-                        *fatal.lock().unwrap_or_else(|p| p.into_inner()) = Some(format!("{error:#}"));
-                        return;
-                    }
-                };
-                ready.store(true, Ordering::Release);
-                eprintln!("ready: serving {} on http://{address}", M::MODEL_ID);
-                while let Ok(job) = job_rx.recv() {
-                    engine.serve(job);
-                }
-            })
-            .context("spawning the engine thread")?;
+            .spawn(move || engine_loop::<M>(&model_dir, &options, generator, job_rx, &lifecycle, shutdown, address))
+            .context("spawning the engine thread")?
+    };
+    {
+        // SIGTERM (launchd's stop) or SIGINT: close the door, give the
+        // running request its grace, then cancel it. The engine thread and
+        // the listener notice the flag; a loopback connection wakes the
+        // listener out of `accept`.
+        let shutdown = shutdown.clone();
+        let lifecycle = lifecycle.clone();
+        let jobs = jobs.clone();
+        signals.spawn_handler(move |signal| {
+            if shutdown.requested() {
+                eprintln!("second {signal}: exiting now");
+                std::process::exit(130);
+            }
+            eprintln!("{signal}: stopping (no new requests; a running request has {}s to finish)", SHUTDOWN_GRACE.as_secs());
+            shutdown.requested.store(true, Ordering::Release);
+            lifecycle.set(State::Stopping);
+            let _ = jobs.try_send(Cmd::Wake);
+            let _ = TcpStream::connect_timeout(&loopback_of(address), Duration::from_secs(1));
+            std::thread::sleep(SHUTDOWN_GRACE);
+            shutdown.cancel.store(true, Ordering::Relaxed);
+        })?;
     }
     eprintln!("listening on http://{address} (loading model)");
 
-    let front = Arc::new(Front { generator, defaults, max_seq, jobs, ready, fatal, model_id: M::MODEL_ID });
+    let connections = Arc::new(AtomicUsize::new(0));
+    let front = Arc::new(Front {
+        generator,
+        defaults,
+        max_seq,
+        jobs,
+        lifecycle,
+        shutdown: shutdown.clone(),
+        connections: connections.clone(),
+        model_id: M::MODEL_ID,
+        idle_unload_secs: options.idle_unload_secs,
+    });
     for stream in listener.incoming() {
+        if shutdown.requested() {
+            break;
+        }
         let stream = match stream {
             Ok(stream) => stream,
             Err(error) => {
@@ -794,18 +1155,24 @@ fn run_with<M: LanguageModel + 'static>(model_dir: &Path, options: ServeOptions)
                 continue;
             }
         };
-        if let Some(fatal) = front.fatal.lock().unwrap_or_else(|p| p.into_inner()).clone() {
-            send_json(stream, 500, &json!({"error": {"message": fatal, "type": "server_error"}}));
-            std::process::exit(1);
-        }
         let front = front.clone();
-        if let Err(error) = std::thread::Builder::new()
-            .name("lily-http".into())
-            .spawn(move || handle(&front, stream))
-        {
+        connections.fetch_add(1, Ordering::AcqRel);
+        if let Err(error) = std::thread::Builder::new().name("lily-http".into()).spawn(move || {
+            handle(&front, stream);
+            front.connections.fetch_sub(1, Ordering::AcqRel);
+        }) {
+            connections.fetch_sub(1, Ordering::AcqRel);
             eprintln!("failed to spawn connection thread: {error}");
         }
     }
+    drop(listener);
+    eprintln!("stopping: listener closed, waiting for the engine");
+    let _ = engine_thread.join();
+    let deadline = Instant::now() + SHUTDOWN_DRAIN;
+    while connections.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    eprintln!("stopped");
     Ok(())
 }
 
@@ -818,14 +1185,20 @@ fn handle(front: &Front, mut stream: TcpStream) {
         }
     };
     let path = request.path.split('?').next().unwrap_or("").to_string();
-    let ready = front.ready.load(Ordering::Acquire);
+    let state = if front.shutdown.requested() { State::Stopping } else { front.lifecycle.get() };
     match (request.method.as_str(), path.as_str()) {
         ("GET", "/health") => {
-            if ready {
-                send_json(stream, 200, &json!({"status": "ok", "model": front.model_id}));
-            } else {
-                send_json(stream, 503, &json!({"status": "loading", "model": front.model_id}));
-            }
+            let (code, status) = state.health();
+            send_json(
+                stream,
+                code,
+                &json!({
+                    "status": status,
+                    "state": state.as_str(),
+                    "model": front.model_id,
+                    "idle_unload_secs": front.idle_unload_secs,
+                }),
+            );
         }
         ("GET", "/v1/models") => send_json(
             stream,
@@ -852,14 +1225,21 @@ fn handle(front: &Front, mut stream: TcpStream) {
                     return;
                 }
             };
-            if !ready {
-                send_error(stream, 503, "server_error", "model is still loading");
-                return;
+            match state {
+                State::Stopping => {
+                    send_error(stream, 503, "server_error", "the server is shutting down");
+                    return;
+                }
+                State::Loading => {
+                    send_error(stream, 503, "server_error", "model is still loading");
+                    return;
+                }
+                State::Ready | State::Idle | State::Reloading => {}
             }
             let (tx, rx) = mpsc::channel();
             let cancelled = Arc::new(AtomicBool::new(false));
             let job = Job { prepared, sink: Sink { tx, cancelled: cancelled.clone(), started: false }, queued_at: Instant::now() };
-            match front.jobs.try_send(job) {
+            match front.jobs.try_send(Cmd::Job(job)) {
                 Ok(()) => relay(stream, rx, cancelled),
                 Err(TrySendError::Full(_)) => {
                     send_error(stream, 503, "server_error", "the request queue is full; retry later");
@@ -878,6 +1258,70 @@ fn handle(front: &Front, mut stream: TcpStream) {
 
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+/// Stop signals, taken synchronously on one thread. SIGTERM and SIGINT are
+/// blocked process-wide (every thread inherits the mask of the one that
+/// spawned it, so this must happen before the first spawn) and a dedicated
+/// thread `sigwait`s for them, which keeps the handler an ordinary function
+/// instead of an async-signal context.
+mod signal {
+    use std::mem::MaybeUninit;
+
+    use anyhow::{Result, ensure};
+
+    pub struct Signals {
+        set: libc::sigset_t,
+    }
+
+    impl Signals {
+        pub fn block() -> Result<Self> {
+            let mut set = MaybeUninit::<libc::sigset_t>::uninit();
+            // SAFETY: plain libc calls on a set we own; `set` is initialised
+            // by `sigemptyset` before anything reads it.
+            let set = unsafe {
+                // A non-interactive shell starts background jobs with SIGINT
+                // ignored, and an ignored signal is discarded before
+                // `sigwait` could take it: restore the default disposition
+                // so the stop path works however the process was started.
+                libc::signal(libc::SIGTERM, libc::SIG_DFL);
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                libc::sigemptyset(set.as_mut_ptr());
+                libc::sigaddset(set.as_mut_ptr(), libc::SIGTERM);
+                libc::sigaddset(set.as_mut_ptr(), libc::SIGINT);
+                let rc = libc::pthread_sigmask(libc::SIG_BLOCK, set.as_ptr(), std::ptr::null_mut());
+                ensure!(rc == 0, "blocking SIGTERM/SIGINT failed: {}", std::io::Error::from_raw_os_error(rc));
+                set.assume_init()
+            };
+            Ok(Self { set })
+        }
+
+        /// Runs `on_signal` with the signal's name on a new thread each
+        /// time one of the blocked signals arrives.
+        pub fn spawn_handler(self, mut on_signal: impl FnMut(&'static str) + Send + 'static) -> Result<()> {
+            std::thread::Builder::new()
+                .name("lily-signals".into())
+                .spawn(move || {
+                    loop {
+                        let mut signal = 0;
+                        // SAFETY: `set` is a valid, initialised signal set
+                        // and `signal` a valid out-pointer.
+                        let rc = unsafe { libc::sigwait(&self.set, &mut signal) };
+                        if rc != 0 {
+                            eprintln!("sigwait failed: {}", std::io::Error::from_raw_os_error(rc));
+                            return;
+                        }
+                        on_signal(match signal {
+                            libc::SIGTERM => "SIGTERM",
+                            libc::SIGINT => "SIGINT",
+                            _ => "signal",
+                        });
+                    }
+                })
+                .map(drop)
+                .map_err(Into::into)
+        }
+    }
 }
 
 #[cfg(test)]

@@ -197,6 +197,7 @@ layout, so other models never read it.
 | `--disk-cache-dir` | `~/Library/Caches/lily/sessions` | where evicted sessions are kept |
 | `--disk-cache-bytes` | 100G | disk tier budget, LRU; `0` disables the tier |
 | `--disk-cache-ttl` | 3d | delete disk entries unused this long (`0`: never) |
+| `--idle-unload` | 0 | unload the model after this long without a request (`30m`, `2h`; `0`: never) |
 | `--thinking` | true | open a reasoning block unless the request says otherwise |
 | `--reasoning-effort` | template default | `low`, `medium`, `xhigh` |
 | `--temperature` … `--repetition-penalty` | generation_config | sampling defaults |
@@ -206,6 +207,31 @@ Two more binaries share the engine: `lily-probe` runs one prompt step by step
 and records the top logits (used by `tools/reference/compare.py`), and
 `lily-bench` measures prefill and pipelined decode throughput (`--drafts N`
 measures speculative decoding and its acceptance rate instead).
+
+### Idle unloading and stopping
+
+With `--idle-unload 30m` the engine drops the model once no request has run
+for half an hour: resident sessions go to the disk tier first, then the
+weights, scratch, caches, Metal context and the n-gram mapping are released
+(the process falls from tens of gigabytes to about 120 MB of footprint). The
+next request reloads the model and waits for it instead of failing; requests
+that arrive during the reload queue as usual. `/health` reports where the
+engine is:
+
+```json
+{"status": "ok", "state": "idle", "model": "Qwen3.8-Flash-Next", "idle_unload_secs": 1800}
+```
+
+`state` is `loading` (first load, 503), `ready`, `idle`, `reloading` or
+`stopping` (503); `status` stays `ok` whenever a request would be served, so
+clients that only read the status code behave as before.
+
+SIGTERM or SIGINT stop the server cleanly: the listener closes, a running
+request gets 10 s to finish (then it is cancelled and told so with a 503 or a
+stream error), queued requests get 503, resident sessions are spilled to the
+disk tier so the prefix caches survive the restart, and the process exits 0.
+A load that fails exits 1 so a supervisor restarts the server with its
+backoff instead of leaving a server up that can never answer.
 
 ## Tests
 

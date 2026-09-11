@@ -275,19 +275,39 @@ impl<M: LanguageModel> SessionStore<M> {
         }
     }
 
+    /// Moves every resident session to the disk tier and empties the store;
+    /// sessions the tier does not take (too short, or no tier at all) are
+    /// lost. Returns how many were written and how many were dropped.
+    pub fn spill_all(&mut self, ctx: &MetalContext) -> (usize, usize) {
+        let (mut spilled, mut dropped) = (0, 0);
+        let entries = std::mem::take(&mut self.entries);
+        if self.disk.is_none() && !entries.is_empty() {
+            eprintln!("session cache: no disk tier; {} resident sessions are lost", entries.len());
+        }
+        for session in entries {
+            if self.spill(ctx, session) {
+                spilled += 1;
+            } else {
+                dropped += 1;
+            }
+        }
+        (spilled, dropped)
+    }
+
     /// Writes an evicted session to the disk tier (when there is one and the
     /// session is long enough to be worth it). Failures only cost the copy.
-    fn spill(&mut self, ctx: &MetalContext, session: Session<M>) {
-        let Some(disk) = self.disk.as_mut() else { return };
+    /// Returns whether the session is now on disk.
+    fn spill(&mut self, ctx: &MetalContext, session: Session<M>) -> bool {
+        let Some(disk) = self.disk.as_mut() else { return false };
         if session.tokens.len() < MIN_DISK_TOKENS || session.state.pos() != session.tokens.len() {
-            return;
+            return false;
         }
         let started = Instant::now();
         let live = match session.state.snapshot(ctx) {
             Ok(live) => live,
             Err(error) => {
                 eprintln!("session cache: cannot snapshot an evicted session: {error:#}");
-                return;
+                return false;
             }
         };
         let n = session.tokens.len();
@@ -307,15 +327,21 @@ impl<M: LanguageModel> SessionStore<M> {
             },
         );
         match result {
-            Ok(Some(id)) => eprintln!(
-                "session cache: spilled {n} tokens to disk as {id} in {:.2}s ({} entries, {:.1}/{:.1} GB on disk)",
-                started.elapsed().as_secs_f64(),
-                disk.len(),
-                disk.used_bytes() as f64 / 1e9,
-                disk.budget_bytes() as f64 / 1e9
-            ),
-            Ok(None) => {}
-            Err(error) => eprintln!("session cache: spilling to disk failed: {error:#}"),
+            Ok(Some(id)) => {
+                eprintln!(
+                    "session cache: spilled {n} tokens to disk as {id} in {:.2}s ({} entries, {:.1}/{:.1} GB on disk)",
+                    started.elapsed().as_secs_f64(),
+                    disk.len(),
+                    disk.used_bytes() as f64 / 1e9,
+                    disk.budget_bytes() as f64 / 1e9
+                );
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                eprintln!("session cache: spilling to disk failed: {error:#}");
+                false
+            }
         }
     }
 

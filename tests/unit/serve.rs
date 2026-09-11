@@ -75,3 +75,86 @@ fn sampling_defaults_apply_overrides() {
     assert_eq!(checkpoint_eos_ids(&dir).unwrap(), vec![1, 2]);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn durations_parse_with_units() {
+    assert_eq!(parse_duration_secs("0").unwrap(), 0);
+    assert_eq!(parse_duration_secs("45").unwrap(), 45);
+    assert_eq!(parse_duration_secs("45s").unwrap(), 45);
+    assert_eq!(parse_duration_secs("90m").unwrap(), 5400);
+    assert_eq!(parse_duration_secs(" 2h ").unwrap(), 7200);
+    assert_eq!(parse_duration_secs("1.5h").unwrap(), 5400);
+    assert_eq!(parse_duration_secs("3d").unwrap(), 259_200);
+    assert!(parse_duration_secs("30x").is_err());
+    assert!(parse_duration_secs("").is_err());
+    assert!(parse_duration_secs("m").is_err());
+}
+
+#[test]
+fn health_keeps_ok_and_loading_and_adds_the_state() {
+    // Status codes and `status` are what pre-idle-unload clients saw.
+    assert_eq!(State::Loading.health(), (503, "loading"));
+    assert_eq!(State::Ready.health(), (200, "ok"));
+    // Unloaded or reloading: a request would still be served (after a wait).
+    assert_eq!(State::Idle.health(), (200, "ok"));
+    assert_eq!(State::Reloading.health(), (200, "ok"));
+    assert_eq!(State::Stopping.health(), (503, "stopping"));
+    for state in [State::Loading, State::Ready, State::Idle, State::Reloading, State::Stopping] {
+        assert_eq!(state.accepting(), state.health().0 == 200, "{state:?}");
+    }
+    assert_eq!(State::Idle.as_str(), "idle");
+    assert_eq!(State::Reloading.as_str(), "reloading");
+}
+
+#[test]
+fn lifecycle_round_trips_every_state() {
+    let lifecycle = Lifecycle::new(State::Loading);
+    assert_eq!(lifecycle.get(), State::Loading);
+    for state in [State::Ready, State::Idle, State::Reloading, State::Stopping, State::Loading] {
+        lifecycle.set(state);
+        assert_eq!(lifecycle.get(), state);
+    }
+}
+
+#[test]
+fn idle_timer_counts_from_the_last_activity() {
+    let t0 = Instant::now();
+    let s = Duration::from_secs;
+    // 0 never expires: nothing to wait for.
+    let never = IdleTimer::new(0, t0);
+    assert_eq!(never.remaining(t0 + s(1_000_000)), None);
+    assert!(!never.expired(t0 + s(1_000_000)));
+
+    let mut timer = IdleTimer::new(120, t0);
+    assert_eq!(timer.remaining(t0), Some(s(120)));
+    assert_eq!(timer.remaining(t0 + s(50)), Some(s(70)));
+    assert!(!timer.expired(t0 + s(119)));
+    assert!(timer.expired(t0 + s(120)));
+    assert!(timer.expired(t0 + s(500)));
+    assert_eq!(timer.remaining(t0 + s(500)), Some(Duration::ZERO));
+    // A request at t0+100 pushes the deadline out.
+    timer.touch(t0 + s(100));
+    assert!(!timer.expired(t0 + s(219)));
+    assert_eq!(timer.remaining(t0 + s(219)), Some(s(1)));
+    assert!(timer.expired(t0 + s(220)));
+    // A clock reading before the last activity never underflows.
+    assert_eq!(timer.remaining(t0), Some(s(120)));
+}
+
+#[test]
+fn seconds_are_described_in_the_largest_exact_unit() {
+    assert_eq!(describe_secs(1800), "30m");
+    assert_eq!(describe_secs(7200), "2h");
+    assert_eq!(describe_secs(90), "90s");
+    assert_eq!(describe_secs(3660), "61m");
+}
+
+#[test]
+fn unspecified_bind_addresses_are_reached_on_loopback() {
+    let any: SocketAddr = "0.0.0.0:8000".parse().unwrap();
+    assert_eq!(loopback_of(any), "127.0.0.1:8000".parse().unwrap());
+    let any6: SocketAddr = "[::]:8000".parse().unwrap();
+    assert_eq!(loopback_of(any6), "[::1]:8000".parse().unwrap());
+    let local: SocketAddr = "192.168.1.5:8000".parse().unwrap();
+    assert_eq!(loopback_of(local), local);
+}

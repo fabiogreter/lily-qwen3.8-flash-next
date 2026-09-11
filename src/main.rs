@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use lily::qwen4exp::NgramStorage;
-use lily::serve::{SamplingOverrides, ServeOptions};
+use lily::serve::{SamplingOverrides, ServeOptions, parse_duration_secs};
 
 #[derive(Parser)]
 #[command(
@@ -52,6 +52,13 @@ struct Cli {
     /// evicts them.
     #[arg(long, default_value = "3d")]
     disk_cache_ttl: String,
+
+    /// Unload the model (weights, caches, the n-gram table) after this long
+    /// without a request, e.g. `30m`, `2h`; resident sessions go to the disk
+    /// tier first and the next request reloads it while it waits. `0` keeps
+    /// the model loaded.
+    #[arg(long, default_value = "0")]
+    idle_unload: String,
 
     /// Where the Qwen3.8-Flash-Next n-gram table lives: `paged` reads rows
     /// from the checkpoint files through the page cache (32 GB less GPU
@@ -123,23 +130,6 @@ fn parse_bytes(text: &str) -> Result<usize> {
     Ok((value * scale) as usize)
 }
 
-/// Parses `3d`, `12h`, `90m`, `45s` or a bare number of seconds.
-fn parse_duration_secs(text: &str) -> Result<u64> {
-    let text = text.trim();
-    let (digits, unit) = text
-        .find(|c: char| !c.is_ascii_digit() && c != '.')
-        .map_or((text, ""), |i| text.split_at(i));
-    let value: f64 = digits.parse().with_context(|| format!("invalid duration {text:?}"))?;
-    let scale = match unit.trim().to_ascii_lowercase().as_str() {
-        "" | "s" => 1.0,
-        "m" => 60.0,
-        "h" => 3600.0,
-        "d" => 86_400.0,
-        other => anyhow::bail!("unknown duration unit {other:?} (use s, m, h or d)"),
-    };
-    Ok((value * scale) as u64)
-}
-
 fn default_disk_cache_dir() -> PathBuf {
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     home.join("Library").join("Caches").join("lily").join("sessions")
@@ -171,6 +161,7 @@ fn main() -> Result<()> {
             frequency_penalty: cli.frequency_penalty,
             repetition_penalty: cli.repetition_penalty,
         },
+        idle_unload_secs: parse_duration_secs(&cli.idle_unload)?,
     };
     lily::serve::run(&cli.model, options)
 }

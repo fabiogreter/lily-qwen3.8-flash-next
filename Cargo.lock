@@ -431,6 +431,7 @@ dependencies = [
  "bytemuck",
  "clap",
  "half",
+ "libc",
  "minijinja",
  "minijinja-contrib",
  "objc2",
