@@ -182,3 +182,35 @@ fn memory_bandwidth_probe() {
         );
     }
 }
+
+/// `silu_mul_rows_bf16` over a `[m, 2n]` gate|up stack equals `silu_mul_bf16`
+/// on the split halves bit for bit (the small-m MoE path's shared expert
+/// reads the fused stack GEMM output in place instead of splitting it).
+#[test]
+fn silu_mul_rows_matches_split_silu_mul_bitwise() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(97);
+    for (m, n) in [(1usize, 640usize), (3, 640), (8, 96), (16, 1280)] {
+        let gu: Vec<f32> =
+            (0..m * 2 * n).map(|_| rng.gen_range(-4.0f32..4.0)).collect();
+        let gu_ref = &gu;
+        let (gate, up): (Vec<f32>, Vec<f32>) = (0..m)
+            .flat_map(|r| {
+                (0..n).map(move |c| (gu_ref[r * 2 * n + c], gu_ref[r * 2 * n + n + c]))
+            })
+            .unzip();
+        let t_gu = Tensor::from_f32_as_bf16(&ctx, &gu, &[m, 2 * n]).expect("gu");
+        let t_gate = Tensor::from_f32_as_bf16(&ctx, &gate, &[m, n]).expect("gate");
+        let t_up = Tensor::from_f32_as_bf16(&ctx, &up, &[m, n]).expect("up");
+        let rows_out = Tensor::zeros(&ctx, &[m, n], DType::BF16).expect("rows out");
+        let split_out = Tensor::zeros(&ctx, &[m, n], DType::BF16).expect("split out");
+        let pass = ctx.begin().expect("pass");
+        silu_mul_rows_bf16(&ctx, &pass, &t_gu, &rows_out).expect("rows");
+        silu_mul_bf16(&ctx, &pass, &t_gate, &t_up, &split_out).expect("split");
+        pass.commit_wait().expect("commit");
+        let bits = |t: &Tensor| -> Vec<u32> {
+            t.to_f32().expect("read").iter().map(|x| x.to_bits()).collect()
+        };
+        assert_eq!(bits(&rows_out), bits(&split_out), "m={m} n={n}");
+    }
+}

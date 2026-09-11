@@ -124,60 +124,30 @@ pub fn moe_gather_gemv_gate_up(
     )
 }
 
-/// Largest chunk row count accepted by the small-M gather GEMV.
+/// Largest chunk row count the fused small-batch expert kernels hold per
+/// union expert in registers.
 pub const MOE_SMALLM_MAX_M: usize = 8;
 
 /// Pair-list capacity compiled into moe.metal.
 const MOE_SMALLM_MAX_S: usize = 256;
 
-/// Routed-row capacity per union expert.
-const MOE_SMALLM_MAX_ROWS: usize = 16;
+/// Pair-parallel simdgroups per column group of the fused down kernel
+/// (`MOE_SMALLM_DOWN_PSG` in moe.metal).
+const MOE_SMALLM_DOWN_PSG: usize = 4;
 
-/// Words in the expert-major map: count, expert/row metadata, then pair ids.
-pub const MOE_UNION_MAP_WORDS: usize = 1 + MOE_SMALLM_MAX_S * (2 + MOE_SMALLM_MAX_ROWS);
-
-/// Builds an expert-major map from U32 `[m, top_k]` indices.
-pub fn moe_union_experts(
-    ctx: &MetalContext,
-    pass: &ComputePass<'_>,
-    indices: &Tensor,
-    umap: &Tensor,
-) -> Result<()> {
-    let s = indices.numel();
-    ensure!(
-        indices.dtype() == DType::U32 && s > 0 && s <= MOE_SMALLM_MAX_S,
-        "indices must be U32 [1..={MOE_SMALLM_MAX_S}]"
-    );
-    ensure!(
-        umap.dtype() == DType::U32 && umap.numel() >= MOE_UNION_MAP_WORDS,
-        "umap must be U32 [>= {MOE_UNION_MAP_WORDS}]"
-    );
-    let pipeline = ctx.pipeline("moe_union_experts", SOURCE, MslVersion::V3_1)?;
-    // One thread per routed pair.
-    pass.dispatch_at(
-        &pipeline,
-        &[indices.binding(), umap.binding()],
-        &[&u32_bytes(s)],
-        Grid::Threadgroups { groups: (1, 1, 1), threadgroup: (MOE_SMALLM_MAX_S, 1, 1) },
-    )
-}
-
-/// Expert-major Q4 GEMV over a union map.
-#[allow(clippy::too_many_arguments)]
-pub fn moe_gemv_smallm_em(
-    ctx: &MetalContext,
-    pass: &ComputePass<'_>,
+/// Shape checks shared by the small-batch expert kernels: Q4 stacked experts
+/// with block-packable groups, `S = m * top_k` routed pairs with
+/// `m <= MOE_SMALLM_MAX_M`, and `n_per_expert` a multiple of the `2 * r4`
+/// rows a threadgroup walks. Returns `(k_in, m, s)`.
+fn check_smallm(
     w: &QuantWeights,
     n_per_expert: usize,
-    x: &Tensor,
-    umap: &Tensor,
-    y: &Tensor,
-    s: usize,
+    indices: &Tensor,
     top_k: usize,
-    x_per_pair: bool,
-) -> Result<()> {
+    r4: usize,
+) -> Result<(usize, usize, usize)> {
     let (rows, k_in) = (w.out_features(), w.in_features());
-    ensure!(w.bits == 4, "small-m gather GEMV is 4-bit only");
+    ensure!(w.bits == 4, "small-m expert kernels are 4-bit only");
     ensure!(
         rows.is_multiple_of(n_per_expert),
         "stacked rows {rows} not a multiple of per-expert rows {n_per_expert}"
@@ -189,10 +159,8 @@ pub fn moe_gemv_smallm_em(
         w.group_size
     );
     ensure!(top_k > 0 && top_k <= MAX_K, "top_k {top_k} out of 1..={MAX_K}");
-    ensure!(
-        umap.dtype() == DType::U32 && umap.numel() >= MOE_UNION_MAP_WORDS,
-        "umap must be U32 [>= {MOE_UNION_MAP_WORDS}]"
-    );
+    ensure!(indices.dtype() == DType::U32, "indices must be U32 [m, top_k]");
+    let s = indices.numel();
     ensure!(s.is_multiple_of(top_k) && s > 0, "pair count {s} not m * {top_k}");
     ensure!(
         s <= MOE_SMALLM_MAX_S,
@@ -201,43 +169,135 @@ pub fn moe_gemv_smallm_em(
     let m = s / top_k;
     ensure!(
         m <= MOE_SMALLM_MAX_M,
-        "small-m gather GEMV holds at most {MOE_SMALLM_MAX_M} rows per expert \
+        "small-m expert kernels hold at most {MOE_SMALLM_MAX_M} rows per expert \
          in registers (got m={m})"
     );
-    let x_expect = if x_per_pair { s * k_in } else { m * k_in };
     ensure!(
-        x.numel() == x_expect && x.dtype() == DType::BF16,
-        "x numel {} != {x_expect}",
-        x.numel()
+        n_per_expert.is_multiple_of(2 * r4),
+        "small-m N per expert {n_per_expert} must be a multiple of {}",
+        2 * r4
+    );
+    Ok((k_in, m, s))
+}
+
+/// Fused small-batch gate + up + SwiGLU over the union of the routed experts:
+/// `y[pair, :] = silu(gate_e . x[row]) * (up_e . x[row])` for every routed
+/// `(row, k)` pair with `e = indices[row, k]`, `x` `[m, K]`, `y` BF16
+/// `[S, N]`. Each union expert's weights are streamed once and applied to
+/// all its rows; the grid is `(N / rows, S)` (duplicate pairs exit), so it
+/// encodes before the routing is known. Matches `silu_mul_bf16` of the two
+/// expert-major GEMVs bit for bit.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_smallm_gate_up(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    gate: &QuantWeights,
+    up: &QuantWeights,
+    n_per_expert: usize,
+    x: &Tensor,
+    indices: &Tensor,
+    y: &Tensor,
+    top_k: usize,
+) -> Result<()> {
+    ensure!(
+        (up.out_features(), up.in_features(), up.group_size, up.bits)
+            == (gate.out_features(), gate.in_features(), gate.group_size, gate.bits),
+        "expert gate/up shapes, group sizes or bit widths differ"
+    );
+    let k_in = gate.in_features();
+    let m = indices.numel() / top_k.max(1);
+    // Rows per simdgroup: 8 on the wide walk (K <= 512), else 4 for the
+    // m <= 4 tier and 2 for the 8-row tier (64 accumulators per lane at 4
+    // rows changed the compiler's f32 scheduling against the reference).
+    let (name, r4) = match (m <= 4, k_in <= 512) {
+        (true, false) => ("moe_smallm_q4_gate_up_r4", 4),
+        (true, true) => ("moe_smallm_q4_gate_up_r4_w", 8),
+        (false, false) => ("moe_smallm_q4_gate_up_r8", 2),
+        (false, true) => ("moe_smallm_q4_gate_up_r8_w", 8),
+    };
+    let (k_in, m, s) = check_smallm(gate, n_per_expert, indices, top_k, r4)?;
+    ensure!(
+        x.numel() == m * k_in && x.dtype() == DType::BF16,
+        "x must be BF16 [{m}, {k_in}]"
     );
     ensure!(
         y.numel() == s * n_per_expert && y.dtype() == DType::BF16,
         "y must be BF16 [{s}, {n_per_expert}]"
     );
-    let rows_per_tg = if k_in <= 512 { 16 } else { 8 };
-    ensure!(
-        n_per_expert.is_multiple_of(rows_per_tg),
-        "production small-m N per expert {n_per_expert} must be a multiple of \
-         {rows_per_tg}"
-    );
-    let name = if k_in <= 512 {
-        "moe_gemv_smallm_q4_em_r8_w"
+    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            gate.codes.binding(),
+            gate.scales.binding(),
+            gate.biases.binding(),
+            up.codes.binding(),
+            up.scales.binding(),
+            up.biases.binding(),
+            x.binding(),
+            indices.binding(),
+            y.binding(),
+        ],
+        &[
+            &u32_bytes(k_in),
+            &u32_bytes(gate.group_size),
+            &u32_bytes(n_per_expert),
+            &u32_bytes(s),
+            &u32_bytes(top_k),
+        ],
+        Grid::Threadgroups {
+            groups: (n_per_expert / (2 * r4), s, 1),
+            threadgroup: (64, 1, 1),
+        },
+    )
+}
+
+/// Fused small-batch down + combine + shared-expert add:
+/// `out[row, :] = bf16(sum_k scores[row, k] * bf16(down_e . x[row, k])) +
+/// sigmoid(shared_gate[row]) * shared_out[row, :]` with `e = indices[row,
+/// k]`, `x` BF16 `[S, K]` (one activation row per routed pair), `scores` F32
+/// `[m, top_k]`, `shared_out`/`out` BF16 `[m, H]`, `shared_gate` BF16 `[m]`.
+/// One threadgroup per (column tile, row) walks the row's pairs; grid
+/// `(H / rows, m)`. Matches the expert-major down GEMV followed by
+/// `moe_combine_rows` and `moe_row_gate_add` bit for bit.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_smallm_down_combine(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    w: &QuantWeights,
+    h: usize,
+    x: &Tensor,
+    indices: &Tensor,
+    scores: &Tensor,
+    shared_out: &Tensor,
+    shared_gate: &Tensor,
+    out: &Tensor,
+    top_k: usize,
+) -> Result<()> {
+    let (name, r4) = if w.in_features() <= 512 {
+        ("moe_smallm_q4_down_combine_w", 8)
     } else {
-        "moe_gemv_smallm_q4_em_r8"
+        ("moe_smallm_q4_down_combine", 4)
     };
-    let grid = Grid::Threadgroups {
-        groups: (n_per_expert / rows_per_tg, s, 1),
-        threadgroup: (64, 1, 1),
-    };
-    let (kb, gsb, nb, sb, tkb, xpb) = (
-        u32_bytes(k_in),
-        u32_bytes(w.group_size),
-        u32_bytes(n_per_expert),
-        u32_bytes(s),
-        u32_bytes(top_k),
-        u32_bytes(x_per_pair as usize),
+    let (k_in, m, s) = check_smallm(w, h, indices, top_k, r4)?;
+    ensure!(
+        x.numel() == s * k_in && x.dtype() == DType::BF16,
+        "x must be BF16 [{s}, {k_in}]"
     );
-    let params: [&[u8]; 6] = [&kb, &gsb, &nb, &sb, &tkb, &xpb];
+    ensure!(
+        scores.numel() == s && scores.dtype() == DType::F32,
+        "scores must be F32 [{m}, {top_k}]"
+    );
+    for (t, what) in [(shared_out, "shared_out"), (out, "out")] {
+        ensure!(
+            t.numel() == m * h && t.dtype() == DType::BF16,
+            "{what} must be BF16 [{m}, {h}]"
+        );
+    }
+    ensure!(
+        shared_gate.numel() == m && shared_gate.dtype() == DType::BF16,
+        "shared_gate must be BF16 [{m}]"
+    );
     let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
@@ -246,11 +306,17 @@ pub fn moe_gemv_smallm_em(
             w.scales.binding(),
             w.biases.binding(),
             x.binding(),
-            umap.binding(),
-            y.binding(),
+            indices.binding(),
+            scores.binding(),
+            shared_out.binding(),
+            shared_gate.binding(),
+            out.binding(),
         ],
-        &params,
-        grid,
+        &[&u32_bytes(k_in), &u32_bytes(w.group_size), &u32_bytes(h), &u32_bytes(top_k)],
+        Grid::Threadgroups {
+            groups: (h / (2 * r4), m, 1),
+            threadgroup: (64 * MOE_SMALLM_DOWN_PSG, 1, 1),
+        },
     )
 }
 

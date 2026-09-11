@@ -26,6 +26,23 @@ kernel void silu_mul_bf16(device const bfloat* gate [[buffer(0)]],
     out[gid] = bfloat(s * float(up[gid]));
 }
 
+// out[r, c] = silu(gu[r, c]) * gu[r, N + c] over a [m, 2N] gate|up stack
+// (silu_mul_bf16 without splitting the stack first).
+kernel void silu_mul_gu_rows_bf16(device const bfloat* gu  [[buffer(0)]],
+                                  device bfloat*       out [[buffer(1)]],
+                                  constant uint&       N   [[buffer(2)]],
+                                  uint2 gid [[thread_position_in_grid]]) {
+    const uint c = gid.x;
+    const uint r = gid.y;
+    if (c >= N) {
+        return;
+    }
+    const ulong base = (ulong)r * 2 * N;
+    float g = float(gu[base + c]);
+    float s = g / (1.0f + exp(-g));
+    out[(ulong)r * N + c] = bfloat(s * float(gu[base + N + c]));
+}
+
 // Attention output gate: out = x * sigmoid(gate).
 kernel void sigmoid_mul_bf16(device const bfloat* gate [[buffer(0)]],
                              device const bfloat* x    [[buffer(1)]],

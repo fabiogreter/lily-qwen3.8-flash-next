@@ -359,34 +359,62 @@ static inline float2 qdot_word_masked(uint word, float4 xlo, float4 xhi) {
 
 constant uint MOE_SMALLM_MAX_S = 256;
 
-constant uint MOE_SMALLM_MAX_ROWS = 16;
 
-// Reads expert ids and routed rows from the union map.
-#define MOE_GEMV_SMALLM_EM_PROLOGUE(MAXR)                                      \
-    const uint u = tg.y;                                                       \
-    if (u >= min(umap[0], S)) {                                                \
-        return;                                                                \
+// Pair-parallel simdgroups per column group of the fused down kernel
+// (2 * PSG simdgroups per threadgroup).
+constant uint MOE_SMALLM_DOWN_PSG = 4;
+
+// ---- Small-batch expert path (m <= MOE_SMALLM_MAX_M token rows) -------------
+// Two kernels per layer, the batched counterparts of the decode gathers:
+// gate + up + SwiGLU per union expert (the union of the S = m * top_k routed
+// pairs built on the fly from the staged pair list), then down + score-
+// weighted combine + gated shared-expert add per token row. Grids depend
+// only on S, m and N, so both encode before the routing is known (the verify
+// pass and the GPU-selected draft pass encode ahead; work is gated on the
+// GPU). Expert weights are streamed once per union expert in the first
+// kernel and once per routed pair in the second.
+
+// Stages the S pair ids, exits when an earlier pair already owns this
+// threadgroup's expert (that threadgroup carries every row routed to it),
+// and collects the (at most MAXR) pairs routed to it with their token rows.
+#define MOE_SMALLM_UNION_PROLOGUE(MAXR)                                        \
+    threadgroup uint tg_pairs[MOE_SMALLM_MAX_S];                               \
+    for (uint jj = lane; jj < S; jj += 64) {                                   \
+        tg_pairs[jj] = indices[jj];                                            \
     }                                                                          \
-    const uint e = umap[1 + u];                                                \
-    const uint nr = min(umap[1 + MOE_SMALLM_MAX_S + u], (uint)MAXR);           \
-    device const uint* upairs =                                                \
-        umap + 1 + 2 * MOE_SMALLM_MAX_S + u * MOE_SMALLM_MAX_ROWS;             \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                           \
+    const uint j = tg.y;                                                       \
+    const uint e = tg_pairs[j];                                                \
+    for (uint jj = 0; jj < j; ++jj) {                                          \
+        if (tg_pairs[jj] == e) {                                               \
+            return;                                                            \
+        }                                                                      \
+    }                                                                          \
     uint pair[MAXR];                                                           \
     uint xbase[MAXR];                                                          \
-    _Pragma("clang loop unroll(full)")                                         \
-    for (uint ri = 0; ri < MAXR; ++ri) {                                       \
-        if (ri < nr) {                                                         \
-            const uint jj = upairs[ri];                                        \
-            pair[ri] = jj;                                                     \
-            xbase[ri] = ((XPP != 0) ? jj : jj / TOPK) * (K / 4);               \
+    uint nr = 0;                                                               \
+    for (uint jj = j; jj < S; ++jj) {                                          \
+        if (tg_pairs[jj] != e || nr >= MAXR) {                                 \
+            continue;                                                          \
         }                                                                      \
+        const uint xr = jj / TOPK;                                             \
+        _Pragma("clang loop unroll(full)")                                     \
+        for (uint ri = 0; ri < MAXR; ++ri) {                                   \
+            if (ri == nr) {                                                    \
+                pair[ri] = jj;                                                 \
+                xbase[ri] = xr * (K / 4);                                      \
+            }                                                                  \
+        }                                                                      \
+        ++nr;                                                                  \
     }
 
-#define MOE_GEMV_SMALLM_EM_BODY(MAXR, R4)                               \
-    MOE_GEMV_SMALLM_EM_PROLOGUE(MAXR)                                          \
-    MOE_GEMV_SMALLM_CORE(MAXR, R4)
-
-#define MOE_GEMV_SMALLM_CORE(MAXR, R4)                                  \
+// One threadgroup per (R4-row pair of 2 simdgroups, union expert): each lane
+// walks its 16-element blocks of the expert's gate and up rows once and
+// applies them to every routed token row (x [m, K]); y[pair, n] =
+// silu(gate) * up, on the bf16-rounded sums (silu_mul_bf16's expression).
+// The per-(pair, row) accumulation order is the expert-major GEMV's.
+#define MOE_SMALLM_GATE_UP_BODY(MAXR, R4)                                      \
+    MOE_SMALLM_UNION_PROLOGUE(MAXR)                                            \
     const uint sg = lane / 32;                                                 \
     const uint sl = lane % 32;                                                 \
     const uint row0 = (tg.x * 2 + sg) * R4;                                    \
@@ -395,31 +423,41 @@ constant uint MOE_SMALLM_MAX_ROWS = 16;
     const uint bpg = GS / 16;                                                  \
     const uint groups = K / GS;                                                \
     device const bfloat4* xw = (device const bfloat4*)x;                       \
-    device const uint2* wrow[R4];                                              \
+    device const uint2* g_wrow[R4];                                            \
+    device const uint2* u_wrow[R4];                                            \
     _Pragma("clang loop unroll(full)")                                         \
     for (uint r4 = 0; r4 < R4; ++r4) {                                         \
-        wrow[r4] =                                                             \
-            (device const uint2*)(codes + ((ulong)e * N + row0 + r4) * words); \
+        const ulong grow = (ulong)e * N + row0 + r4;                           \
+        g_wrow[r4] = (device const uint2*)(g_codes + grow * words);            \
+        u_wrow[r4] = (device const uint2*)(u_codes + grow * words);            \
     }                                                                          \
-    float acc[MAXR][R4];                                                       \
+    float acc_g[MAXR][R4];                                                     \
+    float acc_u[MAXR][R4];                                                     \
     _Pragma("clang loop unroll(full)")                                         \
     for (uint ri = 0; ri < MAXR; ++ri) {                                       \
         _Pragma("clang loop unroll(full)")                                     \
         for (uint r4 = 0; r4 < R4; ++r4) {                                     \
-            acc[ri][r4] = 0.0f;                                                \
+            acc_g[ri][r4] = 0.0f;                                              \
+            acc_u[ri][r4] = 0.0f;                                              \
         }                                                                      \
     }                                                                          \
     for (uint i = sl; i < blocks; i += 32) {                                   \
         const uint g = i / bpg;                                                \
-        uint2 w2[R4];                                                          \
-        float s[R4];                                                           \
-        float b[R4];                                                           \
+        uint2 gw[R4];                                                          \
+        uint2 uw[R4];                                                          \
+        float gs_[R4];                                                         \
+        float gb[R4];                                                          \
+        float us[R4];                                                          \
+        float ub[R4];                                                          \
         _Pragma("clang loop unroll(full)")                                     \
         for (uint r4 = 0; r4 < R4; ++r4) {                                     \
             const ulong grow = (ulong)e * N + row0 + r4;                       \
-            w2[r4] = wrow[r4][i];                                              \
-            s[r4] = float(scales[grow * groups + g]);                          \
-            b[r4] = float(biases[grow * groups + g]);                          \
+            gw[r4] = g_wrow[r4][i];                                            \
+            uw[r4] = u_wrow[r4][i];                                            \
+            gs_[r4] = float(g_scales[grow * groups + g]);                      \
+            gb[r4] = float(g_biases[grow * groups + g]);                       \
+            us[r4] = float(u_scales[grow * groups + g]);                       \
+            ub[r4] = float(u_biases[grow * groups + g]);                       \
         }                                                                      \
         _Pragma("clang loop unroll(full)")                                     \
         for (uint ri = 0; ri < MAXR; ++ri) {                                   \
@@ -433,9 +471,12 @@ constant uint MOE_SMALLM_MAX_ROWS = 16;
             const float4 x3 = float4(xv[3]);                                   \
             _Pragma("clang loop unroll(full)")                                 \
             for (uint r4 = 0; r4 < R4; ++r4) {                                 \
-                float2 d = qdot_word_masked(w2[r4].x, x0, x1);                 \
-                d += qdot_word_masked(w2[r4].y, x2, x3);                       \
-                acc[ri][r4] += s[r4] * d.x + b[r4] * d.y;                      \
+                float2 dg = qdot_word_masked(gw[r4].x, x0, x1);                \
+                dg += qdot_word_masked(gw[r4].y, x2, x3);                      \
+                acc_g[ri][r4] += gs_[r4] * dg.x + gb[r4] * dg.y;               \
+                float2 du = qdot_word_masked(uw[r4].x, x0, x1);                \
+                du += qdot_word_masked(uw[r4].y, x2, x3);                      \
+                acc_u[ri][r4] += us[r4] * du.x + ub[r4] * du.y;                \
             }                                                                  \
         }                                                                      \
     }                                                                          \
@@ -446,82 +487,144 @@ constant uint MOE_SMALLM_MAX_ROWS = 16;
         }                                                                      \
         _Pragma("clang loop unroll(full)")                                     \
         for (uint r4 = 0; r4 < R4; ++r4) {                                     \
-            const float r = simd_sum(acc[ri][r4]);                             \
+            const float gsum = simd_sum(acc_g[ri][r4]);                        \
+            const float usum = simd_sum(acc_u[ri][r4]);                        \
             if (sl == 0) {                                                     \
-                y[(ulong)pair[ri] * N + row0 + r4] = bfloat(r);                \
+                const float gv = float(bfloat(gsum));                          \
+                const float s = gv / (1.0f + exp(-gv));                        \
+                y[(ulong)pair[ri] * N + row0 + r4] =                           \
+                    bfloat(s * float(bfloat(usum)));                           \
             }                                                                  \
         }                                                                      \
     }
 
-// Builds an expert-major union map; S must not exceed MOE_SMALLM_MAX_S.
-// One pair per thread avoids a macOS 27 AGX compiler crash.
-kernel void moe_union_experts(device const uint* indices [[buffer(0)]],
-                              device uint*       umap    [[buffer(1)]],
-                              constant uint&     S       [[buffer(2)]],
-                              uint tid [[thread_index_in_threadgroup]]) {
-    threadgroup uint pairs[MOE_SMALLM_MAX_S];
-    threadgroup uint first[MOE_SMALLM_MAX_S];
-    threadgroup uint slot[MOE_SMALLM_MAX_S];
-    if (tid < S) {
-        pairs[tid] = indices[tid];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid < S) {
-        uint f = 1;
-        for (uint jj = 0; jj < tid; ++jj) {
-            if (pairs[jj] == pairs[tid]) {
-                f = 0;
-                break;
-            }
-        }
-        first[tid] = f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        uint u = 0;
-        for (uint j = 0; j < S; ++j) {
-            slot[j] = u;
-            u += first[j];
-        }
-        umap[0] = u;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid < S && first[tid] != 0) {
-        const uint u = slot[tid];
-        const uint e = pairs[tid];
-        uint nr = 0;
-        for (uint jj = tid; jj < S && nr < MOE_SMALLM_MAX_ROWS; ++jj) {
-            if (pairs[jj] == e) {
-                umap[1 + 2 * MOE_SMALLM_MAX_S + u * MOE_SMALLM_MAX_ROWS + nr] = jj;
-                ++nr;
-            }
-        }
-        umap[1 + u] = e;
-        umap[1 + MOE_SMALLM_MAX_S + u] = nr;
-    }
-}
-
-#define MOE_GEMV_SMALLM_EM_KERNEL(NAME, MAXR, R4)                              \
-    kernel void NAME(device const uint*   codes   [[buffer(0)]],               \
-                     device const bfloat* scales  [[buffer(1)]],               \
-                     device const bfloat* biases  [[buffer(2)]],               \
-                     device const bfloat* x       [[buffer(3)]],               \
-                     device const uint*   umap    [[buffer(4)]],               \
-                     device bfloat*       y       [[buffer(5)]],               \
-                     constant uint&       K       [[buffer(6)]],               \
-                     constant uint&       GS      [[buffer(7)]],               \
-                     constant uint&       N       [[buffer(8)]],               \
-                     constant uint&       S       [[buffer(9)]],               \
-                     constant uint&       TOPK    [[buffer(10)]],              \
-                     constant uint&       XPP     [[buffer(11)]],              \
+#define MOE_SMALLM_GATE_UP_KERNEL(NAME, MAXR, R4)                              \
+    kernel void NAME(device const uint*   g_codes  [[buffer(0)]],              \
+                     device const bfloat* g_scales [[buffer(1)]],              \
+                     device const bfloat* g_biases [[buffer(2)]],              \
+                     device const uint*   u_codes  [[buffer(3)]],              \
+                     device const bfloat* u_scales [[buffer(4)]],              \
+                     device const bfloat* u_biases [[buffer(5)]],              \
+                     device const bfloat* x        [[buffer(6)]],              \
+                     device const uint*   indices  [[buffer(7)]],              \
+                     device bfloat*       y        [[buffer(8)]],              \
+                     constant uint&       K        [[buffer(9)]],              \
+                     constant uint&       GS       [[buffer(10)]],             \
+                     constant uint&       N        [[buffer(11)]],             \
+                     constant uint&       S        [[buffer(12)]],             \
+                     constant uint&       TOPK     [[buffer(13)]],             \
                      uint2 tg  [[threadgroup_position_in_grid]],               \
                      uint lane [[thread_index_in_threadgroup]]) {              \
-        MOE_GEMV_SMALLM_EM_BODY(MAXR, R4)                                    \
+        MOE_SMALLM_GATE_UP_BODY(MAXR, R4)                                      \
     }
 
+// MAXR 4 covers the verify pass and the draft head (m <= 4), 8 the largest
+// small-m chunk; `_w` walks 16 rows per threadgroup for K <= 512.
+MOE_SMALLM_GATE_UP_KERNEL(moe_smallm_q4_gate_up_r4, 4, 4)
+MOE_SMALLM_GATE_UP_KERNEL(moe_smallm_q4_gate_up_r4_w, 4, 8)
+MOE_SMALLM_GATE_UP_KERNEL(moe_smallm_q4_gate_up_r8, 8, 2)
+MOE_SMALLM_GATE_UP_KERNEL(moe_smallm_q4_gate_up_r8_w, 8, 8)
 
-MOE_GEMV_SMALLM_EM_KERNEL(moe_gemv_smallm_q4_em_r8, 8, 4)
-MOE_GEMV_SMALLM_EM_KERNEL(moe_gemv_smallm_q4_em_r8_w, 8, 8)
+// One threadgroup per (2 * R4 output columns, token row), 2 * PSG simdgroups:
+// simdgroup (cg, pp) owns columns cg * R4.. of the pairs k = pp, pp + PSG,
+// ... of the row, computing each pair's down projection of its activation
+// row (x [S, K]) in the expert-major GEMV's order and parking the bf16-
+// rounded value; then one lane per column sums score * value over k in pair
+// order (moe_combine_rows' order), rounds to bf16, and adds
+// sigmoid(gate[row]) * shared_out (moe_row_gate_add's expression).
+#define MOE_SMALLM_DOWN_COMBINE_BODY(R4, PSG)                                  \
+    threadgroup float part[2 * MOE_MAX_K * R4];                                \
+    const uint sgi = lane / 32;                                                \
+    const uint sl = lane % 32;                                                 \
+    const uint cg = sgi / PSG;                                                 \
+    const uint pp = sgi % PSG;                                                 \
+    const uint row = tg.y;                                                     \
+    const uint row0 = (tg.x * 2 + cg) * R4;                                    \
+    const uint words = K / 8;                                                  \
+    const uint blocks = K / 16;                                                \
+    const uint bpg = GS / 16;                                                  \
+    const uint groups = K / GS;                                                \
+    device const bfloat4* xw = (device const bfloat4*)x;                       \
+    for (uint k = pp; k < TOPK; k += PSG) {                                    \
+        const uint pair = row * TOPK + k;                                      \
+        const uint e = indices[pair];                                          \
+        device const uint2* wrow[R4];                                          \
+        _Pragma("clang loop unroll(full)")                                     \
+        for (uint r4 = 0; r4 < R4; ++r4) {                                     \
+            wrow[r4] =                                                         \
+                (device const uint2*)(codes + ((ulong)e * N + row0 + r4) * words); \
+        }                                                                      \
+        float acc[R4];                                                         \
+        _Pragma("clang loop unroll(full)")                                     \
+        for (uint r4 = 0; r4 < R4; ++r4) {                                     \
+            acc[r4] = 0.0f;                                                    \
+        }                                                                      \
+        device const bfloat4* xv0 = xw + (ulong)pair * (K / 4);                \
+        for (uint i = sl; i < blocks; i += 32) {                               \
+            const uint g = i / bpg;                                            \
+            uint2 w2[R4];                                                      \
+            float s[R4];                                                       \
+            float b[R4];                                                       \
+            _Pragma("clang loop unroll(full)")                                 \
+            for (uint r4 = 0; r4 < R4; ++r4) {                                 \
+                const ulong grow = (ulong)e * N + row0 + r4;                   \
+                w2[r4] = wrow[r4][i];                                          \
+                s[r4] = float(scales[grow * groups + g]);                      \
+                b[r4] = float(biases[grow * groups + g]);                      \
+            }                                                                  \
+            device const bfloat4* xv = xv0 + 4 * i;                            \
+            const float4 x0 = float4(xv[0]);                                   \
+            const float4 x1 = float4(xv[1]);                                   \
+            const float4 x2 = float4(xv[2]);                                   \
+            const float4 x3 = float4(xv[3]);                                   \
+            _Pragma("clang loop unroll(full)")                                 \
+            for (uint r4 = 0; r4 < R4; ++r4) {                                 \
+                float2 d = qdot_word_masked(w2[r4].x, x0, x1);                 \
+                d += qdot_word_masked(w2[r4].y, x2, x3);                       \
+                acc[r4] += s[r4] * d.x + b[r4] * d.y;                          \
+            }                                                                  \
+        }                                                                      \
+        _Pragma("clang loop unroll(full)")                                     \
+        for (uint r4 = 0; r4 < R4; ++r4) {                                     \
+            const float r = simd_sum(acc[r4]);                                 \
+            if (sl == 0) {                                                     \
+                part[(cg * MOE_MAX_K + k) * R4 + r4] = float(bfloat(r));       \
+            }                                                                  \
+        }                                                                      \
+    }                                                                          \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                           \
+    if (pp == 0 && sl < R4) {                                                  \
+        const uint r4 = sl;                                                    \
+        float combined = 0.0f;                                                 \
+        for (uint k = 0; k < TOPK; ++k) {                                      \
+            combined += scores[row * TOPK + k] * part[(cg * MOE_MAX_K + k) * R4 + r4]; \
+        }                                                                      \
+        const float gsig = 1.0f / (1.0f + exp(-float(shared_gate[row])));      \
+        const ulong d = (ulong)row * N + row0 + r4;                            \
+        out[d] = bfloat(float(bfloat(combined)) + gsig * float(shared_out[d])); \
+    }
+
+#define MOE_SMALLM_DOWN_COMBINE_KERNEL(NAME, R4, PSG)                          \
+    kernel void NAME(device const uint*   codes       [[buffer(0)]],           \
+                     device const bfloat* scales      [[buffer(1)]],           \
+                     device const bfloat* biases      [[buffer(2)]],           \
+                     device const bfloat* x           [[buffer(3)]],           \
+                     device const uint*   indices     [[buffer(4)]],           \
+                     device const float*  scores      [[buffer(5)]],           \
+                     device const bfloat* shared_out  [[buffer(6)]],           \
+                     device const bfloat* shared_gate [[buffer(7)]],           \
+                     device bfloat*       out         [[buffer(8)]],           \
+                     constant uint&       K           [[buffer(9)]],           \
+                     constant uint&       GS          [[buffer(10)]],          \
+                     constant uint&       N           [[buffer(11)]],          \
+                     constant uint&       TOPK        [[buffer(12)]],          \
+                     uint2 tg  [[threadgroup_position_in_grid]],               \
+                     uint lane [[thread_index_in_threadgroup]]) {              \
+        MOE_SMALLM_DOWN_COMBINE_BODY(R4, PSG)                                  \
+    }
+
+MOE_SMALLM_DOWN_COMBINE_KERNEL(moe_smallm_q4_down_combine, 4, MOE_SMALLM_DOWN_PSG)
+MOE_SMALLM_DOWN_COMBINE_KERNEL(moe_smallm_q4_down_combine_w, 8, MOE_SMALLM_DOWN_PSG)
 
 // Adds sigmoid(gate[r]) * src[r, :] to each destination row.
 kernel void moe_row_gate_add(device const bfloat* src  [[buffer(0)]],  // [m, h]

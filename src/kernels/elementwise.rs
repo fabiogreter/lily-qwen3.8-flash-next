@@ -80,6 +80,36 @@ pub fn silu_mul_bf16(
     binary_op(ctx, pass, "silu_mul_bf16", DType::BF16, gate, up, out)
 }
 
+/// `out[r, c] = silu(gu[r, c]) * gu[r, n + c]` over the gate|up halves of a
+/// `[m, 2n]` stack (a fused gate|up GEMM output) into `out` `[m, n]`: the
+/// same expression as [`silu_mul_bf16`], addressing the halves in place.
+pub fn silu_mul_rows_bf16(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    gu: &Tensor,
+    out: &Tensor,
+) -> Result<()> {
+    ensure!(gu.shape().len() == 2 && out.shape().len() == 2, "gu/out must be 2-D");
+    let (m, n) = (out.shape()[0], out.shape()[1]);
+    ensure!(
+        gu.shape()[0] == m && gu.shape()[1] == 2 * n,
+        "gu shape {:?} is not [{m}, {}]",
+        gu.shape(),
+        2 * n
+    );
+    ensure!(
+        gu.dtype() == DType::BF16 && out.dtype() == DType::BF16,
+        "silu_mul_rows_bf16 expects BF16"
+    );
+    let pipeline = ctx.pipeline("silu_mul_gu_rows_bf16", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[gu.binding(), out.binding()],
+        &[&u32_bytes(n)],
+        Grid::Threads { grid: (n, m, 1), threadgroup: (256.min(n), 1, 1) },
+    )
+}
+
 pub fn sigmoid_mul_bf16(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,

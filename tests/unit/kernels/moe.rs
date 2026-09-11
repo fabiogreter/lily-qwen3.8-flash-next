@@ -7,6 +7,40 @@ const TEST_SOURCE: &str = concat!(
 /// Includes extended-row variants from test-only MSL.
 const MOE_SMALLM_TEST_MAX_M: usize = 16;
 
+/// Routed-row capacity per union expert (test-only union map).
+const MOE_SMALLM_MAX_ROWS: usize = 16;
+
+/// Words in the expert-major map: count, expert/row metadata, then pair ids.
+const MOE_UNION_MAP_WORDS: usize = 1 + MOE_SMALLM_MAX_S * (2 + MOE_SMALLM_MAX_ROWS);
+
+/// Builds an expert-major map from U32 `[m, top_k]` indices (the reference
+/// small-m chain's first dispatch; test-only since the fused kernels build
+/// the union on the fly).
+fn moe_union_experts(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    indices: &Tensor,
+    umap: &Tensor,
+) -> Result<()> {
+    let s = indices.numel();
+    ensure!(
+        indices.dtype() == DType::U32 && s > 0 && s <= MOE_SMALLM_MAX_S,
+        "indices must be U32 [1..={MOE_SMALLM_MAX_S}]"
+    );
+    ensure!(
+        umap.dtype() == DType::U32 && umap.numel() >= MOE_UNION_MAP_WORDS,
+        "umap must be U32 [>= {MOE_UNION_MAP_WORDS}]"
+    );
+    let pipeline = ctx.pipeline("moe_union_experts", TEST_SOURCE, MslVersion::V3_1)?;
+    // One thread per routed pair.
+    pass.dispatch_at(
+        &pipeline,
+        &[indices.binding(), umap.binding()],
+        &[&u32_bytes(s)],
+        Grid::Threadgroups { groups: (1, 1, 1), threadgroup: (MOE_SMALLM_MAX_S, 1, 1) },
+    )
+}
+
 enum TestSmallmIndex<'a> {
     Pairs(&'a Tensor),
     Union(&'a Tensor, usize),
@@ -180,6 +214,7 @@ use rand::{Rng, SeedableRng};
 
 use super::*;
 use crate::cpu_ref;
+use crate::kernels::elementwise::silu_mul_bf16;
 
 fn random_vec(rng: &mut StdRng, len: usize, lo: f32, hi: f32) -> Vec<f32> {
     (0..len).map(|_| rng.gen_range(lo..hi)).collect()
@@ -410,10 +445,6 @@ fn gemv_smallm_q4_matches_cpu() {
         .expect("idx");
         let ty = Tensor::zeros(&ctx, &[s, n], DType::BF16).expect("y");
         let ty_em = Tensor::zeros(&ctx, &[s, n], DType::BF16).expect("y em");
-        let production_eligible =
-            m <= MOE_SMALLM_MAX_M && n.is_multiple_of(if k_in <= 512 { 16 } else { 8 });
-        let ty_prod = production_eligible
-            .then(|| Tensor::zeros(&ctx, &[s, n], DType::BF16).expect("y prod"));
         let umap =
             Tensor::zeros(&ctx, &[MOE_UNION_MAP_WORDS], DType::U32).expect("umap");
 
@@ -427,12 +458,6 @@ fn gemv_smallm_q4_matches_cpu() {
             &ctx, &pass, &w, n, &tx, &umap, &ty_em, s, top_k, x_per_pair,
         )
         .expect("smallm gemv em");
-        if let Some(ty_prod) = &ty_prod {
-            moe_gemv_smallm_em(
-                &ctx, &pass, &w, n, &tx, &umap, ty_prod, s, top_k, x_per_pair,
-            )
-            .expect("production smallm gemv em");
-        }
         pass.commit_wait().expect("commit");
 
         let rx = cpu_ref::round_bf16(&x);
@@ -445,16 +470,6 @@ fn gemv_smallm_q4_matches_cpu() {
                 "expert-major diverged from pair-major at {i} ({mode}, \
                      K={k_in}, n={n})"
             );
-        }
-        if let Some(ty_prod) = &ty_prod {
-            let got_prod = ty_prod.to_f32().expect("read prod");
-            for (i, (a, b)) in got_em.iter().zip(&got_prod).enumerate() {
-                assert_eq!(
-                    a.to_bits(),
-                    b.to_bits(),
-                    "production expert-major diverged at {i} ({mode}, K={k_in}, n={n})"
-                );
-            }
         }
         for (pair, &ei) in indices.iter().enumerate() {
             let x_row = if x_per_pair { pair } else { pair / top_k };
@@ -480,35 +495,24 @@ fn gemv_smallm_q4_matches_cpu() {
 /// The register bound is a hard host-side error, not a truncation: m
 /// above [`MOE_SMALLM_MAX_M`] must be rejected before any dispatch.
 #[test]
-fn gemv_smallm_rejects_m_above_register_bound() {
+fn smallm_fused_rejects_m_above_register_bound() {
     let ctx = MetalContext::new().expect("metal context");
-    let (e, n, k_in, top_k) = (4usize, 8usize, 64usize, 2usize);
+    let (e, n, k_in, top_k) = (4usize, 16usize, 64usize, 2usize);
     let m = MOE_SMALLM_MAX_M + 1;
-    let w = QuantWeights {
+    let zeros_w = || QuantWeights {
         codes: Tensor::zeros(&ctx, &[e * n, k_in / 8], DType::U32).expect("codes"),
         scales: Tensor::zeros(&ctx, &[e * n, k_in / 64], DType::BF16).expect("scales"),
         biases: Tensor::zeros(&ctx, &[e * n, k_in / 64], DType::BF16).expect("biases"),
         group_size: 64,
         bits: 4,
     };
+    let (gate, up) = (zeros_w(), zeros_w());
     let tx = Tensor::zeros(&ctx, &[m, k_in], DType::BF16).expect("x");
     let tidx = Tensor::zeros(&ctx, &[m, top_k], DType::U32).expect("idx");
     let ty = Tensor::zeros(&ctx, &[m * top_k, n], DType::BF16).expect("y");
-    let umap = Tensor::zeros(&ctx, &[MOE_UNION_MAP_WORDS], DType::U32).expect("umap");
     let pass = ctx.begin().expect("pass");
-    let err = moe_gemv_smallm_em(
-        &ctx,
-        &pass,
-        &w,
-        n,
-        &tx,
-        &umap,
-        &ty,
-        tidx.numel(),
-        top_k,
-        false,
-    )
-    .expect_err("m above the production register bound must be rejected");
+    let err = moe_smallm_gate_up(&ctx, &pass, &gate, &up, n, &tx, &tidx, &ty, top_k)
+        .expect_err("m above the register bound must be rejected");
     assert!(err.to_string().contains("registers"), "unexpected error: {err:#}");
 }
 
@@ -905,4 +909,514 @@ fn router_topk_timing() {
         fill_zero_u32(&ctx, pass, &idx).unwrap();
         pass.level_barrier(&[&idx]).unwrap();
     });
+}
+
+/// A random 4-bit stacked expert weight (`[rows, k_in]`, group size `gs`)
+/// without the dequantized image (`random_quant_stack` keeps one; at the
+/// model's expert shapes that would be gigabytes).
+fn random_q4_stack(
+    ctx: &MetalContext,
+    rng: &mut StdRng,
+    rows: usize,
+    k_in: usize,
+    gs: usize,
+) -> QuantWeights {
+    let words = k_in / 8;
+    let groups = k_in / gs;
+    let mut codes = vec![0u32; rows * words];
+    rng.fill(&mut codes[..]);
+    let scales: Vec<bf16> = (0..rows * groups)
+        .map(|_| bf16::from_f32(rng.gen_range(0.01f32..0.4)))
+        .collect();
+    let biases: Vec<bf16> = (0..rows * groups)
+        .map(|_| bf16::from_f32(rng.gen_range(-1.0f32..0.0)))
+        .collect();
+    let upload = |v: &[u8], shape: &[usize], dtype| {
+        Tensor::from_bytes(ctx, v, shape, dtype).expect("weight upload")
+    };
+    QuantWeights {
+        codes: upload(bytemuck::cast_slice(&codes), &[rows, words], DType::U32),
+        scales: upload(bytemuck::cast_slice(&scales), &[rows, groups], DType::BF16),
+        biases: upload(bytemuck::cast_slice(&biases), &[rows, groups], DType::BF16),
+        group_size: gs,
+        bits: 4,
+    }
+}
+
+/// The inputs one small-m layer step reads: routed pairs, activations, scores
+/// and the shared expert's output and gate logits.
+struct SmallmInputs {
+    x: Tensor,
+    indices: Tensor,
+    scores: Tensor,
+    shared_out: Tensor,
+    shared_gate: Tensor,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn smallm_inputs(
+    ctx: &MetalContext,
+    rng: &mut StdRng,
+    e: usize,
+    k_in: usize,
+    h: usize,
+    m: usize,
+    top_k: usize,
+    mode: &str,
+) -> SmallmInputs {
+    let routing = smallm_routing(rng, m, top_k, e, mode);
+    SmallmInputs {
+        x: Tensor::from_f32_as_bf16(
+            ctx,
+            &random_vec(rng, m * k_in, -1.0, 1.0),
+            &[m, k_in],
+        )
+        .expect("x"),
+        indices: Tensor::from_bytes(
+            ctx,
+            bytemuck::cast_slice(&routing),
+            &[m, top_k],
+            DType::U32,
+        )
+        .expect("indices"),
+        scores: Tensor::from_f32(
+            ctx,
+            &random_vec(rng, m * top_k, 0.0, 1.0),
+            &[m, top_k],
+        )
+        .expect("scores"),
+        shared_out: Tensor::from_f32_as_bf16(
+            ctx,
+            &random_vec(rng, m * h, -2.0, 2.0),
+            &[m, h],
+        )
+        .expect("shared_out"),
+        shared_gate: Tensor::from_f32_as_bf16(
+            ctx,
+            &random_vec(rng, m, -3.0, 3.0),
+            &[m],
+        )
+        .expect("shared_gate"),
+    }
+}
+
+/// Scratch of the reference small-m chain.
+struct SmallmChainScratch {
+    umap: Tensor,
+    eg: Tensor,
+    eu: Tensor,
+    ea: Tensor,
+    ed: Tensor,
+    slots_iota: Tensor,
+}
+
+impl SmallmChainScratch {
+    fn new(
+        ctx: &MetalContext,
+        s: usize,
+        inter: usize,
+        h: usize,
+        m: usize,
+        top_k: usize,
+    ) -> Self {
+        let iota: Vec<u32> = (0..s as u32).collect();
+        Self {
+            umap: Tensor::zeros(ctx, &[MOE_UNION_MAP_WORDS], DType::U32).expect("umap"),
+            eg: Tensor::zeros(ctx, &[s, inter], DType::BF16).expect("eg"),
+            eu: Tensor::zeros(ctx, &[s, inter], DType::BF16).expect("eu"),
+            ea: Tensor::zeros(ctx, &[s, inter], DType::BF16).expect("ea"),
+            ed: Tensor::zeros(ctx, &[s, h], DType::BF16).expect("ed"),
+            slots_iota: Tensor::from_bytes(
+                ctx,
+                bytemuck::cast_slice(&iota),
+                &[m, top_k],
+                DType::U32,
+            )
+            .expect("iota"),
+        }
+    }
+}
+
+/// The reference small-m expert chain (what `prefill_moe` ran before the
+/// fusion): union map, expert-major gate and up GEMVs, `silu_mul`, expert-
+/// major down GEMV over the per-pair activations, `moe_combine_rows` in pair
+/// order, `moe_row_gate_add` of the shared expert. Level barriers between
+/// dependent stages as the production graph had them.
+#[allow(clippy::too_many_arguments)]
+fn smallm_reference_chain(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    (gate, up, down): (&QuantWeights, &QuantWeights, &QuantWeights),
+    inter: usize,
+    h: usize,
+    inp: &SmallmInputs,
+    sc: &SmallmChainScratch,
+    out: &Tensor,
+    top_k: usize,
+) -> Result<()> {
+    let s = inp.indices.numel();
+    moe_union_experts(ctx, pass, &inp.indices, &sc.umap)?;
+    pass.level_barrier(&[&sc.umap])?;
+    moe_gemv_smallm_em_test(
+        ctx, pass, gate, inter, &inp.x, &sc.umap, &sc.eg, s, top_k, false,
+    )?;
+    moe_gemv_smallm_em_test(
+        ctx, pass, up, inter, &inp.x, &sc.umap, &sc.eu, s, top_k, false,
+    )?;
+    pass.level_barrier(&[&sc.eg, &sc.eu])?;
+    silu_mul_bf16(ctx, pass, &sc.eg, &sc.eu, &sc.ea)?;
+    pass.level_barrier(&[&sc.ea])?;
+    moe_gemv_smallm_em_test(
+        ctx, pass, down, h, &sc.ea, &sc.umap, &sc.ed, s, top_k, true,
+    )?;
+    pass.level_barrier(&[&sc.ed])?;
+    moe_combine_rows(ctx, pass, &sc.ed, &sc.slots_iota, &inp.scores, out, top_k)?;
+    pass.level_barrier(&[out])?;
+    moe_row_gate_add(ctx, pass, &inp.shared_out, &inp.shared_gate, out)?;
+    pass.level_barrier(&[out])
+}
+
+/// The fused small-m pair as `prefill_moe` dispatches it.
+#[allow(clippy::too_many_arguments)]
+fn smallm_fused_chain(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    (gate, up, down): (&QuantWeights, &QuantWeights, &QuantWeights),
+    inter: usize,
+    h: usize,
+    inp: &SmallmInputs,
+    ea: &Tensor,
+    out: &Tensor,
+    top_k: usize,
+) -> Result<()> {
+    moe_smallm_gate_up(ctx, pass, gate, up, inter, &inp.x, &inp.indices, ea, top_k)?;
+    pass.level_barrier(&[ea])?;
+    moe_smallm_down_combine(
+        ctx,
+        pass,
+        down,
+        h,
+        ea,
+        &inp.indices,
+        &inp.scores,
+        &inp.shared_out,
+        &inp.shared_gate,
+        out,
+        top_k,
+    )?;
+    pass.level_barrier(&[out])
+}
+
+fn bits_of(t: &Tensor) -> Vec<u32> {
+    t.to_f32().expect("read").iter().map(|x| x.to_bits()).collect()
+}
+
+/// The fused small-m kernels against the reference chain: `ea` (gate + up +
+/// SwiGLU) and `out` (down + combine + gated shared add) bit-identical, at
+/// the model's expert shapes (E reduced to 16) for every row tier (m <= 4 and
+/// 5..=8, including full rows per expert), and at K <= 512 shapes for the
+/// wide-walk instantiations, with per-row distinct random routings and
+/// all-rows-same-experts routings.
+#[test]
+fn smallm_fused_kernels_match_reference_chain_bitwise() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(91);
+    // (E, inter, K, H, gs, m, top_k, routing)
+    type Case = (usize, usize, usize, usize, usize, usize, usize, &'static str);
+    let cases: &[Case] = &[
+        (16, 640, 2560, 2560, 64, 1, 10, "random"),
+        (16, 640, 2560, 2560, 64, 3, 10, "random"),
+        (16, 640, 2560, 2560, 64, 4, 10, "all_dup"),
+        (16, 640, 2560, 2560, 64, 5, 10, "random"),
+        (16, 640, 2560, 2560, 64, 8, 10, "all_dup"),
+        (8, 64, 256, 128, 64, 3, 4, "random"),
+        (8, 64, 256, 128, 64, 8, 1, "all_dup"),
+        (8, 32, 64, 32, 32, 6, 8, "random"),
+    ];
+    for &(e, inter, k_in, h, gs, m, top_k, mode) in cases {
+        let s = m * top_k;
+        let gate = random_q4_stack(&ctx, &mut rng, e * inter, k_in, gs);
+        let up = random_q4_stack(&ctx, &mut rng, e * inter, k_in, gs);
+        let down = random_q4_stack(&ctx, &mut rng, e * h, inter, gs);
+        let inp = smallm_inputs(&ctx, &mut rng, e, k_in, h, m, top_k, mode);
+        let sc = SmallmChainScratch::new(&ctx, s, inter, h, m, top_k);
+        let out_ref = Tensor::zeros(&ctx, &[m, h], DType::BF16).expect("out ref");
+        let ea_new = Tensor::zeros(&ctx, &[s, inter], DType::BF16).expect("ea new");
+        let out_new = Tensor::zeros(&ctx, &[m, h], DType::BF16).expect("out new");
+
+        let pass = ctx.begin().expect("pass");
+        smallm_reference_chain(
+            &ctx,
+            &pass,
+            (&gate, &up, &down),
+            inter,
+            h,
+            &inp,
+            &sc,
+            &out_ref,
+            top_k,
+        )
+        .expect("reference chain");
+        smallm_fused_chain(
+            &ctx,
+            &pass,
+            (&gate, &up, &down),
+            inter,
+            h,
+            &inp,
+            &ea_new,
+            &out_new,
+            top_k,
+        )
+        .expect("fused chain");
+        pass.commit_wait().expect("commit");
+
+        let tag = format!(
+            "E={e} inter={inter} K={k_in} H={h} gs={gs} m={m} top_k={top_k} {mode}"
+        );
+        let (ea_r, ea_n) = (bits_of(&sc.ea), bits_of(&ea_new));
+        let ea_diff = ea_r.iter().zip(&ea_n).filter(|(a, b)| a != b).count();
+        assert_eq!(
+            ea_diff,
+            0,
+            "gate+up+SwiGLU: {ea_diff} of {} elements differ ({tag})",
+            ea_r.len()
+        );
+        let (o_r, o_n) = (bits_of(&out_ref), bits_of(&out_new));
+        let o_diff = o_r.iter().zip(&o_n).filter(|(a, b)| a != b).count();
+        assert_eq!(
+            o_diff,
+            0,
+            "down+combine+shared: {o_diff} of {} elements differ ({tag})",
+            o_r.len()
+        );
+    }
+}
+
+/// Dispatches a named fused down-combine instantiation (the `_p<PSG>` test
+/// variants) with `psg` pair-parallel simdgroups per column group.
+#[allow(clippy::too_many_arguments)]
+fn down_combine_named(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    name: &'static str,
+    psg: usize,
+    w: &QuantWeights,
+    h: usize,
+    inp: &SmallmInputs,
+    ea: &Tensor,
+    out: &Tensor,
+    top_k: usize,
+) -> Result<()> {
+    let (k_in, m) = (w.in_features(), inp.shared_gate.numel());
+    let pipeline = ctx.pipeline(name, TEST_SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            w.codes.binding(),
+            w.scales.binding(),
+            w.biases.binding(),
+            ea.binding(),
+            inp.indices.binding(),
+            inp.scores.binding(),
+            inp.shared_out.binding(),
+            inp.shared_gate.binding(),
+            out.binding(),
+        ],
+        &[&u32_bytes(k_in), &u32_bytes(w.group_size), &u32_bytes(h), &u32_bytes(top_k)],
+        Grid::Threadgroups { groups: (h / 8, m, 1), threadgroup: (64 * psg, 1, 1) },
+    )
+}
+
+/// Dispatches a named fused gate-up instantiation walking `2 * r4` rows per
+/// threadgroup.
+#[allow(clippy::too_many_arguments)]
+fn gate_up_named(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    name: &'static str,
+    r4: usize,
+    gate: &QuantWeights,
+    up: &QuantWeights,
+    inter: usize,
+    inp: &SmallmInputs,
+    ea: &Tensor,
+    top_k: usize,
+) -> Result<()> {
+    let (k_in, s) = (gate.in_features(), inp.indices.numel());
+    let pipeline = ctx.pipeline(name, TEST_SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            gate.codes.binding(),
+            gate.scales.binding(),
+            gate.biases.binding(),
+            up.codes.binding(),
+            up.scales.binding(),
+            up.biases.binding(),
+            inp.x.binding(),
+            inp.indices.binding(),
+            ea.binding(),
+        ],
+        &[
+            &u32_bytes(k_in),
+            &u32_bytes(gate.group_size),
+            &u32_bytes(inter),
+            &u32_bytes(s),
+            &u32_bytes(top_k),
+        ],
+        Grid::Threadgroups {
+            groups: (inter / (2 * r4), s, 1),
+            threadgroup: (64, 1, 1),
+        },
+    )
+}
+
+/// Kernel-level timing of the small-m expert path at the model's shape
+/// (E = 512, top_k = 10, inter = 640, H = 2560, gs 64) for m = 1 and 3 rows:
+/// the reference chain (union map, two expert-major GEMVs, silu_mul, expert-
+/// major down GEMV, combine, gated add: 7 dispatches, 6 levels) against the
+/// fused pair (2 dispatches, 2 levels) and their halves, on a concurrent pass
+/// with level barriers as the graph has them, cycling through 64 random
+/// routings so the expert weights stream from DRAM. Prints µs per layer; run
+/// with `cargo test --release -- --ignored --nocapture smallm_moe_timing`.
+#[test]
+#[ignore = "timing only"]
+fn smallm_moe_timing() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(93);
+    let (e, inter, k_in, h, gs, top_k) =
+        (512usize, 640usize, 2560usize, 2560usize, 64usize, 10usize);
+    let gate = random_q4_stack(&ctx, &mut rng, e * inter, k_in, gs);
+    let up = random_q4_stack(&ctx, &mut rng, e * inter, k_in, gs);
+    let down = random_q4_stack(&ctx, &mut rng, e * h, inter, gs);
+    let routings = 64;
+    let iters = 256;
+    for m in [1usize, 3] {
+        let s = m * top_k;
+        let inputs: Vec<SmallmInputs> = (0..routings)
+            .map(|_| smallm_inputs(&ctx, &mut rng, e, k_in, h, m, top_k, "random"))
+            .collect();
+        let sc = SmallmChainScratch::new(&ctx, s, inter, h, m, top_k);
+        let ea = Tensor::zeros(&ctx, &[s, inter], DType::BF16).expect("ea");
+        let out = Tensor::zeros(&ctx, &[m, h], DType::BF16).expect("out");
+        let time = |name: &str, f: &dyn Fn(&ComputePass<'_>, &SmallmInputs)| {
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let pass = ctx.begin_concurrent().expect("pass");
+                for i in 0..iters {
+                    f(&pass, &inputs[i % routings]);
+                }
+                let start = std::time::Instant::now();
+                pass.commit_wait().expect("commit");
+                best = best.min(start.elapsed().as_secs_f64() * 1e6 / iters as f64);
+            }
+            eprintln!("m={m} {name}: {best:.1} us per layer (best of 3)");
+        };
+        let w3 = (&gate, &up, &down);
+        time("reference chain (7 dispatches)", &|pass, inp| {
+            smallm_reference_chain(&ctx, pass, w3, inter, h, inp, &sc, &out, top_k)
+                .unwrap();
+        });
+        time("fused pair (2 dispatches)", &|pass, inp| {
+            smallm_fused_chain(&ctx, pass, w3, inter, h, inp, &ea, &out, top_k)
+                .unwrap();
+        });
+        time("reference union + gate/up em + silu", &|pass, inp| {
+            moe_union_experts(&ctx, pass, &inp.indices, &sc.umap).unwrap();
+            pass.level_barrier(&[&sc.umap]).unwrap();
+            moe_gemv_smallm_em_test(
+                &ctx, pass, &gate, inter, &inp.x, &sc.umap, &sc.eg, s, top_k, false,
+            )
+            .unwrap();
+            moe_gemv_smallm_em_test(
+                &ctx, pass, &up, inter, &inp.x, &sc.umap, &sc.eu, s, top_k, false,
+            )
+            .unwrap();
+            pass.level_barrier(&[&sc.eg, &sc.eu]).unwrap();
+            silu_mul_bf16(&ctx, pass, &sc.eg, &sc.eu, &sc.ea).unwrap();
+            pass.level_barrier(&[&sc.ea]).unwrap();
+        });
+        time("fused gate_up (production tier)", &|pass, inp| {
+            moe_smallm_gate_up(
+                &ctx,
+                pass,
+                &gate,
+                &up,
+                inter,
+                &inp.x,
+                &inp.indices,
+                &ea,
+                top_k,
+            )
+            .unwrap();
+            pass.level_barrier(&[&ea]).unwrap();
+        });
+        time("fused gate_up r8 (R4=2)", &|pass, inp| {
+            gate_up_named(
+                &ctx,
+                pass,
+                "moe_smallm_q4_gate_up_r8",
+                2,
+                &gate,
+                &up,
+                inter,
+                inp,
+                &ea,
+                top_k,
+            )
+            .unwrap();
+            pass.level_barrier(&[&ea]).unwrap();
+        });
+        time("reference down em + combine + gate_add", &|pass, inp| {
+            moe_gemv_smallm_em_test(
+                &ctx, pass, &down, h, &sc.ea, &sc.umap, &sc.ed, s, top_k, true,
+            )
+            .unwrap();
+            pass.level_barrier(&[&sc.ed]).unwrap();
+            moe_combine_rows(
+                &ctx,
+                pass,
+                &sc.ed,
+                &sc.slots_iota,
+                &inp.scores,
+                &out,
+                top_k,
+            )
+            .unwrap();
+            pass.level_barrier(&[&out]).unwrap();
+            moe_row_gate_add(&ctx, pass, &inp.shared_out, &inp.shared_gate, &out)
+                .unwrap();
+            pass.level_barrier(&[&out]).unwrap();
+        });
+        time("fused down_combine (production PSG)", &|pass, inp| {
+            moe_smallm_down_combine(
+                &ctx,
+                pass,
+                &down,
+                h,
+                &ea,
+                &inp.indices,
+                &inp.scores,
+                &inp.shared_out,
+                &inp.shared_gate,
+                &out,
+                top_k,
+            )
+            .unwrap();
+            pass.level_barrier(&[&out]).unwrap();
+        });
+        for (name, psg) in [
+            ("moe_smallm_q4_down_combine_p1", 1usize),
+            ("moe_smallm_q4_down_combine_p4", 4),
+        ] {
+            time(&format!("fused down_combine PSG={psg}"), &|pass, inp| {
+                down_combine_named(
+                    &ctx, pass, name, psg, &down, h, inp, &ea, &out, top_k,
+                )
+                .unwrap();
+                pass.level_barrier(&[&out]).unwrap();
+            });
+        }
+    }
 }

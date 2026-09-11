@@ -5,7 +5,9 @@
 
 use anyhow::{Result, ensure};
 
-use crate::kernels::elementwise::{gather_rows_bf16, silu_mul_bf16, split_cols_bf16};
+use crate::kernels::elementwise::{
+    gather_rows_bf16, silu_mul_bf16, silu_mul_rows_bf16, split_cols_bf16,
+};
 use crate::kernels::{moe, quant, skinny};
 use crate::metal::{ComputePass, MetalContext};
 use crate::tensor::{DType, Tensor};
@@ -21,9 +23,41 @@ pub(crate) struct MoeDims {
     pub norm_topk_prob: bool,
 }
 
-/// Projects an already-stacked weight group as one skinny GEMM when eligible;
-/// otherwise dispatches the corresponding per-slice projections. Keeping both
-/// arms here prevents the fused and fallback projection lists from drifting.
+/// Projects `a` `[m, K]` through an already-stacked weight group as one
+/// skinny GEMM into `stack_c` when eligible, returning the `[m, n_total]`
+/// view holding the stacked output; `None` when the stack must be projected
+/// slice by slice (the caller then dispatches the per-slice projections).
+/// `widths` are the slice widths in stack order.
+pub(crate) fn project_stack_fused(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    a: &Tensor,
+    stack_w: &LinearWeights,
+    stack_c: &Tensor,
+    widths: &[usize],
+) -> Result<Option<Tensor>> {
+    let m = a.shape()[0];
+    let n_total = stack_w.out_features();
+    let walk_ok = skinny::q4_block_walk_ok(stack_w.in_features(), stack_w.group_size);
+    let fused = widths.iter().sum::<usize>() == n_total
+        && stack_w.bits == 4
+        && skinny::dense_smallm_routes(m)
+        && skinny::stack_route_uniform(m, n_total, widths, walk_ok);
+    if !fused {
+        return Ok(None);
+    }
+    // Fusing is bit-identical only when the stack and every slice choose
+    // the same skinny variant; staged and register-A reduce in different
+    // f32 orders.
+    let c = stack_c.view(0, &[m, n_total])?;
+    skinny::gemm_skinny_q4_nt(ctx, pass, a, stack_w, &c)?;
+    Ok(Some(c))
+}
+
+/// Projects an already-stacked weight group as one skinny GEMM when eligible
+/// and splits the result into the slice outputs; otherwise dispatches the
+/// corresponding per-slice projections. Keeping both arms here prevents the
+/// fused and fallback projection lists from drifting.
 pub(crate) fn project_stack_or_slices<const N: usize>(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
@@ -34,19 +68,8 @@ pub(crate) fn project_stack_or_slices<const N: usize>(
     scratch: &Tensor,
 ) -> Result<()> {
     let m = a.shape()[0];
-    let n_total = stack_w.out_features();
     let widths: [usize; N] = std::array::from_fn(|i| projections[i].1.numel() / m);
-    let walk_ok = skinny::q4_block_walk_ok(stack_w.in_features(), stack_w.group_size);
-    let fused = widths.iter().sum::<usize>() == n_total
-        && stack_w.bits == 4
-        && skinny::dense_smallm_routes(m)
-        && skinny::stack_route_uniform(m, n_total, &widths, walk_ok);
-    if fused {
-        // Fusing is bit-identical only when the stack and every slice choose
-        // the same skinny variant; staged and register-A reduce in different
-        // f32 orders.
-        let c = stack_c.view(0, &[m, n_total])?;
-        skinny::gemm_skinny_q4_nt(ctx, pass, a, stack_w, &c)?;
+    if let Some(c) = project_stack_fused(ctx, pass, a, stack_w, stack_c, &widths)? {
         pass.level_barrier(&[&c])?;
         let outs: [&Tensor; N] = std::array::from_fn(|i| projections[i].1);
         split_cols_bf16(ctx, pass, &c, &outs)?;
@@ -77,7 +100,10 @@ pub(crate) fn project_mat(
         if w.bits == 4 {
             return skinny::gemm_skinny_q4_nt(ctx, pass, a, w, c);
         }
-        if w.bits == 8 && w.group_size.is_multiple_of(8) && w.in_features().is_multiple_of(8) {
+        if w.bits == 8
+            && w.group_size.is_multiple_of(8)
+            && w.in_features().is_multiple_of(8)
+        {
             return skinny::gemm_skinny_q8_nt(ctx, pass, a, w, c);
         }
     }
@@ -125,21 +151,17 @@ pub(crate) struct PrefillMoeScratch {
     pub tile_offsets: Tensor,
     pub ids_sorted: Tensor,
     pub slot_of: Tensor,
-    /// Identity slot map `0..S` (`[m, top_k]`, host-filled once, never
-    /// written by the GPU): the small-m GEMV route keeps its expert outputs
-    /// in natural (row, k) pair order, so `moe_combine_rows` consumes this
-    /// instead of the counting sort's `slot_of`.
-    pub slots_iota: Tensor,
-    /// The expert-major union map (`moe_union_experts` output,
-    /// capacity-sized) the GEMV route's kernels read — built once per
-    /// layer·chunk and shared by the three expert projections.
-    pub umap: Tensor,
     pub blocks_gu: Tensor,
     pub blocks_dn: Tensor,
     pub gx: Tensor,
+    /// `[S, inter]` expert gate / up outputs (grouped route only).
     pub eg: Tensor,
     pub eu: Tensor,
+    /// `[S, inter]` expert activations `silu(gate) * up`, one row per
+    /// routed pair; both routes' down input.
     pub ea: Tensor,
+    /// `[S, h]` expert down outputs (grouped route; the small-m route
+    /// combines in-kernel).
     pub ed: Tensor,
     /// Row-tile capacity bound `ceil(S/T) + min(E, S)` at `tile.rows()` —
     /// covers any expert split without a readback; block-map slots past the
@@ -191,11 +213,6 @@ impl PrefillMoeScratch {
             tile_offsets: Tensor::zeros(ctx, &[e + 1], u32t)?,
             ids_sorted: Tensor::zeros(ctx, &[s_total], u32t)?,
             slot_of: Tensor::zeros(ctx, &[m, k], u32t)?,
-            slots_iota: {
-                let iota: Vec<u32> = (0..s_total as u32).collect();
-                Tensor::from_bytes(ctx, bytemuck::cast_slice(&iota), &[m, k], u32t)?
-            },
-            umap: Tensor::zeros(ctx, &[moe::MOE_UNION_MAP_WORDS], u32t)?,
             blocks_gu: Tensor::zeros(ctx, &[cap * (mi / 64) * 4], u32t)?,
             blocks_dn: Tensor::zeros(ctx, &[cap * (h / 64) * 4], u32t)?,
             gx: Tensor::zeros(ctx, &[s_total, h], bf)?,
@@ -244,8 +261,6 @@ impl PrefillMoeScratch {
             tile_offsets: self.tile_offsets.view(0, self.tile_offsets.shape())?,
             ids_sorted: self.ids_sorted.view(0, &[s_total])?,
             slot_of: prefix_rows(&self.slot_of, m)?,
-            slots_iota: prefix_rows(&self.slots_iota, m)?,
-            umap: self.umap.view(0, self.umap.shape())?,
             blocks_gu: block_view(&self.blocks_gu)?,
             blocks_dn: block_view(&self.blocks_dn)?,
             gx: slot_rows(&self.gx)?,
@@ -276,10 +291,14 @@ pub(crate) struct PrefillMoeIo<'a> {
 }
 
 /// The prefill MoE FFN, GPU-resident end to end: router GEMM → per-row
-/// softmax/top-k → counting sort (histogram, serial scans, atomic scatter) →
-/// GPU-built block map (sentinel-padded to a readback-free capacity bound) →
-/// grouped expert GEMMs → per-row combine. No host round-trip and no
-/// per-layer allocations, so the whole chunk stays in one command buffer.
+/// softmax/top-k → then either (grouped route, m > 8) counting sort
+/// (histogram, serial scans, atomic scatter) → GPU-built block map
+/// (sentinel-padded to a readback-free capacity bound) → grouped expert GEMMs
+/// → per-row combine → gated shared-expert add, or (small-m route, m <= 8)
+/// the two fused small-batch expert kernels (gate + up + SwiGLU over the
+/// union of the routed experts; down + combine + shared add per row), the
+/// batched shape of the decode gathers. No host round-trip and no per-layer
+/// allocations, so the whole chunk stays in one command buffer.
 pub(crate) fn prefill_moe(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
@@ -320,17 +339,29 @@ pub(crate) fn prefill_moe(
     // gated add.
     let shared = &moe_w.shared;
     project_mat(ctx, pass, io.x, &moe_w.gate, &ms.router_logits, io.dequant)?;
-    project_stack_or_slices(
+    // The shared expert's gate|up as one stacked GEMM when eligible: its
+    // SwiGLU then reads the two halves in place (no split copy).
+    let inter_s = io.mlp_gate.numel() / m;
+    let stacked_gu = project_stack_fused(
         ctx,
         pass,
         io.x,
         &shared.gate_up_proj,
         io.stack,
-        [(&shared.gate_proj, io.mlp_gate), (&shared.up_proj, io.mlp_up)],
-        io.dequant,
+        &[inter_s, inter_s],
     )?;
+    if stacked_gu.is_none() {
+        project_mat(ctx, pass, io.x, &shared.gate_proj, io.mlp_gate, io.dequant)?;
+        project_mat(ctx, pass, io.x, &shared.up_proj, io.mlp_up, io.dequant)?;
+    }
     project_mat(ctx, pass, io.x, &moe_w.shared_gate, &ms.shared_gate, io.dequant)?;
-    pass.level_barrier(&[&ms.router_logits, io.mlp_gate, io.mlp_up, &ms.shared_gate])?;
+    pass.level_barrier(&[
+        &ms.router_logits,
+        io.stack,
+        io.mlp_gate,
+        io.mlp_up,
+        &ms.shared_gate,
+    ])?;
     moe::moe_router_topk_rows(
         ctx,
         pass,
@@ -339,104 +370,15 @@ pub(crate) fn prefill_moe(
         &ms.scores,
         dims.norm_topk_prob,
     )?;
-    silu_mul_bf16(ctx, pass, io.mlp_gate, io.mlp_up, io.mlp_act)?;
+    match &stacked_gu {
+        Some(gu) => silu_mul_rows_bf16(ctx, pass, gu, io.mlp_act)?,
+        None => silu_mul_bf16(ctx, pass, io.mlp_gate, io.mlp_up, io.mlp_act)?,
+    }
     pass.level_barrier(&[&ms.indices, &ms.scores, io.mlp_act])?;
     project_mat(ctx, pass, io.mlp_act, &shared.down_proj, &ms.shared_out, io.dequant)?;
-    // The GEMV route consumes the router output directly in natural (row, k)
-    // pair order: no counting sort, no gather, no block maps.
-    if matches!(ms.route, quant::MoeRoute::Grouped(_)) {
-        moe::fill_zero_u32(ctx, pass, &ms.counts)?;
-        moe::fill_zero_u32(ctx, pass, &ms.cursors)?;
-        pass.level_barrier(&[&ms.counts, &ms.cursors])?;
-        moe::moe_sort_slots(
-            ctx,
-            pass,
-            &moe::MoeSortBuffers {
-                indices: &ms.indices,
-                counts: &ms.counts,
-                cursors: &ms.cursors,
-                offsets: &ms.offsets,
-                tile_offsets: &ms.tile_offsets,
-                ids_sorted: &ms.ids_sorted,
-                slot_of: &ms.slot_of,
-            },
-            e,
-            top_k,
-            ms.tile.rows(),
-        )?;
-        pass.level_barrier(&[&ms.ids_sorted, &ms.offsets, &ms.tile_offsets, &ms.slot_of])?;
-        gather_rows_bf16(ctx, pass, io.x, &ms.ids_sorted, &ms.gx)?;
-        moe::moe_build_blocks(
-            ctx,
-            pass,
-            &ms.offsets,
-            &ms.tile_offsets,
-            &ms.blocks_gu,
-            e,
-            inter,
-            ms.tile.rows(),
-        )?;
-        moe::moe_build_blocks(
-            ctx,
-            pass,
-            &ms.offsets,
-            &ms.tile_offsets,
-            &ms.blocks_dn,
-            e,
-            h,
-            ms.tile.rows(),
-        )?;
-        pass.level_barrier(&[&ms.gx, &ms.blocks_gu, &ms.blocks_dn])?;
-    }
 
-    match ms.route {
-        quant::MoeRoute::Grouped(_) => {
-            let nb_gu = ms.tile_capacity * (inter / 64);
-            let nb_dn = ms.tile_capacity * (h / 64);
-            quant::gemm_q4_grouped_nt(
-                ctx,
-                pass,
-                &ms.gx,
-                &moe_w.expert_gate,
-                &ms.eg,
-                &ms.blocks_gu,
-                nb_gu,
-                ms.tile,
-            )?;
-            quant::gemm_q4_grouped_nt(
-                ctx,
-                pass,
-                &ms.gx,
-                &moe_w.expert_up,
-                &ms.eu,
-                &ms.blocks_gu,
-                nb_gu,
-                ms.tile,
-            )?;
-            pass.level_barrier(&[&ms.eg, &ms.eu])?;
-            silu_mul_bf16(ctx, pass, &ms.eg, &ms.eu, &ms.ea)?;
-            pass.level_barrier(&[&ms.ea])?;
-            quant::gemm_q4_grouped_nt(
-                ctx,
-                pass,
-                &ms.ea,
-                &moe_w.expert_down,
-                &ms.ed,
-                &ms.blocks_dn,
-                nb_dn,
-                ms.tile,
-            )?;
-            pass.level_barrier(&[&ms.ed])?;
-            moe::moe_combine_rows(
-                ctx,
-                pass,
-                &ms.ed,
-                &ms.slot_of,
-                &ms.scores,
-                io.out,
-                top_k,
-            )?;
-        }
+    let tile = match ms.route {
+        quant::MoeRoute::Grouped(tile) => tile,
         quant::MoeRoute::SmallmGemv => {
             ensure!(
                 moe_w.expert_gate.bits == 4
@@ -444,39 +386,118 @@ pub(crate) fn prefill_moe(
                     && moe_w.expert_down.bits == 4,
                 "small-m route requires q4 experts"
             );
-            let run_gemv = |w: &LinearWeights,
-                            n_per: usize,
-                            x: &Tensor,
-                            y: &Tensor,
-                            x_per_pair: bool|
-             -> Result<()> {
-                moe::moe_gemv_smallm_em(
-                    ctx, pass, w, n_per, x, &ms.umap, y, s_slots, top_k, x_per_pair,
-                )
-            };
-            // Build one union map shared by the three expert projections.
-            moe::moe_union_experts(ctx, pass, &ms.indices, &ms.umap)?;
-            pass.level_barrier(&[&ms.umap])?;
-            run_gemv(&moe_w.expert_gate, inter, io.x, &ms.eg, false)?;
-            run_gemv(&moe_w.expert_up, inter, io.x, &ms.eu, false)?;
-            pass.level_barrier(&[&ms.eg, &ms.eu])?;
-            silu_mul_bf16(ctx, pass, &ms.eg, &ms.eu, &ms.ea)?;
-            pass.level_barrier(&[&ms.ea])?;
-            run_gemv(&moe_w.expert_down, h, &ms.ea, &ms.ed, true)?;
-            pass.level_barrier(&[&ms.ed])?;
-            // GEMV outputs are in natural (row, k) pair order: the combine
-            // reads the identity slot map.
-            moe::moe_combine_rows(
+            // The fused kernels consume the router output directly in
+            // natural (row, k) pair order: no union map, no counting sort,
+            // no gather, no block maps, and the combine and the shared add
+            // ride in the down kernel.
+            moe::moe_smallm_gate_up(
                 ctx,
                 pass,
-                &ms.ed,
-                &ms.slots_iota,
-                &ms.scores,
-                io.out,
+                &moe_w.expert_gate,
+                &moe_w.expert_up,
+                inter,
+                io.x,
+                &ms.indices,
+                &ms.ea,
                 top_k,
             )?;
+            pass.level_barrier(&[&ms.ea, &ms.shared_out])?;
+            return moe::moe_smallm_down_combine(
+                ctx,
+                pass,
+                &moe_w.expert_down,
+                h,
+                &ms.ea,
+                &ms.indices,
+                &ms.scores,
+                &ms.shared_out,
+                &ms.shared_gate,
+                io.out,
+                top_k,
+            );
         }
-    }
+    };
+
+    moe::fill_zero_u32(ctx, pass, &ms.counts)?;
+    moe::fill_zero_u32(ctx, pass, &ms.cursors)?;
+    pass.level_barrier(&[&ms.counts, &ms.cursors])?;
+    moe::moe_sort_slots(
+        ctx,
+        pass,
+        &moe::MoeSortBuffers {
+            indices: &ms.indices,
+            counts: &ms.counts,
+            cursors: &ms.cursors,
+            offsets: &ms.offsets,
+            tile_offsets: &ms.tile_offsets,
+            ids_sorted: &ms.ids_sorted,
+            slot_of: &ms.slot_of,
+        },
+        e,
+        top_k,
+        tile.rows(),
+    )?;
+    pass.level_barrier(&[&ms.ids_sorted, &ms.offsets, &ms.tile_offsets, &ms.slot_of])?;
+    gather_rows_bf16(ctx, pass, io.x, &ms.ids_sorted, &ms.gx)?;
+    moe::moe_build_blocks(
+        ctx,
+        pass,
+        &ms.offsets,
+        &ms.tile_offsets,
+        &ms.blocks_gu,
+        e,
+        inter,
+        tile.rows(),
+    )?;
+    moe::moe_build_blocks(
+        ctx,
+        pass,
+        &ms.offsets,
+        &ms.tile_offsets,
+        &ms.blocks_dn,
+        e,
+        h,
+        tile.rows(),
+    )?;
+    pass.level_barrier(&[&ms.gx, &ms.blocks_gu, &ms.blocks_dn])?;
+
+    let nb_gu = ms.tile_capacity * (inter / 64);
+    let nb_dn = ms.tile_capacity * (h / 64);
+    quant::gemm_q4_grouped_nt(
+        ctx,
+        pass,
+        &ms.gx,
+        &moe_w.expert_gate,
+        &ms.eg,
+        &ms.blocks_gu,
+        nb_gu,
+        tile,
+    )?;
+    quant::gemm_q4_grouped_nt(
+        ctx,
+        pass,
+        &ms.gx,
+        &moe_w.expert_up,
+        &ms.eu,
+        &ms.blocks_gu,
+        nb_gu,
+        tile,
+    )?;
+    pass.level_barrier(&[&ms.eg, &ms.eu])?;
+    silu_mul_bf16(ctx, pass, &ms.eg, &ms.eu, &ms.ea)?;
+    pass.level_barrier(&[&ms.ea])?;
+    quant::gemm_q4_grouped_nt(
+        ctx,
+        pass,
+        &ms.ea,
+        &moe_w.expert_down,
+        &ms.ed,
+        &ms.blocks_dn,
+        nb_dn,
+        tile,
+    )?;
+    pass.level_barrier(&[&ms.ed])?;
+    moe::moe_combine_rows(ctx, pass, &ms.ed, &ms.slot_of, &ms.scores, io.out, top_k)?;
 
     // Both chains are complete: the routed sum is in `out`, the shared
     // expert in `shared_out`.
