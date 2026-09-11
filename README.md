@@ -38,6 +38,10 @@ Performance over time, one fixed matrix per commit: [performance timeline](docs/
 Design notes: [phase 2 design](docs/phase2-server-design.md),
 [checkpoint format](docs/qwen38-flash-next-checkpoint-format.md).
 
+Where to pick up: [optimization potential](docs/optimization-potential.md) records every remaining
+performance lever with its evidence, estimated upside, effort and the measurement that would settle
+it, including the first per-kernel prefill profile (2026-09-11), and ends with a ranked shortlist.
+
 Upstream's own account of the engine this fork started from: Perplexity,
 [Optimizing On-Device Inference for Apple Silicon](https://www.perplexity.ai/hub/blog/optimizing-on-device-inference-for-apple-silicon).
 
