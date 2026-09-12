@@ -21,12 +21,37 @@ fn chunks_carry_the_openai_shape() {
 }
 
 #[test]
-fn request_budgets_fill_the_context_by_default() {
-    assert_eq!(api::resolve_budget_for_test(10, None, 100).unwrap(), 90);
-    assert_eq!(api::resolve_budget_for_test(10, Some(20), 100).unwrap(), 20);
-    assert!(api::resolve_budget_for_test(10, Some(91), 100).is_err());
-    assert!(api::resolve_budget_for_test(100, None, 100).is_err());
-    assert!(api::resolve_budget_for_test(10, Some(0), 100).is_err());
+fn request_budgets_fill_the_context_by_default_and_clamp_to_it() {
+    let budget = |prompt, requested, max_seq| api::resolve_budget_for_test(prompt, requested, max_seq);
+    let fits = |max_tokens| api::Budget { max_tokens, clamped_from: None };
+    assert_eq!(budget(10, None, 100).unwrap(), fits(90));
+    assert_eq!(budget(10, Some(20), 100).unwrap(), fits(20));
+    assert_eq!(budget(10, Some(90), 100).unwrap(), fits(90));
+    // Asking for more than the prompt leaves room for clamps instead of
+    // refusing (the response then ends with finish_reason "length").
+    assert_eq!(budget(10, Some(91), 100).unwrap(), api::Budget { max_tokens: 90, clamped_from: Some(91) });
+    assert_eq!(
+        budget(99_204, Some(32_000), 131_072).unwrap(),
+        api::Budget { max_tokens: 131_072 - 99_204, clamped_from: Some(32_000) }
+    );
+    // Only a prompt that fills the context is refused, with the numbers.
+    let error = budget(100, None, 100).unwrap_err().to_string();
+    assert!(error.starts_with("prompt exceeds the server context: 100 prompt tokens, 100 tokens of context"), "{error}");
+    let error = budget(131_072, Some(1), 131_072).unwrap_err().to_string();
+    assert!(error.contains("131072 prompt tokens"), "{error}");
+    assert!(budget(101, Some(5), 100).is_err());
+    assert!(budget(0, None, 100).is_err());
+    assert!(budget(10, Some(0), 100).is_err());
+}
+
+#[test]
+fn effective_context_takes_the_smallest_of_flag_kernel_and_checkpoint() {
+    assert_eq!(effective_max_seq(131_072, 262_144), 131_072);
+    assert_eq!(effective_max_seq(300_000, 262_144), MAX_SEQ.min(262_144));
+    assert_eq!(effective_max_seq(131_072, 65_536), 65_536);
+    // An undeclared window (0) only leaves the kernel limit.
+    assert_eq!(effective_max_seq(131_072, 0), 131_072);
+    assert_eq!(effective_max_seq(usize::MAX, 0), MAX_SEQ);
 }
 
 #[test]

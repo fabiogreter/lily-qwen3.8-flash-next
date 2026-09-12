@@ -197,6 +197,17 @@ pub struct Prepared {
     /// `tool_choice` is `none`).
     pub tools: Option<Vec<ToolSchema>>,
     pub cache_key: Option<String>,
+    /// The `max_tokens` the request asked for when it had to be clamped to
+    /// the room the prompt leaves in the context (for the log).
+    pub clamped_from: Option<usize>,
+}
+
+/// The completion budget a request gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Budget {
+    pub max_tokens: usize,
+    /// Set when the request asked for more than the prompt leaves room for.
+    pub clamped_from: Option<usize>,
 }
 
 fn resolve_sampling(fields: &SamplingFields, defaults: &SamplingParams) -> Result<SamplingParams> {
@@ -230,23 +241,23 @@ fn resolve_sampling(fields: &SamplingFields, defaults: &SamplingParams) -> Resul
     Ok(params)
 }
 
-fn resolve_budget(prompt_tokens: usize, requested: Option<usize>, max_seq: usize) -> Result<usize> {
+/// How many completion tokens a request may generate. A prompt that fills
+/// the context is refused (nothing could be generated); a `max_tokens` the
+/// prompt leaves no room for is clamped to that room, as OpenAI-compatible
+/// servers do, and the response then ends with `finish_reason: "length"`.
+fn resolve_budget(prompt_tokens: usize, requested: Option<usize>, max_seq: usize) -> Result<Budget> {
     ensure!(prompt_tokens > 0, "the prompt is empty");
     ensure!(
         prompt_tokens < max_seq,
-        "the prompt has {prompt_tokens} tokens; this server's context is {max_seq} tokens and needs room for at least one completion token"
+        "prompt exceeds the server context: {prompt_tokens} prompt tokens, {max_seq} tokens of context \
+         (at least one completion token must fit)"
     );
     let room = max_seq - prompt_tokens;
     match requested {
         Some(0) => bail!("max_tokens must be greater than zero"),
-        Some(n) => {
-            ensure!(
-                n <= room,
-                "prompt ({prompt_tokens}) plus max_tokens ({n}) exceeds the server context of {max_seq} tokens"
-            );
-            Ok(n)
-        }
-        None => Ok(room),
+        Some(n) if n > room => Ok(Budget { max_tokens: room, clamped_from: Some(n) }),
+        Some(n) => Ok(Budget { max_tokens: n, clamped_from: None }),
+        None => Ok(Budget { max_tokens: room, clamped_from: None }),
     }
 }
 
@@ -366,7 +377,7 @@ pub fn prepare_chat(
         })
         .context("rendering the chat template")?;
     let prompt = tokenizer.encode(&rendered)?;
-    let max_tokens = resolve_budget(
+    let budget = resolve_budget(
         prompt.len(),
         request.max_completion_tokens.or(request.max_tokens),
         max_seq,
@@ -374,7 +385,7 @@ pub fn prepare_chat(
     Ok(Prepared {
         kind: Kind::Chat,
         prompt,
-        max_tokens,
+        max_tokens: budget.max_tokens,
         sampling: resolve_sampling(&request.sampling, &defaults.sampling)?,
         stop_strings: request.stop.map(StringOrVec::into_vec).unwrap_or_default(),
         stream: request.stream,
@@ -382,6 +393,7 @@ pub fn prepare_chat(
         thinking_open: enable_thinking,
         tools,
         cache_key: request.prompt_cache_key,
+        clamped_from: budget.clamped_from,
     })
 }
 
@@ -403,11 +415,11 @@ pub fn prepare_completion(
     ensure!(prompts.len() == 1, "exactly one prompt string is supported");
     let prompt = tokenizer.encode(&prompts[0])?;
     // OpenAI's completions default is 16 tokens.
-    let max_tokens = resolve_budget(prompt.len(), Some(request.max_tokens.unwrap_or(16)), max_seq)?;
+    let budget = resolve_budget(prompt.len(), Some(request.max_tokens.unwrap_or(16)), max_seq)?;
     Ok(Prepared {
         kind: Kind::Completion,
         prompt,
-        max_tokens,
+        max_tokens: budget.max_tokens,
         sampling: resolve_sampling(&request.sampling, &defaults.sampling)?,
         stop_strings: request.stop.map(StringOrVec::into_vec).unwrap_or_default(),
         stream: request.stream,
@@ -415,10 +427,11 @@ pub fn prepare_completion(
         thinking_open: false,
         tools: None,
         cache_key: request.prompt_cache_key,
+        clamped_from: budget.clamped_from,
     })
 }
 
 #[cfg(test)]
-pub(super) fn resolve_budget_for_test(prompt: usize, requested: Option<usize>, max_seq: usize) -> Result<usize> {
+pub(super) fn resolve_budget_for_test(prompt: usize, requested: Option<usize>, max_seq: usize) -> Result<Budget> {
     resolve_budget(prompt, requested, max_seq)
 }

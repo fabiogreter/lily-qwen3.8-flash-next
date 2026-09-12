@@ -140,8 +140,10 @@ and `tool`; `tools` and `tool_choice` (`none` hides the tools, anything else
 renders them); `temperature`, `top_p`, `top_k`, `min_p`, `seed`,
 `presence_penalty`, `frequency_penalty`, `repetition_penalty` (penalties
 apply to generated tokens); `stop` strings; `max_tokens` /
-`max_completion_tokens` (default: the rest of the context);
-`stream_options.include_usage`; `reasoning_effort` (`none` disables
+`max_completion_tokens` (default: the rest of the context; a larger value is
+clamped to it, as OpenAI-compatible servers do, and the response then ends
+with `finish_reason: "length"`); `stream_options.include_usage`;
+`reasoning_effort` (`none` disables
 thinking, `low`, `medium`, `high`); `chat_template_kwargs` with
 `enable_thinking`, `reasoning_effort`, `preserve_thinking`; and
 `prompt_cache_key` as a cache hint. Sampling defaults come from the
@@ -156,9 +158,12 @@ as OpenAI `tool_calls` with `finish_reason: "tool_calls"`. The final message
 must be `user` or `tool`.
 
 Rejected with 400: images, `n > 1`, `logprobs`, `response_format` other than
-`text`, `echo`. Requests wait in a bounded queue (`--queue`, 503 when full)
-and run one at a time; a client that disconnects cancels its generation at
-the next token.
+`text`, `echo`, and a prompt that fills the whole context (`prompt exceeds
+the server context: N prompt tokens, M tokens of context`). Every rejected
+request leaves a `rejected POST /v1/chat/completions with 400: ...` line in
+the log, and a clamped `max_tokens` a `warning:` line. Requests wait in a
+bounded queue (`--queue`, 503 when full) and run one at a time; a client
+that disconnects cancels its generation at the next token.
 
 ### Session cache
 

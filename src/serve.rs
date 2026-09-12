@@ -266,6 +266,14 @@ fn send_error(stream: TcpStream, status: u16, kind: &'static str, message: impl 
     }
 }
 
+/// Answers a request the engine never sees and logs why, so a client that
+/// gives up on a 4xx/5xx can be traced in the server log.
+fn refuse(stream: TcpStream, request: &str, status: u16, kind: &'static str, message: impl Into<String>) {
+    let message = message.into();
+    eprintln!("rejected {request} with {status}: {message}");
+    send_error(stream, status, kind, message);
+}
+
 /// What the engine sends the responder thread for one request.
 enum Out {
     Start { status: u16, content_type: &'static str },
@@ -326,7 +334,7 @@ impl Job {
 
 /// What the HTTP threads (and the stop handler) send the engine thread.
 enum Cmd {
-    Job(Job),
+    Job(Box<Job>),
     /// Wakes the engine so it notices a stop request; carries nothing.
     Wake,
 }
@@ -423,11 +431,7 @@ impl<M: LanguageModel> Engine<M> {
                 );
             }
         }
-        let declared = model.max_position_embeddings();
-        let mut max_seq = options.max_seq.min(MAX_SEQ);
-        if declared > 0 {
-            max_seq = max_seq.min(declared);
-        }
+        let max_seq = effective_max_seq(options.max_seq, model.max_position_embeddings());
         ensure!(max_seq > 1, "max_seq must be at least 2");
         let mut scratch = model.new_scratch_with_capacity(&ctx, max_seq)?;
         warm_up(&ctx, &model, &mut scratch)?;
@@ -542,7 +546,13 @@ impl<M: LanguageModel> Engine<M> {
             return Ok(());
         }
         let Engine { ctx, model, generator, sessions, scratch, max_seq, drafts, next_id, shutdown } = self;
-        ensure!(p.prompt.len() < *max_seq, "prompt too long for the server context");
+        // The HTTP thread validated against the same limit; this only guards
+        // the engine's buffers if the two ever disagree.
+        ensure!(
+            p.prompt.len() < *max_seq,
+            "prompt exceeds the engine context: {} prompt tokens, {max_seq} tokens of context",
+            p.prompt.len()
+        );
         let n = p.prompt.len();
         let started = Instant::now();
         let acquired = sessions.acquire(ctx, model, &p.prompt, p.cache_key.as_deref())?;
@@ -859,6 +869,25 @@ fn checkpoint_eos_ids(model_dir: &Path) -> Result<Vec<u32>> {
     })
 }
 
+/// `max_position_embeddings` from `config.json` (top level or `text_config`);
+/// zero when the checkpoint does not declare one.
+fn checkpoint_max_position_embeddings(model_dir: &Path) -> Result<usize> {
+    let config = read_config(model_dir)?;
+    Ok(config
+        .get("max_position_embeddings")
+        .or_else(|| config.get("text_config").and_then(|t| t.get("max_position_embeddings")))
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize)
+}
+
+/// The per-request context the server enforces: the flag, capped by the
+/// kernels' limit and by the window the checkpoint declares (the engine
+/// applies the same caps from the loaded model, so both sides agree).
+fn effective_max_seq(requested: usize, declared: usize) -> usize {
+    let max_seq = requested.min(MAX_SEQ);
+    if declared > 0 { max_seq.min(declared) } else { max_seq }
+}
+
 /// Sampling defaults: `generation_config.json` over OpenAI's defaults, then
 /// the command-line overrides.
 fn sampling_defaults(model_dir: &Path, overrides: &SamplingOverrides) -> Result<SamplingParams> {
@@ -969,8 +998,13 @@ fn engine_loop<M: LanguageModel>(
     let fatal = |what: &str, error: anyhow::Error, rx: &Receiver<Cmd>| -> ! {
         eprintln!("{what}: {error:#}");
         lifecycle.set(State::Stopping);
+        let mut refused = 0usize;
         while let Ok(Cmd::Job(job)) = rx.try_recv() {
             job.reject(500, "the model failed to load");
+            refused += 1;
+        }
+        if refused > 0 {
+            eprintln!("exiting: refused {refused} queued requests with 500");
         }
         std::process::exit(1)
     };
@@ -1018,7 +1052,7 @@ fn engine_loop<M: LanguageModel>(
                         }
                     }
                 }
-                engine.as_mut().expect("engine loaded").serve(job);
+                engine.as_mut().expect("engine loaded").serve(*job);
                 idle.touch(Instant::now());
             }
             Ok(Cmd::Wake) => {}
@@ -1091,7 +1125,10 @@ fn run_with<M: LanguageModel + 'static>(model_dir: &Path, options: ServeOptions,
         if defaults.thinking { "on" } else { "off" },
         defaults.reasoning_effort.as_deref().map(|e| format!(" (effort {e})")).unwrap_or_default(),
     );
-    let max_seq = options.max_seq.min(MAX_SEQ);
+    let max_seq = effective_max_seq(options.max_seq, checkpoint_max_position_embeddings(model_dir)?);
+    if max_seq < options.max_seq {
+        eprintln!("context: --max-seq {} capped to {max_seq} (the checkpoint's window or the kernel limit)", options.max_seq);
+    }
 
     let listener = TcpListener::bind(address).with_context(|| format!("binding http://{}", options.bind))?;
     let (jobs, job_rx) = mpsc::sync_channel::<Cmd>(options.queue.max(1));
@@ -1180,11 +1217,12 @@ fn handle(front: &Front, mut stream: TcpStream) {
     let request = match http::read_request(&mut stream, MAX_REQUEST_BYTES) {
         Ok(request) => request,
         Err(error) => {
-            send_error(stream, 400, "invalid_request_error", format!("{error:#}"));
+            refuse(stream, "request", 400, "invalid_request_error", format!("{error:#}"));
             return;
         }
     };
     let path = request.path.split('?').next().unwrap_or("").to_string();
+    let what = format!("{} {path}", request.method);
     let state = if front.shutdown.requested() { State::Stopping } else { front.lifecycle.get() };
     match (request.method.as_str(), path.as_str()) {
         ("GET", "/health") => {
@@ -1221,17 +1259,26 @@ fn handle(front: &Front, mut stream: TcpStream) {
             let prepared = match prepared {
                 Ok(p) => p,
                 Err(error) => {
-                    send_error(stream, 400, "invalid_request_error", format!("{error:#}"));
+                    refuse(stream, &what, 400, "invalid_request_error", format!("{error:#}"));
                     return;
                 }
             };
+            if let Some(asked) = prepared.clamped_from {
+                eprintln!(
+                    "warning: {what}: max_tokens {asked} clamped to {} (the prompt has {} tokens, the server context \
+                     is {}); the response ends with finish_reason \"length\" if it uses them all",
+                    prepared.max_tokens,
+                    prepared.prompt.len(),
+                    front.max_seq
+                );
+            }
             match state {
                 State::Stopping => {
-                    send_error(stream, 503, "server_error", "the server is shutting down");
+                    refuse(stream, &what, 503, "server_error", "the server is shutting down");
                     return;
                 }
                 State::Loading => {
-                    send_error(stream, 503, "server_error", "model is still loading");
+                    refuse(stream, &what, 503, "server_error", "model is still loading");
                     return;
                 }
                 State::Ready | State::Idle | State::Reloading => {}
@@ -1239,20 +1286,20 @@ fn handle(front: &Front, mut stream: TcpStream) {
             let (tx, rx) = mpsc::channel();
             let cancelled = Arc::new(AtomicBool::new(false));
             let job = Job { prepared, sink: Sink { tx, cancelled: cancelled.clone(), started: false }, queued_at: Instant::now() };
-            match front.jobs.try_send(Cmd::Job(job)) {
+            match front.jobs.try_send(Cmd::Job(Box::new(job))) {
                 Ok(()) => relay(stream, rx, cancelled),
                 Err(TrySendError::Full(_)) => {
-                    send_error(stream, 503, "server_error", "the request queue is full; retry later");
+                    refuse(stream, &what, 503, "server_error", "the request queue is full; retry later");
                 }
                 Err(TrySendError::Disconnected(_)) => {
-                    send_error(stream, 500, "server_error", "engine stopped");
+                    refuse(stream, &what, 500, "server_error", "engine stopped");
                 }
             }
         }
         (_, "/health" | "/v1/models" | "/v1/chat/completions" | "/v1/completions") => {
-            send_error(stream, 405, "invalid_request_error", "method not allowed");
+            refuse(stream, &what, 405, "invalid_request_error", "method not allowed");
         }
-        _ => send_error(stream, 404, "invalid_request_error", "not found"),
+        _ => refuse(stream, &what, 404, "invalid_request_error", "not found"),
     }
 }
 
