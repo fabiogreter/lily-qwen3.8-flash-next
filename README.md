@@ -169,7 +169,12 @@ that disconnects cancels its generation at the next token.
 
 Every request leaves its state in a cache of sessions under a byte budget
 (`--cache-bytes`; by default what the device's recommended working set leaves
-after the weights, minus 2 GiB). A session holds the per-token caches for its
+after the weights, the paged n-gram table (32 GB that lives in the page cache
+rather than GPU memory, with `--ngram-table paged`) and 8 GiB of headroom for
+the applications sharing the machine, but at least 8 GiB; on the 128 GB
+machine that is the floor, 8 GiB, and the log states the derivation as
+`session cache budget: ... = working set - allocated - paged weights -
+headroom`). A session holds the per-token caches for its
 tokens and up to three checkpoints of the recurrent state (Gated DeltaNet
 states and conv windows) taken at `prompt_len - 1` of recent requests. A new
 prompt resumes from the furthest position that is both checkpointed (or the
@@ -193,7 +198,7 @@ layout, so other models never read it.
 | flag | default | meaning |
 |------|---------|---------|
 | `--max-seq` | 131072 | prompt plus completion capacity per request (kernel limit 262 144) |
-| `--cache-bytes` | derived | GPU bytes for cached sessions, e.g. `24G` |
+| `--cache-bytes` | derived | GPU bytes for cached sessions, e.g. `24G` (default: working set - weights - paged table - 8 GiB, at least 8 GiB) |
 | `--max-sessions` | 16 | most cached sessions |
 | `--ngram-table` | `paged` | `paged` (memory-mapped) or `resident` (uploaded) n-gram table |
 | `--ngram-preload` | true | read the table at startup so no request pays cold reads |

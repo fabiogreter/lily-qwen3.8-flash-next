@@ -55,9 +55,22 @@ use tools::ParsedToolCall;
 const MAX_REQUEST_BYTES: usize = 32 << 20;
 /// Recurrent-state checkpoints kept per session (the newest ones).
 const CHECKPOINTS_PER_SESSION: usize = 3;
-/// Left free below the device's recommended working set when the cache
-/// budget is derived automatically.
-const BUDGET_MARGIN_BYTES: usize = 2 << 30;
+/// Left free when the cache budget is derived automatically: room for the OS
+/// and the applications that share the machine with the server (a browser,
+/// containers, an IDE), so a full cache does not push them into swap.
+const BUDGET_HEADROOM_BYTES: usize = 8 << 30;
+/// The derived budget never goes below this (two full 131k contexts of the
+/// Qwen3.8 caches), whatever the arithmetic says; `--cache-bytes` overrides.
+const BUDGET_FLOOR_BYTES: usize = 8 << 30;
+
+/// The default session-cache budget: what the device's recommended working
+/// set leaves after the weights already allocated, the paged weights that
+/// live in the page cache (the n-gram table) and the headroom, floored.
+/// Returns the budget and whether the floor applied.
+fn derive_cache_budget(working_set: usize, allocated: usize, paged: usize) -> (usize, bool) {
+    let derived = working_set.saturating_sub(allocated).saturating_sub(paged).saturating_sub(BUDGET_HEADROOM_BYTES);
+    (derived.max(BUDGET_FLOOR_BYTES), derived < BUDGET_FLOOR_BYTES)
+}
 /// How long a running request may keep going after a stop signal before it
 /// is cancelled at its next token.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
@@ -490,20 +503,36 @@ impl<M: LanguageModel> Engine<M> {
 
         let allocated = ctx.current_allocated();
         let working_set = ctx.recommended_working_set();
+        let paged = model.paged_storage_bytes();
+        let gb = |bytes: usize| bytes as f64 / 1e9;
         let budget = match options.cache_bytes {
             Some(b) => b,
-            None => working_set.saturating_sub(allocated).saturating_sub(BUDGET_MARGIN_BYTES).max(512 << 20),
+            None => {
+                let (budget, floored) = derive_cache_budget(working_set, allocated, paged);
+                eprintln!(
+                    "session cache budget: {:.1} GB = {:.1} GB recommended working set - {:.1} GB allocated \
+                     (weights, scratch) - {:.1} GB paged weights in the page cache - {:.1} GB headroom for \
+                     other applications{}; override with --cache-bytes",
+                    gb(budget),
+                    gb(working_set),
+                    gb(allocated),
+                    gb(paged),
+                    gb(BUDGET_HEADROOM_BYTES),
+                    if floored { format!(", raised to the {:.1} GB floor", gb(BUDGET_FLOOR_BYTES)) } else { String::new() },
+                );
+                budget
+            }
         };
         let per_request = model.bytes_per_token() * max_seq;
         eprintln!(
             "memory: {:.1} GB allocated, {:.1} GB recommended working set, {:.1} GB session cache budget \
              ({} B/token of context; a full {}-token request needs {:.1} GB)",
-            allocated as f64 / 1e9,
-            working_set as f64 / 1e9,
-            budget as f64 / 1e9,
+            gb(allocated),
+            gb(working_set),
+            gb(budget),
             model.bytes_per_token(),
             max_seq,
-            per_request as f64 / 1e9,
+            gb(per_request),
         );
         if per_request > budget {
             eprintln!(

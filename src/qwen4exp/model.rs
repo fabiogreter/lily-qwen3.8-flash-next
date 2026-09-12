@@ -2556,6 +2556,13 @@ impl LanguageModel for Qwen4ExpModel {
         }
     }
 
+    fn paged_storage_bytes(&self) -> usize {
+        match self.ple_table() {
+            Some(NgramTable::Paged(table)) => table.bytes() as usize,
+            _ => 0,
+        }
+    }
+
     fn new_state(&self, ctx: &MetalContext, capacity: usize) -> Result<DecodeState> {
         Qwen4ExpModel::new_state(self, ctx, capacity)
     }

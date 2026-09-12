@@ -45,6 +45,28 @@ fn request_budgets_fill_the_context_by_default_and_clamp_to_it() {
 }
 
 #[test]
+fn default_cache_budget_leaves_room_for_the_paged_table_and_other_apps() {
+    const GB: usize = 1 << 30;
+    // The 128 GB machine: 115.4 GB working set, 73.0 GB weights, 32.0 GB
+    // paged table. The arithmetic gives 2.4 GB; the floor lifts it to 8 GiB.
+    let (budget, floored) = derive_cache_budget(115_400_000_000, 73_000_000_000, 32_000_000_000);
+    assert_eq!((budget, floored), (8 * GB, true));
+    // With the table resident on the GPU (`--ngram-table resident`) it is in
+    // the allocated bytes instead and counts once.
+    let (budget, floored) = derive_cache_budget(115_400_000_000, 105_000_000_000, 0);
+    assert_eq!((budget, floored), (8 * GB, true));
+    // A small model on the same machine: working set - allocated - table - headroom.
+    let (budget, floored) = derive_cache_budget(115_400_000_000, 8_200_000_000, 32_000_000_000);
+    assert_eq!((budget, floored), (115_400_000_000 - 8_200_000_000 - 32_000_000_000 - 8 * GB, false));
+    // No paged weights at all (the Qwen3.6 path).
+    let (budget, floored) = derive_cache_budget(115_400_000_000, 20_000_000_000, 0);
+    assert_eq!((budget, floored), (115_400_000_000 - 20_000_000_000 - 8 * GB, false));
+    // Nothing underflows when the weights alone exceed the working set.
+    assert_eq!(derive_cache_budget(10 * GB, 20 * GB, 0), (8 * GB, true));
+    assert_eq!((BUDGET_HEADROOM_BYTES, BUDGET_FLOOR_BYTES), (8 * GB, 8 * GB));
+}
+
+#[test]
 fn effective_context_takes_the_smallest_of_flag_kernel_and_checkpoint() {
     assert_eq!(effective_max_seq(131_072, 262_144), 131_072);
     assert_eq!(effective_max_seq(300_000, 262_144), MAX_SEQ.min(262_144));

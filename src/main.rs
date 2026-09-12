@@ -28,7 +28,9 @@ struct Cli {
 
     /// GPU memory for cached sessions (KV caches and recurrent checkpoints),
     /// e.g. `24G`. Default: what the device's recommended working set leaves
-    /// after the weights, minus a safety margin.
+    /// after the weights, the paged n-gram table (32 GB of page cache with
+    /// `--ngram-table paged`) and 8 GiB of headroom for other applications,
+    /// but at least 8 GiB; the log states the derivation.
     #[arg(long)]
     cache_bytes: Option<String>,
 

@@ -166,6 +166,14 @@ pub trait LanguageModel: Sized {
         Ok(0)
     }
 
+    /// Bytes of weights served from the page cache instead of GPU memory
+    /// (the paged n-gram table). They are not in the device's allocated
+    /// size, yet they want to stay resident and so compete with the session
+    /// cache for physical memory; 0 for models without such weights.
+    fn paged_storage_bytes(&self) -> usize {
+        0
+    }
+
     /// A state with capacity for `capacity` tokens (grown later on demand).
     fn new_state(&self, ctx: &MetalContext, capacity: usize) -> Result<Self::State>;
 
