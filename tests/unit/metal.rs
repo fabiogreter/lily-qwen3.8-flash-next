@@ -531,3 +531,18 @@ fn blocking_wait_latency() {
         median(&mut spinning)
     );
 }
+
+#[test]
+fn injected_fault_fails_the_next_submission_and_is_reported() {
+    let ctx = MetalContext::new().expect("metal context");
+    assert!(ctx.fault().is_none());
+    ctx.inject_fault("injected for the test");
+    assert_eq!(ctx.fault().as_deref(), Some("injected for the test"));
+    // The fault is checked before anything reaches the queue, so even an
+    // empty pass fails with it, and it stays: the context is done for.
+    let pass = ctx.begin().expect("pass");
+    let error = pass.commit_wait().expect_err("a faulted context must not submit");
+    assert!(format!("{error:#}").contains("injected for the test"), "{error:#}");
+    assert!(ctx.begin().expect("pass").commit_wait().is_err());
+    assert_eq!(ctx.fault().as_deref(), Some("injected for the test"));
+}

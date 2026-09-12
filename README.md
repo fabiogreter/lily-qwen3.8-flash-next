@@ -227,9 +227,29 @@ engine is:
 {"status": "ok", "state": "idle", "model": "Qwen3.8-Flash-Next", "idle_unload_secs": 1800}
 ```
 
-`state` is `loading` (first load, 503), `ready`, `idle`, `reloading` or
-`stopping` (503); `status` stays `ok` whenever a request would be served, so
-clients that only read the status code behave as before.
+`state` is `loading` (first load, 503), `ready`, `idle`, `reloading`,
+`recovering` (503, see below) or `stopping` (503); `status` stays `ok`
+whenever a request would be served, so clients that only read the status
+code behave as before.
+
+### GPU faults
+
+A Metal 4 command-queue error reported for a command buffer (typically
+`MTL4CommandQueueErrorDomain error 1`, a GPU **timeout**, which the system
+raises when a workload runs longer than it allows; severe memory pressure,
+with the GPU stalling on paging, is the likely trigger) leaves the queue in
+a state nothing can trust, so the server treats it as a transport failure:
+the running request gets a 503 whose message names the error (or a stream
+error event and `[DONE]` when the response had started), the engine is
+dropped **without spilling** its sessions (their GPU state is suspect;
+clients re-prefill, and entries the disk tier already holds stay valid),
+loaded again on the same thread while `/health` answers `503` with
+`"state": "recovering"`, and then serves again as `ready`. Requests that
+arrive meanwhile queue for the reload. More than 3 faults within 10 minutes
+exit the process with status 1, so the launchd agent restarts it with its
+`ThrottleInterval`. The log names the error and its meaning
+(`GPU fault: MTL4CommandQueueErrorDomain error 1 (Timeout: ...)`), the
+recovery count, and the reload time.
 
 SIGTERM or SIGINT stop the server cleanly: the listener closes, a running
 request gets 10 s to finish (then it is cancelled and told so with a 503 or a

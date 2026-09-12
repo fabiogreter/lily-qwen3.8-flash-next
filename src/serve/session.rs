@@ -294,12 +294,27 @@ impl<M: LanguageModel> SessionStore<M> {
         (spilled, dropped)
     }
 
+    /// Empties the store without writing anything to disk, for a context
+    /// whose GPU state can no longer be trusted or read (a fault). Returns
+    /// how many sessions were dropped; the disk tier's earlier copies stay.
+    pub fn drop_all(&mut self) -> usize {
+        let dropped = self.entries.len();
+        self.entries.clear();
+        dropped
+    }
+
     /// Writes an evicted session to the disk tier (when there is one and the
     /// session is long enough to be worth it). Failures only cost the copy.
     /// Returns whether the session is now on disk.
     fn spill(&mut self, ctx: &MetalContext, session: Session<M>) -> bool {
         let Some(disk) = self.disk.as_mut() else { return false };
         if session.tokens.len() < MIN_DISK_TOKENS || session.state.pos() != session.tokens.len() {
+            return false;
+        }
+        // A faulted context cannot run the snapshot blit and its caches are
+        // not trustworthy; the engine is about to drop every session and
+        // reports that once, so do not log a failure per session here.
+        if ctx.fault().is_some() {
             return false;
         }
         let started = Instant::now();

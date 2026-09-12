@@ -44,11 +44,11 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use block2::RcBlock;
 use core::ptr::NonNull;
 use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSString;
+use objc2::runtime::{AnyObject, ProtocolObject};
+use objc2_foundation::{NSArray, NSError, NSString};
 use objc2_metal::{
     MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer,
-    MTL4CommandEncoder, MTL4CommandQueue, MTL4CommitFeedback, MTL4CommitOptions,
+    MTL4CommandEncoder, MTL4CommandQueue, MTL4CommandQueueError, MTL4CommitFeedback, MTL4CommitOptions,
     MTL4ComputeCommandEncoder, MTL4VisibilityOptions, MTLAllocation, MTLBuffer,
     MTLCompileOptions, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
     MTLEvent, MTLLanguageVersion, MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor,
@@ -396,6 +396,23 @@ impl MetalContext {
         self.device.currentAllocatedSize()
     }
 
+    /// The first GPU error the commit feedback reported on this context, if
+    /// any. A fault is permanent: every later submission and wait fails with
+    /// it, because the queue's state after a timeout or hang (and whatever
+    /// its last command buffers left in memory) is not trustworthy. The
+    /// owner recovers by replacing the context and everything allocated
+    /// from it.
+    pub fn fault(&self) -> Option<String> {
+        self.fault.message()
+    }
+
+    /// Records a fault as if the commit feedback had reported `message`
+    /// (tests and the server's hidden fault-injection flag): the next
+    /// submission or wait fails exactly as after a real GPU error.
+    pub fn inject_fault(&self, message: &str) {
+        self.fault.record(message.to_owned());
+    }
+
     /// Copies byte ranges between buffers on the GPU and waits. Used for
     /// session forks and recurrent-state checkpoints, where a few hundred
     /// megabytes move at memory speed instead of through the host.
@@ -703,6 +720,64 @@ impl Fault {
             Err(e) => bail!("fault lock poisoned: {e}"),
         }
     }
+
+    fn message(&self) -> Option<String> {
+        self.message.lock().ok().and_then(|slot| slot.clone())
+    }
+}
+
+/// One line naming a Metal error: domain and code, what the code means for
+/// the Metal 4 command-queue domain, the system's description, and the
+/// underlying errors Metal attaches (the driver's own diagnosis, which the
+/// generic "operation couldn't be completed" text hides).
+fn describe_error(error: &NSError) -> String {
+    let domain = error.domain().to_string();
+    let code = error.code();
+    let mut text = format!("{domain} error {code}");
+    if domain == "MTL4CommandQueueErrorDomain" {
+        let meaning = match MTL4CommandQueueError(code) {
+            MTL4CommandQueueError::Timeout => Some("Timeout: the workload took longer to execute than the system allows"),
+            MTL4CommandQueueError::NotPermitted => Some("NotPermitted: the process has no access to a GPU device"),
+            MTL4CommandQueueError::OutOfMemory => Some("OutOfMemory: the GPU lacks the memory to execute a command buffer"),
+            MTL4CommandQueueError::DeviceRemoved => Some("DeviceRemoved: the GPU was removed before the command buffer completed"),
+            MTL4CommandQueueError::AccessRevoked => {
+                Some("AccessRevoked: the system revoked GPU access after too many timeouts or hangs")
+            }
+            MTL4CommandQueueError::Internal => Some("Internal: a problem inside the Metal framework"),
+            _ => None,
+        };
+        if let Some(meaning) = meaning {
+            text.push_str(&format!(" ({meaning})"));
+        }
+    }
+    text.push_str(&format!(": {}", error.localizedDescription()));
+    let info = error.userInfo();
+    let one_line = |e: &NSError| format!("{} error {}: {}", e.domain(), e.code(), e.localizedDescription());
+    let mut underlying: Vec<String> = Vec::new();
+    // The key strings are what `NSUnderlyingErrorKey` and
+    // `NSMultipleUnderlyingErrorsKey` hold (reading the extern statics
+    // needs `unsafe`; the literals do not).
+    if let Some(object) = info.objectForKey(&NSString::from_str("NSUnderlyingError"))
+        && let Some(e) = object.downcast_ref::<NSError>()
+    {
+        underlying.push(one_line(e));
+    }
+    if let Some(object) = info.objectForKey(&NSString::from_str("NSMultipleUnderlyingErrorsKey"))
+        && let Some(list) = object.downcast_ref::<NSArray<AnyObject>>()
+    {
+        for item in list.iter() {
+            if let Some(e) = item.downcast_ref::<NSError>() {
+                let line = one_line(e);
+                if !underlying.contains(&line) {
+                    underlying.push(line);
+                }
+            }
+        }
+    }
+    if !underlying.is_empty() {
+        text.push_str(&format!("; underlying: {}", underlying.join(", ")));
+    }
+    text
 }
 
 /// Commit feedback for one pass: how many of its command buffers reported,
@@ -744,7 +819,7 @@ impl Feedback {
         RcBlock::new(move |fb: NonNull<ProtocolObject<dyn MTL4CommitFeedback>>| {
             // SAFETY: Metal hands a valid feedback object for the callback.
             let fb = unsafe { fb.as_ref() };
-            let error = fb.error().map(|e| format!("{e:?}"));
+            let error = fb.error().map(|e| describe_error(&e));
             let (start, end) = (fb.GPUStartTime(), fb.GPUEndTime());
             if let Some(message) = &error {
                 fault.record(message.clone());

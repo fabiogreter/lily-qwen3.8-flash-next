@@ -13,6 +13,14 @@
 //! no request has run for that long, and loads it again for the next request,
 //! which waits instead of failing. SIGTERM/SIGINT stop the listener, give the
 //! running request a bounded grace, spill the sessions and exit 0.
+//!
+//! A GPU fault (a Metal 4 command-queue error such as a timeout, reported
+//! through the commit feedback) makes the context permanently unusable, so
+//! the engine thread answers the running request with 503, drops the whole
+//! engine without spilling (the caches on a faulted queue are not
+//! trustworthy) and loads it again; `/health` says `recovering` meanwhile.
+//! More than [`MAX_RECOVERIES`] faults within [`RECOVERY_WINDOW`] exit the
+//! process with status 1 for the supervisor to restart it.
 
 pub mod api;
 pub mod disk;
@@ -111,6 +119,10 @@ pub struct ServeOptions {
     pub sampling: SamplingOverrides,
     /// Seconds without a request after which the engine is unloaded (0: never).
     pub idle_unload_secs: u64,
+    /// Testing only: record a Metal fault on the N-th request the engine
+    /// serves (1-based, counted across reloads) to exercise the recovery
+    /// path; `None` in normal operation.
+    pub inject_metal_fault: Option<u64>,
 }
 
 // --- lifecycle ---------------------------------------------------------------
@@ -129,6 +141,9 @@ pub enum State {
     Reloading = 3,
     /// A stop signal arrived; new requests are refused with 503.
     Stopping = 4,
+    /// A GPU fault took the engine down; it is being dropped and loaded
+    /// again. Requests wait for it (their cached prefixes are gone).
+    Recovering = 5,
 }
 
 impl State {
@@ -139,23 +154,27 @@ impl State {
             State::Idle => "idle",
             State::Reloading => "reloading",
             State::Stopping => "stopping",
+            State::Recovering => "recovering",
         }
     }
 
     /// Whether the server takes requests in this state (they may have to
     /// wait for a reload).
     pub fn accepting(self) -> bool {
-        matches!(self, State::Ready | State::Idle | State::Reloading)
+        matches!(self, State::Ready | State::Idle | State::Reloading | State::Recovering)
     }
 
     /// The `/health` status code and `status` field. `ok`/`loading` keep the
     /// meaning they had before idle unloading existed: a client that only
-    /// looks at the code sees 200 whenever a request would be served.
+    /// looks at the code sees 200 whenever a request would be served, with
+    /// one exception: `recovering` is 503 although requests are queued,
+    /// because something went wrong that an operator should notice.
     pub fn health(self) -> (u16, &'static str) {
         match self {
             State::Loading => (503, "loading"),
             State::Ready | State::Idle | State::Reloading => (200, "ok"),
             State::Stopping => (503, "stopping"),
+            State::Recovering => (503, "recovering"),
         }
     }
 }
@@ -180,8 +199,41 @@ impl Lifecycle {
             1 => State::Ready,
             2 => State::Idle,
             3 => State::Reloading,
-            _ => State::Stopping,
+            4 => State::Stopping,
+            _ => State::Recovering,
         }
+    }
+}
+
+/// Most automatic recoveries from GPU faults within [`RECOVERY_WINDOW`]; one
+/// more exits the process so the supervisor restarts it with its throttle.
+pub const MAX_RECOVERIES: usize = 3;
+pub const RECOVERY_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+/// Counts GPU-fault recoveries in a sliding window, so a GPU that keeps
+/// faulting does not keep the server in a reload loop that never serves.
+pub struct RecoveryBudget {
+    max: usize,
+    window: Duration,
+    faults: Vec<Instant>,
+}
+
+impl RecoveryBudget {
+    pub fn new(max: usize, window: Duration) -> Self {
+        Self { max, window, faults: Vec::new() }
+    }
+
+    /// Records a fault at `now`. `Some(n)`: recovering is allowed and this
+    /// is the n-th recovery within the window; `None`: the budget is used up.
+    pub fn record(&mut self, now: Instant) -> Option<usize> {
+        self.faults.retain(|&at| now.saturating_duration_since(at) < self.window);
+        self.faults.push(now);
+        (self.faults.len() <= self.max).then_some(self.faults.len())
+    }
+
+    /// Faults recorded within the window as of the last `record`.
+    pub fn faults_in_window(&self) -> usize {
+        self.faults.len()
     }
 }
 
@@ -499,7 +551,12 @@ impl<M: LanguageModel> Engine<M> {
         let started = Instant::now();
         let Engine { ctx, model, generator: _, mut sessions, scratch, next_id, .. } = self;
         let resident = ctx.current_allocated();
-        let (spilled, dropped) = sessions.spill_all(&ctx);
+        // A faulted queue cannot run the snapshot blits, and what its last
+        // command buffers left in the caches is not trustworthy either: the
+        // sessions are dropped and clients re-prefill (the disk tier's
+        // earlier copies were written by a healthy queue and stay valid).
+        let faulted = ctx.fault().is_some();
+        let (spilled, dropped) = if faulted { (0, sessions.drop_all()) } else { sessions.spill_all(&ctx) };
         let spill_secs = started.elapsed().as_secs_f64();
         drop(scratch);
         drop(sessions);
@@ -511,34 +568,55 @@ impl<M: LanguageModel> Engine<M> {
         drop(ctx);
         eprintln!(
             "{reason}: unloaded {} in {:.1}s ({:.1} GB was resident; {spilled} sessions spilled to disk, \
-             {dropped} dropped, in {spill_secs:.1}s; {:.2} GB in {allocations} pool allocations \
+             {dropped} dropped{}, in {spill_secs:.1}s; {:.2} GB in {allocations} pool allocations \
              released with the context)",
             M::MODEL_ID,
             started.elapsed().as_secs_f64(),
             resident as f64 / 1e9,
+            if faulted { " without spilling (GPU faulted; their state is not trustworthy)" } else { "" },
             left as f64 / 1e9,
         );
         next_id
     }
 
-    fn serve(&mut self, job: Job) {
+    /// Testing only: makes the context fail its next submission the way a
+    /// reported GPU error would.
+    fn inject_fault(&self) {
+        self.ctx.inject_fault("injected by --debug-inject-metal-fault");
+    }
+
+    /// Runs one request and answers it. Returns the GPU fault the context
+    /// recorded, if any: the engine is then unusable and must be replaced,
+    /// even when this request happened to finish before the feedback arrived.
+    fn serve(&mut self, job: Job) -> Option<String> {
         let mut sink = job.sink;
         let stream = job.prepared.stream;
         let kind = job.prepared.kind;
         let queued = job.queued_at.elapsed();
         let result = self.run(job.prepared, &mut sink);
+        let fault = self.ctx.fault();
         if let Err(error) = result {
-            eprintln!("request failed: {error:#}");
+            let (status, message) = match &fault {
+                Some(fault) => {
+                    eprintln!("request failed on a GPU fault (the engine reloads): {error:#}");
+                    (503, format!("the GPU command queue failed ({fault}); the engine is reloading, retry shortly"))
+                }
+                None => {
+                    eprintln!("request failed: {error:#}");
+                    (500, "internal server error".to_owned())
+                }
+            };
             if !sink.started {
-                sink.start(500, "application/json");
-                sink.send(error_json("server_error", "internal server error"));
+                sink.start(status, "application/json");
+                sink.send(error_json("server_error", message));
             } else if stream {
-                sink.sse(&json!({"error": {"message": "internal server error", "type": "server_error"}}));
+                sink.sse(&json!({"error": {"message": message, "type": "server_error"}}));
                 sink.send(b"data: [DONE]\n\n".to_vec());
             }
         }
         sink.end();
         let _ = (kind, queued);
+        fault
     }
 
     fn run(&mut self, p: Prepared, sink: &mut Sink) -> Result<()> {
@@ -995,24 +1073,32 @@ fn engine_loop<M: LanguageModel>(
     shutdown: Arc<Shutdown>,
     address: SocketAddr,
 ) {
-    let fatal = |what: &str, error: anyhow::Error, rx: &Receiver<Cmd>| -> ! {
-        eprintln!("{what}: {error:#}");
+    // Exits with status 1 after logging `what` and refusing the queued
+    // requests with `status`/`client_message`.
+    let exit_failed = |what: String, status: u16, client_message: &str, rx: &Receiver<Cmd>| -> ! {
+        eprintln!("{what}");
         lifecycle.set(State::Stopping);
         let mut refused = 0usize;
         while let Ok(Cmd::Job(job)) = rx.try_recv() {
-            job.reject(500, "the model failed to load");
+            job.reject(status, client_message);
             refused += 1;
         }
         if refused > 0 {
-            eprintln!("exiting: refused {refused} queued requests with 500");
+            eprintln!("exiting: refused {refused} queued requests with {status}");
         }
         std::process::exit(1)
+    };
+    let fatal = |what: &str, error: anyhow::Error, rx: &Receiver<Cmd>| -> ! {
+        exit_failed(format!("{what}: {error:#}"), 500, "the model failed to load", rx)
     };
     let mut engine = match Engine::<M>::load(model_dir, options, generator.clone(), shutdown.clone(), 1) {
         Ok(engine) => Some(engine),
         Err(error) => fatal("engine failed to start", error, &rx),
     };
     let mut next_id = 1;
+    let mut recoveries = RecoveryBudget::new(MAX_RECOVERIES, RECOVERY_WINDOW);
+    let mut inject_fault_at = options.inject_metal_fault;
+    let mut served = 0u64;
     lifecycle.set(State::Ready);
     eprintln!(
         "ready: serving {} on http://{address}{}",
@@ -1052,8 +1138,50 @@ fn engine_loop<M: LanguageModel>(
                         }
                     }
                 }
-                engine.as_mut().expect("engine loaded").serve(*job);
+                served += 1;
+                if inject_fault_at.take_if(|at| *at == served).is_some() {
+                    eprintln!("debug: injecting a Metal fault on request {served} (--debug-inject-metal-fault)");
+                    engine.as_ref().expect("engine loaded").inject_fault();
+                }
+                let fault = engine.as_mut().expect("engine loaded").serve(*job);
                 idle.touch(Instant::now());
+                if let Some(fault) = fault {
+                    let faulted = engine.take().expect("engine loaded");
+                    lifecycle.set(State::Recovering);
+                    let window = describe_secs(RECOVERY_WINDOW.as_secs());
+                    let Some(attempt) = recoveries.record(Instant::now()) else {
+                        exit_failed(
+                            format!(
+                                "GPU fault: {fault}; fault {} within {window} exceeds the {MAX_RECOVERIES} automatic \
+                                 recoveries, exiting for the supervisor to restart the process",
+                                recoveries.faults_in_window()
+                            ),
+                            503,
+                            "the server is restarting after repeated GPU faults",
+                            &rx,
+                        );
+                    };
+                    eprintln!(
+                        "GPU fault: {fault}; dropping the engine and loading it again \
+                         (recovery {attempt} of {MAX_RECOVERIES} within {window})"
+                    );
+                    next_id = faulted.unload("GPU fault");
+                    let started = Instant::now();
+                    match Engine::<M>::load(model_dir, options, generator.clone(), shutdown.clone(), next_id) {
+                        Ok(loaded) => {
+                            eprintln!(
+                                "recovered: reloaded {} in {:.1}s after the GPU fault; resident sessions were \
+                                 dropped, clients re-prefill (disk tier entries still apply)",
+                                M::MODEL_ID,
+                                started.elapsed().as_secs_f64()
+                            );
+                            engine = Some(loaded);
+                            lifecycle.set(State::Ready);
+                            idle.touch(Instant::now());
+                        }
+                        Err(error) => fatal("engine failed to reload after a GPU fault", error, &rx),
+                    }
+                }
             }
             Ok(Cmd::Wake) => {}
             Err(RecvTimeoutError::Timeout) => {
@@ -1281,7 +1409,7 @@ fn handle(front: &Front, mut stream: TcpStream) {
                     refuse(stream, &what, 503, "server_error", "model is still loading");
                     return;
                 }
-                State::Ready | State::Idle | State::Reloading => {}
+                State::Ready | State::Idle | State::Reloading | State::Recovering => {}
             }
             let (tx, rx) = mpsc::channel();
             let cancelled = Arc::new(AtomicBool::new(false));

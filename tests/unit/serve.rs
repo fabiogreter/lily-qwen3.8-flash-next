@@ -124,21 +124,48 @@ fn health_keeps_ok_and_loading_and_adds_the_state() {
     assert_eq!(State::Idle.health(), (200, "ok"));
     assert_eq!(State::Reloading.health(), (200, "ok"));
     assert_eq!(State::Stopping.health(), (503, "stopping"));
+    // Recovering from a GPU fault: requests are queued for the reload, but
+    // the code is 503 so a monitor sees that something went wrong.
+    assert_eq!(State::Recovering.health(), (503, "recovering"));
+    assert!(State::Recovering.accepting());
     for state in [State::Loading, State::Ready, State::Idle, State::Reloading, State::Stopping] {
         assert_eq!(state.accepting(), state.health().0 == 200, "{state:?}");
     }
     assert_eq!(State::Idle.as_str(), "idle");
     assert_eq!(State::Reloading.as_str(), "reloading");
+    assert_eq!(State::Recovering.as_str(), "recovering");
 }
 
 #[test]
 fn lifecycle_round_trips_every_state() {
     let lifecycle = Lifecycle::new(State::Loading);
     assert_eq!(lifecycle.get(), State::Loading);
-    for state in [State::Ready, State::Idle, State::Reloading, State::Stopping, State::Loading] {
+    for state in [State::Ready, State::Idle, State::Reloading, State::Stopping, State::Recovering, State::Loading] {
         lifecycle.set(state);
         assert_eq!(lifecycle.get(), state);
     }
+}
+
+#[test]
+fn recovery_budget_allows_three_faults_per_window_then_gives_up() {
+    let t0 = Instant::now();
+    let m = |minutes: u64| Duration::from_secs(minutes * 60);
+    let mut budget = RecoveryBudget::new(3, m(10));
+    assert_eq!(budget.record(t0), Some(1));
+    assert_eq!(budget.record(t0 + m(1)), Some(2));
+    assert_eq!(budget.record(t0 + m(2)), Some(3));
+    // The fourth fault within ten minutes is one too many.
+    assert_eq!(budget.record(t0 + m(3)), None);
+    assert_eq!(budget.faults_in_window(), 4);
+    // The window slides: once the early faults age out, recovering resumes.
+    let mut budget = RecoveryBudget::new(3, m(10));
+    for i in 0..3 {
+        assert!(budget.record(t0 + m(i)).is_some());
+    }
+    assert_eq!(budget.record(t0 + m(10)), Some(3), "the fault at t0 has aged out");
+    assert_eq!(budget.record(t0 + m(10) + Duration::from_secs(1)), None);
+    // The server's own constants.
+    assert_eq!((MAX_RECOVERIES, RECOVERY_WINDOW), (3, Duration::from_secs(600)));
 }
 
 #[test]

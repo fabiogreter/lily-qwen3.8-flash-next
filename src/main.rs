@@ -111,6 +111,12 @@ struct Cli {
     frequency_penalty: Option<f32>,
     #[arg(long)]
     repetition_penalty: Option<f32>,
+
+    /// Testing only: record a Metal fault on the N-th request the engine
+    /// serves (counted from 1 across reloads) so the fault recovery path can
+    /// be exercised end to end.
+    #[arg(long, hide = true)]
+    debug_inject_metal_fault: Option<u64>,
 }
 
 fn parse_bytes(text: &str) -> Result<usize> {
@@ -162,6 +168,7 @@ fn main() -> Result<()> {
             repetition_penalty: cli.repetition_penalty,
         },
         idle_unload_secs: parse_duration_secs(&cli.idle_unload)?,
+        inject_metal_fault: cli.debug_inject_metal_fault,
     };
     lily::serve::run(&cli.model, options)
 }
