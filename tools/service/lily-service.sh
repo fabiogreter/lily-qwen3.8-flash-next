@@ -6,7 +6,8 @@
 #   tools/service/lily-service.sh start      run it now (kickstart)
 #   tools/service/lily-service.sh stop       SIGTERM it: the running request gets 10 s, sessions are
 #                                            spilled to disk, exit 0; stays down until `start` or login
-#   tools/service/lily-service.sh restart    kickstart -k (stop, then start)
+#   tools/service/lily-service.sh restart    stop, wait for the old process to release the
+#                                            model's memory, then start
 #   tools/service/lily-service.sh status     launchd state, pid, exit code, /health, memory
 #   tools/service/lily-service.sh logs [N]   the last N (default 40) log lines, then follow
 #
@@ -119,9 +120,34 @@ cmd_stop() {
     fi
 }
 
+# The pid launchd currently tracks for the job, empty when it is not running.
+service_pid() {
+    launchctl print "$target" 2>/dev/null | awk -F' = ' '/^\tpid = /{print $2; exit}'
+}
+
+# Waits for the running instance to be gone. The outgoing process holds the
+# model's GPU memory (73 GB) until it has finished spilling its sessions, so a
+# replacement started before it exits asks a 128 GB machine for two full
+# models at once. That happened on 2026-09-12 (102.8 GB + 68.6 GB resident,
+# 62 MB free) and the machine panicked.
+wait_for_exit() {
+    local timeout=${1:-180} waited=0
+    while [ -n "$(service_pid)" ]; do
+        if [ "$waited" -ge "$timeout" ]; then
+            die "still running ${timeout}s after SIGTERM; refusing to start a second instance"
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+    [ "$waited" -gt 0 ] && echo "previous instance exited after ${waited}s"
+    return 0
+}
+
 cmd_restart() {
     loaded || die "$target is not loaded; run install first"
-    launchctl kickstart -k "$target"
+    cmd_stop
+    wait_for_exit
+    launchctl kickstart "$target"
     echo "restarted $target"
 }
 
