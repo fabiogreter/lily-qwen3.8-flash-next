@@ -7,8 +7,8 @@ ever resident. Quantization is `mlx.core.quantize`, so the packed layout is
 bit-identical to what lily's Q4/Q8 Metal kernels consume.
 
     .venv/bin/python tools/convert/convert_qwen38_flash_next.py \
-        --src ~/projects/personal/local-llms/models/Qwen3.8-Flash-Next \
-        --dst ~/projects/personal/local-llms/models/Qwen3.8-Flash-Next-lily-q4 \
+        --src ~/models/Qwen3.8-Flash-Next \
+        --dst ~/models/Qwen3.8-Flash-Next-lily-q4 \
         [--layers 4] [--dry-run]
 
 `mlx` needs a Metal device even for CPU arrays, so a real conversion must run

@@ -4976,7 +4976,7 @@
  "prefill_seconds": 54.03,
  "meta": {
   "source": "lily-dequant",
-  "directory": "~/models/Qwen3.8-Flash-Next-lily-q4-l4",
+  "directory": "<model-dir>",
   "layers": 4,
   "dtype": "bf16",
   "budget": 2048,

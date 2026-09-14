@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Performance timeline: run the fixed lily-bench matrix at one or more commits
 # and record every run under docs/bench/<date>-<sha>/, then regenerate
-# docs/performance-timeline.md. Run it on demand, on mains power; nothing runs
-# it automatically.
+# docs/performance-timeline.md. Both are local measurement output and are not
+# tracked. Run it on demand, on mains power; nothing runs it automatically.
 #
 #   tools/bench/timeline.sh --note "Q8 skinny GEMMs for m <= 16"
 #   tools/bench/timeline.sh --commit 1e33b4e --commit f5b3317 --commit HEAD --cooldown 20

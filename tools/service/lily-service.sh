@@ -12,7 +12,7 @@
 #   tools/service/lily-service.sh logs [N]   the last N (default 40) log lines, then follow
 #
 # Environment for `install` (all optional except the model):
-#   LILY_MODEL        checkpoint directory (default: ~/projects/personal/local-llms/models/Qwen3.8-Flash-Next-lily-q4)
+#   LILY_MODEL        checkpoint directory (default: ~/models/Qwen3.8-Flash-Next-lily-q4)
 #   LILY_BIN          server binary (default: <repo>/target/release/lily)
 #   LILY_BIND         listen address (default: 127.0.0.1:8000)
 #   LILY_MAX_SEQ      --max-seq (default: 131072)
@@ -42,7 +42,7 @@ loaded() { launchctl print "$target" >/dev/null 2>&1; }
 
 render() {
     local bin=${LILY_BIN:-$repo/target/release/lily}
-    local model=${LILY_MODEL:-$HOME/projects/personal/local-llms/models/Qwen3.8-Flash-Next-lily-q4}
+    local model=${LILY_MODEL:-$HOME/models/Qwen3.8-Flash-Next-lily-q4}
     local bind=${LILY_BIND:-127.0.0.1:8000}
     local max_seq=${LILY_MAX_SEQ:-131072}
     local idle=${LILY_IDLE_UNLOAD:-30m}

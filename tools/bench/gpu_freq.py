@@ -9,7 +9,7 @@ Capture while tools/bench/timeline.sh runs (own terminal, needs sudo):
 
 Then, for one or more record directories:
 
-    tools/bench/gpu_freq.py gpu-power.log docs/bench/2026-09-09-*/ [--annotate]
+    tools/bench/gpu_freq.py gpu-power.log docs/bench/<date>-<sha>/ [--annotate]
 
 A run's window is the timestamp in its .env.txt (UTC, taken right before the
 process started) to the modification time of its result JSON (written at the

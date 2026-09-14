@@ -334,7 +334,7 @@
  "prefill_seconds": 1.23,
  "meta": {
   "source": "hf-bf16",
-  "directory": "~/models/Qwen3.8-Flash-Next",
+  "directory": "<model-dir>",
   "layers": 4,
   "dtype": "bf16",
   "budget": 2048,

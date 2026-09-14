@@ -16,3 +16,11 @@ bench-results/
 
 # powermetrics capture for tools/bench/gpu_freq.py, taken by hand
 gpu-power.log
+
+# The local development record: raw benchmark records, dated progress reports,
+# evaluation runs and superseded design notes. Kept on disk, not published.
+docs/bench/
+docs/2026-*
+docs/performance-timeline.md
+docs/phase2-server-design.md
+docs/optimization-potential.md

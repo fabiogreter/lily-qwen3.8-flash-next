@@ -1,89 +1,78 @@
 # lily
 
-A Metal inference server for Apple Silicon, forked from Perplexity's
-[pplx-garden/lily](https://github.com/perplexityai/pplx-garden/tree/main/lily)
-(imported at commit `1ed972e`, 2026-09-02) and extended to a second model and
-to a full OpenAI-compatible API:
+lily is a Metal inference server for Apple Silicon. It loads one quantized
+checkpoint, runs the whole model as hand-written Metal kernels, and serves it
+over an OpenAI-compatible HTTP API. The kernels compile from source at
+runtime; there is no offline shader build step.
 
-| `model_type`  | checkpoint                                                   | status              |
-|---------------|--------------------------------------------------------------|---------------------|
-| `qwen3_5_moe` | Qwen3.6-35B-A3B, MLX affine 4-bit (upstream's target)        | unchanged graph, new API |
-| `qwen4_exp`   | Qwen3.8-Flash-Next, lily's own `qwen4_exp-affine-v1` layout  | this fork           |
+It is a fork of Perplexity's
+[pplx-garden/lily](https://github.com/perplexityai/pplx-garden/tree/main/lily),
+imported at commit `1ed972e` (2026-09-02). The fork adds a second model
+architecture and the server around it:
 
-The Metal kernels compile from source at runtime; there is no offline shader
-build step.
-
-Reports, with measurement contract (newest first):
-
-- [2026-09-11: an opencode agent session against the server](docs/2026-09-11-opencode-session-report.md)
-  (100 requests, 94.9% of prompt tokens served from the session cache, disk restores, two concurrent sessions)
-- [2026-09-11: per-kernel profile and the fusion work it picked](docs/2026-09-11-kernel-profile-and-fusion-report.md)
-  (profiler mode, decode/verify/draft breakdowns, fused hyper-connection read, router top-k, small-m MoE fusion)
-- [2026-09-10: the accepted count decided on the GPU](docs/2026-09-10-gpu-accepted-count-report.md)
-  (draft pass committed behind the verify pass, GPU-supplied positions, the one-draft-in-ninety route effect)
-- [2026-09-09: the per-token host round trip, parked passes, bandwidth probes, Metal 4 port](docs/2026-09-09-host-round-trip-report.md)
-- [2026-09-08: phase 3, speculative decoding and the disk tier](docs/2026-09-08-phase3-speculation-disk-report.md)
-  (98 tok/s greedy with two drafts against 76 plain at that commit; evicted sessions resume from disk)
-- [2026-09-08: phase 2, the server and its memory](docs/2026-09-08-phase2-server-report.md)
-  (71 GB resident, 32 GB table in the page cache, decode 78 tok/s greedy / 62 to 75 sampling)
-- [2026-09-07: Qwen3.8-Flash-Next engine on the M5 Max](docs/2026-09-07-performance-qwen38-flash-next.md)
-  (first numbers: 82 tok/s decode, 1 949 tok/s prefill at 1K, correctness against the HF reference)
-- upstream, Qwen3.6-35B-A3B: [2026-09-01: MLX 0.31.2](docs/2026-09-01-performance-mlx-0.31.2.md),
-  [2026-09-02: MLX 0.32.2](docs/2026-09-02-performance-mlx-0.32.2.md)
-
-Performance over time, one fixed matrix per commit: [performance timeline](docs/performance-timeline.md)
-(records in `docs/bench/`, produced on demand by `tools/bench/timeline.sh`; the interleaved A/B pairs live in
-`docs/bench/ab-*/`, the GPU clock trace of the first series in `docs/bench/2026-09-09-interleaved-gpu-clocks.md`).
-
-Design notes: [phase 2 design](docs/phase2-server-design.md),
-[checkpoint format](docs/qwen38-flash-next-checkpoint-format.md).
-
-Where to pick up: [optimization potential](docs/optimization-potential.md) records every remaining
-performance lever with its evidence, estimated upside, effort and the measurement that would settle
-it, including the first per-kernel prefill profile (2026-09-11), and ends with a ranked shortlist.
+| `model_type`  | checkpoint                                                  | status                   |
+|---------------|-------------------------------------------------------------|--------------------------|
+| `qwen3_5_moe` | Qwen3.6-35B-A3B, MLX affine 4-bit (upstream's target)       | unchanged graph, new API |
+| `qwen4_exp`   | Qwen3.8-Flash-Next, lily's own `qwen4_exp-affine-v1` layout | this fork                |
 
 Upstream's own account of the engine this fork started from: Perplexity,
 [Optimizing On-Device Inference for Apple Silicon](https://www.perplexity.ai/hub/blog/optimizing-on-device-inference-for-apple-silicon).
 
-## Qwen3.8-Flash-Next
+How the engine works: [docs/architecture.md](docs/architecture.md). What it
+measures: [docs/performance.md](docs/performance.md).
+
+## The model it serves
 
 Qwen3.8-Flash-Next is Qwen's `qwen4_exp` preview architecture: 48 layers of
-Gated DeltaNet / Qwen Sparse Attention (3:1) with 512-expert MoE, a 4-stream
+Gated DeltaNet / Qwen Sparse Attention (3:1) with a 512-expert MoE, a 4-stream
 gated residual (hyper-connections), a hashed n-gram embedding at layer 2 with
 a 51B-parameter table, and a QSA indexer that selects 512 blocks of 4 tokens
-per query once the context exceeds 2 051 tokens. Everything the model needs
-is implemented; the vision tower is dropped, and the multi-token-prediction
-head is converted separately and drives speculative decoding.
+per query once the context exceeds 2 051 tokens. A separate
+multi-token-prediction head drives speculative decoding.
 
 The checkpoint is produced by `tools/convert/convert_qwen38_flash_next.py`
 from the raw Hugging Face BF16 weights: affine 4-bit / group 64 for experts,
 attention, GDN, shared expert and embeddings, 4-bit / group 32 for the n-gram
 table, 8-bit for routers, gates and the hyper-connection mixers. The full
-checkpoint is 103 GB on disk, plus 1.5 GB for the multi-token-prediction
-draft head (`--mtp-only` appends it to an existing conversion).
+checkpoint is 103 GB on disk, plus 1.5 GB for the draft head. Of that, 71 GB
+is uploaded to the GPU and the 32 GB n-gram table stays in the page cache.
+The layout is written out in
+[docs/qwen38-flash-next-checkpoint-format.md](docs/qwen38-flash-next-checkpoint-format.md).
 
-**Speculative decoding.** With the draft head converted, the server verifies
-the head's proposals in batched trunk passes (`--mtp-drafts`, default 2): on
-the M5 Max greedy decoding runs at 117 tok/s instead of 87 at a 1K prompt and
-98 instead of 80 at 8K (timeline row `7fb89bf`, synthetic prompt), with 66 to
-80% of drafts accepted on real code and prose. Outputs do not depend on the draft count;
-the usage block reports `completion_tokens_details` with accepted and rejected
-drafts. Sampling with temperature accepts fewer drafts (the head drafts
-greedily) and gains less.
+### What is not supported
 
-**Memory.** Only 71 GB of it is uploaded to the GPU. The 32 GB n-gram table
-is a pure row gather (16 rows of 100 bytes per token), so the server memory
-maps the checkpoint files and copies the rows into a small staging buffer
-each step; the rows live in the page cache, evictable, or pinned with
-`--ngram-lock`. On a 128 GB machine this leaves room for tens of gigabytes of
-cached sessions without raising the GPU wired limit. `--ngram-table resident`
-restores the fully resident layout.
+- **The vision tower.** `model.visual.*` is dropped at conversion, and the
+  API rejects image content.
+- **Batch size 1.** One generation runs at a time; further requests queue.
+  There is no batching across requests.
+- **Greedy drafts only.** The draft head proposes with argmax, so a request
+  that samples with temperature accepts fewer drafts and gains less from
+  speculation than a greedy one.
+- **macOS 26 and Metal 4.** The engine submits through the Metal 4 command
+  queue and the GEMMs use Metal tensor operations. Older systems and Apple
+  GPUs before family 10 cannot run it.
+- **Other checkpoints.** lily validates the exact architecture and
+  quantization layout at load time. Dense Qwen checkpoints, smaller Qwen
+  checkpoints, BF16 checkpoints, GGUF, AWQ, GPTQ, int8 and fp8 are rejected.
+- **Constrained decoding.** `response_format` other than `text`, `n > 1` and
+  `logprobs` are rejected.
 
-Correctness is checked against Hugging Face transformers on the same
-dequantized weights with a 4-layer truncation (`tools/reference`): argmax
-agreement at every compared position at short context and through the sparse
-attention path, logit gaps within bf16 rounding. The paged table reproduces
-the resident table's logits exactly.
+## Performance
+
+On an M5 Max (40-core GPU, 128 GB), greedy, synthetic prompts, median of
+three repeats:
+
+| tok/s                  | 1K prompt | 8K prompt | 32K prompt |
+|------------------------|-----------|-----------|------------|
+| prefill                | 1 825     | 1 396     | 1 195      |
+| decode, no drafts      | 86.8      | 79.7      | 75.6       |
+| decode, 2 drafts       | 116.9     | 98.1      | 70.9       |
+
+Draft acceptance on this prompt is 73% at 1K and 64% at 8K; on real code and
+prose it has measured 66 to 98%. The 1K prefill column and the 32K
+speculative cell both carry caveats. Method, noise band, the comparison
+against mlx-lm and the remaining levers are in
+[docs/performance.md](docs/performance.md).
 
 ## Requirements
 
@@ -93,21 +82,48 @@ the resident table's logits exactly.
   Metal tensor operations
 - Rust 1.92, pinned by `rust-toolchain.toml` (this repo drives it through
   asdf's `rustup`; `.tool-versions` names the asdf shim version)
-- A converted checkpoint (see above), or upstream's
+- A converted checkpoint (see below), or upstream's
   `mlx-community/Qwen3.6-35B-A3B-4bit` at revision
   `38740b847e4cb78f352aba30aa41c76e08e6eb46`
+- About 103 GB of memory for the full Qwen3.8-Flash-Next checkpoint, plus the
+  session cache budget: 71 GB of GPU-resident weights and 32 GB of page cache
+  for the n-gram table
 
-Lily validates the exact architecture and quantization layout at load time.
-Dense Qwen checkpoints, smaller Qwen checkpoints, BF16 checkpoints, GGUF,
-AWQ, GPTQ, int8 and fp8 are not supported.
+## Converting a checkpoint
 
-## Run
+The converter needs a Python environment with `mlx`, `safetensors`, `numpy`,
+`torch` and `transformers`, and a Metal device (`mlx` needs one even for CPU
+arrays). `--dry-run` never imports `mlx`.
+
+```sh
+uv venv --python 3.13 .venv
+uv pip install --python .venv/bin/python mlx safetensors numpy torch \
+    "transformers @ git+https://github.com/huggingface/transformers"
+
+.venv/bin/python tools/convert/convert_qwen38_flash_next.py \
+    --src ~/models/Qwen3.8-Flash-Next \
+    --dst ~/models/Qwen3.8-Flash-Next-lily-q4
+```
+
+The full 48-layer conversion takes about a minute on an M5 Max and writes
+103.1 GB. `--layers N` truncates the model, which is how the test checkpoints
+are made (`--layers 4` writes 38.6 GB). `--mtp-only` appends the 1.5 GB
+draft head to an existing conversion; `--no-mtp` leaves it out. See
+[tools/README.md](tools/README.md) for the other flags and
+[docs/qwen38-flash-next-checkpoint-format.md](docs/qwen38-flash-next-checkpoint-format.md)
+for what it writes.
+
+## Building
 
 ```sh
 cargo build --release --locked
+```
 
+## Running the server
+
+```sh
 ./target/release/lily \
-  --model /path/to/Qwen3.8-Flash-Next-lily-q4 \
+  --model ~/models/Qwen3.8-Flash-Next-lily-q4 \
   --bind 127.0.0.1:8000 \
   --max-seq 131072
 ```
@@ -143,19 +159,18 @@ apply to generated tokens); `stop` strings; `max_tokens` /
 `max_completion_tokens` (default: the rest of the context; a larger value is
 clamped to it, as OpenAI-compatible servers do, and the response then ends
 with `finish_reason: "length"`); `stream_options.include_usage`;
-`reasoning_effort` (`none` disables
-thinking, `low`, `medium`, `high`); `chat_template_kwargs` with
-`enable_thinking`, `reasoning_effort`, `preserve_thinking`; and
-`prompt_cache_key` as a cache hint. Sampling defaults come from the
-checkpoint's `generation_config.json` (temperature 1.0, top_k 20, top_p 0.95
-for Qwen3.8) and can be overridden on the command line. `top_k` above 1 024
-or unset is capped at 1 024 candidates.
+`reasoning_effort` (`none` disables thinking, `low`, `medium`, `high`);
+`chat_template_kwargs` with `enable_thinking`, `reasoning_effort`,
+`preserve_thinking`; and `prompt_cache_key` as a cache hint. Sampling
+defaults come from the checkpoint's `generation_config.json` (temperature
+1.0, top_k 20, top_p 0.95 for Qwen3.8) and can be overridden on the command
+line. `top_k` above 1 024 or unset is capped at 1 024 candidates.
 
 Reasoning comes back as `reasoning_content` (in `message` or in stream
-deltas). Tool calls are parsed from the model's
-`<tool_call><function=…>` XML, typed by the tool's JSON schema, and returned
-as OpenAI `tool_calls` with `finish_reason: "tool_calls"`. The final message
-must be `user` or `tool`.
+deltas). Tool calls are parsed from the model's `<tool_call><function=…>`
+XML, typed by the tool's JSON schema, and returned as OpenAI `tool_calls`
+with `finish_reason: "tool_calls"`. The final message must be `user` or
+`tool`.
 
 Rejected with 400: images, `n > 1`, `logprobs`, `response_format` other than
 `text`, `echo`, and a prompt that fills the whole context (`prompt exceeds
@@ -165,38 +180,15 @@ the log, and a clamped `max_tokens` a `warning:` line. Requests wait in a
 bounded queue (`--queue`, 503 when full) and run one at a time; a client
 that disconnects cancels its generation at the next token.
 
-### Session cache
-
-Every request leaves its state in a cache of sessions under a byte budget
-(`--cache-bytes`; by default what the device's recommended working set leaves
-after the weights, the paged n-gram table (32 GB that lives in the page cache
-rather than GPU memory, with `--ngram-table paged`) and 8 GiB of headroom for
-the applications sharing the machine, but at least 8 GiB; on the 128 GB
-machine that is the floor, 8 GiB, and the log states the derivation as
-`session cache budget: ... = working set - allocated - paged weights -
-headroom`). A session holds the per-token caches for its
-tokens and up to three checkpoints of the recurrent state (Gated DeltaNet
-states and conv windows) taken at `prompt_len - 1` of recent requests. A new
-prompt resumes from the furthest position that is both checkpointed (or the
-live end) and a common prefix. Extending a conversation reuses its session in
-place; regenerating, editing, or branching forks a copy of the shared prefix,
-so parallel conversations never destroy each other's context. Per-token caches
-grow in 8 192-token steps. `usage.prompt_tokens_details.cached_tokens`
-reports the reuse.
-
-Sessions evicted from GPU memory go to a disk tier
-(`--disk-cache-dir`, default `~/Library/Caches/lily/sessions`;
-`--disk-cache-bytes`, default 100 GB, least recently used first, `0` turns it
-off; `--disk-cache-ttl`, default 3 days unused, after which an entry is
-deleted even when the budget has room). A later prompt that shares their
-prefix reads it back in about a second per few gigabytes instead of
-recomputing it; the tier survives restarts and is keyed by the model's cache
-layout, so other models never read it.
+Usage blocks report `prompt_tokens_details.cached_tokens` for session-cache
+reuse and `completion_tokens_details` with accepted and rejected drafts.
 
 ### Flags
 
 | flag | default | meaning |
 |------|---------|---------|
+| `--model` | required | checkpoint directory |
+| `--bind` | `127.0.0.1:8000` | HTTP listen address |
 | `--max-seq` | 131072 | prompt plus completion capacity per request (kernel limit 262 144) |
 | `--cache-bytes` | derived | GPU bytes for cached sessions, e.g. `24G` (default: working set - weights - paged table - 8 GiB, at least 8 GiB) |
 | `--max-sessions` | 16 | most cached sessions |
@@ -218,7 +210,33 @@ and records the top logits (used by `tools/reference/compare.py`), and
 `lily-bench` measures prefill and pipelined decode throughput (`--drafts N`
 measures speculative decoding and its acceptance rate instead).
 
-### Idle unloading and stopping
+### Session cache and disk tier
+
+Every request leaves its state in a cache of sessions under a byte budget
+(`--cache-bytes`; by default what the device's recommended working set leaves
+after the weights, the paged n-gram table and 8 GiB of headroom for the
+applications sharing the machine, but at least 8 GiB; the log states the
+derivation as `session cache budget: ... = working set - allocated - paged
+weights - headroom`). A session holds the per-token caches for its tokens and
+up to three checkpoints of the recurrent state (Gated DeltaNet states and
+conv windows) taken at `prompt_len - 1` of recent requests. A new prompt
+resumes from the furthest position that is both checkpointed (or the live
+end) and a common prefix. Extending a conversation reuses its session in
+place; regenerating, editing, or branching forks a copy of the shared prefix,
+so parallel conversations never destroy each other's context. Per-token
+caches grow in 8 192-token steps.
+
+Sessions evicted from GPU memory go to a disk tier
+(`--disk-cache-dir`, default `~/Library/Caches/lily/sessions`;
+`--disk-cache-bytes`, default 100 GB, least recently used first, `0` turns it
+off; `--disk-cache-ttl`, default 3 days unused, after which an entry is
+deleted even when the budget has room). A later prompt that shares their
+prefix reads it back in about a second per few gigabytes instead of
+recomputing it; the tier survives restarts and is keyed by the model's cache
+layout, so other models never read it. Only sessions of 256 tokens or more
+are kept, and an 8 GB free-space margin is respected.
+
+### Idle unloading, health states and stopping
 
 With `--idle-unload 30m` the engine drops the model once no request has run
 for half an hour: resident sessions go to the disk tier first, then the
@@ -237,31 +255,30 @@ engine is:
 whenever a request would be served, so clients that only read the status
 code behave as before.
 
-### GPU faults
-
-A Metal 4 command-queue error reported for a command buffer (typically
-`MTL4CommandQueueErrorDomain error 1`, a GPU **timeout**, which the system
-raises when a workload runs longer than it allows; severe memory pressure,
-with the GPU stalling on paging, is the likely trigger) leaves the queue in
-a state nothing can trust, so the server treats it as a transport failure:
-the running request gets a 503 whose message names the error (or a stream
-error event and `[DONE]` when the response had started), the engine is
+**GPU faults.** A Metal 4 command-queue error reported for a command buffer
+(typically `MTL4CommandQueueErrorDomain error 1`, a GPU timeout, which the
+system raises when a workload runs longer than it allows; severe memory
+pressure, with the GPU stalling on paging, is the likely trigger) leaves the
+queue in a state nothing can trust, so the server treats it as a transport
+failure: the running request gets a 503 whose message names the error (or a
+stream error event and `[DONE]` when the response had started), the engine is
 dropped **without spilling** its sessions (their GPU state is suspect;
 clients re-prefill, and entries the disk tier already holds stay valid),
 loaded again on the same thread while `/health` answers `503` with
 `"state": "recovering"`, and then serves again as `ready`. Requests that
 arrive meanwhile queue for the reload. More than 3 faults within 10 minutes
-exit the process with status 1, so the launchd agent restarts it with its
-`ThrottleInterval`. The log names the error and its meaning
+exit the process with status 1, so a supervisor restarts it with its
+throttle interval. The log names the error and its meaning
 (`GPU fault: MTL4CommandQueueErrorDomain error 1 (Timeout: ...)`), the
 recovery count, and the reload time.
 
-SIGTERM or SIGINT stop the server cleanly: the listener closes, a running
-request gets 10 s to finish (then it is cancelled and told so with a 503 or a
-stream error), queued requests get 503, resident sessions are spilled to the
-disk tier so the prefix caches survive the restart, and the process exits 0.
-A load that fails exits 1 so a supervisor restarts the server with its
-backoff instead of leaving a server up that can never answer.
+**Stopping.** SIGTERM or SIGINT stop the server cleanly: the listener closes,
+a running request gets 10 s to finish (then it is cancelled and told so with
+a 503 or a stream error), queued requests get 503, resident sessions are
+spilled to the disk tier so the prefix caches survive the restart, and the
+process exits 0. A second signal exits at once with status 130. A load that
+fails exits 1 so a supervisor restarts the server with its backoff instead of
+leaving a server up that can never answer.
 
 ### Running as a service
 
@@ -283,33 +300,41 @@ cargo test --locked
 This runs the CPU-reference kernel tests (including the hyper-connection, PLE,
 QSA and sampler kernels), the n-gram hasher and paged-table tests on a
 synthetic checkpoint, the shader compilation test, the output parser and
-tool-call tests, and the API schema tests. Tests that need a checkpoint are
-ignored by default:
+tool-call tests, and the API schema tests. They need a Metal device but no
+checkpoint. Tests that need a checkpoint are ignored by default:
 
 ```sh
-LILY_MODEL_DIR_35B=/path/to/Qwen3.6-35B-A3B-4bit \
+LILY_MODEL_DIR_35B=~/models/Qwen3.6-35B-A3B-4bit \
   cargo test --test test_tokenizer -- --ignored --test-threads=1
 
-LILY_MODEL_DIR_35B=/path/to/Qwen3.6-35B-A3B-4bit \
+LILY_MODEL_DIR_35B=~/models/Qwen3.6-35B-A3B-4bit \
   cargo test --test test_e2e_35b -- --ignored --test-threads=1
 
-LILY_MODEL_DIR_FLASH=/path/to/Qwen3.8-Flash-Next-lily-q4 \
+LILY_MODEL_DIR_FLASH=~/models/Qwen3.8-Flash-Next-lily-q4 \
   cargo test --release --lib paged_gather_timing -- --ignored --nocapture
 
 # Speculation invariance and the disk-tier round trip (a 4-layer conversion
 # with the draft head is enough):
-LILY_MODEL_DIR_FLASH=/path/to/Qwen3.8-Flash-Next-lily-q4-l4 \
+LILY_MODEL_DIR_FLASH=~/models/Qwen3.8-Flash-Next-lily-q4-l4 \
   cargo test --release --test test_speculative_flash -- --ignored --test-threads=1
 ```
 
+Two things to know before trusting a green run are in
+[CONTRIBUTING.md](CONTRIBUTING.md): a skipped test reports `ok`, and the
+tests share one GPU.
+
 End-to-end scripts against a running server live in `tools/e2e/` (`e2e.sh`,
-`longctx.py`, `disk.py`).
+`longctx.py`, `disk.py`). Correctness against Hugging Face transformers on
+the same dequantized weights is checked with `tools/reference/`; see
+[tools/README.md](tools/README.md).
 
 ## Source layout
 
 ```text
 src/config.rs         strict 35B-A3B checkpoint validation
 src/weights.rs        MLX affine Q4/Q8 weight loading (shared loader)
+src/metal.rs          Metal 4 transport: queue, argument tables, residency,
+                      passes, events, the per-kernel profile mode
 src/model.rs          Qwen3.5 prefill and decode graph
 src/moe_ffn.rs        sparse-MoE FFN graph shared by both models
 src/qwen4exp/         Qwen3.8-Flash-Next config, weights, n-gram table, model graph,
@@ -327,12 +352,15 @@ src/kernels/          Rust dispatch and Metal shader sources
   hc.*                hyper-connection (gated residual) kernels
   ple.*               n-gram embedding kernels
   qsa.*               Qwen Sparse Attention kernels
+  skinny.*            small-row GEMMs for the verify pass
+  spec.*              speculative accept and rollback kernels
   sample.*            GPU sampler
 tests/                kernel, API, tokenizer, shader, and 35B golden tests
-tools/                converter and Hugging Face reference harness
+tools/                converter, Hugging Face reference harness, bench and service scripts
 benchmarks/           Lily/MLX harnesses and the fail-closed matrix runner
 ```
 
 ## License
 
-Apache-2.0. See `LICENSE` and `NOTICE`.
+Apache-2.0. See `LICENSE` and `NOTICE`. `NOTICE` records the upstream
+copyright and the MLX and MLX-LM code the Metal kernels were adapted from.

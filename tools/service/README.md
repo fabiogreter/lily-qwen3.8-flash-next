@@ -6,7 +6,7 @@ model's memory to the system while nobody is talking to it.
 
 ```sh
 cargo build --release --locked
-LILY_MODEL=~/projects/personal/local-llms/models/Qwen3.8-Flash-Next-lily-q4 \
+LILY_MODEL=~/models/Qwen3.8-Flash-Next-lily-q4 \
     tools/service/lily-service.sh install
 tools/service/lily-service.sh status
 tools/service/lily-service.sh logs

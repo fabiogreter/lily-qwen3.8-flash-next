@@ -2,6 +2,9 @@
 """Turn the lily-bench records under docs/bench/<date>-<sha>/ into the tables in
 docs/performance-timeline.md.
 
+Both the records and that document are local measurement output and are not
+tracked; the document is created when it is missing.
+
 Each record directory holds a run.json (written by tools/bench/timeline.sh)
 and one lily-bench JSON per cell and repeat, named p<prompt>-d<drafts>-r<n>.json.
 Cells are summarised as the median over repeats, with the min and max shown so
@@ -9,7 +12,7 @@ run-to-run noise stays visible. Standard library only.
 
     tools/bench/summarize.py                       # print the tables
     tools/bench/summarize.py --write docs/performance-timeline.md
-    tools/bench/summarize.py --only docs/bench/2026-09-09-743cf98   # echo one run's rows
+    tools/bench/summarize.py --only docs/bench/<date>-<sha>     # echo one run's rows
 """
 import argparse
 import json
@@ -171,7 +174,7 @@ def render(runs):
     out.append(
         "Prefill is taken from the no-draft runs; the tokens column says whether the no-draft "
         "and speculative runs produced the same output (they legitimately differ on near-ties, "
-        "see the phase 3 report). Cells show the median over repeats; a range in parentheses "
+        "see docs/architecture.md). Cells show the median over repeats; a range in parentheses "
         "is the min and max, which is the run-to-run noise band."
     )
     return "\n".join(out) + "\n"

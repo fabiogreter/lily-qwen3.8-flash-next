@@ -11,8 +11,8 @@ Converts the raw Hugging Face BF16 checkpoint into lily's
 
 ```sh
 .venv/bin/python tools/convert/convert_qwen38_flash_next.py \
-    --src ~/projects/personal/local-llms/models/Qwen3.8-Flash-Next \
-    --dst ~/projects/personal/local-llms/models/Qwen3.8-Flash-Next-lily-q4 \
+    --src ~/models/Qwen3.8-Flash-Next \
+    --dst ~/models/Qwen3.8-Flash-Next-lily-q4 \
     [--layers 4] [--dry-run] [--ngram-bits 4 --ngram-group 32]
 ```
 
@@ -58,13 +58,17 @@ being quantization error.
 
 ## bench/timeline.sh and bench/summarize.py
 
-The performance timeline (`docs/performance-timeline.md`). `timeline.sh` runs
+The performance timeline. `timeline.sh` runs
 the fixed `lily-bench` matrix (1K / 8K / 32K prompts, 0 and 2 drafts, 96
 tokens, 3 repeats) at one or more commits (`--commit <rev>`, older commits are
 built in worktrees under `target/timeline/`, `HEAD` is the working tree),
 writes every run's JSON, a `.env.txt` snapshot (swap, paging, thermal level)
 and a `run.json` into `docs/bench/<date>-<sha>/`, and calls `summarize.py` to
-regenerate the tables. Several commits are interleaved per repeat so drift
+regenerate the tables in `docs/performance-timeline.md`. Both the records and
+that document are local measurement output: they are not tracked, and
+`summarize.py` creates the document when it is missing. The published
+numbers and the method behind them are in `docs/performance.md`.
+Several commits are interleaved per repeat so drift
 affects them equally; `--cooldown SEC` idles between runs. Run it by hand on
 mains power; it refuses to start on battery unless told `--allow-battery`, and
 nothing runs it automatically. About 10 minutes per commit. `summarize.py`
