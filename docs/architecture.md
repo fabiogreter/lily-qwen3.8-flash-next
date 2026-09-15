@@ -382,6 +382,19 @@ disconnect detection needs the socket: a general-purpose crate buffered
 writes and swallowed the errors, so a departed client kept the GPU busy to
 `max_tokens`.
 
+Each request's own numbers leave the engine twice. The `timings` object goes
+into the response (next to `usage`, and on the last chunk of a stream) from
+values the request already measured for its log line, so the addition is a
+`serde_json` serialization and nothing else; and a copy goes into a 32-entry
+ring buffer behind `GET /v1/timings`. The ring buffer is the only piece of
+frontend state that is not a lock-free atomic: the engine thread pushes one
+small entry per request and connection threads clone the buffer to answer,
+so the mutex is held for a push or a bounded copy and never across a socket
+write or a GPU call. It exists because client libraries drop response fields
+they do not know — the AI SDK's openai-compatible provider does, which is why
+the opencode plugin in `tools/opencode-plugin-timings/` reads the endpoint
+instead of the response.
+
 Sampling runs on the GPU, so that only the token id crosses to the host. Two
 kernels per step: a wide one applies the penalties (presence, frequency and
 repetition over generated tokens through a per-request count table) and

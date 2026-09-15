@@ -183,6 +183,46 @@ that disconnects cancels its generation at the next token.
 Usage blocks report `prompt_tokens_details.cached_tokens` for session-cache
 reuse and `completion_tokens_details` with accepted and rejected drafts.
 
+### Timings
+
+Every response carries a `timings` object next to `usage`: the same numbers
+the per-request log line prints, as JSON. It is lily's own extension, so a
+client that ignores the field sees exactly the response it saw before.
+
+| field | meaning |
+|-------|---------|
+| `prompt_tokens` | every token of the rendered prompt |
+| `cached_tokens` | prompt tokens the session cache supplied (resident prefix, fork, or a checkpoint restored from disk) |
+| `prefill_tokens` | prompt tokens actually run through the model: `prompt_tokens - cached_tokens` |
+| `prefill_ms` | the `prefix` figure of the log line: the cache lookup, a disk restore if there was one, the prefill and the checkpoint |
+| `prefill_per_second` | `prefill_tokens` per second, `null` when nothing was prefilled (never over the whole prompt, which a cache hit would inflate) |
+| `generated_tokens`, `decode_ms`, `decode_per_second` | the decode loop, rate `null` when nothing was generated |
+| `drafted_tokens`, `accepted_tokens`, `acceptance_ratio` | speculative decoding, all three `null` when the draft head is off for the request, so they never read as a 0 % acceptance; the ratio is `null` when nothing was proposed |
+
+Durations are milliseconds, rates tokens per second, and the final prompt
+token is fed by the first decode step rather than the prefill, so
+`prefill_ms` covers one token fewer than `prefill_tokens` counts.
+
+In a stream the object rides the last chunk before `data: [DONE]`: the usage
+chunk when the request asked for `stream_options.include_usage`, the
+finish-reason chunk otherwise. No client sees a chunk shape it did not
+already get.
+
+`GET /v1/timings` returns the same objects for the last 32 completed
+requests, newest first, each with its response `id`, `model` and `created`:
+
+```json
+{"object": "list", "data": [{"id": "chatcmpl-1789465213-2", "model": "Qwen3.8-Flash-Next",
+  "created": 1789465213, "timings": {"prompt_tokens": 21934, "cached_tokens": 0,
+  "prefill_tokens": 21934, "prefill_ms": 60098.238, "prefill_per_second": 364.97,
+  "generated_tokens": 16, "decode_ms": 415.843, "decode_per_second": 38.48,
+  "drafted_tokens": 10, "accepted_tokens": 10, "acceptance_ratio": 1.0}}]}
+```
+
+The endpoint exists because client libraries drop response fields they do not
+know: `tools/opencode-plugin-timings/` reads it to show lily's real prefill,
+decode and acceptance numbers in the opencode terminal UI.
+
 ### Flags
 
 | flag | default | meaning |
@@ -347,6 +387,7 @@ src/serve/api.rs      request schemas and validation
 src/serve/stream.rs   detokenizer, reasoning split, tool-call blocks, stop strings
 src/serve/tools.rs    tool schemas and the <tool_call> XML parser
 src/serve/session.rs  session cache with checkpoints, forks and a byte budget
+src/serve/timings.rs  the `timings` response object and the /v1/timings ring buffer
 src/serve/disk.rs     the disk tier below it (LRU, budget, format-tagged files)
 src/kernels/          Rust dispatch and Metal shader sources
   hc.*                hyper-connection (gated residual) kernels
@@ -356,7 +397,8 @@ src/kernels/          Rust dispatch and Metal shader sources
   spec.*              speculative accept and rollback kernels
   sample.*            GPU sampler
 tests/                kernel, API, tokenizer, shader, and 35B golden tests
-tools/                converter, Hugging Face reference harness, bench and service scripts
+tools/                converter, Hugging Face reference harness, bench and service scripts,
+                      the opencode timings plugin
 benchmarks/           Lily/MLX harnesses and the fail-closed matrix runner
 ```
 

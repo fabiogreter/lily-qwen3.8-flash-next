@@ -27,6 +27,7 @@ pub mod disk;
 pub mod http;
 mod session;
 pub mod stream;
+pub mod timings;
 pub mod tools;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -50,11 +51,15 @@ use crate::qwen4exp::{NgramStorage, Qwen4ExpModel};
 use api::{Defaults, Kind, Prepared};
 use session::SessionStore;
 use stream::{Event, OutputParser, ParserConfig};
+use timings::{Speculation, Timings, TimingsEntry, TimingsLog};
 use tools::ParsedToolCall;
 
 const MAX_REQUEST_BYTES: usize = 32 << 20;
 /// Recurrent-state checkpoints kept per session (the newest ones).
 const CHECKPOINTS_PER_SESSION: usize = 3;
+/// Completed requests `GET /v1/timings` remembers (a ring buffer; a client
+/// polls it right after its request, so a handful of entries is plenty).
+const TIMINGS_LOG_CAPACITY: usize = 32;
 /// Left free when the cache budget is derived automatically: room for the OS
 /// and the applications that share the machine with the server (a browser,
 /// containers, an IDE), so a full cache does not push them into swap.
@@ -455,6 +460,8 @@ struct Engine<M: LanguageModel> {
     drafts: usize,
     next_id: u64,
     shutdown: Arc<Shutdown>,
+    /// Where each finished request's numbers go for `GET /v1/timings`.
+    timings: Arc<TimingsLog>,
 }
 
 /// Where a request's text ends up when not streaming.
@@ -466,13 +473,8 @@ struct Collected {
 }
 
 impl<M: LanguageModel> Engine<M> {
-    fn load(
-        model_dir: &Path,
-        options: &ServeOptions,
-        generator: Arc<Generator>,
-        shutdown: Arc<Shutdown>,
-        next_id: u64,
-    ) -> Result<Self> {
+    fn load(model_dir: &Path, options: &ServeOptions, shared: &Shared, next_id: u64) -> Result<Self> {
+        let Shared { generator, shutdown, timings } = shared.clone();
         let ctx = MetalContext::new()?;
         let started = Instant::now();
         let model = M::load(&ctx, model_dir, &LoadOptions { ngram_storage: options.ngram_storage, mtp_drafts: options.mtp_drafts })?;
@@ -568,6 +570,7 @@ impl<M: LanguageModel> Engine<M> {
             drafts,
             next_id,
             shutdown,
+            timings,
         })
     }
 
@@ -652,7 +655,7 @@ impl<M: LanguageModel> Engine<M> {
         if sink.cancelled() {
             return Ok(());
         }
-        let Engine { ctx, model, generator, sessions, scratch, max_seq, drafts, next_id, shutdown } = self;
+        let Engine { ctx, model, generator, sessions, scratch, max_seq, drafts, next_id, shutdown, timings } = self;
         // The HTTP thread validated against the same limit; this only guards
         // the engine's buffers if the two ever disagree.
         ensure!(
@@ -799,6 +802,18 @@ impl<M: LanguageModel> Engine<M> {
             sessions.budget_bytes() as f64 / 1e9,
             sessions.disk().map(|d| format!(", disk {} ({:.1} GB)", d.len(), d.used_bytes() as f64 / 1e9)).unwrap_or_default(),
         );
+        // The same numbers the line above prints, as JSON: attached to the
+        // response below and kept for `GET /v1/timings`. Recorded before the
+        // cancellation checks so the log and the ring buffer never disagree.
+        let measured = Timings::measure(
+            n,
+            reused,
+            prefix_secs,
+            completion_tokens,
+            decode_secs,
+            (*drafts > 0).then_some(Speculation { drafted: generation.drafted, accepted: generation.accepted }),
+        );
+        timings.record(TimingsEntry { id: id.clone(), model: M::MODEL_ID, created, timings: measured });
         if sink.cancelled() {
             return Ok(());
         }
@@ -826,22 +841,31 @@ impl<M: LanguageModel> Engine<M> {
                 "rejected_prediction_tokens": generation.drafted - generation.accepted,
             });
         }
+        let timings_json = serde_json::to_value(measured)?;
         if p.stream {
-            if p.kind == Kind::Chat {
-                sink.sse(&chunk(&id, created, M::MODEL_ID, json!({}), Some(finish_reason)));
+            // `timings` rides the last chunk the stream already sends: the
+            // usage chunk when the client asked for one, the finish chunk
+            // otherwise. No client ever sees a chunk shape it did not
+            // already get, and the extension costs nothing to those that
+            // ignore it.
+            let mut last = if p.kind == Kind::Chat {
+                chunk(&id, created, M::MODEL_ID, json!({}), Some(finish_reason))
             } else {
-                sink.sse(&text_chunk(&id, created, M::MODEL_ID, "", Some(finish_reason)));
-            }
+                text_chunk(&id, created, M::MODEL_ID, "", Some(finish_reason))
+            };
             if p.include_usage {
-                sink.sse(&json!({
+                sink.sse(&last);
+                last = json!({
                     "id": id,
                     "object": if p.kind == Kind::Chat { "chat.completion.chunk" } else { "text_completion" },
                     "created": created,
                     "model": M::MODEL_ID,
                     "choices": [],
                     "usage": usage,
-                }));
+                });
             }
+            last["timings"] = timings_json;
+            sink.sse(&last);
             sink.send(b"data: [DONE]\n\n".to_vec());
         } else {
             let body = if p.kind == Kind::Chat {
@@ -875,6 +899,7 @@ impl<M: LanguageModel> Engine<M> {
                     "model": M::MODEL_ID,
                     "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
                     "usage": usage,
+                    "timings": timings_json,
                 })
             } else {
                 json!({
@@ -884,6 +909,7 @@ impl<M: LanguageModel> Engine<M> {
                     "model": M::MODEL_ID,
                     "choices": [{"index": 0, "text": collected.content, "finish_reason": finish_reason, "logprobs": null}],
                     "usage": usage,
+                    "timings": timings_json,
                 })
             };
             sink.start(200, "application/json");
@@ -1074,14 +1100,22 @@ pub fn run(model_dir: &Path, options: ServeOptions) -> Result<()> {
     }
 }
 
+/// The handles the HTTP threads and the engine thread share.
+#[derive(Clone)]
+struct Shared {
+    generator: Arc<Generator>,
+    shutdown: Arc<Shutdown>,
+    /// Where each finished request's numbers go for `GET /v1/timings`.
+    timings: Arc<TimingsLog>,
+}
+
 /// Everything the HTTP thread needs without the engine.
 struct Front {
-    generator: Arc<Generator>,
+    shared: Shared,
     defaults: Defaults,
     max_seq: usize,
     jobs: SyncSender<Cmd>,
     lifecycle: Arc<Lifecycle>,
-    shutdown: Arc<Shutdown>,
     /// Connection threads still running (the listener waits for them a
     /// little at shutdown so responses in flight get written).
     connections: Arc<AtomicUsize>,
@@ -1096,12 +1130,12 @@ struct Front {
 fn engine_loop<M: LanguageModel>(
     model_dir: &Path,
     options: &ServeOptions,
-    generator: Arc<Generator>,
+    shared: Shared,
     rx: Receiver<Cmd>,
     lifecycle: &Lifecycle,
-    shutdown: Arc<Shutdown>,
     address: SocketAddr,
 ) {
+    let Shared { shutdown, .. } = &shared;
     // Exits with status 1 after logging `what` and refusing the queued
     // requests with `status`/`client_message`.
     let exit_failed = |what: String, status: u16, client_message: &str, rx: &Receiver<Cmd>| -> ! {
@@ -1120,7 +1154,7 @@ fn engine_loop<M: LanguageModel>(
     let fatal = |what: &str, error: anyhow::Error, rx: &Receiver<Cmd>| -> ! {
         exit_failed(format!("{what}: {error:#}"), 500, "the model failed to load", rx)
     };
-    let mut engine = match Engine::<M>::load(model_dir, options, generator.clone(), shutdown.clone(), 1) {
+    let mut engine = match Engine::<M>::load(model_dir, options, &shared, 1) {
         Ok(engine) => Some(engine),
         Err(error) => fatal("engine failed to start", error, &rx),
     };
@@ -1155,7 +1189,7 @@ fn engine_loop<M: LanguageModel>(
                 if engine.is_none() {
                     lifecycle.set(State::Reloading);
                     let started = Instant::now();
-                    match Engine::<M>::load(model_dir, options, generator.clone(), shutdown.clone(), next_id) {
+                    match Engine::<M>::load(model_dir, options, &shared, next_id) {
                         Ok(loaded) => {
                             eprintln!("reloaded {} in {:.1}s for a waiting request", M::MODEL_ID, started.elapsed().as_secs_f64());
                             engine = Some(loaded);
@@ -1196,7 +1230,7 @@ fn engine_loop<M: LanguageModel>(
                     );
                     next_id = faulted.unload("GPU fault");
                     let started = Instant::now();
-                    match Engine::<M>::load(model_dir, options, generator.clone(), shutdown.clone(), next_id) {
+                    match Engine::<M>::load(model_dir, options, &shared, next_id) {
                         Ok(loaded) => {
                             eprintln!(
                                 "recovered: reloaded {} in {:.1}s after the GPU fault; resident sessions were \
@@ -1291,15 +1325,15 @@ fn run_with<M: LanguageModel + 'static>(model_dir: &Path, options: ServeOptions,
     let (jobs, job_rx) = mpsc::sync_channel::<Cmd>(options.queue.max(1));
     let lifecycle = Arc::new(Lifecycle::new(State::Loading));
     let shutdown = Arc::new(Shutdown::default());
+    let shared = Shared { generator, shutdown: shutdown.clone(), timings: Arc::new(TimingsLog::new(TIMINGS_LOG_CAPACITY)) };
     let engine_thread = {
         let model_dir = model_dir.to_path_buf();
         let options = options.clone();
-        let generator = generator.clone();
         let lifecycle = lifecycle.clone();
-        let shutdown = shutdown.clone();
+        let shared = shared.clone();
         std::thread::Builder::new()
             .name("lily-engine".into())
-            .spawn(move || engine_loop::<M>(&model_dir, &options, generator, job_rx, &lifecycle, shutdown, address))
+            .spawn(move || engine_loop::<M>(&model_dir, &options, shared, job_rx, &lifecycle, address))
             .context("spawning the engine thread")?
     };
     {
@@ -1328,12 +1362,11 @@ fn run_with<M: LanguageModel + 'static>(model_dir: &Path, options: ServeOptions,
 
     let connections = Arc::new(AtomicUsize::new(0));
     let front = Arc::new(Front {
-        generator,
+        shared,
         defaults,
         max_seq,
         jobs,
         lifecycle,
-        shutdown: shutdown.clone(),
         connections: connections.clone(),
         model_id: M::MODEL_ID,
         idle_unload_secs: options.idle_unload_secs,
@@ -1380,7 +1413,7 @@ fn handle(front: &Front, mut stream: TcpStream) {
     };
     let path = request.path.split('?').next().unwrap_or("").to_string();
     let what = format!("{} {path}", request.method);
-    let state = if front.shutdown.requested() { State::Stopping } else { front.lifecycle.get() };
+    let state = if front.shared.shutdown.requested() { State::Stopping } else { front.lifecycle.get() };
     match (request.method.as_str(), path.as_str()) {
         ("GET", "/health") => {
             let (code, status) = state.health();
@@ -1395,6 +1428,12 @@ fn handle(front: &Front, mut stream: TcpStream) {
                 }),
             );
         }
+        // Lily's own extension: the `timings` object of the most recent
+        // completed requests, newest first, for clients whose SDK drops
+        // unknown response fields.
+        ("GET", "/v1/timings") => {
+            send_json(stream, 200, &json!({"object": "list", "data": front.shared.timings.recent()}));
+        }
         ("GET", "/v1/models") => send_json(
             stream,
             200,
@@ -1407,11 +1446,11 @@ fn handle(front: &Front, mut stream: TcpStream) {
             let prepared = if path == "/v1/chat/completions" {
                 serde_json::from_slice::<api::ChatRequest>(&request.body)
                     .context("parsing the chat request")
-                    .and_then(|r| api::prepare_chat(r, front.generator.tokenizer(), &front.defaults, front.max_seq))
+                    .and_then(|r| api::prepare_chat(r, front.shared.generator.tokenizer(), &front.defaults, front.max_seq))
             } else {
                 serde_json::from_slice::<api::CompletionRequest>(&request.body)
                     .context("parsing the completion request")
-                    .and_then(|r| api::prepare_completion(r, front.generator.tokenizer(), &front.defaults, front.max_seq))
+                    .and_then(|r| api::prepare_completion(r, front.shared.generator.tokenizer(), &front.defaults, front.max_seq))
             };
             let prepared = match prepared {
                 Ok(p) => p,
@@ -1453,7 +1492,7 @@ fn handle(front: &Front, mut stream: TcpStream) {
                 }
             }
         }
-        (_, "/health" | "/v1/models" | "/v1/chat/completions" | "/v1/completions") => {
+        (_, "/health" | "/v1/models" | "/v1/timings" | "/v1/chat/completions" | "/v1/completions") => {
             refuse(stream, &what, 405, "invalid_request_error", "method not allowed");
         }
         _ => refuse(stream, &what, 404, "invalid_request_error", "not found"),
