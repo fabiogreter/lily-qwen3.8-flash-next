@@ -1,10 +1,10 @@
 # opencode TUI plugin: lily timings
 
-Shows what the last request actually cost, to the right of the session
-prompt in [opencode](https://opencode.ai):
+Shows what the last request actually cost and what the session has cost so
+far, to the right of the session prompt in [opencode](https://opencode.ai):
 
 ```
-pf 21.9k 365/s · dec 16 38.5/s · spec 100%
+now pf 21.9k 365/s · dec 16 38.5/s · spec 100%  Σ 7 req · pf 1.1k/s · dec 98/s · cached 62% · spec 71%
 ```
 
 The numbers are lily's own. The community throughput plugins estimate tokens
@@ -14,6 +14,8 @@ separated and the draft head's acceptance is real.
 
 ## What each number means
 
+The half after `now` is the request that just finished.
+
 | part | meaning |
 |------|---------|
 | `pf 21.9k 365/s` | 21 934 prompt tokens were run through the model, at 365 tokens per second. The rate is over the tokens actually computed, never over the whole prompt, so a cache hit cannot inflate it. |
@@ -21,9 +23,28 @@ separated and the draft head's acceptance is real.
 | `cached 98%` | Only shown when the session cache supplied part of the prompt: the share of prompt tokens that came from a resident prefix, a forked session or the disk tier, and so cost no prefill. |
 | `spec 100%` | Only shown when speculative decoding ran: the share of proposed draft tokens the verify pass accepted. Absent, never `0%`, when the draft head is off. |
 
+The half after `Σ` is every request since the terminal UI started.
+
+| part | meaning |
+|------|---------|
+| `Σ 7 req` | How many requests are in the totals. A response id already counted is never added twice. |
+| `pf 1.1k/s` | All the prefilled tokens over all the prefill time. |
+| `dec 98/s` | All the generated tokens over all the decode time. |
+| `cached 62%` | The share of every prompt token that the cache supplied, which is the figure that becomes interesting over a session. |
+| `spec 71%` | All accepted draft tokens over all proposed ones. Requests that ran without the draft head are absent from both sides rather than counted as zero. |
+
+Every aggregate rate is token-weighted, a total divided by a total. It is
+never the mean of per-request rates, which would let a sixteen-token answer
+outweigh a two-thousand-token one.
+
 A rate is `—` when the server reported none, which happens when nothing was
 computed in that phase. The line is refreshed after every assistant message
-and stays on screen until the next one.
+and stays on screen until the next one. The totals live in memory for the
+life of the process and are not written anywhere.
+
+In a narrow terminal the aggregate gives way first, in stages, and the latest
+request is the last thing to be abbreviated, because it is the half a reader
+cannot reconstruct from the server log afterwards.
 
 ## Where the numbers come from
 
