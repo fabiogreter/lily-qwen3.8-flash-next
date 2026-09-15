@@ -1,0 +1,20 @@
+{
+  "name": "opencode-plugin-lily-timings",
+  "version": "0.1.0",
+  "private": true,
+  "description": "opencode TUI plugin showing lily's own prefill, decode and speculation numbers",
+  "type": "module",
+  "exports": {
+    "./tui": "./index.tsx"
+  },
+  "keywords": ["opencode", "opencode-plugin", "tui", "lily"],
+  "license": "Apache-2.0",
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.17.0",
+    "solid-js": ">=1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@opencode-ai/plugin": { "optional": true },
+    "solid-js": { "optional": true }
+  }
+}
