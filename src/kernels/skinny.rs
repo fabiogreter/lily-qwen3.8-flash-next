@@ -202,7 +202,10 @@ pub fn gemm_skinny_q8_nt(
 ) -> Result<()> {
     let (n, k) = (w.out_features(), w.in_features());
     let m = a.shape()[0];
-    ensure!(m > 0 && m <= DENSE_SMALLM_THRESHOLD, "skinny q8 GEMM handles 1..={DENSE_SMALLM_THRESHOLD} rows (got {m})");
+    ensure!(
+        m > 0 && m <= DENSE_SMALLM_THRESHOLD,
+        "skinny q8 GEMM handles 1..={DENSE_SMALLM_THRESHOLD} rows (got {m})"
+    );
     ensure!(w.bits == 8, "skinny q8 GEMM needs 8-bit weights");
     ensure!(
         w.group_size.is_multiple_of(8) && k.is_multiple_of(8),
@@ -214,11 +217,21 @@ pub fn gemm_skinny_q8_nt(
     ensure!(a.dtype() == DType::BF16, "skinny q8 GEMM input must be BF16");
     // Register-A for small m (no threadgroup staging or barriers: the
     // narrow, deep mixers and routers are latency-bound in the staged walk).
-    if m <= REG_MAX_M && c.dtype() == DType::BF16 && w.group_size.is_multiple_of(16) && k.is_multiple_of(16) {
+    if m <= REG_MAX_M
+        && c.dtype() == DType::BF16
+        && w.group_size.is_multiple_of(16)
+        && k.is_multiple_of(16)
+    {
         let pipeline = ctx.pipeline(Q8_REG_FNS[m - 1], SOURCE, MslVersion::V3_1)?;
         return pass.dispatch_at(
             &pipeline,
-            &[w.codes.binding(), w.scales.binding(), w.biases.binding(), a.binding(), c.binding()],
+            &[
+                w.codes.binding(),
+                w.scales.binding(),
+                w.biases.binding(),
+                a.binding(),
+                c.binding(),
+            ],
             &[&u32_bytes(k), &u32_bytes(n), &u32_bytes(w.group_size)],
             reg_grid(n, WIDE_ROWS_PER_TG),
         );
@@ -233,7 +246,13 @@ pub fn gemm_skinny_q8_nt(
     let pipeline = ctx.pipeline(fn_name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
-        &[w.codes.binding(), w.scales.binding(), w.biases.binding(), a.binding(), c.binding()],
+        &[
+            w.codes.binding(),
+            w.scales.binding(),
+            w.biases.binding(),
+            a.binding(),
+            c.binding(),
+        ],
         &[&u32_bytes(k), &u32_bytes(n), &u32_bytes(w.group_size), &u32_bytes(m)],
         staged_grid(n),
     )

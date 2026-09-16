@@ -150,7 +150,10 @@ pub fn qsa_block_keys<'t>(
         (first_block.max + count.max) * ratio <= cache.shape()[0],
         "block keys read past the cache"
     );
-    ensure!(first_block.max + count.max <= blocks.shape()[0], "block key store overflow");
+    ensure!(
+        first_block.max + count.max <= blocks.shape()[0],
+        "block key store overflow"
+    );
     ensure!(
         w.numel() == d && w.dtype() == DType::BF16,
         "k norm weight must be BF16 [D]"

@@ -11,19 +11,32 @@ fn model_dir() -> Option<String> {
     std::env::var("LILY_MODEL_DIR_FLASH").ok()
 }
 
-fn copy_state(ctx: &MetalContext, model: &Qwen4ExpModel, src: &DecodeState, tokens: usize, capacity: usize) -> DecodeState {
+fn copy_state(
+    ctx: &MetalContext,
+    model: &Qwen4ExpModel,
+    src: &DecodeState,
+    tokens: usize,
+    capacity: usize,
+) -> DecodeState {
     let mut bytes = Vec::new();
     src.write_prefix(tokens, &mut bytes).expect("prefix");
     let snap = src.snapshot(ctx).expect("snapshot");
     let mut dst = model.new_state(ctx, capacity).expect("state");
-    dst.read_prefix(ctx, tokens, tokens, &mut std::io::Cursor::new(&bytes)).expect("read prefix");
+    dst.read_prefix(ctx, tokens, tokens, &mut std::io::Cursor::new(&bytes))
+        .expect("read prefix");
     dst.restore(ctx, &snap).expect("restore");
     dst
 }
 
 /// Runs one verify pass the host-driven way (stage the n-gram rows, encode,
 /// wait, advance the bookkeeping) and returns its draws.
-fn host_verify(ctx: &MetalContext, model: &Qwen4ExpModel, state: &mut DecodeState, s: &mut Scratch, tokens: &[u32]) -> Vec<u32> {
+fn host_verify(
+    ctx: &MetalContext,
+    model: &Qwen4ExpModel,
+    state: &mut DecodeState,
+    s: &mut Scratch,
+    tokens: &[u32],
+) -> Vec<u32> {
     let m = tokens.len();
     model.ensure_room(ctx, state, s, m + 8).expect("room");
     let greedy = SamplingParams::greedy();
@@ -35,7 +48,13 @@ fn host_verify(ctx: &MetalContext, model: &Qwen4ExpModel, state: &mut DecodeStat
         model.stage_ngram(w, p, tokens, pst.hist).expect("stage n-gram rows");
     }
     model
-        .encode_batch(ctx, state, s, &ps, BatchMode::Verify { params: &greedy, step0: 0, park: None })
+        .encode_batch(
+            ctx,
+            state,
+            s,
+            &ps,
+            BatchMode::Verify { params: &greedy, step0: 0, park: None },
+        )
         .expect("encode")
         .commit()
         .expect("commit")
@@ -55,7 +74,17 @@ fn host_verify(ctx: &MetalContext, model: &Qwen4ExpModel, state: &mut DecodeStat
 /// kernel routes), chain from row `a`. Returns the proposals and leaves the
 /// host bookkeeping as `finish_speculation` does.
 #[allow(clippy::too_many_arguments)]
-fn host_draft(ctx: &MetalContext, model: &Qwen4ExpModel, state: &mut DecodeState, s: &Scratch, pos_before: usize, hist_before: Option<[u32; 2]>, tokens: &[u32], sampled: &[u32], chain: usize) -> Vec<u32> {
+fn host_draft(
+    ctx: &MetalContext,
+    model: &Qwen4ExpModel,
+    state: &mut DecodeState,
+    s: &Scratch,
+    pos_before: usize,
+    hist_before: Option<[u32; 2]>,
+    tokens: &[u32],
+    sampled: &[u32],
+    chain: usize,
+) -> Vec<u32> {
     let wide = model.config.hc_width();
     let m = tokens.len();
     let a = sampled.iter().zip(&tokens[1..]).take_while(|(x, y)| x == y).count();
@@ -63,21 +92,47 @@ fn host_draft(ctx: &MetalContext, model: &Qwen4ExpModel, state: &mut DecodeState
     let hidden = capacity_scratch.hyper.view(0, &[m, wide]).expect("hidden");
     let keep = capacity_scratch.hyper.view(a * wide, &[wide]).expect("keep");
     let rollback = (a + 1 < m).then_some((a, m));
-    let encoded = model.encode_draft(ctx, state, s, &hidden, m, a, pos_before, Some(&keep), rollback, chain, None).expect("encode draft");
-    s.spec.as_ref().expect("spec").mtp_ids.view(0, &[m]).expect("ids").write_bytes(bytemuck::cast_slice(sampled)).expect("write ids");
+    let encoded = model
+        .encode_draft(
+            ctx,
+            state,
+            s,
+            &hidden,
+            m,
+            a,
+            pos_before,
+            Some(&keep),
+            rollback,
+            chain,
+            None,
+        )
+        .expect("encode draft");
+    s.spec
+        .as_ref()
+        .expect("spec")
+        .mtp_ids
+        .view(0, &[m])
+        .expect("ids")
+        .write_bytes(bytemuck::cast_slice(sampled))
+        .expect("write ids");
     encoded.commit().expect("commit").wait().expect("draft");
     state.pos = pos_before + a + 1;
     if let (Some(pst), Some(before)) = (&mut state.ple, hist_before) {
         pst.hist = NgramHasher::advance(before, &tokens[..=a]);
     }
-    s.spec.as_ref().expect("spec").draft_tokens.to_u32().expect("drafts")[..chain].to_vec()
+    s.spec.as_ref().expect("spec").draft_tokens.to_u32().expect("drafts")[..chain]
+        .to_vec()
 }
 
 /// Positions below `pos` whose draft-head cache rows differ between two states.
 fn head_cache_diff(g: &DecodeState, b: &DecodeState, pos: usize) -> Vec<String> {
     let (gm, bm) = (g.mtp.as_ref().expect("mtp"), b.mtp.as_ref().expect("mtp"));
     let mut out = Vec::new();
-    let (LayerState::Attn { k_cache: gk, v_cache: gv, idx_keys: gi, blk_keys: gb }, LayerState::Attn { k_cache: bk, v_cache: bv, idx_keys: bi, blk_keys: bb }) = (&gm.layer, &bm.layer) else {
+    let (
+        LayerState::Attn { k_cache: gk, v_cache: gv, idx_keys: gi, blk_keys: gb },
+        LayerState::Attn { k_cache: bk, v_cache: bv, idx_keys: bi, blk_keys: bb },
+    ) = (&gm.layer, &bm.layer)
+    else {
         panic!("head is not attention")
     };
     for (name, x, y) in [("k", gk, bk), ("v", gv, bv)] {
@@ -123,16 +178,23 @@ fn head_cache_diff(g: &DecodeState, b: &DecodeState, pos: usize) -> Vec<String> 
 fn gpu_selected_drafts_equal_host_driven_drafts() {
     let Some(dir) = model_dir() else { return };
     let ctx = MetalContext::new().expect("metal context");
-    let model = <Qwen4ExpModel as LanguageModel>::load(&ctx, Path::new(&dir), &LoadOptions { mtp_drafts: 3, ..LoadOptions::default() }).expect("load");
+    let model = <Qwen4ExpModel as LanguageModel>::load(
+        &ctx,
+        Path::new(&dir),
+        &LoadOptions { mtp_drafts: 3, ..LoadOptions::default() },
+    )
+    .expect("load");
     let greedy = SamplingParams::greedy();
     let chain = 2usize;
     let pattern = [0usize, 0, 1, 0, 2, 1, 1, 0, 2, 0, 1, 2];
     for prompt_len in [300usize, 33000] {
-        let prompt: Vec<u32> = (0..prompt_len).map(|i| 1000 + (i * 37 % 5000) as u32).collect();
+        let prompt: Vec<u32> =
+            (0..prompt_len).map(|i| 1000 + (i * 37 % 5000) as u32).collect();
         let capacity = prompt_len + 128;
         let mut s = model.new_scratch_with_capacity(&ctx, capacity).expect("scratch");
         let mut b = model.new_state(&ctx, capacity).expect("state");
-        LanguageModel::prefill(&model, &ctx, &mut b, &mut s, &prompt, None).expect("prefill");
+        LanguageModel::prefill(&model, &ctx, &mut b, &mut s, &prompt, None)
+            .expect("prefill");
         let mut g = copy_state(&ctx, &model, &b, prompt_len, capacity);
         let mut pending = 4242u32;
         for (step, &want) in pattern.iter().enumerate() {
@@ -141,33 +203,66 @@ fn gpu_selected_drafts_equal_host_driven_drafts() {
             let mut probe = copy_state(&ctx, &model, &b, fed, capacity);
             let d0 = host_verify(&ctx, &model, &mut probe, &mut s, &[pending, 0, 0])[0];
             let mut probe = copy_state(&ctx, &model, &b, fed, capacity);
-            let d1 = host_verify(&ctx, &model, &mut probe, &mut s, &[pending, d0, 0])[1];
+            let d1 =
+                host_verify(&ctx, &model, &mut probe, &mut s, &[pending, d0, 0])[1];
             let drafts = match want {
                 0 => vec![d0 + 1, d1],
                 1 => vec![d0, d1 + 1],
                 _ => vec![d0, d1],
             };
-            let tokens: Vec<u32> = std::iter::once(pending).chain(drafts.iter().copied()).collect();
+            let tokens: Vec<u32> =
+                std::iter::once(pending).chain(drafts.iter().copied()).collect();
 
             // Host-driven step.
             let pos_before = b.pos;
             let hist_before = b.ple.as_ref().map(|p| p.hist);
             let sampled = host_verify(&ctx, &model, &mut b, &mut s, &tokens);
             let a = sampled.iter().zip(&drafts).take_while(|(x, y)| x == y).count();
-            assert_eq!(a, want, "step {step} at {prompt_len}: probe did not yield the wanted accepted count");
-            let host_proposals = host_draft(&ctx, &model, &mut b, &s, pos_before, hist_before, &tokens, &sampled, chain);
+            assert_eq!(
+                a, want,
+                "step {step} at {prompt_len}: probe did not yield the wanted accepted count"
+            );
+            let host_proposals = host_draft(
+                &ctx,
+                &model,
+                &mut b,
+                &s,
+                pos_before,
+                hist_before,
+                &tokens,
+                &sampled,
+                chain,
+            );
 
             // GPU-selected step, without parking (the fed drafts are not the
             // head's proposals, so a parked next pass would verify the wrong
             // rows and advance the state wrongly).
-            let (sampled_g, draft) = model.verify(&ctx, &mut g, &mut s, pending, &drafts, &greedy, 0, None, chain).expect("verify");
-            assert_eq!(sampled_g, sampled, "step {step} at {prompt_len}: draws differ (trunk states diverged)");
-            model.finish_speculation(&ctx, &mut g, &mut s, a, None, draft).expect("finish");
-            let gpu_proposals = s.spec.as_ref().expect("spec").draft_tokens.to_u32().expect("drafts")[..chain].to_vec();
+            let (sampled_g, draft) = model
+                .verify(&ctx, &mut g, &mut s, pending, &drafts, &greedy, 0, None, chain)
+                .expect("verify");
+            assert_eq!(
+                sampled_g, sampled,
+                "step {step} at {prompt_len}: draws differ (trunk states diverged)"
+            );
+            model
+                .finish_speculation(&ctx, &mut g, &mut s, a, None, draft)
+                .expect("finish");
+            let gpu_proposals =
+                s.spec.as_ref().expect("spec").draft_tokens.to_u32().expect("drafts")
+                    [..chain]
+                    .to_vec();
             let diff = head_cache_diff(&g, &b, b.pos + 3);
-            eprintln!("step {step} a={a} at {prompt_len}: draws {sampled:?}, host {host_proposals:?}, gpu {gpu_proposals:?}, head cache rows differing: {diff:?}");
-            assert_eq!(gpu_proposals, host_proposals, "step {step} a={a} at {prompt_len}: GPU-selected drafts differ from the host-driven ones");
-            assert!(diff.is_empty(), "step {step} a={a} at {prompt_len}: head caches differ at {diff:?}");
+            eprintln!(
+                "step {step} a={a} at {prompt_len}: draws {sampled:?}, host {host_proposals:?}, gpu {gpu_proposals:?}, head cache rows differing: {diff:?}"
+            );
+            assert_eq!(
+                gpu_proposals, host_proposals,
+                "step {step} a={a} at {prompt_len}: GPU-selected drafts differ from the host-driven ones"
+            );
+            assert!(
+                diff.is_empty(),
+                "step {step} a={a} at {prompt_len}: head caches differ at {diff:?}"
+            );
             assert_eq!(g.pos, b.pos);
             pending = sampled[a];
         }
@@ -186,7 +281,12 @@ fn gpu_selected_drafts_equal_host_driven_drafts() {
 fn probe_head_row_result_vs_batch_size() {
     let Some(dir) = model_dir() else { return };
     let ctx = MetalContext::new().expect("metal context");
-    let model = <Qwen4ExpModel as LanguageModel>::load(&ctx, Path::new(&dir), &LoadOptions { mtp_drafts: 3, ..LoadOptions::default() }).expect("load");
+    let model = <Qwen4ExpModel as LanguageModel>::load(
+        &ctx,
+        Path::new(&dir),
+        &LoadOptions { mtp_drafts: 3, ..LoadOptions::default() },
+    )
+    .expect("load");
     let cfg = &model.config;
     let wide = cfg.hc_width();
     let (h, groups, eps) = (cfg.hidden_size, cfg.hc_count, cfg.rms_norm_eps);
@@ -194,7 +294,8 @@ fn probe_head_row_result_vs_batch_size() {
     let capacity = prompt.len() + 64;
     let mut s = model.new_scratch_with_capacity(&ctx, capacity).expect("scratch");
     let mut state = model.new_state(&ctx, capacity).expect("state");
-    LanguageModel::prefill(&model, &ctx, &mut state, &mut s, &prompt, None).expect("prefill");
+    LanguageModel::prefill(&model, &ctx, &mut state, &mut s, &prompt, None)
+        .expect("prefill");
     host_verify(&ctx, &model, &mut state, &mut s, &[4242, 17, 99]);
     let mtp = model.weights.mtp.as_ref().expect("draft head");
     let s = &s;
@@ -205,11 +306,30 @@ fn probe_head_row_result_vs_batch_size() {
         let hidden = cap.hyper.view(0, &[rows, wide]).expect("hidden");
         let hyper = ps.mtp_hyper.as_ref().expect("head scratch");
         let pass = ctx.begin_concurrent().expect("pass");
-        crate::kernels::hc::rmsnorm_grouped_bf16(&ctx, &pass, &hidden, &mtp.norm_hidden, &ps.hc.hn, h, groups, eps, super::super::model::NORM_WEIGHT_BIAS).expect("norm");
+        crate::kernels::hc::rmsnorm_grouped_bf16(
+            &ctx,
+            &pass,
+            &hidden,
+            &mtp.norm_hidden,
+            &ps.hc.hn,
+            h,
+            groups,
+            eps,
+            super::super::model::NORM_WEIGHT_BIAS,
+        )
+        .expect("norm");
         pass.level_barrier(&[&ps.hc.hn]).expect("barrier");
         let hn_streams = ps.hc.hn.view(0, &[rows * groups, h]).expect("streams");
         let hyper_streams = hyper.view(0, &[rows * groups, h]).expect("streams");
-        project_mat(&ctx, &pass, &hn_streams, &mtp.fc_hidden, &hyper_streams, &s.dequant).expect("project");
+        project_mat(
+            &ctx,
+            &pass,
+            &hn_streams,
+            &mtp.fc_hidden,
+            &hyper_streams,
+            &s.dequant,
+        )
+        .expect("project");
         pass.commit_wait().expect("run");
         outs.push([
             ps.hc.hn.view(0, &[wide]).expect("row").to_f32().expect("read"),
@@ -217,8 +337,19 @@ fn probe_head_row_result_vs_batch_size() {
             Vec::new(),
         ]);
     }
-    for (i, name) in ["rmsnorm_grouped_bf16", "fc_hidden project_mat (skinny Q4, 4 vs 12 streams)"].iter().enumerate() {
-        let n = outs[0][i].iter().zip(&outs[1][i]).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
-        eprintln!("{name}: row 0 differs in {n} of {} elements between a 1-row and a 3-row run", outs[0][i].len());
+    for (i, name) in
+        ["rmsnorm_grouped_bf16", "fc_hidden project_mat (skinny Q4, 4 vs 12 streams)"]
+            .iter()
+            .enumerate()
+    {
+        let n = outs[0][i]
+            .iter()
+            .zip(&outs[1][i])
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        eprintln!(
+            "{name}: row 0 differs in {n} of {} elements between a 1-row and a 3-row run",
+            outs[0][i].len()
+        );
     }
 }

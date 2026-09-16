@@ -641,8 +641,18 @@ fn gemm_skinny_q4_f32_out_is_the_unrounded_bf16_result() {
             pass.commit_wait().expect("commit");
             let got_f32 = c_f32.to_f32().expect("read f32");
             let got_bf = c_bf.to_f32().expect("read bf16");
-            assert_bits_eq(&cpu_ref::round_bf16(&got_f32), &got_bf, &format!("m={m} n={n} rounded f32 vs bf16"));
-            let expected = cpu_ref::gemm_nt(&cpu_ref::round_bf16(&a), &cpu_ref::round_bf16(&dequant), m, k, n);
+            assert_bits_eq(
+                &cpu_ref::round_bf16(&got_f32),
+                &got_bf,
+                &format!("m={m} n={n} rounded f32 vs bf16"),
+            );
+            let expected = cpu_ref::gemm_nt(
+                &cpu_ref::round_bf16(&a),
+                &cpu_ref::round_bf16(&dequant),
+                m,
+                k,
+                n,
+            );
             cpu_ref::assert_close(&got_f32, &expected, ATOL, RTOL);
         }
     }
@@ -655,19 +665,43 @@ fn gemm_skinny_q4_f32_out_is_the_unrounded_bf16_result() {
 fn gemm_skinny_q8_matches_reference() {
     let ctx = MetalContext::new().expect("metal context");
     let mut rng = StdRng::seed_from_u64(78);
-    for (n, k) in [(512usize, 2560usize), (320, 10240), (4, 10240), (1, 2560), (33, 64)] {
+    for (n, k) in [(512usize, 2560usize), (320, 10240), (4, 10240), (1, 2560), (33, 64)]
+    {
         let gs = 64;
         let words = k / 4;
         let groups = k / gs;
         let codes: Vec<u32> = (0..n * words).map(|_| rng.r#gen()).collect();
-        let scales: Vec<f32> = (0..n * groups).map(|_| bf16::from_f32(rng.gen_range(0.001f32..0.02)).to_f32()).collect();
-        let biases: Vec<f32> = (0..n * groups).map(|_| bf16::from_f32(rng.gen_range(-2.0f32..0.0)).to_f32()).collect();
+        let scales: Vec<f32> = (0..n * groups)
+            .map(|_| bf16::from_f32(rng.gen_range(0.001f32..0.02)).to_f32())
+            .collect();
+        let biases: Vec<f32> = (0..n * groups)
+            .map(|_| bf16::from_f32(rng.gen_range(-2.0f32..0.0)).to_f32())
+            .collect();
         let dequant = cpu_ref::dequant_affine(&codes, &scales, &biases, n, k, gs, 8);
-        let to_bf16 = |v: &[f32]| -> Vec<bf16> { v.iter().map(|&x| bf16::from_f32(x)).collect() };
+        let to_bf16 =
+            |v: &[f32]| -> Vec<bf16> { v.iter().map(|&x| bf16::from_f32(x)).collect() };
         let w = QuantWeights {
-            codes: Tensor::from_bytes(&ctx, bytemuck::cast_slice(&codes), &[n, words], DType::U32).expect("codes"),
-            scales: Tensor::from_bytes(&ctx, bytemuck::cast_slice(&to_bf16(&scales)), &[n, groups], DType::BF16).expect("scales"),
-            biases: Tensor::from_bytes(&ctx, bytemuck::cast_slice(&to_bf16(&biases)), &[n, groups], DType::BF16).expect("biases"),
+            codes: Tensor::from_bytes(
+                &ctx,
+                bytemuck::cast_slice(&codes),
+                &[n, words],
+                DType::U32,
+            )
+            .expect("codes"),
+            scales: Tensor::from_bytes(
+                &ctx,
+                bytemuck::cast_slice(&to_bf16(&scales)),
+                &[n, groups],
+                DType::BF16,
+            )
+            .expect("scales"),
+            biases: Tensor::from_bytes(
+                &ctx,
+                bytemuck::cast_slice(&to_bf16(&biases)),
+                &[n, groups],
+                DType::BF16,
+            )
+            .expect("biases"),
             group_size: gs,
             bits: 8,
         };
@@ -680,13 +714,24 @@ fn gemm_skinny_q8_matches_reference() {
             gemm_skinny_q8_nt(&ctx, &pass, &ta, &w, &c_bf).expect("q8 bf16");
             gemm_skinny_q8_nt(&ctx, &pass, &ta, &w, &c_f32).expect("q8 f32");
             pass.commit_wait().expect("commit");
-            let expected = cpu_ref::gemm_nt(&cpu_ref::round_bf16(&a), &cpu_ref::round_bf16(&dequant), m, k, n);
+            let expected = cpu_ref::gemm_nt(
+                &cpu_ref::round_bf16(&a),
+                &cpu_ref::round_bf16(&dequant),
+                m,
+                k,
+                n,
+            );
             let got_f32 = c_f32.to_f32().expect("read");
             cpu_ref::assert_close(&got_f32, &expected, ATOL, RTOL);
             // bf16 output takes the register-A kernel for m <= 8 (a different
             // reduction order than the staged f32 kernel), so compare it to
             // the reference rather than bit-for-bit to the f32 result.
-            cpu_ref::assert_close(&c_bf.to_f32().expect("read"), &expected, ATOL * 4.0, RTOL * 4.0);
+            cpu_ref::assert_close(
+                &c_bf.to_f32().expect("read"),
+                &expected,
+                ATOL * 4.0,
+                RTOL * 4.0,
+            );
         }
     }
 }

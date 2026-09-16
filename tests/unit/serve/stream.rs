@@ -16,7 +16,10 @@ fn detok(table: &'static [&'static str]) -> impl FnMut(&[u32]) -> Result<String>
     }
 }
 
-fn run(parser: &mut OutputParser<impl FnMut(&[u32]) -> Result<String>>, ids: &[u32]) -> Vec<Event> {
+fn run(
+    parser: &mut OutputParser<impl FnMut(&[u32]) -> Result<String>>,
+    ids: &[u32],
+) -> Vec<Event> {
     let mut events = Vec::new();
     for &id in ids {
         events.extend(parser.push(id).expect("push"));
@@ -43,16 +46,37 @@ fn text_of(events: &[Event]) -> (String, String, Vec<ParsedToolCall>) {
 }
 
 const TABLE: &[&str] = &[
-    "Hello", " world", "\n", "</think>", "\n\n", "<tool_call>", "</tool_call>", "<function=f>",
-    "<parameter=x>", "</parameter>", "</function>", "<", "/think", ">", "STOP", "ab", "The answer",
-    "<tool", "_call>",
+    "Hello",
+    " world",
+    "\n",
+    "</think>",
+    "\n\n",
+    "<tool_call>",
+    "</tool_call>",
+    "<function=f>",
+    "<parameter=x>",
+    "</parameter>",
+    "</function>",
+    "<",
+    "/think",
+    ">",
+    "STOP",
+    "ab",
+    "The answer",
+    "<tool",
+    "_call>",
 ];
 
 #[test]
 fn reasoning_then_content_split_and_trimmed() {
     let mut p = OutputParser::new(
         detok(TABLE),
-        ParserConfig { thinking_open: true, tools: None, stop_strings: vec![], raw: false },
+        ParserConfig {
+            thinking_open: true,
+            tools: None,
+            stop_strings: vec![],
+            raw: false,
+        },
     );
     // "Hello world\n</think>\n\nThe answer"
     let events = run(&mut p, &[0, 1, 2, 3, 4, 16]);
@@ -66,7 +90,12 @@ fn reasoning_then_content_split_and_trimmed() {
 fn think_end_split_across_tokens_is_still_found() {
     let mut p = OutputParser::new(
         detok(TABLE),
-        ParserConfig { thinking_open: true, tools: None, stop_strings: vec![], raw: false },
+        ParserConfig {
+            thinking_open: true,
+            tools: None,
+            stop_strings: vec![],
+            raw: false,
+        },
     );
     // "Hello" "<" "/think" ">" " world"
     let events = run(&mut p, &[0, 11, 12, 13, 1]);
@@ -79,12 +108,19 @@ fn think_end_split_across_tokens_is_still_found() {
 
 #[test]
 fn tool_call_block_becomes_a_call_and_surrounding_text_is_content() {
-    let tools = ToolSchema::from_request(&[serde_json::json!({"type": "function", "function": {
-        "name": "f", "parameters": {"properties": {"x": {"type": "integer"}}}}})])
+    let tools = ToolSchema::from_request(&[
+        serde_json::json!({"type": "function", "function": {
+        "name": "f", "parameters": {"properties": {"x": {"type": "integer"}}}}}),
+    ])
     .unwrap();
     let mut p = OutputParser::new(
         detok(TABLE),
-        ParserConfig { thinking_open: false, tools: Some(tools), stop_strings: vec![], raw: false },
+        ParserConfig {
+            thinking_open: false,
+            tools: Some(tools),
+            stop_strings: vec![],
+            raw: false,
+        },
     );
     // "The answer\n\n<tool_call>\n<function=f>\n<parameter=x>\nab\n</parameter>\n</function>\n</tool_call>"
     let ids = [16, 4, 5, 2, 7, 2, 8, 2, 15, 2, 9, 2, 10, 2, 6];
@@ -99,10 +135,18 @@ fn tool_call_block_becomes_a_call_and_surrounding_text_is_content() {
 
 #[test]
 fn split_tool_start_marker_is_held_back_then_recognised() {
-    let tools = ToolSchema::from_request(&[serde_json::json!({"type": "function", "function": {"name": "f"}})]).unwrap();
+    let tools = ToolSchema::from_request(&[
+        serde_json::json!({"type": "function", "function": {"name": "f"}}),
+    ])
+    .unwrap();
     let mut p = OutputParser::new(
         detok(TABLE),
-        ParserConfig { thinking_open: false, tools: Some(tools), stop_strings: vec![], raw: false },
+        ParserConfig {
+            thinking_open: false,
+            tools: Some(tools),
+            stop_strings: vec![],
+            raw: false,
+        },
     );
     // "Hello" "<tool" "_call>" "<function=f>" "</function>" "</tool_call>"
     let events = run(&mut p, &[0, 17, 18, 7, 10, 6]);
@@ -114,10 +158,18 @@ fn split_tool_start_marker_is_held_back_then_recognised() {
 
 #[test]
 fn unterminated_tool_block_is_returned_as_content() {
-    let tools = ToolSchema::from_request(&[serde_json::json!({"type": "function", "function": {"name": "f"}})]).unwrap();
+    let tools = ToolSchema::from_request(&[
+        serde_json::json!({"type": "function", "function": {"name": "f"}}),
+    ])
+    .unwrap();
     let mut p = OutputParser::new(
         detok(TABLE),
-        ParserConfig { thinking_open: false, tools: Some(tools), stop_strings: vec![], raw: false },
+        ParserConfig {
+            thinking_open: false,
+            tools: Some(tools),
+            stop_strings: vec![],
+            raw: false,
+        },
     );
     let events = run(&mut p, &[5, 2, 7]);
     let (_, content, calls) = text_of(&events);
@@ -129,14 +181,21 @@ fn unterminated_tool_block_is_returned_as_content() {
 fn stop_strings_truncate_and_stop() {
     let mut p = OutputParser::new(
         detok(TABLE),
-        ParserConfig { thinking_open: false, tools: None, stop_strings: vec!["STOP".into()], raw: false },
+        ParserConfig {
+            thinking_open: false,
+            tools: None,
+            stop_strings: vec!["STOP".into()],
+            raw: false,
+        },
     );
     let events = run(&mut p, &[0, 1, 14, 0, 0]);
     let (_, content, _) = text_of(&events);
     assert_eq!(content, "Hello world");
     assert!(p.stopped);
     // Streaming holds back stop-length text: nothing after "Hello world" leaks.
-    assert!(events.iter().all(|e| !matches!(e, Event::Content(t) if t.contains("STOP"))));
+    assert!(
+        events.iter().all(|e| !matches!(e, Event::Content(t) if t.contains("STOP")))
+    );
 }
 
 #[test]
@@ -144,19 +203,33 @@ fn multibyte_codepoints_split_over_tokens_are_not_emitted_partially() {
     // "é" is 0xC3 0xA9.
     let mut p = OutputParser::new(
         detok(TABLE),
-        ParserConfig { thinking_open: false, tools: None, stop_strings: vec![], raw: true },
+        ParserConfig {
+            thinking_open: false,
+            tools: None,
+            stop_strings: vec![],
+            raw: true,
+        },
     );
     let events = run(&mut p, &[0, 1000 + 0xC3, 1000 + 0xA9, 1]);
     let (_, content, _) = text_of(&events);
     assert_eq!(content, "Helloé world");
-    assert!(events.iter().all(|e| !matches!(e, Event::Content(t) if t.contains('\u{FFFD}'))));
+    assert!(
+        events
+            .iter()
+            .all(|e| !matches!(e, Event::Content(t) if t.contains('\u{FFFD}')))
+    );
 }
 
 #[test]
 fn raw_mode_ignores_markers() {
     let mut p = OutputParser::new(
         detok(TABLE),
-        ParserConfig { thinking_open: true, tools: None, stop_strings: vec![], raw: true },
+        ParserConfig {
+            thinking_open: true,
+            tools: None,
+            stop_strings: vec![],
+            raw: true,
+        },
     );
     let events = run(&mut p, &[0, 3, 5]);
     let (reasoning, content, _) = text_of(&events);

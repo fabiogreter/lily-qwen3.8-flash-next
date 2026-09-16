@@ -57,9 +57,17 @@ pub fn add_bf16(
 
 /// Copies `src` into `dst` (same byte length, any dtype) as a compute
 /// dispatch, so a state restore can sit inside a pass between other kernels.
-pub fn copy_words(ctx: &MetalContext, pass: &ComputePass<'_>, src: &Tensor, dst: &Tensor) -> Result<()> {
+pub fn copy_words(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    src: &Tensor,
+    dst: &Tensor,
+) -> Result<()> {
     let bytes = src.byte_len();
-    ensure!(dst.byte_len() == bytes && bytes.is_multiple_of(4) && bytes > 0, "copy needs equal, word-sized buffers");
+    ensure!(
+        dst.byte_len() == bytes && bytes.is_multiple_of(4) && bytes > 0,
+        "copy needs equal, word-sized buffers"
+    );
     let words = bytes / 4;
     let pipeline = ctx.pipeline("copy_u32", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(

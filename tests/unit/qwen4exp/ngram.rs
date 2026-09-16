@@ -68,7 +68,8 @@ fn hasher_matches_reference_and_respects_eos_segments() {
 /// that paged gathers return the same bytes as the source rows.
 #[test]
 fn paged_table_gathers_rows_from_shard_files() {
-    let dir = std::env::temp_dir().join(format!("lily-ngram-test-{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("lily-ngram-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let (rows0, rows1, words, groups) = (7usize, 5usize, 20usize, 5usize);
     let base = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding";
@@ -106,18 +107,48 @@ fn paged_table_gathers_rows_from_shard_files() {
     write_shard(
         "model-00001-of-00002.safetensors",
         &[
-            (&format!("{base}.shard_0.weight"), "U32", vec![rows0, words], u32s(&codes0)),
-            (&format!("{base}.shard_0.scales"), "BF16", vec![rows0, groups], u16s(&scales0)),
-            (&format!("{base}.shard_0.biases"), "BF16", vec![rows0, groups], u16s(&biases0)),
+            (
+                &format!("{base}.shard_0.weight"),
+                "U32",
+                vec![rows0, words],
+                u32s(&codes0),
+            ),
+            (
+                &format!("{base}.shard_0.scales"),
+                "BF16",
+                vec![rows0, groups],
+                u16s(&scales0),
+            ),
+            (
+                &format!("{base}.shard_0.biases"),
+                "BF16",
+                vec![rows0, groups],
+                u16s(&biases0),
+            ),
         ],
     );
     write_shard(
         "model-00002-of-00002.safetensors",
         &[
             ("other.weight", "U32", vec![3], u32s(&[9, 9, 9])),
-            (&format!("{base}.shard_1.weight"), "U32", vec![rows1, words], u32s(&codes1)),
-            (&format!("{base}.shard_1.scales"), "BF16", vec![rows1, groups], u16s(&scales1)),
-            (&format!("{base}.shard_1.biases"), "BF16", vec![rows1, groups], u16s(&biases1)),
+            (
+                &format!("{base}.shard_1.weight"),
+                "U32",
+                vec![rows1, words],
+                u32s(&codes1),
+            ),
+            (
+                &format!("{base}.shard_1.scales"),
+                "BF16",
+                vec![rows1, groups],
+                u16s(&scales1),
+            ),
+            (
+                &format!("{base}.shard_1.biases"),
+                "BF16",
+                vec![rows1, groups],
+                u16s(&biases1),
+            ),
         ],
     );
     let index = serde_json::json!({"weight_map": {
@@ -129,8 +160,11 @@ fn paged_table_gathers_rows_from_shard_files() {
         format!("{base}.shard_1.scales"): "model-00002-of-00002.safetensors",
         format!("{base}.shard_1.biases"): "model-00002-of-00002.safetensors",
     }});
-    std::fs::write(dir.join("model.safetensors.index.json"), serde_json::to_vec(&index).unwrap())
-        .expect("index");
+    std::fs::write(
+        dir.join("model.safetensors.index.json"),
+        serde_json::to_vec(&index).unwrap(),
+    )
+    .expect("index");
 
     let ckpt = Checkpoint::open(&dir).expect("checkpoint");
     let bases = shard_bases("model.language_model.layers.1.ple.", 2);
@@ -146,18 +180,46 @@ fn paged_table_gathers_rows_from_shard_files() {
     let mut biases = vec![0u8; n * groups * 2];
     table.gather(&ids, &mut codes, &mut scales, &mut biases).expect("gather");
     for (i, &id) in ids.iter().enumerate() {
-        let (want_codes, want_scales, want_biases): (&[u32], &[u16], &[u16]) = if (id as usize) < rows0 {
-            let r = id as usize;
-            (&codes0[r * words..(r + 1) * words], &scales0[r * groups..(r + 1) * groups], &biases0[r * groups..(r + 1) * groups])
-        } else {
-            let r = id as usize - rows0;
-            (&codes1[r * words..(r + 1) * words], &scales1[r * groups..(r + 1) * groups], &biases1[r * groups..(r + 1) * groups])
-        };
-        assert_eq!(&codes[i * words * 4..(i + 1) * words * 4], bytemuck::cast_slice::<u32, u8>(want_codes), "codes of row {id}");
-        assert_eq!(&scales[i * groups * 2..(i + 1) * groups * 2], bytemuck::cast_slice::<u16, u8>(want_scales));
-        assert_eq!(&biases[i * groups * 2..(i + 1) * groups * 2], bytemuck::cast_slice::<u16, u8>(want_biases));
+        let (want_codes, want_scales, want_biases): (&[u32], &[u16], &[u16]) =
+            if (id as usize) < rows0 {
+                let r = id as usize;
+                (
+                    &codes0[r * words..(r + 1) * words],
+                    &scales0[r * groups..(r + 1) * groups],
+                    &biases0[r * groups..(r + 1) * groups],
+                )
+            } else {
+                let r = id as usize - rows0;
+                (
+                    &codes1[r * words..(r + 1) * words],
+                    &scales1[r * groups..(r + 1) * groups],
+                    &biases1[r * groups..(r + 1) * groups],
+                )
+            };
+        assert_eq!(
+            &codes[i * words * 4..(i + 1) * words * 4],
+            bytemuck::cast_slice::<u32, u8>(want_codes),
+            "codes of row {id}"
+        );
+        assert_eq!(
+            &scales[i * groups * 2..(i + 1) * groups * 2],
+            bytemuck::cast_slice::<u16, u8>(want_scales)
+        );
+        assert_eq!(
+            &biases[i * groups * 2..(i + 1) * groups * 2],
+            bytemuck::cast_slice::<u16, u8>(want_biases)
+        );
     }
-    assert!(table.gather(&[12], &mut codes[..words * 4], &mut scales[..groups * 2], &mut biases[..groups * 2]).is_err());
+    assert!(
+        table
+            .gather(
+                &[12],
+                &mut codes[..words * 4],
+                &mut scales[..groups * 2],
+                &mut biases[..groups * 2]
+            )
+            .is_err()
+    );
     assert!(table.preload(false).expect("preload") >= table.bytes());
     assert_eq!(table.bytes() as usize, (rows0 + rows1) * (words * 4 + groups * 4));
 
@@ -170,8 +232,14 @@ fn paged_table_gathers_rows_from_shard_files() {
     assert_eq!(staged.in_features(), 160);
     let staged_codes = staged.codes.to_u32().expect("codes");
     assert_eq!(&staged_codes[..words], &codes0[..words]);
-    assert_eq!(&staged_codes[words..2 * words], &codes1[(11 - rows0) * words..(12 - rows0) * words]);
-    assert_eq!(stage.seq_ids(n).expect("ids").to_u32().expect("ids"), (0..n as u32).collect::<Vec<_>>());
+    assert_eq!(
+        &staged_codes[words..2 * words],
+        &codes1[(11 - rows0) * words..(12 - rows0) * words]
+    );
+    assert_eq!(
+        stage.seq_ids(n).expect("ids").to_u32().expect("ids"),
+        (0..n as u32).collect::<Vec<_>>()
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -184,7 +252,11 @@ fn paged_gather_timing() {
     let ckpt = Checkpoint::open(&dir).expect("checkpoint");
     let bases = shard_bases("model.language_model.layers.1.ple.", 128);
     let table = PagedTable::open(&ckpt, &bases, 32).expect("paged table");
-    eprintln!("resident before: {:.2} GB of {:.2} GB", table.resident_bytes().unwrap() as f64 / 1e9, table.bytes() as f64 / 1e9);
+    eprintln!(
+        "resident before: {:.2} GB of {:.2} GB",
+        table.resident_bytes().unwrap() as f64 / 1e9,
+        table.bytes() as f64 / 1e9
+    );
     let n = 16;
     let (cb, gb) = (table.codes_bytes(), table.group_bytes());
     let mut codes = vec![0u8; n * cb];
@@ -194,7 +266,9 @@ fn paged_gather_timing() {
     let mut fresh_ids = move || -> Vec<u32> {
         (0..n)
             .map(|_| {
-                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 ((seed >> 33) % 320_001_536) as u32
             })
             .collect()
@@ -207,7 +281,12 @@ fn paged_gather_timing() {
             samples.push(t.elapsed().as_secs_f64());
         }
         samples.sort_by(f64::total_cmp);
-        eprintln!("{label}: median {:.1} us, p90 {:.1} us, max {:.1} us", samples[50] * 1e6, samples[90] * 1e6, samples[99] * 1e6);
+        eprintln!(
+            "{label}: median {:.1} us, p90 {:.1} us, max {:.1} us",
+            samples[50] * 1e6,
+            samples[90] * 1e6,
+            samples[99] * 1e6
+        );
     };
     time("fresh random rows (likely cold)", &mut || {
         let ids = fresh_ids();
@@ -215,11 +294,17 @@ fn paged_gather_timing() {
     });
     let ids = fresh_ids();
     table.gather(&ids, &mut codes, &mut scales, &mut biases).unwrap();
-    time("same rows again (warm)", &mut || table.gather(&ids, &mut codes, &mut scales, &mut biases).unwrap());
+    time("same rows again (warm)", &mut || {
+        table.gather(&ids, &mut codes, &mut scales, &mut biases).unwrap()
+    });
     if std::env::var_os("LILY_PRELOAD").is_some() {
         let t = std::time::Instant::now();
         let resident = table.preload(false).unwrap();
-        eprintln!("preload: {:.2} GB resident after {:.1}s", resident as f64 / 1e9, t.elapsed().as_secs_f64());
+        eprintln!(
+            "preload: {:.2} GB resident after {:.1}s",
+            resident as f64 / 1e9,
+            t.elapsed().as_secs_f64()
+        );
         time("fresh random rows after preload", &mut || {
             let ids = fresh_ids();
             table.gather(&ids, &mut codes, &mut scales, &mut biases).unwrap();

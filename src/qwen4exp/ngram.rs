@@ -43,7 +43,10 @@ impl NgramHasher {
             sizes.len() == offsets.len() && !sizes.is_empty(),
             "sizes/offsets mismatch"
         );
-        ensure!(heads_per_ngram > 0 && sizes.len() == 2 * heads_per_ngram, "head count");
+        ensure!(
+            heads_per_ngram > 0 && sizes.len() == 2 * heads_per_ngram,
+            "head count"
+        );
         ensure!(
             sizes.iter().zip(offsets).all(|(&s, &o)| s + o <= u32::MAX as u64),
             "table ids must fit u32"
@@ -81,10 +84,14 @@ impl NgramHasher {
             };
             let s1 = if p1 == eos { eos } else { p1 };
             let s2 = if p1 == eos || p2 == eos { eos } else { p2 };
-            let bigram = (t0 as u64).wrapping_mul(m[0]) ^ (s1 as u64).wrapping_mul(m[1]);
+            let bigram =
+                (t0 as u64).wrapping_mul(m[0]) ^ (s1 as u64).wrapping_mul(m[1]);
             let trigram = bigram ^ (s2 as u64).wrapping_mul(m[2]);
-            for (j, (&size, &offset)) in self.sizes.iter().zip(&self.offsets).enumerate() {
-                let mixed = if j / self.heads_per_ngram >= 1 { trigram } else { bigram };
+            for (j, (&size, &offset)) in
+                self.sizes.iter().zip(&self.offsets).enumerate()
+            {
+                let mixed =
+                    if j / self.heads_per_ngram >= 1 { trigram } else { bigram };
                 out.push((mixed % size) as u32 + offset as u32);
             }
         }
@@ -114,12 +121,27 @@ unsafe impl Sync for Mapping {}
 impl Mapping {
     fn open(path: &Path) -> Result<Self> {
         use std::os::unix::io::AsRawFd as _;
-        let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let file =
+            File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let len = file.metadata().context("file metadata")?.len() as usize;
         ensure!(len > 0, "{} is empty", path.display());
         // SAFETY: a fresh read-only shared mapping of the whole file.
-        let ptr = unsafe { sys::mmap(std::ptr::null_mut(), len, sys::PROT_READ, sys::MAP_SHARED, file.as_raw_fd(), 0) };
-        ensure!(ptr != sys::MAP_FAILED, "mmap of {} failed: {}", path.display(), std::io::Error::last_os_error());
+        let ptr = unsafe {
+            sys::mmap(
+                std::ptr::null_mut(),
+                len,
+                sys::PROT_READ,
+                sys::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        ensure!(
+            ptr != sys::MAP_FAILED,
+            "mmap of {} failed: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
         Ok(Self { ptr: ptr.cast::<u8>().cast_const(), len })
     }
 
@@ -137,7 +159,11 @@ impl Mapping {
         let end = (offset + len).min(self.len);
         // SAFETY: page-aligned range inside the mapping; advice only.
         unsafe {
-            sys::madvise(self.ptr.add(start).cast_mut().cast(), end - start, sys::MADV_WILLNEED);
+            sys::madvise(
+                self.ptr.add(start).cast_mut().cast(),
+                end - start,
+                sys::MADV_WILLNEED,
+            );
         }
     }
 
@@ -150,7 +176,13 @@ impl Mapping {
         let pages = (end - start) / page;
         let mut vec = vec![0u8; pages];
         // SAFETY: page-aligned range inside the mapping; `vec` has one byte per page.
-        let rc = unsafe { sys::mincore(self.ptr.add(start).cast_mut().cast(), end - start, vec.as_mut_ptr().cast()) };
+        let rc = unsafe {
+            sys::mincore(
+                self.ptr.add(start).cast_mut().cast(),
+                end - start,
+                vec.as_mut_ptr().cast(),
+            )
+        };
         ensure!(rc == 0, "mincore failed: {}", std::io::Error::last_os_error());
         Ok(vec.iter().filter(|&&b| b & 1 != 0).count() * page)
     }
@@ -161,7 +193,8 @@ impl Mapping {
         let start = offset & !(page - 1);
         let end = (offset + len).min(self.len);
         // SAFETY: page-aligned range inside the mapping.
-        let rc = unsafe { sys::mlock(self.ptr.add(start).cast_mut().cast(), end - start) };
+        let rc =
+            unsafe { sys::mlock(self.ptr.add(start).cast_mut().cast(), end - start) };
         ensure!(rc == 0, "mlock failed: {}", std::io::Error::last_os_error());
         Ok(())
     }
@@ -187,7 +220,14 @@ mod sys {
     pub const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
 
     unsafe extern "C" {
-        pub fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, offset: i64) -> *mut c_void;
+        pub fn mmap(
+            addr: *mut c_void,
+            len: usize,
+            prot: c_int,
+            flags: c_int,
+            fd: c_int,
+            offset: i64,
+        ) -> *mut c_void;
         pub fn munmap(addr: *mut c_void, len: usize) -> c_int;
         pub fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
         pub fn mincore(addr: *mut c_void, len: usize, vec: *mut u8) -> c_int;
@@ -238,7 +278,11 @@ impl PagedTable {
 
     /// Opens the shards named `bases[i]` (each with `.weight`, `.scales` and
     /// `.biases`) in row order.
-    pub fn open(ckpt: &Checkpoint, bases: &[String], group_size: usize) -> Result<Self> {
+    pub fn open(
+        ckpt: &Checkpoint,
+        bases: &[String],
+        group_size: usize,
+    ) -> Result<Self> {
         ensure!(!bases.is_empty(), "n-gram table has no shards");
         let mut regions = Vec::with_capacity(bases.len());
         let mut row_starts = vec![0usize];
@@ -262,11 +306,16 @@ impl PagedTable {
                 "{base}: unexpected dtypes for an affine table"
             );
             ensure!(
-                codes.shape.len() == 2 && scales.shape.len() == 2 && biases.shape == scales.shape,
+                codes.shape.len() == 2
+                    && scales.shape.len() == 2
+                    && biases.shape == scales.shape,
                 "{base}: table shard shapes must be [rows, k]"
             );
             let rows = codes.shape[0];
-            ensure!(scales.shape[0] == rows, "{base}: scale rows differ from code rows");
+            ensure!(
+                scales.shape[0] == rows,
+                "{base}: scale rows differ from code rows"
+            );
             let w = codes.shape[1];
             let g = scales.shape[1];
             ensure!(words.is_none_or(|x| x == w), "{base}: code width differs");
@@ -282,7 +331,10 @@ impl PagedTable {
                         m
                     }
                 };
-                ensure!(meta.start() as usize + meta.byte_len() <= map.len, "{base}: tensor beyond its shard file");
+                ensure!(
+                    meta.start() as usize + meta.byte_len() <= map.len,
+                    "{base}: tensor beyond its shard file"
+                );
                 Ok(Region { map, start: meta.start() as usize })
             };
             regions.push(ShardRegion {
@@ -326,13 +378,19 @@ impl PagedTable {
 
     /// Bytes of the table on disk.
     pub fn bytes(&self) -> u64 {
-        self.regions.iter().map(|r| (r.rows * (self.codes_bytes() + 2 * self.group_bytes())) as u64).sum()
+        self.regions
+            .iter()
+            .map(|r| (r.rows * (self.codes_bytes() + 2 * self.group_bytes())) as u64)
+            .sum()
     }
 
     /// The three byte ranges of `row`: (region, offsets of codes, scales, biases).
     fn locate(&self, row: usize) -> Result<(&ShardRegion, usize, usize, usize)> {
         let region_index = self.row_starts.partition_point(|&s| s <= row);
-        ensure!(region_index >= 1 && row < self.rows(), "n-gram row {row} out of range");
+        ensure!(
+            region_index >= 1 && row < self.rows(),
+            "n-gram row {row} out of range"
+        );
         let region = &self.regions[region_index - 1];
         let local = row - self.row_starts[region_index - 1];
         Ok((
@@ -343,13 +401,21 @@ impl PagedTable {
         ))
     }
 
-    fn copy_rows(&self, ids: &[u32], codes: &mut [u8], scales: &mut [u8], biases: &mut [u8]) -> Result<()> {
+    fn copy_rows(
+        &self,
+        ids: &[u32],
+        codes: &mut [u8],
+        scales: &mut [u8],
+        biases: &mut [u8],
+    ) -> Result<()> {
         let (cb, gb) = (self.codes_bytes(), self.group_bytes());
         for (i, &id) in ids.iter().enumerate() {
             let (region, c, s, b) = self.locate(id as usize)?;
             codes[i * cb..(i + 1) * cb].copy_from_slice(region.codes.map.slice(c, cb));
-            scales[i * gb..(i + 1) * gb].copy_from_slice(region.scales.map.slice(s, gb));
-            biases[i * gb..(i + 1) * gb].copy_from_slice(region.biases.map.slice(b, gb));
+            scales[i * gb..(i + 1) * gb]
+                .copy_from_slice(region.scales.map.slice(s, gb));
+            biases[i * gb..(i + 1) * gb]
+                .copy_from_slice(region.biases.map.slice(b, gb));
         }
         Ok(())
     }
@@ -365,7 +431,9 @@ impl PagedTable {
     ) -> Result<()> {
         let (cb, gb) = (self.codes_bytes(), self.group_bytes());
         ensure!(
-            codes.len() == ids.len() * cb && scales.len() == ids.len() * gb && biases.len() == ids.len() * gb,
+            codes.len() == ids.len() * cb
+                && scales.len() == ids.len() * gb
+                && biases.len() == ids.len() * gb,
             "staging buffers do not match {} rows",
             ids.len()
         );
@@ -398,7 +466,9 @@ impl PagedTable {
                 handles.push(scope.spawn(move || self.copy_rows(ids_a, c_a, s_a, b_a)));
             }
             for handle in handles {
-                handle.join().map_err(|_| anyhow::anyhow!("n-gram copy thread panicked"))??;
+                handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("n-gram copy thread panicked"))??;
             }
             Ok(())
         })
@@ -475,7 +545,11 @@ pub struct StagedRows {
 }
 
 impl StagedRows {
-    pub fn new(ctx: &MetalContext, table: &PagedTable, capacity: usize) -> Result<Self> {
+    pub fn new(
+        ctx: &MetalContext,
+        table: &PagedTable,
+        capacity: usize,
+    ) -> Result<Self> {
         ensure!(capacity > 0, "staging capacity must be nonzero");
         let seq: Vec<u32> = (0..capacity as u32).collect();
         Ok(Self {
@@ -496,7 +570,12 @@ impl StagedRows {
     /// Reads rows `ids` from `table` into the staging buffers. The GPU must
     /// not be reading them (the previous step has completed).
     pub fn fill(&self, table: &PagedTable, ids: &[u32]) -> Result<()> {
-        ensure!(ids.len() <= self.capacity, "{} rows exceed staging capacity {}", ids.len(), self.capacity);
+        ensure!(
+            ids.len() <= self.capacity,
+            "{} rows exceed staging capacity {}",
+            ids.len(),
+            self.capacity
+        );
         let n = ids.len();
         let cb = table.codes_bytes();
         let gb = table.group_bytes();
@@ -555,7 +634,9 @@ impl std::str::FromStr for NgramStorage {
         match s {
             "paged" => Ok(Self::Paged),
             "resident" => Ok(Self::Resident),
-            other => anyhow::bail!("unknown n-gram table storage {other:?}; use paged or resident"),
+            other => anyhow::bail!(
+                "unknown n-gram table storage {other:?}; use paged or resident"
+            ),
         }
     }
 }

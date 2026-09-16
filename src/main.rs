@@ -134,7 +134,8 @@ fn parse_bytes(text: &str) -> Result<usize> {
     let (digits, unit) = text
         .find(|c: char| !c.is_ascii_digit() && c != '.')
         .map_or((text, ""), |i| text.split_at(i));
-    let value: f64 = digits.parse().with_context(|| format!("invalid byte size {text:?}"))?;
+    let value: f64 =
+        digits.parse().with_context(|| format!("invalid byte size {text:?}"))?;
     let scale = match unit.trim().to_ascii_uppercase().as_str() {
         "" | "B" => 1.0,
         "K" | "KB" | "KIB" => 1024.0,
@@ -147,7 +148,9 @@ fn parse_bytes(text: &str) -> Result<usize> {
 }
 
 fn default_disk_cache_dir() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     home.join("Library").join("Caches").join("lily").join("sessions")
 }
 

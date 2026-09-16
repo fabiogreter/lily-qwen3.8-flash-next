@@ -3,7 +3,12 @@ use super::*;
 use serde_json::{Value, json};
 
 fn entry(id: &str) -> TimingsEntry {
-    TimingsEntry { id: id.to_owned(), model: "m", created: 7, timings: Timings::measure(10, 0, 1.0, 5, 1.0, None) }
+    TimingsEntry {
+        id: id.to_owned(),
+        model: "m",
+        created: 7,
+        timings: Timings::measure(10, 0, 1.0, 5, 1.0, None),
+    }
 }
 
 #[test]
@@ -45,25 +50,56 @@ fn a_zero_duration_leaves_the_rate_null_rather_than_infinite() {
 #[test]
 fn speculation_is_null_when_it_is_off_and_a_ratio_when_it_ran() {
     let off = Timings::measure(100, 0, 1.0, 10, 1.0, None);
-    assert_eq!((off.drafted_tokens, off.accepted_tokens, off.acceptance_ratio), (None, None, None));
+    assert_eq!(
+        (off.drafted_tokens, off.accepted_tokens, off.acceptance_ratio),
+        (None, None, None)
+    );
     let json = serde_json::to_value(off).unwrap();
     for field in ["drafted_tokens", "accepted_tokens", "acceptance_ratio"] {
-        assert_eq!(json[field], Value::Null, "{field} must not read as a zero acceptance");
+        assert_eq!(
+            json[field],
+            Value::Null,
+            "{field} must not read as a zero acceptance"
+        );
     }
 
-    let on = Timings::measure(100, 0, 1.0, 10, 1.0, Some(Speculation { drafted: 14, accepted: 11 }));
+    let on = Timings::measure(
+        100,
+        0,
+        1.0,
+        10,
+        1.0,
+        Some(Speculation { drafted: 14, accepted: 11 }),
+    );
     assert_eq!((on.drafted_tokens, on.accepted_tokens), (Some(14), Some(11)));
     assert_eq!(on.acceptance_ratio, Some(0.7857));
 
     // Speculation on but nothing proposed yet (a one-token answer): the
     // counts are real, the ratio would divide by zero.
-    let idle = Timings::measure(100, 0, 1.0, 1, 0.01, Some(Speculation { drafted: 0, accepted: 0 }));
-    assert_eq!((idle.drafted_tokens, idle.accepted_tokens, idle.acceptance_ratio), (Some(0), Some(0), None));
+    let idle = Timings::measure(
+        100,
+        0,
+        1.0,
+        1,
+        0.01,
+        Some(Speculation { drafted: 0, accepted: 0 }),
+    );
+    assert_eq!(
+        (idle.drafted_tokens, idle.accepted_tokens, idle.acceptance_ratio),
+        (Some(0), Some(0), None)
+    );
 }
 
 #[test]
 fn the_json_shape_is_the_documented_one() {
-    let t = Timings::measure(24_538, 0, 21.18, 19, 0.19, Some(Speculation { drafted: 14, accepted: 11 }));
+    let t = Timings::measure(
+        24_538,
+        0,
+        21.18,
+        19,
+        0.19,
+        Some(Speculation { drafted: 14, accepted: 11 }),
+    );
     assert_eq!(
         serde_json::to_value(t).unwrap(),
         json!({
@@ -84,23 +120,39 @@ fn the_json_shape_is_the_documented_one() {
 }
 
 #[test]
-fn agreement_never_reads_below_the_cached_prefix_and_the_durable_field_is_absent_unless_written() {
+fn agreement_never_reads_below_the_cached_prefix_and_the_durable_field_is_absent_unless_written()
+ {
     // Without the session cache's word, the agreement is what was reused.
     let plain = Timings::measure(1000, 300, 1.0, 5, 0.1, None);
     assert_eq!((plain.agreement_tokens, plain.durable_prefix_tokens), (300, None));
     let json = serde_json::to_value(plain).unwrap();
     assert_eq!(json["agreement_tokens"], json!(300));
-    assert!(json.get("durable_prefix_tokens").is_none(), "absent, never a zero-length write");
+    assert!(
+        json.get("durable_prefix_tokens").is_none(),
+        "absent, never a zero-length write"
+    );
 
     // A run that shared 900 tokens, resumed none and wrote the entry there.
-    let written = Timings::measure(1000, 0, 1.0, 5, 0.1, None).with_agreement(900, Some(900));
-    assert_eq!((written.agreement_tokens, written.durable_prefix_tokens), (900, Some(900)));
-    assert_eq!(serde_json::to_value(written).unwrap()["durable_prefix_tokens"], json!(900));
+    let written =
+        Timings::measure(1000, 0, 1.0, 5, 0.1, None).with_agreement(900, Some(900));
+    assert_eq!(
+        (written.agreement_tokens, written.durable_prefix_tokens),
+        (900, Some(900))
+    );
+    assert_eq!(
+        serde_json::to_value(written).unwrap()["durable_prefix_tokens"],
+        json!(900)
+    );
 
     // Clamped into [cached, prompt] whatever the caller passes.
     let t = Timings::measure(1000, 300, 1.0, 5, 0.1, None).with_agreement(10, None);
     assert_eq!(t.agreement_tokens, 300);
-    assert_eq!(Timings::measure(1000, 300, 1.0, 5, 0.1, None).with_agreement(5000, None).agreement_tokens, 1000);
+    assert_eq!(
+        Timings::measure(1000, 300, 1.0, 5, 0.1, None)
+            .with_agreement(5000, None)
+            .agreement_tokens,
+        1000
+    );
 }
 
 #[test]
@@ -112,7 +164,10 @@ fn the_log_is_bounded_and_newest_first() {
     }
     let recent = log.recent();
     assert_eq!(recent.len(), 3, "the ring buffer keeps at most its capacity");
-    assert_eq!(recent.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["id-4", "id-3", "id-2"]);
+    assert_eq!(
+        recent.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+        ["id-4", "id-3", "id-2"]
+    );
     // Reading does not consume.
     assert_eq!(log.recent().len(), 3);
     // A zero capacity would drop every entry; one is the floor.
@@ -120,7 +175,10 @@ fn the_log_is_bounded_and_newest_first() {
     assert_eq!(tiny.capacity(), 1);
     tiny.record(entry("only"));
     tiny.record(entry("last"));
-    assert_eq!(tiny.recent().iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["last"]);
+    assert_eq!(
+        tiny.recent().iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+        ["last"]
+    );
 }
 
 #[test]
@@ -134,5 +192,8 @@ fn the_log_survives_a_poisoned_lock() {
     })
     .join();
     log.record(entry("after"));
-    assert_eq!(log.recent().iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["after", "before"]);
+    assert_eq!(
+        log.recent().iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+        ["after", "before"]
+    );
 }

@@ -18,7 +18,11 @@ fn cpu_sample(
         .map(|(&l, &c)| {
             let mut l = l;
             if p.uses_penalties() && c > 0 {
-                l = if l > 0.0 { l / p.repetition_penalty } else { l * p.repetition_penalty };
+                l = if l > 0.0 {
+                    l / p.repetition_penalty
+                } else {
+                    l * p.repetition_penalty
+                };
                 l -= p.presence_penalty + p.frequency_penalty * c as f32;
             }
             l / temperature
@@ -98,7 +102,10 @@ fn draws_match_the_cpu_reference() {
     for step in 0..steps {
         let got = run_kernel(&ctx, &logits, &counts, &params, step);
         let (want, kept) = cpu_sample(&logits, &counts, &params, step as u32);
-        assert!(kept.contains(&got), "step {step}: {got} outside the kept set {kept:?}");
+        assert!(
+            kept.contains(&got),
+            "step {step}: {got} outside the kept set {kept:?}"
+        );
         if got == want {
             agree += 1;
         }
@@ -178,8 +185,24 @@ fn sampler_timing() {
     let out = Tensor::zeros(&ctx, &[1], DType::U32).expect("out");
     for (label, params) in [
         ("greedy", SamplingParams::greedy()),
-        ("top_k 20", SamplingParams { temperature: 1.0, top_k: 20, top_p: 0.95, ..SamplingParams::greedy() }),
-        ("top_k 0 (cap)", SamplingParams { temperature: 1.0, top_k: 0, top_p: 0.95, ..SamplingParams::greedy() }),
+        (
+            "top_k 20",
+            SamplingParams {
+                temperature: 1.0,
+                top_k: 20,
+                top_p: 0.95,
+                ..SamplingParams::greedy()
+            },
+        ),
+        (
+            "top_k 0 (cap)",
+            SamplingParams {
+                temperature: 1.0,
+                top_k: 0,
+                top_p: 0.95,
+                ..SamplingParams::greedy()
+            },
+        ),
     ] {
         // Warm the pipeline, then time 50 back-to-back dispatches.
         let pass = ctx.begin().expect("pass");
@@ -188,7 +211,8 @@ fn sampler_timing() {
         let n = 50;
         let pass = ctx.begin().expect("pass");
         for step in 0..n {
-            sample_f32(&ctx, &pass, &t_logits, &scratch, &params, step, &out).expect("sample");
+            sample_f32(&ctx, &pass, &t_logits, &scratch, &params, step, &out)
+                .expect("sample");
         }
         let started = std::time::Instant::now();
         pass.commit_wait().expect("run");

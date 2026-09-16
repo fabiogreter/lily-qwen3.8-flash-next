@@ -124,7 +124,8 @@ fn copy_words_copies_any_dtype_and_rejects_mismatch() {
     assert_eq!(t_dst.to_f32().expect("read"), src);
 
     let ids: Vec<u32> = (0..6).collect();
-    let t_ids = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&ids), &[6], DType::U32).expect("ids");
+    let t_ids = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&ids), &[6], DType::U32)
+        .expect("ids");
     let t_out = Tensor::zeros(&ctx, &[6], DType::U32).expect("out");
     let pass = ctx.begin().expect("pass");
     copy_words(&ctx, &pass, &t_ids, &t_out).expect("copy u32");
@@ -153,19 +154,33 @@ fn memory_bandwidth_probe() {
     let grid = Grid::Threads { grid: (threads, 1, 1), threadgroup: (256, 1, 1) };
     let per = u32_bytes(per_thread);
     {
-        let fill = ctx.pipeline("bw_fill_u4", TEST_SOURCE, MslVersion::V3_1).expect("fill");
+        let fill =
+            ctx.pipeline("bw_fill_u4", TEST_SOURCE, MslVersion::V3_1).expect("fill");
         let pass = ctx.begin().expect("pass");
-        pass.dispatch_at(&fill, &[src.binding()], &[], Grid::Threads { grid: (u4, 1, 1), threadgroup: (256, 1, 1) }).expect("dispatch");
+        pass.dispatch_at(
+            &fill,
+            &[src.binding()],
+            &[],
+            Grid::Threads { grid: (u4, 1, 1), threadgroup: (256, 1, 1) },
+        )
+        .expect("dispatch");
         pass.commit_wait().expect("fill");
     }
     let read = ctx.pipeline("bw_read_u4", TEST_SOURCE, MslVersion::V3_1).expect("read");
     let copy = ctx.pipeline("bw_copy_u4", TEST_SOURCE, MslVersion::V3_1).expect("copy");
-    for (name, kernel, traffic) in [("read", &read, bytes), ("copy", &copy, 2 * bytes)] {
+    for (name, kernel, traffic) in [("read", &read, bytes), ("copy", &copy, 2 * bytes)]
+    {
         let mut times = Vec::new();
         for _ in 0..5 {
             let pass = ctx.begin().expect("pass");
             let second: &Tensor = if name == "read" { &out } else { &dst };
-            pass.dispatch_at(kernel, &[src.binding(), second.binding()], &[&per[..]], grid).expect("dispatch");
+            pass.dispatch_at(
+                kernel,
+                &[src.binding(), second.binding()],
+                &[&per[..]],
+                grid,
+            )
+            .expect("dispatch");
             let done = pass.commit().expect("commit").wait_retain().expect("wait");
             let t = done.timing().expect("timing");
             times.push(t.gpu_end_secs - t.gpu_start_secs);

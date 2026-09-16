@@ -15,29 +15,36 @@ use anyhow::{Result, ensure};
 use std::cell::Cell;
 use std::rc::Rc;
 
-use crate::engine::{DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, SnapshotApi};
+use crate::engine::{
+    DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, SnapshotApi,
+};
 use crate::kernels::attention::{
     MAX_SEQ, k_norm_rope_scatter_decode, q_norm_rope_split_decode, rope_neox,
     scatter_kv, sdpa_decode, sdpa_prefill, sdpa_split_scratch_splits, split_q_gate,
 };
-use crate::kernels::elementwise::{add_bf16, copy_words, gather_row_bf16, sigmoid_mul_bf16};
+use crate::kernels::elementwise::{
+    add_bf16, copy_words, gather_row_bf16, sigmoid_mul_bf16,
+};
 use crate::kernels::gdn::{
     GDN_HEAD_DIM, GDN_STATE_DTYPE, GdnGate, GdnRegscanStaging, conv1d_prefill,
     conv1d_step, gated_rmsnorm, gdn_prefill_mid, gdn_step_gated_fused,
 };
 use crate::kernels::hc::{
-    HC_FUSED_MAX_ROWS, fused_read_supported, hc_broadcast_bf16, hc_inject_bf16, hc_mix_bf16,
-    hc_read_down_q8, hc_read_down_q8_rows, hc_read_up_mix_q8, hc_read_up_mix_q8_rows,
-    rmsnorm_grouped_bf16, silu_scaled_bf16,
+    HC_FUSED_MAX_ROWS, fused_read_supported, hc_broadcast_bf16, hc_inject_bf16,
+    hc_mix_bf16, hc_read_down_q8, hc_read_down_q8_rows, hc_read_up_mix_q8,
+    hc_read_up_mix_q8_rows, rmsnorm_grouped_bf16, silu_scaled_bf16,
 };
 use crate::kernels::norm::rmsnorm_bf16;
 use crate::kernels::ple;
 use crate::kernels::qsa::{self, INDEXER_D, SparseSplitScratch};
+use crate::kernels::sample::{SamplerScratch, SamplingParams, sample_f32};
 use crate::kernels::spec::ctrl_words;
 use crate::kernels::{Arg, Pos};
-use crate::kernels::sample::{SamplerScratch, SamplingParams, sample_f32};
 use crate::kernels::{quant, skinny};
-use crate::metal::{BlitCopy, ComputePass, DetachedPass, EncodedPass, MetalContext, Pacer, PendingPass, SharedEvent};
+use crate::metal::{
+    BlitCopy, ComputePass, DetachedPass, EncodedPass, MetalContext, Pacer, PendingPass,
+    SharedEvent,
+};
 use crate::moe_ffn::{
     DecodeMoeIo, MoeDims, MoeScratch, PrefillMoeIo, PrefillMoeScratch, decode_moe,
     prefill_moe, prefix_rows, project_mat, project_stack_or_slices,
@@ -47,8 +54,8 @@ use crate::tensor::{DType, Tensor};
 use super::config::{GateAct, Qwen4ExpConfig};
 use super::ngram::{NgramHasher, NgramStorage, NgramTable, StagedRows};
 use super::weights::{
-    self, AttnWeights, GdnWeights, HcWeights, LayerWeights, Mixer, ModelWeights, MtpWeights,
-    PleWeights,
+    self, AttnWeights, GdnWeights, HcWeights, LayerWeights, Mixer, ModelWeights,
+    MtpWeights, PleWeights,
 };
 
 /// Every RMSNorm in this model is zero-centered: gain = 1 + weight. (The GDN
@@ -382,7 +389,9 @@ fn attn_prefix_regions(
     ratio: usize,
     f: &mut dyn FnMut(&Tensor, usize) -> Result<()>,
 ) -> Result<()> {
-    let LayerState::Attn { k_cache, v_cache, idx_keys, blk_keys } = lstate else { return Ok(()) };
+    let LayerState::Attn { k_cache, v_cache, idx_keys, blk_keys } = lstate else {
+        return Ok(());
+    };
     ensure!(tokens <= written, "prefix of {tokens} tokens from a layout of {written}");
     for cache in [k_cache, v_cache] {
         let (heads, cap, d) = (cache.shape()[0], cache.shape()[1], cache.shape()[2]);
@@ -396,21 +405,41 @@ fn attn_prefix_regions(
     f(&idx_keys.view(0, &[tokens, INDEXER_D])?, (written - tokens) * row)?;
     let blocks = tokens.div_ceil(ratio).min(blk_keys.shape()[0]);
     let written_blocks = written.div_ceil(ratio).min(blk_keys.shape()[0]);
-    f(&blk_keys.view(0, &[blocks, INDEXER_D])?, (written_blocks - blocks) * INDEXER_D * blk_keys.dtype().size())
+    f(
+        &blk_keys.view(0, &[blocks, INDEXER_D])?,
+        (written_blocks - blocks) * INDEXER_D * blk_keys.dtype().size(),
+    )
 }
 
 fn clone_tensor(ctx: &MetalContext, t: &Tensor) -> Result<Tensor> {
     let out = Tensor::zeros(ctx, t.shape(), t.dtype())?;
-    ctx.blit_copy(&[BlitCopy { src: t, src_offset: 0, dst: &out, dst_offset: 0, len: t.byte_len() }])?;
+    ctx.blit_copy(&[BlitCopy {
+        src: t,
+        src_offset: 0,
+        dst: &out,
+        dst_offset: 0,
+        len: t.byte_len(),
+    }])?;
     Ok(out)
 }
 
 /// Copies the first `rows` rows of every `[heads, cap, d]` head block from
 /// `src` to `dst` (both bf16, possibly different capacities).
-fn head_block_copies<'t>(src: &'t Tensor, dst: &'t Tensor, rows: usize, out: &mut Vec<BlitCopy<'t>>) -> Result<()> {
+fn head_block_copies<'t>(
+    src: &'t Tensor,
+    dst: &'t Tensor,
+    rows: usize,
+    out: &mut Vec<BlitCopy<'t>>,
+) -> Result<()> {
     let (heads, src_cap, d) = (src.shape()[0], src.shape()[1], src.shape()[2]);
     let dst_cap = dst.shape()[1];
-    ensure!(rows <= src_cap && rows <= dst_cap && dst.shape()[0] == heads && dst.shape()[2] == d, "cache copy shape mismatch");
+    ensure!(
+        rows <= src_cap
+            && rows <= dst_cap
+            && dst.shape()[0] == heads
+            && dst.shape()[2] == d,
+        "cache copy shape mismatch"
+    );
     let row_bytes = d * src.dtype().size();
     for h in 0..heads {
         out.push(BlitCopy {
@@ -425,10 +454,21 @@ fn head_block_copies<'t>(src: &'t Tensor, dst: &'t Tensor, rows: usize, out: &mu
 }
 
 /// Copies the first `rows` rows of a `[cap, d]` store.
-fn row_copy<'t>(src: &'t Tensor, dst: &'t Tensor, rows: usize, out: &mut Vec<BlitCopy<'t>>) -> Result<()> {
+fn row_copy<'t>(
+    src: &'t Tensor,
+    dst: &'t Tensor,
+    rows: usize,
+    out: &mut Vec<BlitCopy<'t>>,
+) -> Result<()> {
     let rows = rows.min(src.shape()[0]).min(dst.shape()[0]);
     let row_bytes = src.shape()[1] * src.dtype().size();
-    out.push(BlitCopy { src, src_offset: 0, dst, dst_offset: 0, len: rows * row_bytes });
+    out.push(BlitCopy {
+        src,
+        src_offset: 0,
+        dst,
+        dst_offset: 0,
+        len: rows * row_bytes,
+    });
     Ok(())
 }
 
@@ -456,20 +496,31 @@ impl DecodeState {
         Ok(())
     }
 
-    fn attn_caches(ctx: &MetalContext, kv_heads: usize, head_dim: usize, ratio: usize, capacity: usize) -> Result<LayerState> {
+    fn attn_caches(
+        ctx: &MetalContext,
+        kv_heads: usize,
+        head_dim: usize,
+        ratio: usize,
+        capacity: usize,
+    ) -> Result<LayerState> {
         Ok(LayerState::Attn {
             k_cache: Tensor::zeros(ctx, &[kv_heads, capacity, head_dim], DType::BF16)?,
             v_cache: Tensor::zeros(ctx, &[kv_heads, capacity, head_dim], DType::BF16)?,
             idx_keys: Tensor::zeros(ctx, &[capacity, INDEXER_D], DType::BF16)?,
-            blk_keys: Tensor::zeros(ctx, &[(capacity / ratio).max(1), INDEXER_D], DType::BF16)?,
+            blk_keys: Tensor::zeros(
+                ctx,
+                &[(capacity / ratio).max(1), INDEXER_D],
+                DType::BF16,
+            )?,
         })
     }
 
     /// Per-token cache bytes for `capacity` tokens across all attention
     /// layers, the draft head's included.
     fn cache_bytes(&self, capacity: usize) -> usize {
-        let attn_layers = self.layers.iter().filter(|l| matches!(l, LayerState::Attn { .. })).count()
-            + usize::from(self.mtp.is_some());
+        let attn_layers =
+            self.layers.iter().filter(|l| matches!(l, LayerState::Attn { .. })).count()
+                + usize::from(self.mtp.is_some());
         let per_token = 2 * self.kv_heads * self.head_dim * 2 + INDEXER_D * 2;
         let blocks = (capacity / self.ratio).max(1) * INDEXER_D * 2;
         attn_layers * (capacity * per_token + blocks)
@@ -477,12 +528,23 @@ impl DecodeState {
 
     /// Replaces an attention layer's caches with ones of `capacity` tokens,
     /// copying the first `pos` entries. GPU idle.
-    fn grow_attn(&self, ctx: &MetalContext, lstate: &mut LayerState, capacity: usize) -> Result<()> {
+    fn grow_attn(
+        &self,
+        ctx: &MetalContext,
+        lstate: &mut LayerState,
+        capacity: usize,
+    ) -> Result<()> {
         let LayerState::Attn { k_cache, v_cache, idx_keys, blk_keys } = lstate else {
             return Ok(());
         };
         let LayerState::Attn { k_cache: k2, v_cache: v2, idx_keys: i2, blk_keys: b2 } =
-            DecodeState::attn_caches(ctx, self.kv_heads, self.head_dim, self.ratio, capacity)?
+            DecodeState::attn_caches(
+                ctx,
+                self.kv_heads,
+                self.head_dim,
+                self.ratio,
+                capacity,
+            )?
         else {
             unreachable!()
         };
@@ -502,7 +564,13 @@ impl DecodeState {
 }
 
 /// Copies the first `tokens` entries of one attention layer's caches.
-fn attn_prefix_copies<'t>(dst: &'t LayerState, src: &'t LayerState, tokens: usize, ratio: usize, out: &mut Vec<BlitCopy<'t>>) -> Result<()> {
+fn attn_prefix_copies<'t>(
+    dst: &'t LayerState,
+    src: &'t LayerState,
+    tokens: usize,
+    ratio: usize,
+    out: &mut Vec<BlitCopy<'t>>,
+) -> Result<()> {
     if let (
         LayerState::Attn { k_cache, v_cache, idx_keys, blk_keys },
         LayerState::Attn { k_cache: k0, v_cache: v0, idx_keys: i0, blk_keys: b0 },
@@ -574,17 +642,29 @@ pub(super) struct PleScratch {
 }
 
 impl PleScratch {
-    fn new(ctx: &MetalContext, cfg: &Qwen4ExpConfig, rows: usize, table: &NgramTable) -> Result<Self> {
+    fn new(
+        ctx: &MetalContext,
+        cfg: &Qwen4ExpConfig,
+        rows: usize,
+        table: &NgramTable,
+    ) -> Result<Self> {
         let ple = cfg.ple.as_ref().expect("PLE scratch without PLE config");
         let (h, wide) = (cfg.hidden_size, cfg.hc_width());
         let bf = DType::BF16;
         let heads = ple.ngram_heads();
         let (ids, stage) = match table {
-            NgramTable::Resident(_) => (Tensor::zeros(ctx, &[rows, heads], DType::U32)?, None),
+            NgramTable::Resident(_) => {
+                (Tensor::zeros(ctx, &[rows, heads], DType::U32)?, None)
+            }
             NgramTable::Paged(paged) => {
                 // Staged rows are gathered with their own sequential ids.
                 let seq: Vec<u32> = (0..(rows * heads) as u32).collect();
-                let ids = Tensor::from_bytes(ctx, bytemuck::cast_slice(&seq), &[rows, heads], DType::U32)?;
+                let ids = Tensor::from_bytes(
+                    ctx,
+                    bytemuck::cast_slice(&seq),
+                    &[rows, heads],
+                    DType::U32,
+                )?;
                 (ids, Some(Rc::new(StagedRows::new(ctx, paged, rows * heads)?)))
             }
         };
@@ -760,14 +840,30 @@ impl SpecScratch {
     fn new(ctx: &MetalContext, cfg: &Qwen4ExpConfig) -> Result<Self> {
         let heads = cfg.linear_num_value_heads;
         let c = cfg.gdn_conv_channels();
-        let gdn_layers = cfg.layer_types.iter().filter(|t| matches!(t, super::config::LayerType::LinearAttention)).count();
+        let gdn_layers = cfg
+            .layer_types
+            .iter()
+            .filter(|t| matches!(t, super::config::LayerType::LinearAttention))
+            .count();
         let rows = MAX_DRAFTS + 1;
         Ok(Self {
             mid: (0..gdn_layers)
-                .map(|_| Tensor::zeros(ctx, &[MAX_DRAFTS, heads, GDN_HEAD_DIM, GDN_HEAD_DIM], GDN_STATE_DTYPE))
+                .map(|_| {
+                    Tensor::zeros(
+                        ctx,
+                        &[MAX_DRAFTS, heads, GDN_HEAD_DIM, GDN_HEAD_DIM],
+                        GDN_STATE_DTYPE,
+                    )
+                })
                 .collect::<Result<_>>()?,
-            conv_in: (0..gdn_layers).map(|_| Tensor::zeros(ctx, &[rows, c], DType::BF16)).collect::<Result<_>>()?,
-            ple_conv_in: cfg.ple.as_ref().map(|_| Tensor::zeros(ctx, &[rows, cfg.hc_width()], DType::BF16)).transpose()?,
+            conv_in: (0..gdn_layers)
+                .map(|_| Tensor::zeros(ctx, &[rows, c], DType::BF16))
+                .collect::<Result<_>>()?,
+            ple_conv_in: cfg
+                .ple
+                .as_ref()
+                .map(|_| Tensor::zeros(ctx, &[rows, cfg.hc_width()], DType::BF16))
+                .transpose()?,
             logits: Tensor::zeros(ctx, &[rows, cfg.vocab_size], DType::F32)?,
             verify_tokens: Tensor::zeros(ctx, &[rows], DType::U32)?,
             draft_tokens: Tensor::zeros(ctx, &[MAX_DRAFTS], DType::U32)?,
@@ -796,7 +892,13 @@ impl<'t> AttnPos<'t> {
 
     /// `pos` (a U32 word in `min..=max`), `block` and `count`: the words a
     /// `kernels::spec::spec_accept` dispatch wrote for this row.
-    pub(super) fn gpu(pos: &'t Tensor, min: usize, max: usize, block: &'t Tensor, count: &'t Tensor) -> Self {
+    pub(super) fn gpu(
+        pos: &'t Tensor,
+        min: usize,
+        max: usize,
+        block: &'t Tensor,
+        count: &'t Tensor,
+    ) -> Self {
         Self { pos: Pos::gpu(pos, min, max), block: Some((block, count)) }
     }
 }
@@ -909,8 +1011,12 @@ impl PrefillScratch {
             moe: PrefillMoeScratch::new(ctx, &moe_dims(cfg), m)?,
             qsa: QsaScratch::new(ctx, cfg, max_seq, QSA_QUERY_BATCH.min(m))?,
             ple: table.map(|t| PleScratch::new(ctx, cfg, m, t)).transpose()?,
-            mtp_hyper: with_mtp.then(|| Tensor::zeros(ctx, &[m, cfg.hc_width()], bf)).transpose()?,
-            mtp_hidden_in: with_mtp.then(|| Tensor::zeros(ctx, &[m, cfg.hc_width()], bf)).transpose()?,
+            mtp_hyper: with_mtp
+                .then(|| Tensor::zeros(ctx, &[m, cfg.hc_width()], bf))
+                .transpose()?,
+            mtp_hidden_in: with_mtp
+                .then(|| Tensor::zeros(ctx, &[m, cfg.hc_width()], bf))
+                .transpose()?,
         })
     }
 
@@ -970,8 +1076,16 @@ impl PrefillScratch {
                 stats: self.qsa.stats.view(0, self.qsa.stats.shape())?,
             },
             ple: self.ple.as_ref().map(|p| p.rows(m)).transpose()?,
-            mtp_hyper: self.mtp_hyper.as_ref().map(|t| prefix_rows(t, m)).transpose()?,
-            mtp_hidden_in: self.mtp_hidden_in.as_ref().map(|t| prefix_rows(t, m)).transpose()?,
+            mtp_hyper: self
+                .mtp_hyper
+                .as_ref()
+                .map(|t| prefix_rows(t, m))
+                .transpose()?,
+            mtp_hidden_in: self
+                .mtp_hidden_in
+                .as_ref()
+                .map(|t| prefix_rows(t, m))
+                .transpose()?,
         })
     }
 }
@@ -992,7 +1106,12 @@ impl Qwen4ExpModel {
 
     /// Loads with the n-gram table `storage` of choice, and the draft head
     /// when `with_mtp` and the checkpoint has one.
-    pub fn load_with(ctx: &MetalContext, dir: impl AsRef<Path>, storage: NgramStorage, with_mtp: bool) -> Result<Self> {
+    pub fn load_with(
+        ctx: &MetalContext,
+        dir: impl AsRef<Path>,
+        storage: NgramStorage,
+        with_mtp: bool,
+    ) -> Result<Self> {
         let config = Qwen4ExpConfig::from_model_dir(&dir)?;
         ensure!(
             config.linear_key_head_dim == GDN_HEAD_DIM
@@ -1030,7 +1149,11 @@ impl Qwen4ExpModel {
         self.weights.mtp.is_some()
     }
 
-    fn begin_batched<'a>(&self, ctx: &'a MetalContext, rows: usize) -> Result<ComputePass<'a>> {
+    fn begin_batched<'a>(
+        &self,
+        ctx: &'a MetalContext,
+        rows: usize,
+    ) -> Result<ComputePass<'a>> {
         match encoder_for(rows) {
             Encoder::Serial => ctx.begin(),
             Encoder::Concurrent => ctx.begin_concurrent(),
@@ -1045,7 +1168,13 @@ impl Qwen4ExpModel {
     /// Stages the n-gram rows for `tokens` following `hist` into `p`: hashed
     /// ids for a resident table, the rows themselves for a paged one. The GPU
     /// must not be reading `p`.
-    pub(super) fn stage_ngram(&self, w: &PleWeights, p: &PleScratch, tokens: &[u32], hist: [u32; 2]) -> Result<()> {
+    pub(super) fn stage_ngram(
+        &self,
+        w: &PleWeights,
+        p: &PleScratch,
+        tokens: &[u32],
+        hist: [u32; 2],
+    ) -> Result<()> {
         let hasher = self.hasher.as_ref().expect("PLE weights without hasher");
         let mut ids = Vec::with_capacity(tokens.len() * hasher.heads());
         hasher.ids(tokens, hist, &mut ids);
@@ -1059,10 +1188,19 @@ impl Qwen4ExpModel {
     }
 
     /// Encodes the table gather for `rows` tokens into `p.emb`.
-    fn gather_ngram(&self, ctx: &MetalContext, pass: &ComputePass<'_>, w: &PleWeights, p: &PleScratch, rows: usize) -> Result<()> {
+    fn gather_ngram(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        w: &PleWeights,
+        p: &PleScratch,
+        rows: usize,
+    ) -> Result<()> {
         let heads = self.config.ple.as_ref().expect("PLE config").ngram_heads();
         match &w.table {
-            NgramTable::Resident(table) => ple::ple_gather_q4(ctx, pass, table, &p.ids, heads, &p.emb),
+            NgramTable::Resident(table) => {
+                ple::ple_gather_q4(ctx, pass, table, &p.ids, heads, &p.emb)
+            }
             NgramTable::Paged(_) => {
                 let stage = p.stage.as_ref().expect("paged table without staging");
                 let staged = stage.as_table(rows * heads)?;
@@ -1071,7 +1209,11 @@ impl Qwen4ExpModel {
         }
     }
 
-    pub fn new_state(&self, ctx: &MetalContext, capacity: usize) -> Result<DecodeState> {
+    pub fn new_state(
+        &self,
+        ctx: &MetalContext,
+        capacity: usize,
+    ) -> Result<DecodeState> {
         let capacity = round_capacity(capacity)?;
         let cfg = &self.config;
         let c = cfg.gdn_conv_channels();
@@ -1103,20 +1245,30 @@ impl Qwen4ExpModel {
                 ),
             })
             .collect::<Result<Vec<_>>>()?;
-        let ple = cfg.ple.as_ref().map(|p| {
-            let s = p.conv_state_len();
-            Ok::<_, anyhow::Error>(PleState {
-                hist: [p.eos_token_id, p.eos_token_id],
-                conv_windows: [
-                    Tensor::zeros(ctx, &[cfg.hc_width(), s], DType::BF16)?,
-                    Tensor::zeros(ctx, &[cfg.hc_width(), s], DType::BF16)?,
-                ],
-                eos: p.eos_token_id,
+        let ple = cfg
+            .ple
+            .as_ref()
+            .map(|p| {
+                let s = p.conv_state_len();
+                Ok::<_, anyhow::Error>(PleState {
+                    hist: [p.eos_token_id, p.eos_token_id],
+                    conv_windows: [
+                        Tensor::zeros(ctx, &[cfg.hc_width(), s], DType::BF16)?,
+                        Tensor::zeros(ctx, &[cfg.hc_width(), s], DType::BF16)?,
+                    ],
+                    eos: p.eos_token_id,
+                })
             })
-        }).transpose()?;
+            .transpose()?;
         let mtp = match &self.weights.mtp {
             Some(_) => Some(MtpState {
-                layer: DecodeState::attn_caches(ctx, cfg.num_key_value_heads, cfg.head_dim, ratio, capacity)?,
+                layer: DecodeState::attn_caches(
+                    ctx,
+                    cfg.num_key_value_heads,
+                    cfg.head_dim,
+                    ratio,
+                    capacity,
+                )?,
                 hidden: Tensor::zeros(ctx, &[cfg.hc_width()], DType::BF16)?,
             }),
             None => None,
@@ -1209,7 +1361,10 @@ impl Qwen4ExpModel {
             idx_qk: Tensor::zeros(ctx, &[(nh + 1) * INDEXER_D], bf)?,
             idx_q: Tensor::zeros(ctx, &[nh, INDEXER_D], bf)?,
             qsa: QsaScratch::new(ctx, cfg, capacity_tokens, 1)?,
-            ple: self.ple_table().map(|t| PleScratch::new(ctx, cfg, 1, t)).transpose()?,
+            ple: self
+                .ple_table()
+                .map(|t| PleScratch::new(ctx, cfg, 1, t))
+                .transpose()?,
             gdn_in,
             attn_qkv,
             mlp_gu,
@@ -1221,12 +1376,22 @@ impl Qwen4ExpModel {
             dequant: Tensor::zeros(ctx, &[dequant_numel], bf)?,
             moe: MoeScratch::new(ctx, &moe_dims(cfg))?,
             prefill: None,
-            spec: self.weights.mtp.as_ref().map(|_| SpecScratch::new(ctx, cfg)).transpose()?,
+            spec: self
+                .weights
+                .mtp
+                .as_ref()
+                .map(|_| SpecScratch::new(ctx, cfg))
+                .transpose()?,
         })
     }
 
     /// Makes sure `s.prefill` can hold chunks of `needed` rows.
-    pub(super) fn ensure_prefill_scratch(&self, ctx: &MetalContext, s: &mut Scratch, needed: usize) -> Result<()> {
+    pub(super) fn ensure_prefill_scratch(
+        &self,
+        ctx: &MetalContext,
+        s: &mut Scratch,
+        needed: usize,
+    ) -> Result<()> {
         let needed = needed.min(PREFILL_CHUNK);
         let have = s.prefill.as_ref().map_or(0, |p| p.m);
         if have < needed {
@@ -1270,9 +1435,19 @@ impl Qwen4ExpModel {
 
     /// Host work for the step consuming `token`: stage its n-gram rows and
     /// advance the hash history.
-    pub fn prepare_step_inputs(&self, state: &mut DecodeState, s: &Scratch, token: u32) -> Result<()> {
+    pub fn prepare_step_inputs(
+        &self,
+        state: &mut DecodeState,
+        s: &Scratch,
+        token: u32,
+    ) -> Result<()> {
         if let (Some(pst), Some(p)) = (&mut state.ple, &s.ple) {
-            let w = self.weights.layers.iter().find_map(|l| l.ple.as_deref()).expect("PLE state without weights");
+            let w = self
+                .weights
+                .layers
+                .iter()
+                .find_map(|l| l.ple.as_deref())
+                .expect("PLE state without weights");
             self.stage_ngram(w, p, &[token], pst.hist)?;
             pst.hist = NgramHasher::advance(pst.hist, &[token]);
         }
@@ -1308,13 +1483,17 @@ impl Qwen4ExpModel {
                 self.stage_ngram(w, p, chunk, pst.hist)?;
             }
             remaining -= chunk.len();
-            let mode = BatchMode::Prefill { draw: if remaining == 0 { draw } else { None } };
+            let mode =
+                BatchMode::Prefill { draw: if remaining == 0 { draw } else { None } };
             let started = std::time::Instant::now();
             let encoded = self.encode_batch(ctx, state, s, &ps, mode)?;
             let encoded_at = std::time::Instant::now();
             let completed = encoded.commit()?.wait_retain()?;
             if profile {
-                let gpu = completed.timing().map(|t| (t.gpu_end_secs - t.gpu_start_secs) * 1e3).unwrap_or(-1.0);
+                let gpu = completed
+                    .timing()
+                    .map(|t| (t.gpu_end_secs - t.gpu_start_secs) * 1e3)
+                    .unwrap_or(-1.0);
                 eprintln!(
                     "profile prefill m={}: encode {:.2} ms, gpu {:.2} ms, total {:.2} ms",
                     chunk.len(),
@@ -1357,7 +1536,11 @@ impl Qwen4ExpModel {
         let verify = matches!(mode, BatchMode::Verify { .. });
         pass.set_label(if verify { "verify" } else { "prefill" });
         if verify {
-            ensure!(m <= MAX_DRAFTS + 1, "verify batch of {m} rows exceeds {}", MAX_DRAFTS + 1);
+            ensure!(
+                m <= MAX_DRAFTS + 1,
+                "verify batch of {m} rows exceeds {}",
+                MAX_DRAFTS + 1
+            );
         }
         let spec = if verify { s.spec.as_ref() } else { None };
 
@@ -1374,21 +1557,63 @@ impl Qwen4ExpModel {
             };
             let capture = match (spec, lstate) {
                 (Some(sp), LayerState::Gdn { .. }) => {
-                    let mid = (m > 1).then(|| sp.mid[gdn_index].view(0, &[m - 1, cfg.linear_num_value_heads, GDN_HEAD_DIM, GDN_HEAD_DIM])).transpose()?;
-                    Some(Capture { mid, conv_in: prefix_rows(&sp.conv_in[gdn_index], m)?, ple_conv_in: sp.ple_conv_in.as_ref().map(|t| prefix_rows(t, m)).transpose()? })
+                    let mid = (m > 1)
+                        .then(|| {
+                            sp.mid[gdn_index].view(
+                                0,
+                                &[
+                                    m - 1,
+                                    cfg.linear_num_value_heads,
+                                    GDN_HEAD_DIM,
+                                    GDN_HEAD_DIM,
+                                ],
+                            )
+                        })
+                        .transpose()?;
+                    Some(Capture {
+                        mid,
+                        conv_in: prefix_rows(&sp.conv_in[gdn_index], m)?,
+                        ple_conv_in: sp
+                            .ple_conv_in
+                            .as_ref()
+                            .map(|t| prefix_rows(t, m))
+                            .transpose()?,
+                    })
                 }
-                (Some(sp), LayerState::Attn { .. }) => Some(Capture { mid: None, conv_in: prefix_rows(&sp.conv_in[0], 0)?, ple_conv_in: sp.ple_conv_in.as_ref().map(|t| prefix_rows(t, m)).transpose()? }),
+                (Some(sp), LayerState::Attn { .. }) => Some(Capture {
+                    mid: None,
+                    conv_in: prefix_rows(&sp.conv_in[0], 0)?,
+                    ple_conv_in: sp
+                        .ple_conv_in
+                        .as_ref()
+                        .map(|t| prefix_rows(t, m))
+                        .transpose()?,
+                }),
                 _ => None,
             };
             if matches!(lstate, LayerState::Gdn { .. }) {
                 gdn_index += 1;
             }
-            if let (Some(_), BatchMode::Verify { park: Some(value), .. }) = (&ple, &mode) {
+            if let (Some(_), BatchMode::Verify { park: Some(value), .. }) =
+                (&ple, &mode)
+            {
                 // The n-gram rows are the only host-staged input; everything
                 // before this point ran while the host staged them.
                 s.sync.encode_wait(&pass, *value)?;
             }
-            self.block_batched(ctx, &pass, layer, lstate, &ps.hyper, pos, conv_slot, s, ps, ple, capture.as_ref())?;
+            self.block_batched(
+                ctx,
+                &pass,
+                layer,
+                lstate,
+                &ps.hyper,
+                pos,
+                conv_slot,
+                s,
+                ps,
+                ple,
+                capture.as_ref(),
+            )?;
         }
 
         match mode {
@@ -1400,12 +1625,26 @@ impl Qwen4ExpModel {
                     gather_row_bf16(ctx, &pass, &ps.hyper, &s.hyper, m - 1)?;
                     pass.level_barrier(&[&s.hyper])?;
                     self.hc_read_decode(ctx, &pass, &self.weights.final_mixer, s)?;
-                    quant::gemv_quant(ctx, &pass, &self.weights.lm_head, &s.hc.mixed, &s.logits)?;
+                    quant::gemv_quant(
+                        ctx,
+                        &pass,
+                        &self.weights.lm_head,
+                        &s.hc.mixed,
+                        &s.logits,
+                    )?;
                     pass.level_barrier(&[&s.logits])?;
                     // Slot 0 by convention: the pipelined loop's first decode step
                     // consumes the prefill token from this slot.
                     let out = s.next_token.view(0, &[1])?;
-                    sample_f32(ctx, &pass, &s.logits, &s.sampler, draw.params, draw.step, &out)?;
+                    sample_f32(
+                        ctx,
+                        &pass,
+                        &s.logits,
+                        &s.sampler,
+                        draw.params,
+                        draw.step,
+                        &out,
+                    )?;
                     pass.level_barrier(&[&s.next_token])?;
                 }
                 if let (Some(mtp), Some(mst)) = (&self.weights.mtp, &state.mtp) {
@@ -1413,10 +1652,26 @@ impl Qwen4ExpModel {
                 }
             }
             BatchMode::Verify { params, step0, .. } => {
-                let sp = s.spec.as_ref().ok_or_else(|| anyhow::anyhow!("verify pass without spec scratch"))?;
-                self.hc_read_batched(ctx, &pass, &self.weights.final_mixer, &ps.hyper, s, ps)?;
+                let sp = s.spec.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("verify pass without spec scratch")
+                })?;
+                self.hc_read_batched(
+                    ctx,
+                    &pass,
+                    &self.weights.final_mixer,
+                    &ps.hyper,
+                    s,
+                    ps,
+                )?;
                 let logits = prefix_rows(&sp.logits, m)?;
-                project_mat(ctx, &pass, &ps.hc.mixed, &self.weights.lm_head, &logits, &s.dequant)?;
+                project_mat(
+                    ctx,
+                    &pass,
+                    &ps.hc.mixed,
+                    &self.weights.lm_head,
+                    &logits,
+                    &s.dequant,
+                )?;
                 pass.level_barrier(&[&logits])?;
                 // One draw per row; the rows share the sampler scratch (and
                 // the penalty counts, which must see earlier rows' draws).
@@ -1454,16 +1709,42 @@ impl Qwen4ExpModel {
         let cfg = &self.config;
         let (h, g) = (cfg.hidden_size, cfg.hc_count);
         if let Some((w, p, pst)) = ple {
-            self.ple_batched(ctx, pass, w, p, pst, conv_slot, hyper, s, ps, capture.and_then(|c| c.ple_conv_in.as_ref()))?;
+            self.ple_batched(
+                ctx,
+                pass,
+                w,
+                p,
+                pst,
+                conv_slot,
+                hyper,
+                s,
+                ps,
+                capture.and_then(|c| c.ple_conv_in.as_ref()),
+            )?;
         }
 
         self.hc_read_batched(ctx, pass, &layer.attn_hc, hyper, s, ps)?;
         match (&layer.mixer, lstate) {
             (Mixer::Gdn(w), LayerState::Gdn { state, conv_windows }) => {
-                self.gdn_batched(ctx, pass, w, s, ps, state, conv_windows, conv_slot, capture)?;
+                self.gdn_batched(
+                    ctx,
+                    pass,
+                    w,
+                    s,
+                    ps,
+                    state,
+                    conv_windows,
+                    conv_slot,
+                    capture,
+                )?;
             }
-            (Mixer::Attn(w), LayerState::Attn { k_cache, v_cache, idx_keys, blk_keys }) => {
-                self.attn_batched(ctx, pass, w, s, ps, k_cache, v_cache, idx_keys, blk_keys, pos)?;
+            (
+                Mixer::Attn(w),
+                LayerState::Attn { k_cache, v_cache, idx_keys, blk_keys },
+            ) => {
+                self.attn_batched(
+                    ctx, pass, w, s, ps, k_cache, v_cache, idx_keys, blk_keys, pos,
+                )?;
             }
             _ => anyhow::bail!("layer/state kind mismatch"),
         }
@@ -1510,7 +1791,9 @@ impl Qwen4ExpModel {
     ) -> Result<()> {
         let cfg = &self.config;
         let (h, g) = (cfg.hidden_size, cfg.hc_count);
-        if ps.m <= HC_FUSED_MAX_ROWS && fused_read_supported(&hc.down, &hc.up, hc.inject.as_ref(), h, g) {
+        if ps.m <= HC_FUSED_MAX_ROWS
+            && fused_read_supported(&hc.down, &hc.up, hc.inject.as_ref(), h, g)
+        {
             hc_read_down_q8_rows(
                 ctx,
                 pass,
@@ -1544,7 +1827,17 @@ impl Qwen4ExpModel {
             return pass.level_barrier(&[&ps.hc.mixed]);
         }
         let inv_g = 1.0 / g as f32;
-        rmsnorm_grouped_bf16(ctx, pass, hyper, &hc.norm, &ps.hc.hn, h, g, cfg.rms_norm_eps, NORM_WEIGHT_BIAS)?;
+        rmsnorm_grouped_bf16(
+            ctx,
+            pass,
+            hyper,
+            &hc.norm,
+            &ps.hc.hn,
+            h,
+            g,
+            cfg.rms_norm_eps,
+            NORM_WEIGHT_BIAS,
+        )?;
         pass.level_barrier(&[&ps.hc.hn])?;
         project_mat(ctx, pass, &ps.hc.hn, &hc.down, &ps.hc.down, &s.dequant)?;
         if let Some(inject) = &hc.inject {
@@ -1577,16 +1870,48 @@ impl Qwen4ExpModel {
         let ple = cfg.ple.as_ref().expect("PLE weights without PLE config");
         let (h, g, eps) = (cfg.hidden_size, cfg.hc_count, cfg.rms_norm_eps);
         self.gather_ngram(ctx, pass, w, p, ps.m)?;
-        rmsnorm_grouped_bf16(ctx, pass, hyper, &w.norm_query, &p.query_n, h, g, eps, NORM_WEIGHT_BIAS)?;
+        rmsnorm_grouped_bf16(
+            ctx,
+            pass,
+            hyper,
+            &w.norm_query,
+            &p.query_n,
+            h,
+            g,
+            eps,
+            NORM_WEIGHT_BIAS,
+        )?;
         pass.level_barrier(&[&p.emb, &p.query_n])?;
         project_mat(ctx, pass, &p.emb, &w.key_proj, &p.key, &s.dequant)?;
         project_mat(ctx, pass, &p.emb, &w.value_proj, &p.value, &s.dequant)?;
         pass.level_barrier(&[&p.key, &p.value])?;
-        rmsnorm_grouped_bf16(ctx, pass, &p.key, &w.norm_key, &p.key_n, h, g, eps, NORM_WEIGHT_BIAS)?;
+        rmsnorm_grouped_bf16(
+            ctx,
+            pass,
+            &p.key,
+            &w.norm_key,
+            &p.key_n,
+            h,
+            g,
+            eps,
+            NORM_WEIGHT_BIAS,
+        )?;
         pass.level_barrier(&[&p.key_n])?;
-        ple::ple_gate_value_bf16(ctx, pass, &p.key_n, &p.query_n, &p.value, &p.gated, h, g)?;
+        ple::ple_gate_value_bf16(
+            ctx, pass, &p.key_n, &p.query_n, &p.value, &p.gated, h, g,
+        )?;
         pass.level_barrier(&[&p.gated])?;
-        rmsnorm_grouped_bf16(ctx, pass, &p.gated, &w.norm_conv, &p.gated_n, h, g, eps, NORM_WEIGHT_BIAS)?;
+        rmsnorm_grouped_bf16(
+            ctx,
+            pass,
+            &p.gated,
+            &w.norm_conv,
+            &p.gated_n,
+            h,
+            g,
+            eps,
+            NORM_WEIGHT_BIAS,
+        )?;
         pass.level_barrier(&[&p.gated_n])?;
         if let Some(keep) = conv_capture {
             copy_words(ctx, pass, &p.gated_n, keep)?;
@@ -1668,7 +1993,16 @@ impl Qwen4ExpModel {
             capture.and_then(|c| c.mid.as_ref()),
         )?;
         pass.level_barrier(&[&ps.gdn_out, gdn_state])?;
-        gated_rmsnorm(ctx, pass, &ps.gdn_out, &ps.z, &w.norm_w, &ps.gdn_gated, cfg.rms_norm_eps, self.gdn_gate)?;
+        gated_rmsnorm(
+            ctx,
+            pass,
+            &ps.gdn_out,
+            &ps.z,
+            &w.norm_w,
+            &ps.gdn_gated,
+            cfg.rms_norm_eps,
+            self.gdn_gate,
+        )?;
         pass.level_barrier(&[&ps.gdn_gated])?;
         project_mat(ctx, pass, &ps.gdn_gated, &w.out_proj, &ps.branch_out, &s.dequant)
     }
@@ -1687,7 +2021,19 @@ impl Qwen4ExpModel {
         blk_keys: &Tensor,
         pos: usize,
     ) -> Result<()> {
-        self.attn_batched_theta(ctx, pass, w, s, ps, k_cache, v_cache, idx_keys, blk_keys, AttnPos::host(pos), self.config.rope_parameters.rope_theta)
+        self.attn_batched_theta(
+            ctx,
+            pass,
+            w,
+            s,
+            ps,
+            k_cache,
+            v_cache,
+            idx_keys,
+            blk_keys,
+            AttnPos::host(pos),
+            self.config.rope_parameters.rope_theta,
+        )
     }
 
     /// The attention branch over `ps.hc.mixed` at positions `pos..pos+m`
@@ -1725,12 +2071,38 @@ impl Qwen4ExpModel {
             [(&w.q_proj, &ps.qg), (&w.k_proj, &ps.k_new), (&w.v_proj, &ps.v_new)],
             &s.dequant,
         )?;
-        project_mat(ctx, pass, &ps.hc.mixed, &w.indexer.qk_proj, &ps.idx_qk, &s.dequant)?;
+        project_mat(
+            ctx,
+            pass,
+            &ps.hc.mixed,
+            &w.indexer.qk_proj,
+            &ps.idx_qk,
+            &s.dequant,
+        )?;
         pass.level_barrier(&[&ps.qg, &ps.k_new, &ps.v_new, &ps.idx_qk])?;
         split_q_gate(ctx, pass, &ps.qg, &ps.q, &ps.gate)?;
-        rmsnorm_bf16(ctx, pass, &ps.k_new, &w.k_norm, &ps.k_new, eps, NORM_WEIGHT_BIAS)?;
+        rmsnorm_bf16(
+            ctx,
+            pass,
+            &ps.k_new,
+            &w.k_norm,
+            &ps.k_new,
+            eps,
+            NORM_WEIGHT_BIAS,
+        )?;
         // Indexer: queries for this chunk, raw keys into the cache.
-        qsa::qsa_prep_q(ctx, pass, &ps.idx_qk, &w.indexer.q_norm, &ps.idx_q, idx.n_heads, rot, pos, theta, eps)?;
+        qsa::qsa_prep_q(
+            ctx,
+            pass,
+            &ps.idx_qk,
+            &w.indexer.q_norm,
+            &ps.idx_q,
+            idx.n_heads,
+            rot,
+            pos,
+            theta,
+            eps,
+        )?;
         qsa::qsa_scatter_keys(ctx, pass, &ps.idx_qk, idx_keys, idx.n_heads, pos)?;
         pass.level_barrier(&[&ps.q, &ps.gate, &ps.k_new, &ps.idx_q, idx_keys])?;
         rmsnorm_bf16(ctx, pass, &ps.q, &w.q_norm, &ps.q, eps, NORM_WEIGHT_BIAS)?;
@@ -1742,19 +2114,48 @@ impl Qwen4ExpModel {
                 let first_block = p / ratio;
                 let complete = (p + m) / ratio;
                 if complete > first_block {
-                    qsa::qsa_block_keys(ctx, pass, idx_keys, &w.indexer.k_norm, blk_keys, ratio, first_block, complete - first_block, rot, theta, eps)?;
+                    qsa::qsa_block_keys(
+                        ctx,
+                        pass,
+                        idx_keys,
+                        &w.indexer.k_norm,
+                        blk_keys,
+                        ratio,
+                        first_block,
+                        complete - first_block,
+                        rot,
+                        theta,
+                        eps,
+                    )?;
                 }
             }
             (Arg::Gpu(_), Some((block, count))) => {
                 // The GPU decided whether this row completes a block; the
                 // dispatch is sized for one block and gated by its count word.
-                ensure!(m == 1 && pos.max - pos.min < ratio, "a GPU-supplied position needs a single row within one indexer block");
+                ensure!(
+                    m == 1 && pos.max - pos.min < ratio,
+                    "a GPU-supplied position needs a single row within one indexer block"
+                );
                 let first_min = pos.min / ratio;
                 if (pos.max + 1) / ratio > first_min {
-                    qsa::qsa_block_keys(ctx, pass, idx_keys, &w.indexer.k_norm, blk_keys, ratio, Pos::gpu(block, first_min, pos.max / ratio), Pos::gpu(count, 0, 1), rot, theta, eps)?;
+                    qsa::qsa_block_keys(
+                        ctx,
+                        pass,
+                        idx_keys,
+                        &w.indexer.k_norm,
+                        blk_keys,
+                        ratio,
+                        Pos::gpu(block, first_min, pos.max / ratio),
+                        Pos::gpu(count, 0, 1),
+                        rot,
+                        theta,
+                        eps,
+                    )?;
                 }
             }
-            (Arg::Gpu(_), None) => anyhow::bail!("a GPU-supplied position needs its block words"),
+            (Arg::Gpu(_), None) => {
+                anyhow::bail!("a GPU-supplied position needs its block words")
+            }
         }
         pass.level_barrier(&[&ps.q, &ps.k_new, blk_keys])?;
         rope_neox(ctx, pass, &ps.q, nq, rot, pos, theta)?;
@@ -1765,7 +2166,16 @@ impl Qwen4ExpModel {
         if pos.max + m <= idx.dense_limit() {
             // Every query sees at most the budget: the selection is the whole
             // causal window, so the dense kernel is exact.
-            sdpa_prefill(ctx, pass, &ps.q, k_cache, v_cache, &ps.attn_o, pos, self.attn_scale)?;
+            sdpa_prefill(
+                ctx,
+                pass,
+                &ps.q,
+                k_cache,
+                v_cache,
+                &ps.attn_o,
+                pos,
+                self.attn_scale,
+            )?;
         } else {
             // (Exact below the dense limit too: fewer visible blocks than the
             // budget means all of them are selected.)
@@ -1774,12 +2184,36 @@ impl Qwen4ExpModel {
                 let qb = qb_cap.min(m - q0);
                 let base = pos.offset(q0)?;
                 let nb_max = qsa::visible_blocks(base.max + qb - 1, idx.compress_ratio);
-                let idx_q = ps.idx_q.view(q0 * idx.n_heads * INDEXER_D, &[qb, idx.n_heads, INDEXER_D])?;
+                let idx_q = ps.idx_q.view(
+                    q0 * idx.n_heads * INDEXER_D,
+                    &[qb, idx.n_heads, INDEXER_D],
+                )?;
                 let q = ps.q.view(q0 * nq * hd, &[qb, nq, hd])?;
                 let out = ps.attn_o.view(q0 * nq * hd, &[qb, nq, hd])?;
-                qsa::qsa_scores(ctx, pass, &idx_q, blk_keys, &ps.qsa.scores, idx.n_heads, nb_max, base, idx.compress_ratio)?;
+                qsa::qsa_scores(
+                    ctx,
+                    pass,
+                    &idx_q,
+                    blk_keys,
+                    &ps.qsa.scores,
+                    idx.n_heads,
+                    nb_max,
+                    base,
+                    idx.compress_ratio,
+                )?;
                 pass.level_barrier(&[&ps.qsa.scores])?;
-                qsa::qsa_select_blocks(ctx, pass, &ps.qsa.scores, &ps.qsa.sel, &ps.qsa.n_sel, qb, nb_max, base, idx.compress_ratio, idx.block_topk())?;
+                qsa::qsa_select_blocks(
+                    ctx,
+                    pass,
+                    &ps.qsa.scores,
+                    &ps.qsa.sel,
+                    &ps.qsa.n_sel,
+                    qb,
+                    nb_max,
+                    base,
+                    idx.compress_ratio,
+                    idx.block_topk(),
+                )?;
                 pass.level_barrier(&[&ps.qsa.sel, &ps.qsa.n_sel])?;
                 qsa::qsa_attention(
                     ctx,
@@ -1827,21 +2261,48 @@ impl Qwen4ExpModel {
     ) -> Result<()> {
         let wide = self.config.hc_width();
         let m = ps.m;
-        let hidden_in = ps.mtp_hidden_in.as_ref().ok_or_else(|| anyhow::anyhow!("draft head without prefill scratch"))?;
+        let hidden_in = ps
+            .mtp_hidden_in
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("draft head without prefill scratch"))?;
         let (rows, pos0) = if pos > 0 { (m, pos - 1) } else { (m - 1, 0) };
         if rows > 0 {
             if pos > 0 {
                 copy_words(ctx, pass, &mst.hidden, &hidden_in.view(0, &[wide])?)?;
                 if m > 1 {
-                    copy_words(ctx, pass, &ps.hyper.view(0, &[m - 1, wide])?, &hidden_in.view(wide, &[m - 1, wide])?)?;
+                    copy_words(
+                        ctx,
+                        pass,
+                        &ps.hyper.view(0, &[m - 1, wide])?,
+                        &hidden_in.view(wide, &[m - 1, wide])?,
+                    )?;
                 }
             } else {
-                copy_words(ctx, pass, &ps.hyper.view(0, &[m - 1, wide])?, &hidden_in.view(0, &[m - 1, wide])?)?;
+                copy_words(
+                    ctx,
+                    pass,
+                    &ps.hyper.view(0, &[m - 1, wide])?,
+                    &hidden_in.view(0, &[m - 1, wide])?,
+                )?;
             }
-            let ids = if pos > 0 { ps.ids.view(0, &[m])? } else { ps.ids.view(1, &[m - 1])? };
+            let ids = if pos > 0 {
+                ps.ids.view(0, &[m])?
+            } else {
+                ps.ids.view(1, &[m - 1])?
+            };
             pass.level_barrier(&[hidden_in])?;
             let ps_rows = ps.rows(rows)?;
-            self.mtp_block(ctx, pass, mtp, mst, &hidden_in.view(0, &[rows, wide])?, &ids, AttnPos::host(pos0), s, &ps_rows)?;
+            self.mtp_block(
+                ctx,
+                pass,
+                mtp,
+                mst,
+                &hidden_in.view(0, &[rows, wide])?,
+                &ids,
+                AttnPos::host(pos0),
+                s,
+                &ps_rows,
+            )?;
         }
         // The chunk's last trunk hidden pairs with the next token, whenever
         // it arrives. (Ordered after the reads above by the block's barriers,
@@ -1871,18 +2332,49 @@ impl Qwen4ExpModel {
         let cfg = &self.config;
         let (h, g, eps) = (cfg.hidden_size, cfg.hc_count, cfg.rms_norm_eps);
         let rows = ps.m;
-        ensure!(hidden.shape() == [rows, g * h] && ids.numel() == rows, "draft head input shape mismatch");
-        let hyper = ps.mtp_hyper.as_ref().ok_or_else(|| anyhow::anyhow!("draft head without scratch"))?;
+        ensure!(
+            hidden.shape() == [rows, g * h] && ids.numel() == rows,
+            "draft head input shape mismatch"
+        );
+        let hyper = ps
+            .mtp_hyper
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("draft head without scratch"))?;
         let theta = cfg.mtp.map_or(cfg.rope_parameters.rope_theta, |m| m.rope_theta);
 
         // Per stream: fc_hidden(norm(stream)); shared: fc_embedding(norm(emb)).
-        rmsnorm_grouped_bf16(ctx, pass, hidden, &mtp.norm_hidden, &ps.hc.hn, h, g, eps, NORM_WEIGHT_BIAS)?;
+        rmsnorm_grouped_bf16(
+            ctx,
+            pass,
+            hidden,
+            &mtp.norm_hidden,
+            &ps.hc.hn,
+            h,
+            g,
+            eps,
+            NORM_WEIGHT_BIAS,
+        )?;
         quant::gather_rows_q4(ctx, pass, &self.weights.embed_tokens, ids, &ps.x)?;
         pass.level_barrier(&[&ps.hc.hn, &ps.x])?;
         let hn_streams = ps.hc.hn.view(0, &[rows * g, h])?;
         let hyper_streams = hyper.view(0, &[rows * g, h])?;
-        project_mat(ctx, pass, &hn_streams, &mtp.fc_hidden, &hyper_streams, &s.dequant)?;
-        rmsnorm_bf16(ctx, pass, &ps.x, &mtp.norm_embedding, &ps.x, eps, NORM_WEIGHT_BIAS)?;
+        project_mat(
+            ctx,
+            pass,
+            &hn_streams,
+            &mtp.fc_hidden,
+            &hyper_streams,
+            &s.dequant,
+        )?;
+        rmsnorm_bf16(
+            ctx,
+            pass,
+            &ps.x,
+            &mtp.norm_embedding,
+            &ps.x,
+            eps,
+            NORM_WEIGHT_BIAS,
+        )?;
         pass.level_barrier(&[hyper, &ps.x])?;
         project_mat(ctx, pass, &ps.x, &mtp.fc_embedding, &ps.branch_out, &s.dequant)?;
         pass.level_barrier(&[&ps.branch_out])?;
@@ -1892,10 +2384,17 @@ impl Qwen4ExpModel {
         pass.level_barrier(&[hyper])?;
 
         // The block itself: a trunk-style attention layer with its own RoPE base.
-        let Mixer::Attn(w) = &mtp.layer.mixer else { anyhow::bail!("draft head block is not attention") };
-        let LayerState::Attn { k_cache, v_cache, idx_keys, blk_keys } = &mst.layer else { anyhow::bail!("draft head state is not attention") };
+        let Mixer::Attn(w) = &mtp.layer.mixer else {
+            anyhow::bail!("draft head block is not attention")
+        };
+        let LayerState::Attn { k_cache, v_cache, idx_keys, blk_keys } = &mst.layer
+        else {
+            anyhow::bail!("draft head state is not attention")
+        };
         self.hc_read_batched(ctx, pass, &mtp.layer.attn_hc, hyper, s, ps)?;
-        self.attn_batched_theta(ctx, pass, w, s, ps, k_cache, v_cache, idx_keys, blk_keys, pos0, theta)?;
+        self.attn_batched_theta(
+            ctx, pass, w, s, ps, k_cache, v_cache, idx_keys, blk_keys, pos0, theta,
+        )?;
         pass.level_barrier(&[&ps.branch_out])?;
         hc_inject_bf16(ctx, pass, hyper, &ps.branch_out, &ps.hc.inj, h, g)?;
         pass.level_barrier(&[hyper])?;
@@ -2347,7 +2846,9 @@ impl DecodeStateApi for DecodeState {
             .iter()
             .map(|l| match l {
                 LayerState::Gdn { state, conv_windows } => {
-                    state.byte_len() + conv_windows[0].byte_len() + conv_windows[1].byte_len()
+                    state.byte_len()
+                        + conv_windows[0].byte_len()
+                        + conv_windows[1].byte_len()
                 }
                 LayerState::Attn { .. } => 0,
             })
@@ -2362,7 +2863,10 @@ impl DecodeStateApi for DecodeState {
         let mut gdn = Vec::new();
         for lstate in &self.layers {
             if let LayerState::Gdn { state, conv_windows } = lstate {
-                gdn.push((clone_tensor(ctx, state)?, clone_tensor(ctx, &conv_windows[slot])?));
+                gdn.push((
+                    clone_tensor(ctx, state)?,
+                    clone_tensor(ctx, &conv_windows[slot])?,
+                ));
             }
         }
         let ple = match &self.ple {
@@ -2377,28 +2881,59 @@ impl DecodeStateApi for DecodeState {
     }
 
     fn restore(&mut self, ctx: &MetalContext, snapshot: &Snapshot) -> Result<()> {
-        ensure!(snapshot.pos <= self.capacity, "snapshot position {} exceeds capacity {}", snapshot.pos, self.capacity);
+        ensure!(
+            snapshot.pos <= self.capacity,
+            "snapshot position {} exceeds capacity {}",
+            snapshot.pos,
+            self.capacity
+        );
         let mut copies = Vec::new();
         let mut saved = snapshot.gdn.iter();
         for lstate in &self.layers {
             if let LayerState::Gdn { state, conv_windows } = lstate {
-                let (s, w) = saved.next().ok_or_else(|| anyhow::anyhow!("snapshot has too few GDN layers"))?;
-                copies.push(BlitCopy { src: s, src_offset: 0, dst: state, dst_offset: 0, len: state.byte_len() });
-                copies.push(BlitCopy { src: w, src_offset: 0, dst: &conv_windows[0], dst_offset: 0, len: w.byte_len() });
+                let (s, w) = saved.next().ok_or_else(|| {
+                    anyhow::anyhow!("snapshot has too few GDN layers")
+                })?;
+                copies.push(BlitCopy {
+                    src: s,
+                    src_offset: 0,
+                    dst: state,
+                    dst_offset: 0,
+                    len: state.byte_len(),
+                });
+                copies.push(BlitCopy {
+                    src: w,
+                    src_offset: 0,
+                    dst: &conv_windows[0],
+                    dst_offset: 0,
+                    len: w.byte_len(),
+                });
             }
         }
         ensure!(saved.next().is_none(), "snapshot has too many GDN layers");
         match (&mut self.ple, &snapshot.ple) {
             (Some(p), Some((hist, w))) => {
                 p.hist = *hist;
-                copies.push(BlitCopy { src: w, src_offset: 0, dst: &p.conv_windows[0], dst_offset: 0, len: w.byte_len() });
+                copies.push(BlitCopy {
+                    src: w,
+                    src_offset: 0,
+                    dst: &p.conv_windows[0],
+                    dst_offset: 0,
+                    len: w.byte_len(),
+                });
             }
             (None, None) => {}
             _ => anyhow::bail!("snapshot PLE state mismatch"),
         }
         match (&self.mtp, &snapshot.mtp_hidden) {
             (Some(m), Some(h)) => {
-                copies.push(BlitCopy { src: h, src_offset: 0, dst: &m.hidden, dst_offset: 0, len: h.byte_len() });
+                copies.push(BlitCopy {
+                    src: h,
+                    src_offset: 0,
+                    dst: &m.hidden,
+                    dst_offset: 0,
+                    len: h.byte_len(),
+                });
             }
             (None, None) => {}
             _ => anyhow::bail!("snapshot draft-head state mismatch"),
@@ -2410,15 +2945,30 @@ impl DecodeStateApi for DecodeState {
         Ok(())
     }
 
-    fn copy_prefix_from(&mut self, ctx: &MetalContext, from: &Self, tokens: usize) -> Result<()> {
-        ensure!(tokens <= from.pos, "source state has fed {} tokens, {tokens} requested", from.pos);
+    fn copy_prefix_from(
+        &mut self,
+        ctx: &MetalContext,
+        from: &Self,
+        tokens: usize,
+    ) -> Result<()> {
+        ensure!(
+            tokens <= from.pos,
+            "source state has fed {} tokens, {tokens} requested",
+            from.pos
+        );
         self.ensure_capacity(ctx, tokens)?;
         let mut copies = Vec::new();
         for (dst, src) in self.layers.iter().zip(&from.layers) {
             attn_prefix_copies(dst, src, tokens, self.ratio, &mut copies)?;
         }
         match (&self.mtp, &from.mtp) {
-            (Some(dst), Some(src)) => attn_prefix_copies(&dst.layer, &src.layer, tokens, self.ratio, &mut copies)?,
+            (Some(dst), Some(src)) => attn_prefix_copies(
+                &dst.layer,
+                &src.layer,
+                tokens,
+                self.ratio,
+                &mut copies,
+            )?,
             (None, None) => {}
             _ => anyhow::bail!("draft-head state mismatch between sessions"),
         }
@@ -2426,7 +2976,11 @@ impl DecodeStateApi for DecodeState {
     }
 
     fn write_prefix(&self, tokens: usize, w: &mut dyn std::io::Write) -> Result<()> {
-        ensure!(tokens <= self.pos, "state has fed {} tokens, {tokens} requested", self.pos);
+        ensure!(
+            tokens <= self.pos,
+            "state has fed {} tokens, {tokens} requested",
+            self.pos
+        );
         let mut sink = |t: &Tensor, _: usize| t.write_to(w);
         for lstate in self.layers.iter().chain(self.mtp.as_ref().map(|m| &m.layer)) {
             attn_prefix_regions(lstate, tokens, tokens, self.ratio, &mut sink)?;
@@ -2439,14 +2993,30 @@ impl DecodeStateApi for DecodeState {
     /// the regions follow one another, so stopping early would read the next
     /// head's rows as this one's (a checkpoint hit inside a longer disk entry
     /// once did exactly that).
-    fn read_prefix(&mut self, ctx: &MetalContext, written: usize, tokens: usize, r: &mut dyn std::io::Read) -> Result<()> {
-        ensure!(tokens <= written, "prefix of {tokens} tokens from a layout of {written}");
+    fn read_prefix(
+        &mut self,
+        ctx: &MetalContext,
+        written: usize,
+        tokens: usize,
+        r: &mut dyn std::io::Read,
+    ) -> Result<()> {
+        ensure!(
+            tokens <= written,
+            "prefix of {tokens} tokens from a layout of {written}"
+        );
         self.ensure_capacity(ctx, tokens)?;
         let mut source = |t: &Tensor, tail: usize| {
             t.fill_from(r)?;
             if tail > 0 {
-                let skipped = std::io::copy(&mut std::io::Read::take(&mut *r, tail as u64), &mut std::io::sink())?;
-                ensure!(skipped == tail as u64, "prefix file ends {} bytes early", tail as u64 - skipped);
+                let skipped = std::io::copy(
+                    &mut std::io::Read::take(&mut *r, tail as u64),
+                    &mut std::io::sink(),
+                )?;
+                ensure!(
+                    skipped == tail as u64,
+                    "prefix file ends {} bytes early",
+                    tail as u64 - skipped
+                );
             }
             Ok(())
         };
@@ -2502,7 +3072,12 @@ impl LanguageModel for Qwen4ExpModel {
     const MODEL_ID: &'static str = "Qwen3.8-Flash-Next";
 
     fn load(ctx: &MetalContext, dir: &Path, options: &LoadOptions) -> Result<Self> {
-        Qwen4ExpModel::load_with(ctx, dir, options.ngram_storage, options.mtp_drafts > 0)
+        Qwen4ExpModel::load_with(
+            ctx,
+            dir,
+            options.ngram_storage,
+            options.mtp_drafts > 0,
+        )
     }
 
     fn max_position_embeddings(&self) -> usize {
@@ -2531,7 +3106,11 @@ impl LanguageModel for Qwen4ExpModel {
         ))
     }
 
-    fn read_snapshot(&self, ctx: &MetalContext, r: &mut dyn std::io::Read) -> Result<Snapshot> {
+    fn read_snapshot(
+        &self,
+        ctx: &MetalContext,
+        r: &mut dyn std::io::Read,
+    ) -> Result<Snapshot> {
         let cfg = &self.config;
         let mut pos = [0u8; 8];
         r.read_exact(&mut pos)?;
@@ -2540,8 +3119,16 @@ impl LanguageModel for Qwen4ExpModel {
         let c = cfg.gdn_conv_channels();
         let kd = cfg.linear_conv_kernel_dim;
         let mut gdn = Vec::new();
-        for _ in cfg.layer_types.iter().filter(|t| matches!(t, super::config::LayerType::LinearAttention)) {
-            let state = Tensor::zeros(ctx, &[heads, GDN_HEAD_DIM, GDN_HEAD_DIM], GDN_STATE_DTYPE)?;
+        for _ in cfg
+            .layer_types
+            .iter()
+            .filter(|t| matches!(t, super::config::LayerType::LinearAttention))
+        {
+            let state = Tensor::zeros(
+                ctx,
+                &[heads, GDN_HEAD_DIM, GDN_HEAD_DIM],
+                GDN_STATE_DTYPE,
+            )?;
             state.fill_from(r)?;
             let window = Tensor::zeros(ctx, &[c, kd - 1], DType::BF16)?;
             window.fill_from(r)?;
@@ -2551,8 +3138,15 @@ impl LanguageModel for Qwen4ExpModel {
             Some(p) => {
                 let mut hist = [0u8; 8];
                 r.read_exact(&mut hist)?;
-                let h = [u32::from_le_bytes(hist[..4].try_into()?), u32::from_le_bytes(hist[4..].try_into()?)];
-                let window = Tensor::zeros(ctx, &[cfg.hc_width(), p.conv_state_len()], DType::BF16)?;
+                let h = [
+                    u32::from_le_bytes(hist[..4].try_into()?),
+                    u32::from_le_bytes(hist[4..].try_into()?),
+                ];
+                let window = Tensor::zeros(
+                    ctx,
+                    &[cfg.hc_width(), p.conv_state_len()],
+                    DType::BF16,
+                )?;
                 window.fill_from(r)?;
                 Some((h, window))
             }
@@ -2571,9 +3165,16 @@ impl LanguageModel for Qwen4ExpModel {
 
     fn bytes_per_token(&self) -> usize {
         let cfg = &self.config;
-        let attn_layers = cfg.layer_types.iter().filter(|t| matches!(t, super::config::LayerType::FullAttention)).count()
+        let attn_layers = cfg
+            .layer_types
+            .iter()
+            .filter(|t| matches!(t, super::config::LayerType::FullAttention))
+            .count()
             + usize::from(self.weights.mtp.is_some());
-        attn_layers * (2 * cfg.num_key_value_heads * cfg.head_dim * 2 + INDEXER_D * 2 + INDEXER_D * 2 / cfg.indexer.compress_ratio)
+        attn_layers
+            * (2 * cfg.num_key_value_heads * cfg.head_dim * 2
+                + INDEXER_D * 2
+                + INDEXER_D * 2 / cfg.indexer.compress_ratio)
     }
 
     fn warm_storage(&self, lock: bool) -> Result<u64> {
@@ -2613,7 +3214,12 @@ impl LanguageModel for Qwen4ExpModel {
         Qwen4ExpModel::prefill(self, ctx, state, scratch, tokens, draw)
     }
 
-    fn prepare_step_inputs(&self, state: &mut DecodeState, scratch: &Scratch, token: u32) -> Result<()> {
+    fn prepare_step_inputs(
+        &self,
+        state: &mut DecodeState,
+        scratch: &Scratch,
+        token: u32,
+    ) -> Result<()> {
         Qwen4ExpModel::prepare_step_inputs(self, state, scratch, token)
     }
 
@@ -2626,7 +3232,9 @@ impl LanguageModel for Qwen4ExpModel {
         slot_out: usize,
         draw: Draw<'_>,
     ) -> Result<EncodedPass<'a>> {
-        Qwen4ExpModel::encode_decode_step(self, ctx, state, scratch, slot_in, slot_out, draw, None)
+        Qwen4ExpModel::encode_decode_step(
+            self, ctx, state, scratch, slot_in, slot_out, draw, None,
+        )
     }
 
     fn supports_parking(&self) -> bool {
@@ -2643,7 +3251,16 @@ impl LanguageModel for Qwen4ExpModel {
         draw: Draw<'_>,
     ) -> Result<EncodedPass<'a>> {
         let value = scratch.sync.arm()?;
-        match Qwen4ExpModel::encode_decode_step(self, ctx, state, scratch, slot_in, slot_out, draw, Some(value)) {
+        match Qwen4ExpModel::encode_decode_step(
+            self,
+            ctx,
+            state,
+            scratch,
+            slot_in,
+            slot_out,
+            draw,
+            Some(value),
+        ) {
             Ok(pass) => Ok(pass),
             Err(e) => {
                 // Nothing was committed; free the claimed value.
@@ -2661,7 +3278,14 @@ impl LanguageModel for Qwen4ExpModel {
         Qwen4ExpModel::max_drafts(self)
     }
 
-    fn draft_initial(&self, ctx: &MetalContext, state: &mut DecodeState, scratch: &mut Scratch, first: u32, drafts: usize) -> Result<Vec<u32>> {
+    fn draft_initial(
+        &self,
+        ctx: &MetalContext,
+        state: &mut DecodeState,
+        scratch: &mut Scratch,
+        first: u32,
+        drafts: usize,
+    ) -> Result<Vec<u32>> {
         Qwen4ExpModel::draft_initial(self, ctx, state, scratch, first, drafts)
     }
 
@@ -2677,7 +3301,18 @@ impl LanguageModel for Qwen4ExpModel {
         parked: Option<PendingPass<'a>>,
         next_drafts: usize,
     ) -> Result<(Vec<u32>, PendingPass<'a>)> {
-        Qwen4ExpModel::verify(self, ctx, state, scratch, pending, drafts, params, step0, parked, next_drafts)
+        Qwen4ExpModel::verify(
+            self,
+            ctx,
+            state,
+            scratch,
+            pending,
+            drafts,
+            params,
+            step0,
+            parked,
+            next_drafts,
+        )
     }
 
     fn finish_speculation<'a>(
@@ -2689,6 +3324,8 @@ impl LanguageModel for Qwen4ExpModel {
         next: Option<crate::engine::NextStep<'_>>,
         draft: PendingPass<'a>,
     ) -> Result<(Vec<u32>, Option<PendingPass<'a>>)> {
-        Qwen4ExpModel::finish_speculation(self, ctx, state, scratch, accepted, next, draft)
+        Qwen4ExpModel::finish_speculation(
+            self, ctx, state, scratch, accepted, next, draft,
+        )
     }
 }

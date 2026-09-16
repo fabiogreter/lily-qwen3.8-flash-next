@@ -199,7 +199,21 @@ pub fn gdn_prefill(
     scale: f32,
     num_k_heads: usize,
 ) -> Result<()> {
-    gdn_prefill_mid(ctx, pass, qkv, a, b, a_log, dt_bias, staging, state, out, scale, num_k_heads, None)
+    gdn_prefill_mid(
+        ctx,
+        pass,
+        qkv,
+        a,
+        b,
+        a_log,
+        dt_bias,
+        staging,
+        state,
+        out,
+        scale,
+        num_k_heads,
+        None,
+    )
 }
 
 /// [`gdn_prefill`] that also records the running state after each of the
@@ -256,10 +270,16 @@ pub fn gdn_prefill_mid(
     let mid_count = match mid {
         Some(t) => {
             ensure!(
-                t.dtype() == DType::F32 && t.shape().len() == 4 && t.shape()[1..] == [num_heads, dim, dim],
+                t.dtype() == DType::F32
+                    && t.shape().len() == 4
+                    && t.shape()[1..] == [num_heads, dim, dim],
                 "mid states must be F32 [count, H, {dim}, {dim}]"
             );
-            ensure!(t.shape()[0] <= m, "more mid states ({}) than tokens ({m})", t.shape()[0]);
+            ensure!(
+                t.shape()[0] <= m,
+                "more mid states ({}) than tokens ({m})",
+                t.shape()[0]
+            );
             t.shape()[0]
         }
         None => 0,
@@ -300,17 +320,33 @@ pub fn conv_window_rollback<'t>(
     n: impl Into<Pos<'t>>,
 ) -> Result<()> {
     let n = n.into();
-    ensure!(window_in.shape().len() == 2 && x.shape().len() == 2, "window must be [C, S] and x [M, C]");
+    ensure!(
+        window_in.shape().len() == 2 && x.shape().len() == 2,
+        "window must be [C, S] and x [M, C]"
+    );
     let (c, s) = (window_in.shape()[0], window_in.shape()[1]);
-    ensure!(window_out.shape() == [c, s], "window_out shape {:?} != [{c}, {s}]", window_out.shape());
-    ensure!(x.shape()[1] == c && n.max <= x.shape()[0], "x {:?} does not hold {} rows of {c} channels", x.shape(), n.max);
+    ensure!(
+        window_out.shape() == [c, s],
+        "window_out shape {:?} != [{c}, {s}]",
+        window_out.shape()
+    );
+    ensure!(
+        x.shape()[1] == c && n.max <= x.shape()[0],
+        "x {:?} does not hold {} rows of {c} channels",
+        x.shape(),
+        n.max
+    );
     for t in [window_in, x, window_out] {
         ensure!(t.dtype() == DType::BF16, "conv window rollback expects BF16");
     }
     let (in_buf, in_off) = window_in.binding();
     let (out_buf, out_off) = window_out.binding();
-    ensure!(!(std::ptr::eq(in_buf, out_buf) && in_off == out_off), "window buffers must be distinct");
-    let pipeline = ctx.pipeline("conv_window_rollback_bf16", SOURCE, MslVersion::V3_1)?;
+    ensure!(
+        !(std::ptr::eq(in_buf, out_buf) && in_off == out_off),
+        "window buffers must be distinct"
+    );
+    let pipeline =
+        ctx.pipeline("conv_window_rollback_bf16", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_with(
         &pipeline,
         &[window_in.binding(), x.binding(), window_out.binding()],

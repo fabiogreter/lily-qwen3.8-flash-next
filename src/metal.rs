@@ -47,11 +47,12 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2_foundation::{NSArray, NSError, NSString};
 use objc2_metal::{
-    MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer,
-    MTL4CommandEncoder, MTL4CommandQueue, MTL4CommandQueueError, MTL4CommitFeedback, MTL4CommitOptions,
-    MTL4ComputeCommandEncoder, MTL4VisibilityOptions, MTLAllocation, MTLBuffer,
-    MTLCompileOptions, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLEvent, MTLLanguageVersion, MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor,
+    MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator,
+    MTL4CommandBuffer, MTL4CommandEncoder, MTL4CommandQueue, MTL4CommandQueueError,
+    MTL4CommitFeedback, MTL4CommitOptions, MTL4ComputeCommandEncoder,
+    MTL4VisibilityOptions, MTLAllocation, MTLBuffer, MTLCompileOptions,
+    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLEvent,
+    MTLLanguageVersion, MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor,
     MTLResourceOptions, MTLSharedEvent, MTLSize, MTLStages,
 };
 
@@ -206,7 +207,8 @@ impl MetalContext {
     /// A context on the system default device; the per-kernel profile mode
     /// is on when `LILY_KERNEL_PROFILE` is set to anything but `0`.
     pub fn new() -> Result<Self> {
-        let profile = std::env::var_os("LILY_KERNEL_PROFILE").is_some_and(|v| !v.is_empty() && v != "0");
+        let profile = std::env::var_os("LILY_KERNEL_PROFILE")
+            .is_some_and(|v| !v.is_empty() && v != "0");
         Self::new_with_profile(profile)
     }
 
@@ -220,7 +222,11 @@ impl MetalContext {
         let residency = Rc::new(Residency::new(&device)?);
         queue.addResidencySet(&residency.set);
         let fence = SharedEvent::new(&device)?;
-        let pool = Rc::new(Pool { device: device.clone(), residency: residency.clone(), free: RefCell::new(Vec::new()) });
+        let pool = Rc::new(Pool {
+            device: device.clone(),
+            residency: residency.clone(),
+            free: RefCell::new(Vec::new()),
+        });
         let ctx = Self {
             device,
             queue,
@@ -432,7 +438,13 @@ impl MetalContext {
             }
             let (src, src_base) = copy.src.binding();
             let (dst, dst_base) = copy.dst.binding();
-            pass.copy_buffer(src, src_base + copy.src_offset, dst, dst_base + copy.dst_offset, copy.len)?;
+            pass.copy_buffer(
+                src,
+                src_base + copy.src_offset,
+                dst,
+                dst_base + copy.dst_offset,
+                copy.len,
+            )?;
         }
         pass.commit_wait()
     }
@@ -441,7 +453,8 @@ impl MetalContext {
     /// Returns the fence value to wait for.
     fn submit(&self, program: &[Item], feedback: &Arc<Feedback>) -> Result<u64> {
         self.fault.check()?;
-        let _guard = self.submit.lock().map_err(|e| anyhow!("submit lock poisoned: {e}"))?;
+        let _guard =
+            self.submit.lock().map_err(|e| anyhow!("submit lock poisoned: {e}"))?;
         self.residency.flush();
         let mut index = 0usize;
         for item in program {
@@ -455,10 +468,20 @@ impl MetalContext {
                     unsafe { options.addFeedbackHandler(RcBlock::as_ptr(&handler)) };
                     let mut ptr = NonNull::from(&**cmd);
                     // SAFETY: one valid command buffer pointer, count 1.
-                    unsafe { self.queue.commit_count_options(NonNull::from(&mut ptr), 1, &options) };
+                    unsafe {
+                        self.queue.commit_count_options(
+                            NonNull::from(&mut ptr),
+                            1,
+                            &options,
+                        )
+                    };
                 }
-                Item::Wait(event, value) => self.queue.waitForEvent_value(event.as_event(), *value),
-                Item::Signal(event, value) => self.queue.signalEvent_value(event.as_event(), *value),
+                Item::Wait(event, value) => {
+                    self.queue.waitForEvent_value(event.as_event(), *value)
+                }
+                Item::Signal(event, value) => {
+                    self.queue.signalEvent_value(event.as_event(), *value)
+                }
             }
         }
         let value = self.fence_value.fetch_add(1, Ordering::AcqRel) + 1;
@@ -496,9 +519,16 @@ impl Residency {
         Ok(Self { set, dirty: Cell::new(false) })
     }
 
-    fn new_buffer(self: &Rc<Self>, device: &ProtocolObject<dyn MTLDevice>, len: usize) -> Result<Buffer> {
+    fn new_buffer(
+        self: &Rc<Self>,
+        device: &ProtocolObject<dyn MTLDevice>,
+        len: usize,
+    ) -> Result<Buffer> {
         let raw = device
-            .newBufferWithLength_options(len.max(1), MTLResourceOptions::StorageModeShared)
+            .newBufferWithLength_options(
+                len.max(1),
+                MTLResourceOptions::StorageModeShared,
+            )
             .ok_or_else(|| anyhow!("failed to allocate {len}-byte buffer"))?;
         // Metal does not guarantee new buffer contents; callers rely on zeros.
         unsafe { core::ptr::write_bytes(raw.contents().as_ptr().cast::<u8>(), 0, len) };
@@ -566,10 +596,9 @@ impl Pool {
         let inner = match recycled {
             Some(inner) => inner,
             None => {
-                let allocator = self
-                    .device
-                    .newCommandAllocator()
-                    .ok_or_else(|| anyhow!("failed to create a Metal 4 command allocator"))?;
+                let allocator = self.device.newCommandAllocator().ok_or_else(|| {
+                    anyhow!("failed to create a Metal 4 command allocator")
+                })?;
                 let desc = MTL4ArgumentTableDescriptor::new();
                 desc.setMaxBufferBindCount(MAX_BUFFER_BINDINGS);
                 let table = self
@@ -655,7 +684,8 @@ impl Arena {
                 self.cursor = 0;
                 continue;
             }
-            let size = ARENA_CHUNK.max(len.next_power_of_two()) << self.chunks.len().min(8);
+            let size =
+                ARENA_CHUNK.max(len.next_power_of_two()) << self.chunks.len().min(8);
             let chunk = pool.residency.new_buffer(&pool.device, size)?;
             self.chunks.push(chunk);
         }
@@ -673,7 +703,9 @@ pub struct SharedEvent {
 
 impl SharedEvent {
     fn new(device: &ProtocolObject<dyn MTLDevice>) -> Result<Self> {
-        let event = device.newSharedEvent().ok_or_else(|| anyhow!("failed to create shared event"))?;
+        let event = device
+            .newSharedEvent()
+            .ok_or_else(|| anyhow!("failed to create shared event"))?;
         Ok(Self { event })
     }
 
@@ -736,14 +768,24 @@ fn describe_error(error: &NSError) -> String {
     let mut text = format!("{domain} error {code}");
     if domain == "MTL4CommandQueueErrorDomain" {
         let meaning = match MTL4CommandQueueError(code) {
-            MTL4CommandQueueError::Timeout => Some("Timeout: the workload took longer to execute than the system allows"),
-            MTL4CommandQueueError::NotPermitted => Some("NotPermitted: the process has no access to a GPU device"),
-            MTL4CommandQueueError::OutOfMemory => Some("OutOfMemory: the GPU lacks the memory to execute a command buffer"),
-            MTL4CommandQueueError::DeviceRemoved => Some("DeviceRemoved: the GPU was removed before the command buffer completed"),
-            MTL4CommandQueueError::AccessRevoked => {
-                Some("AccessRevoked: the system revoked GPU access after too many timeouts or hangs")
+            MTL4CommandQueueError::Timeout => Some(
+                "Timeout: the workload took longer to execute than the system allows",
+            ),
+            MTL4CommandQueueError::NotPermitted => {
+                Some("NotPermitted: the process has no access to a GPU device")
             }
-            MTL4CommandQueueError::Internal => Some("Internal: a problem inside the Metal framework"),
+            MTL4CommandQueueError::OutOfMemory => Some(
+                "OutOfMemory: the GPU lacks the memory to execute a command buffer",
+            ),
+            MTL4CommandQueueError::DeviceRemoved => Some(
+                "DeviceRemoved: the GPU was removed before the command buffer completed",
+            ),
+            MTL4CommandQueueError::AccessRevoked => Some(
+                "AccessRevoked: the system revoked GPU access after too many timeouts or hangs",
+            ),
+            MTL4CommandQueueError::Internal => {
+                Some("Internal: a problem inside the Metal framework")
+            }
             _ => None,
         };
         if let Some(meaning) = meaning {
@@ -752,7 +794,9 @@ fn describe_error(error: &NSError) -> String {
     }
     text.push_str(&format!(": {}", error.localizedDescription()));
     let info = error.userInfo();
-    let one_line = |e: &NSError| format!("{} error {}: {}", e.domain(), e.code(), e.localizedDescription());
+    let one_line = |e: &NSError| {
+        format!("{} error {}: {}", e.domain(), e.code(), e.localizedDescription())
+    };
     let mut underlying: Vec<String> = Vec::new();
     // The key strings are what `NSUnderlyingErrorKey` and
     // `NSMultipleUnderlyingErrorsKey` hold (reading the extern statics
@@ -762,7 +806,8 @@ fn describe_error(error: &NSError) -> String {
     {
         underlying.push(one_line(e));
     }
-    if let Some(object) = info.objectForKey(&NSString::from_str("NSMultipleUnderlyingErrorsKey"))
+    if let Some(object) =
+        info.objectForKey(&NSString::from_str("NSMultipleUnderlyingErrorsKey"))
         && let Some(list) = object.downcast_ref::<NSArray<AnyObject>>()
     {
         for item in list.iter() {
@@ -809,8 +854,13 @@ struct FeedbackState {
 
 impl Feedback {
     fn new(expected: usize, profile: Option<ProfileInfo>) -> Arc<Self> {
-        let spans = if profile.is_some() { vec![(0.0, 0.0); expected] } else { Vec::new() };
-        Arc::new(Self { expected, profile, state: Mutex::new(FeedbackState { spans, ..FeedbackState::default() }) })
+        let spans =
+            if profile.is_some() { vec![(0.0, 0.0); expected] } else { Vec::new() };
+        Arc::new(Self {
+            expected,
+            profile,
+            state: Mutex::new(FeedbackState { spans, ..FeedbackState::default() }),
+        })
     }
 
     fn handler(self: &Arc<Self>, fault: &Arc<Fault>, index: usize) -> FeedbackHandler {
@@ -845,7 +895,10 @@ impl Feedback {
                         .names
                         .iter()
                         .zip(&state.spans)
-                        .map(|(name, (start, end))| profile::KernelSample { name, gpu_secs: end - start })
+                        .map(|(name, (start, end))| profile::KernelSample {
+                            name,
+                            gpu_secs: end - start,
+                        })
                         .collect();
                     profile::record(profile::PassProfile {
                         label: info.label,
@@ -863,7 +916,10 @@ impl Feedback {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             {
-                let state = self.state.lock().map_err(|e| anyhow!("feedback lock poisoned: {e}"))?;
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|e| anyhow!("feedback lock poisoned: {e}"))?;
                 if state.received >= self.expected {
                     return Ok(FeedbackState {
                         received: state.received,
@@ -955,17 +1011,20 @@ impl<'a> ComputePass<'a> {
     /// command buffer first if none is.
     fn with_encoder<R>(
         &self,
-        f: impl FnOnce(&ProtocolObject<dyn MTL4ComputeCommandEncoder>, &mut SlotInner, &Pool) -> Result<R>,
+        f: impl FnOnce(
+            &ProtocolObject<dyn MTL4ComputeCommandEncoder>,
+            &mut SlotInner,
+            &Pool,
+        ) -> Result<R>,
     ) -> Result<R> {
         let mut open = self.open.borrow_mut();
         let mut slot = self.slot.borrow_mut();
         let inner = slot.get();
         if open.is_none() {
-            let cmd = self
-                .ctx
-                .device
-                .newCommandBuffer()
-                .ok_or_else(|| anyhow!("failed to create a Metal 4 command buffer"))?;
+            let cmd =
+                self.ctx.device.newCommandBuffer().ok_or_else(|| {
+                    anyhow!("failed to create a Metal 4 command buffer")
+                })?;
             cmd.beginCommandBufferWithAllocator(&inner.allocator);
             let encoder = cmd
                 .computeCommandEncoder()
@@ -991,7 +1050,9 @@ impl<'a> ComputePass<'a> {
             seg.cmd.endCommandBuffer();
             self.program.borrow_mut().push(Item::Cmd(seg.cmd));
             if self.ctx.profile {
-                self.names.borrow_mut().push(self.segment_kernel.take().unwrap_or("(no dispatch)"));
+                self.names
+                    .borrow_mut()
+                    .push(self.segment_kernel.take().unwrap_or("(no dispatch)"));
             }
         }
     }
@@ -1061,7 +1122,9 @@ impl<'a> ComputePass<'a> {
             encoder.setComputePipelineState(&kernel.pipeline);
             for (i, (buf, offset)) in buffers.iter().enumerate() {
                 // SAFETY: the address lies within a resident buffer.
-                unsafe { inner.table.setAddress_atIndex(buf.address() + *offset as u64, i) };
+                unsafe {
+                    inner.table.setAddress_atIndex(buf.address() + *offset as u64, i)
+                };
             }
             for (i, param) in params.iter().enumerate() {
                 let address = match param {
@@ -1072,20 +1135,33 @@ impl<'a> ComputePass<'a> {
                     Param::U32(v) => inner.arena.push(pool, &v.to_ne_bytes())?,
                     Param::F32(v) => inner.arena.push(pool, &v.to_ne_bytes())?,
                     Param::Gpu(buf, offset) => {
-                        ensure!(offset.is_multiple_of(4) && *offset + 4 <= buf.length(), "GPU param at byte {offset} is not a word of its buffer");
+                        ensure!(
+                            offset.is_multiple_of(4) && *offset + 4 <= buf.length(),
+                            "GPU param at byte {offset} is not a word of its buffer"
+                        );
                         buf.address() + *offset as u64
                     }
                 };
                 // SAFETY: the address lies within a resident arena chunk or buffer.
                 unsafe { inner.table.setAddress_atIndex(address, buffers.len() + i) };
             }
-            let size = |(w, h, d): (usize, usize, usize)| MTLSize { width: w, height: h, depth: d };
+            let size = |(w, h, d): (usize, usize, usize)| MTLSize {
+                width: w,
+                height: h,
+                depth: d,
+            };
             match grid {
                 Grid::Threads { grid, threadgroup } => {
-                    encoder.dispatchThreads_threadsPerThreadgroup(size(grid), size(threadgroup));
+                    encoder.dispatchThreads_threadsPerThreadgroup(
+                        size(grid),
+                        size(threadgroup),
+                    );
                 }
                 Grid::Threadgroups { groups, threadgroup } => {
-                    encoder.dispatchThreadgroups_threadsPerThreadgroup(size(groups), size(threadgroup));
+                    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                        size(groups),
+                        size(threadgroup),
+                    );
                 }
             }
             if serial {
@@ -1099,7 +1175,14 @@ impl<'a> ComputePass<'a> {
 
     /// Copies `len` bytes between buffers (any alignment), ordered like a
     /// dispatch of this pass.
-    pub fn copy_buffer(&self, src: &GpuBuffer, src_offset: usize, dst: &GpuBuffer, dst_offset: usize, len: usize) -> Result<()> {
+    pub fn copy_buffer(
+        &self,
+        src: &GpuBuffer,
+        src_offset: usize,
+        dst: &GpuBuffer,
+        dst_offset: usize,
+        len: usize,
+    ) -> Result<()> {
         let serial = !self.concurrent;
         self.with_encoder(|encoder, _inner, _pool| {
             // SAFETY: ranges validated by the caller against the buffer sizes.
@@ -1178,7 +1261,14 @@ impl<'a> ComputePass<'a> {
         let done = self.done.borrow().clone();
         let slot = self.slot.replace(Slot { inner: None, pool: self.ctx.pool.clone() });
         let names = std::mem::take(&mut *self.names.borrow_mut());
-        Ok(EncodedPass { ctx: self.ctx, program, done, slot, label: self.label.get(), names })
+        Ok(EncodedPass {
+            ctx: self.ctx,
+            program,
+            done,
+            slot,
+            label: self.label.get(),
+            names,
+        })
     }
 
     /// Encodes, as the pass's last command, a GPU signal of `event` to
@@ -1223,7 +1313,11 @@ impl<'a> EncodedPass<'a> {
         let EncodedPass { ctx, program, done, slot, label, names } = self;
         let cmds = program.iter().filter(|item| matches!(item, Item::Cmd(_))).count();
         let profile = if ctx.profile {
-            ensure!(names.len() == cmds, "profile: {} kernel names for {cmds} command buffers", names.len());
+            ensure!(
+                names.len() == cmds,
+                "profile: {} kernel names for {cmds} command buffers",
+                names.len()
+            );
             Some(ProfileInfo { label, names })
         } else {
             None
@@ -1237,7 +1331,13 @@ impl<'a> EncodedPass<'a> {
     /// state (passes encoded ahead for several possible outcomes). The
     /// context must outlive it; [`DetachedPass::attach`] restores the tie.
     pub fn detach(self) -> DetachedPass {
-        DetachedPass { program: self.program, done: self.done, slot: self.slot, label: self.label, names: self.names }
+        DetachedPass {
+            program: self.program,
+            done: self.done,
+            slot: self.slot,
+            label: self.label,
+            names: self.names,
+        }
     }
 }
 
@@ -1254,7 +1354,14 @@ pub struct DetachedPass {
 
 impl DetachedPass {
     pub fn attach<'a>(self, ctx: &'a MetalContext) -> EncodedPass<'a> {
-        EncodedPass { ctx, program: self.program, done: self.done, slot: self.slot, label: self.label, names: self.names }
+        EncodedPass {
+            ctx,
+            program: self.program,
+            done: self.done,
+            slot: self.slot,
+            label: self.label,
+            names: self.names,
+        }
     }
 }
 
@@ -1309,7 +1416,10 @@ impl CompletedPass {
         if let Some(error) = state.error {
             bail!("Metal command buffer failed: {error}");
         }
-        let timing = PassTiming { gpu_start_secs: state.gpu_start_secs, gpu_end_secs: state.gpu_end_secs };
+        let timing = PassTiming {
+            gpu_start_secs: state.gpu_start_secs,
+            gpu_end_secs: state.gpu_end_secs,
+        };
         ensure!(
             timing.gpu_start_secs.is_finite()
                 && timing.gpu_end_secs.is_finite()

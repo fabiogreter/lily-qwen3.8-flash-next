@@ -95,7 +95,12 @@ fn now_secs() -> u64 {
 
 /// Sanitizes a format tag into a directory name.
 fn dir_name(format: &str) -> String {
-    format.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' }).collect()
+    format
+        .chars()
+        .map(
+            |c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' },
+        )
+        .collect()
 }
 
 impl DiskStore {
@@ -104,10 +109,13 @@ impl DiskStore {
     /// already there, expiring the stale ones and trimming to budget.
     pub fn open(root: &Path, format: &str, budget: u64, max_age: u64) -> Result<Self> {
         let dir = root.join(dir_name(format));
-        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
         let mut entries = Vec::new();
         let mut next_id = 1u64;
-        for entry in fs::read_dir(&dir).with_context(|| format!("listing {}", dir.display()))? {
+        for entry in
+            fs::read_dir(&dir).with_context(|| format!("listing {}", dir.display()))?
+        {
             let entry = entry?;
             let path = entry.path();
             if !path.is_dir() {
@@ -116,7 +124,9 @@ impl DiskStore {
             let id = entry.file_name().to_string_lossy().into_owned();
             match Self::load_meta(&path, format) {
                 Ok(meta) => {
-                    if let Some(n) = id.strip_prefix("s").and_then(|n| n.parse::<u64>().ok()) {
+                    if let Some(n) =
+                        id.strip_prefix("s").and_then(|n| n.parse::<u64>().ok())
+                    {
                         next_id = next_id.max(n + 1);
                     }
                     entries.push(DiskEntry {
@@ -135,7 +145,8 @@ impl DiskStore {
                 }
             }
         }
-        let mut store = Self { dir, format: format.to_owned(), budget, max_age, entries, next_id };
+        let mut store =
+            Self { dir, format: format.to_owned(), budget, max_age, entries, next_id };
         store.expire();
         store.trim(0);
         Ok(store)
@@ -165,12 +176,19 @@ impl DiskStore {
     }
 
     fn load_meta(path: &Path, format: &str) -> Result<Meta> {
-        let meta: Meta = serde_json::from_slice(&fs::read(path.join(META))?).context("parsing meta.json")?;
+        let meta: Meta = serde_json::from_slice(&fs::read(path.join(META))?)
+            .context("parsing meta.json")?;
         ensure!(meta.format == format, "format {:?} != {format:?}", meta.format);
         ensure!(path.join(PREFIX).is_file(), "prefix.bin missing");
-        ensure!(!meta.tokens.is_empty() && meta.checkpoints.contains(&meta.tokens.len()), "no live-end checkpoint");
+        ensure!(
+            !meta.tokens.is_empty() && meta.checkpoints.contains(&meta.tokens.len()),
+            "no live-end checkpoint"
+        );
         for &pos in &meta.checkpoints {
-            ensure!(path.join(format!("ckpt-{pos}.bin")).is_file(), "ckpt-{pos}.bin missing");
+            ensure!(
+                path.join(format!("ckpt-{pos}.bin")).is_file(),
+                "ckpt-{pos}.bin missing"
+            );
         }
         Ok(meta)
     }
@@ -244,7 +262,10 @@ impl DiskStore {
         checkpoint: &mut dyn FnMut(usize, &mut dyn Write) -> Result<()>,
     ) -> Result<Option<String>> {
         ensure!(!tokens.is_empty(), "empty session");
-        ensure!(checkpoints.contains(&tokens.len()), "the live end must be a checkpoint");
+        ensure!(
+            checkpoints.contains(&tokens.len()),
+            "the live end must be a checkpoint"
+        );
         self.expire();
         let id = format!("s{}", self.next_id);
         let path = self.dir.join(&id);
@@ -284,7 +305,8 @@ impl DiskStore {
         fs::create_dir_all(path)?;
         let mut bytes = 0u64;
         {
-            let mut w = BufWriter::with_capacity(8 << 20, File::create(path.join(PREFIX))?);
+            let mut w =
+                BufWriter::with_capacity(8 << 20, File::create(path.join(PREFIX))?);
             prefix(&mut w)?;
             w.flush()?;
             bytes += w.get_ref().metadata()?.len();
@@ -293,7 +315,10 @@ impl DiskStore {
         positions.sort_unstable();
         positions.dedup();
         for &pos in &positions {
-            let mut w = BufWriter::with_capacity(8 << 20, File::create(path.join(format!("ckpt-{pos}.bin")))?);
+            let mut w = BufWriter::with_capacity(
+                8 << 20,
+                File::create(path.join(format!("ckpt-{pos}.bin")))?,
+            );
             checkpoint(pos, &mut w)?;
             w.flush()?;
             bytes += w.get_ref().metadata()?.len();
@@ -306,7 +331,10 @@ impl DiskStore {
         if let Some(avail) = available_bytes(&self.dir)
             && avail < FREE_SPACE_MARGIN
         {
-            eprintln!("session cache: {:.1} GB free on the volume, not keeping the evicted session", avail as f64 / 1e9);
+            eprintln!(
+                "session cache: {:.1} GB free on the volume, not keeping the evicted session",
+                avail as f64 / 1e9
+            );
             return Ok(None);
         }
         let meta = Meta {
@@ -320,7 +348,10 @@ impl DiskStore {
         };
         fs::write(path.join(META), serde_json::to_vec(&meta)?)?;
         Ok(Some(DiskEntry {
-            id: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            id: path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
             tokens: meta.tokens,
             checkpoints: positions,
             bytes,
@@ -333,13 +364,19 @@ impl DiskStore {
     /// Opens the per-token cache file of `id` for reading.
     pub fn open_prefix(&self, id: &str) -> Result<Box<dyn Read>> {
         let path = self.dir.join(id).join(PREFIX);
-        Ok(Box::new(BufReader::with_capacity(8 << 20, File::open(&path).with_context(|| format!("opening {}", path.display()))?)))
+        Ok(Box::new(BufReader::with_capacity(
+            8 << 20,
+            File::open(&path).with_context(|| format!("opening {}", path.display()))?,
+        )))
     }
 
     /// Opens the checkpoint at `pos` of `id` for reading.
     pub fn open_checkpoint(&self, id: &str, pos: usize) -> Result<Box<dyn Read>> {
         let path = self.dir.join(id).join(format!("ckpt-{pos}.bin"));
-        Ok(Box::new(BufReader::with_capacity(8 << 20, File::open(&path).with_context(|| format!("opening {}", path.display()))?)))
+        Ok(Box::new(BufReader::with_capacity(
+            8 << 20,
+            File::open(&path).with_context(|| format!("opening {}", path.display()))?,
+        )))
     }
 
     /// Marks `id` as just used (in memory and in its meta file).
@@ -368,7 +405,15 @@ impl DiskStore {
     /// [`DURABLE_MAX_ENTRIES`] remain. Evicted sessions are not candidates.
     fn trim_durable(&mut self) {
         while self.durable_len() > DURABLE_MAX_ENTRIES {
-            let Some(victim) = self.entries.iter().filter(|e| e.durable).min_by_key(|e| e.last_used).map(|e| e.id.clone()) else { break };
+            let Some(victim) = self
+                .entries
+                .iter()
+                .filter(|e| e.durable)
+                .min_by_key(|e| e.last_used)
+                .map(|e| e.id.clone())
+            else {
+                break;
+            };
             self.remove(&victim);
         }
     }
@@ -384,7 +429,15 @@ impl DiskStore {
     /// Deletes least-recently-used entries until `extra` more bytes fit.
     fn trim(&mut self, extra: u64) {
         while !self.entries.is_empty() && self.used_bytes() + extra > self.budget {
-            let Some(victim) = self.entries.iter().enumerate().min_by_key(|(_, e)| e.last_used).map(|(i, _)| i) else { break };
+            let Some(victim) = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(i, _)| i)
+            else {
+                break;
+            };
             let id = self.entries.swap_remove(victim).id;
             let _ = fs::remove_dir_all(self.dir.join(&id));
         }
@@ -414,7 +467,19 @@ fn available_bytes(path: &Path) -> Option<u64> {
         fn statvfs(path: *const std::ffi::c_char, buf: *mut StatVfs) -> i32;
     }
     let c = CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut st = StatVfs { f_bsize: 0, f_frsize: 0, f_blocks: 0, f_bfree: 0, f_bavail: 0, f_files: 0, f_ffree: 0, f_favail: 0, f_fsid: 0, f_flag: 0, f_namemax: 0 };
+    let mut st = StatVfs {
+        f_bsize: 0,
+        f_frsize: 0,
+        f_blocks: 0,
+        f_bfree: 0,
+        f_bavail: 0,
+        f_files: 0,
+        f_ffree: 0,
+        f_favail: 0,
+        f_fsid: 0,
+        f_flag: 0,
+        f_namemax: 0,
+    };
     // SAFETY: valid NUL-terminated path and a properly sized out-struct.
     let rc = unsafe { statvfs(c.as_ptr(), &mut st) };
     (rc == 0).then(|| u64::from(st.f_bavail) * st.f_frsize)

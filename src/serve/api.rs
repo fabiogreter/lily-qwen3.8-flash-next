@@ -48,8 +48,12 @@ impl Content {
                 let mut out = String::new();
                 for part in parts {
                     match part.kind.as_str() {
-                        "text" | "input_text" => out.push_str(part.text.as_deref().unwrap_or("")),
-                        other => bail!("content part type {other:?} is not supported (text only)"),
+                        "text" | "input_text" => {
+                            out.push_str(part.text.as_deref().unwrap_or(""))
+                        }
+                        other => bail!(
+                            "content part type {other:?} is not supported (text only)"
+                        ),
                     }
                 }
                 Ok(out)
@@ -210,7 +214,10 @@ pub struct Budget {
     pub clamped_from: Option<usize>,
 }
 
-fn resolve_sampling(fields: &SamplingFields, defaults: &SamplingParams) -> Result<SamplingParams> {
+fn resolve_sampling(
+    fields: &SamplingFields,
+    defaults: &SamplingParams,
+) -> Result<SamplingParams> {
     let top_k = match fields.top_k {
         None => defaults.top_k,
         Some(k) if k < 0 => 0,
@@ -233,8 +240,12 @@ fn resolve_sampling(fields: &SamplingFields, defaults: &SamplingParams) -> Resul
         top_p: fields.top_p.unwrap_or(defaults.top_p),
         min_p: fields.min_p.unwrap_or(defaults.min_p),
         presence_penalty: fields.presence_penalty.unwrap_or(defaults.presence_penalty),
-        frequency_penalty: fields.frequency_penalty.unwrap_or(defaults.frequency_penalty),
-        repetition_penalty: fields.repetition_penalty.unwrap_or(defaults.repetition_penalty),
+        frequency_penalty: fields
+            .frequency_penalty
+            .unwrap_or(defaults.frequency_penalty),
+        repetition_penalty: fields
+            .repetition_penalty
+            .unwrap_or(defaults.repetition_penalty),
         seed,
     };
     params.validate()?;
@@ -245,7 +256,11 @@ fn resolve_sampling(fields: &SamplingFields, defaults: &SamplingParams) -> Resul
 /// the context is refused (nothing could be generated); a `max_tokens` the
 /// prompt leaves no room for is clamped to that room, as OpenAI-compatible
 /// servers do, and the response then ends with `finish_reason: "length"`.
-fn resolve_budget(prompt_tokens: usize, requested: Option<usize>, max_seq: usize) -> Result<Budget> {
+fn resolve_budget(
+    prompt_tokens: usize,
+    requested: Option<usize>,
+    max_seq: usize,
+) -> Result<Budget> {
     ensure!(prompt_tokens > 0, "the prompt is empty");
     ensure!(
         prompt_tokens < max_seq,
@@ -268,7 +283,9 @@ fn map_reasoning_effort(value: &str) -> Result<Option<Option<String>>> {
         "low" => Some(Some("low".into())),
         "medium" => Some(Some("medium".into())),
         "high" | "xhigh" | "max" => Some(Some("xhigh".into())),
-        other => bail!("unknown reasoning_effort {other:?}; use none, low, medium or high"),
+        other => {
+            bail!("unknown reasoning_effort {other:?}; use none, low, medium or high")
+        }
     })
 }
 
@@ -283,7 +300,10 @@ pub fn prepare_chat(
     ensure!(!request.logprobs.unwrap_or(false), "logprobs are not supported");
     if let Some(format) = &request.response_format {
         let kind = format.get("type").and_then(Value::as_str).unwrap_or("");
-        ensure!(kind == "text", "response_format {kind:?} is not supported (only text)");
+        ensure!(
+            kind == "text",
+            "response_format {kind:?} is not supported (only text)"
+        );
     }
     ensure!(!request.messages.is_empty(), "messages must not be empty");
     ensure!(
@@ -339,9 +359,12 @@ pub fn prepare_chat(
 
     let mut messages = Vec::with_capacity(request.messages.len());
     for (index, message) in request.messages.into_iter().enumerate() {
-        let text = message.content.map(Content::into_text).transpose()?.unwrap_or_default();
+        let text =
+            message.content.map(Content::into_text).transpose()?.unwrap_or_default();
         let mut value = match message.role.as_str() {
-            "system" | "developer" => serde_json::json!({"role": "system", "content": text}),
+            "system" | "developer" => {
+                serde_json::json!({"role": "system", "content": text})
+            }
             "user" => serde_json::json!({"role": "user", "content": text}),
             "assistant" => {
                 let mut v = serde_json::json!({"role": "assistant", "content": text});
@@ -389,7 +412,10 @@ pub fn prepare_chat(
         sampling: resolve_sampling(&request.sampling, &defaults.sampling)?,
         stop_strings: request.stop.map(StringOrVec::into_vec).unwrap_or_default(),
         stream: request.stream,
-        include_usage: request.stream_options.and_then(|o| o.include_usage).unwrap_or(false),
+        include_usage: request
+            .stream_options
+            .and_then(|o| o.include_usage)
+            .unwrap_or(false),
         thinking_open: enable_thinking,
         tools,
         cache_key: request.prompt_cache_key,
@@ -405,7 +431,10 @@ pub fn prepare_completion(
     max_seq: usize,
 ) -> Result<Prepared> {
     ensure!(request.n.is_none_or(|n| n == 1), "n must be 1");
-    ensure!(request.logprobs.as_ref().is_none_or(Value::is_null), "logprobs are not supported");
+    ensure!(
+        request.logprobs.as_ref().is_none_or(Value::is_null),
+        "logprobs are not supported"
+    );
     ensure!(!request.echo.unwrap_or(false), "echo is not supported");
     ensure!(
         request.stream || request.stream_options.is_none(),
@@ -415,7 +444,8 @@ pub fn prepare_completion(
     ensure!(prompts.len() == 1, "exactly one prompt string is supported");
     let prompt = tokenizer.encode(&prompts[0])?;
     // OpenAI's completions default is 16 tokens.
-    let budget = resolve_budget(prompt.len(), Some(request.max_tokens.unwrap_or(16)), max_seq)?;
+    let budget =
+        resolve_budget(prompt.len(), Some(request.max_tokens.unwrap_or(16)), max_seq)?;
     Ok(Prepared {
         kind: Kind::Completion,
         prompt,
@@ -423,7 +453,10 @@ pub fn prepare_completion(
         sampling: resolve_sampling(&request.sampling, &defaults.sampling)?,
         stop_strings: request.stop.map(StringOrVec::into_vec).unwrap_or_default(),
         stream: request.stream,
-        include_usage: request.stream_options.and_then(|o| o.include_usage).unwrap_or(false),
+        include_usage: request
+            .stream_options
+            .and_then(|o| o.include_usage)
+            .unwrap_or(false),
         thinking_open: false,
         tools: None,
         cache_key: request.prompt_cache_key,
@@ -432,6 +465,10 @@ pub fn prepare_completion(
 }
 
 #[cfg(test)]
-pub(super) fn resolve_budget_for_test(prompt: usize, requested: Option<usize>, max_seq: usize) -> Result<Budget> {
+pub(super) fn resolve_budget_for_test(
+    prompt: usize,
+    requested: Option<usize>,
+    max_seq: usize,
+) -> Result<Budget> {
     resolve_budget(prompt, requested, max_seq)
 }

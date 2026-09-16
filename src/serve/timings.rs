@@ -76,7 +76,8 @@ pub struct Timings {
 /// Tokens per second, or `None` when either side is zero: a rate over no
 /// tokens is meaningless and a division by a zero duration is worse.
 fn rate(tokens: usize, secs: f64) -> Option<f64> {
-    (tokens > 0 && secs > 0.0 && secs.is_finite()).then(|| round(tokens as f64 / secs, 100.0))
+    (tokens > 0 && secs > 0.0 && secs.is_finite())
+        .then(|| round(tokens as f64 / secs, 100.0))
 }
 
 /// Keeps the JSON readable: the numbers come from a wall clock, so the
@@ -109,9 +110,9 @@ impl Timings {
             decode_per_second: rate(generated_tokens, decode_secs),
             drafted_tokens: speculation.map(|s| s.drafted),
             accepted_tokens: speculation.map(|s| s.accepted),
-            acceptance_ratio: speculation
-                .filter(|s| s.drafted > 0)
-                .map(|s| round(s.accepted.min(s.drafted) as f64 / s.drafted as f64, 1e4)),
+            acceptance_ratio: speculation.filter(|s| s.drafted > 0).map(|s| {
+                round(s.accepted.min(s.drafted) as f64 / s.drafted as f64, 1e4)
+            }),
             agreement_tokens: cached_tokens,
             durable_prefix_tokens: None,
         }
@@ -120,8 +121,13 @@ impl Timings {
     /// Adds what the session cache saw beyond the reused prefix: the
     /// agreement with any lineage (never less than `cached_tokens`) and the
     /// durable prefix entry written for it, if one was.
-    pub fn with_agreement(mut self, agreement_tokens: usize, durable_prefix_tokens: Option<usize>) -> Self {
-        self.agreement_tokens = agreement_tokens.clamp(self.cached_tokens, self.prompt_tokens);
+    pub fn with_agreement(
+        mut self,
+        agreement_tokens: usize,
+        durable_prefix_tokens: Option<usize>,
+    ) -> Self {
+        self.agreement_tokens =
+            agreement_tokens.clamp(self.cached_tokens, self.prompt_tokens);
         self.durable_prefix_tokens = durable_prefix_tokens;
         self
     }
@@ -163,7 +169,8 @@ impl TimingsLog {
 
     /// Appends one entry, dropping the oldest once the buffer is full.
     pub fn record(&self, entry: TimingsEntry) {
-        let mut entries = self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut entries =
+            self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if entries.len() == self.capacity {
             entries.pop_front();
         }
@@ -172,7 +179,8 @@ impl TimingsLog {
 
     /// The entries, newest first.
     pub fn recent(&self) -> Vec<TimingsEntry> {
-        let entries = self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entries =
+            self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         entries.iter().rev().cloned().collect()
     }
 }

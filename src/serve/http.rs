@@ -62,7 +62,10 @@ pub fn read_request(stream: &mut TcpStream, max_body: usize) -> Result<Request> 
         headers.push((name.trim().to_string(), value.trim().to_string()));
     }
     let request = Request { method, path: target, headers, body: Vec::new() };
-    if request.header("Transfer-Encoding").is_some_and(|v| !v.eq_ignore_ascii_case("identity")) {
+    if request
+        .header("Transfer-Encoding")
+        .is_some_and(|v| !v.eq_ignore_ascii_case("identity"))
+    {
         bail!("chunked request bodies are not supported; send Content-Length");
     }
     let length: usize = match request.header("Content-Length") {
@@ -70,8 +73,11 @@ pub fn read_request(stream: &mut TcpStream, max_body: usize) -> Result<Request> 
         None => 0,
     };
     ensure!(length <= max_body, "request body exceeds {max_body} bytes");
-    if request.header("Expect").is_some_and(|v| v.eq_ignore_ascii_case("100-continue")) {
-        stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").context("writing 100 Continue")?;
+    if request.header("Expect").is_some_and(|v| v.eq_ignore_ascii_case("100-continue"))
+    {
+        stream
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .context("writing 100 Continue")?;
     }
     let mut body = vec![0u8; length];
     // Bytes already buffered by the header reader come first.
@@ -100,7 +106,12 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
-fn write_head(stream: &mut TcpStream, status: u16, content_type: &str, extra: &[(&str, &str)]) -> Result<()> {
+fn write_head(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    extra: &[(&str, &str)],
+) -> Result<()> {
     let mut head = format!(
         "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nConnection: close\r\n",
         reason(status)
@@ -116,7 +127,12 @@ fn write_head(stream: &mut TcpStream, status: u16, content_type: &str, extra: &[
 }
 
 /// Writes a complete response and closes the connection.
-pub fn respond(mut stream: TcpStream, status: u16, content_type: &str, body: &[u8]) -> Result<()> {
+pub fn respond(
+    mut stream: TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) -> Result<()> {
     let length = body.len().to_string();
     write_head(&mut stream, status, content_type, &[("Content-Length", &length)])?;
     stream.write_all(body).context("writing response body")?;
@@ -135,11 +151,20 @@ pub struct ChunkedResponse {
 impl ChunkedResponse {
     /// Writes the head. `cancelled` is set as soon as a write fails or the
     /// client's read side reaches EOF (watched by a helper thread).
-    pub fn start(stream: TcpStream, status: u16, content_type: &str, cancelled: Arc<AtomicBool>) -> Result<Self> {
+    pub fn start(
+        stream: TcpStream,
+        status: u16,
+        content_type: &str,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Self> {
         let mut stream = stream;
         stream.set_nodelay(true).ok();
         let extra: &[(&str, &str)] = if content_type.starts_with("text/event-stream") {
-            &[("Transfer-Encoding", "chunked"), ("Cache-Control", "no-cache"), ("X-Accel-Buffering", "no")]
+            &[
+                ("Transfer-Encoding", "chunked"),
+                ("Cache-Control", "no-cache"),
+                ("X-Accel-Buffering", "no"),
+            ]
         } else {
             &[("Transfer-Encoding", "chunked")]
         };

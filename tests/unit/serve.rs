@@ -22,14 +22,19 @@ fn chunks_carry_the_openai_shape() {
 
 #[test]
 fn request_budgets_fill_the_context_by_default_and_clamp_to_it() {
-    let budget = |prompt, requested, max_seq| api::resolve_budget_for_test(prompt, requested, max_seq);
+    let budget = |prompt, requested, max_seq| {
+        api::resolve_budget_for_test(prompt, requested, max_seq)
+    };
     let fits = |max_tokens| api::Budget { max_tokens, clamped_from: None };
     assert_eq!(budget(10, None, 100).unwrap(), fits(90));
     assert_eq!(budget(10, Some(20), 100).unwrap(), fits(20));
     assert_eq!(budget(10, Some(90), 100).unwrap(), fits(90));
     // Asking for more than the prompt leaves room for clamps instead of
     // refusing (the response then ends with finish_reason "length").
-    assert_eq!(budget(10, Some(91), 100).unwrap(), api::Budget { max_tokens: 90, clamped_from: Some(91) });
+    assert_eq!(
+        budget(10, Some(91), 100).unwrap(),
+        api::Budget { max_tokens: 90, clamped_from: Some(91) }
+    );
     assert_eq!(
         budget(99_204, Some(32_000), 131_072).unwrap(),
         api::Budget { max_tokens: 131_072 - 99_204, clamped_from: Some(32_000) }
@@ -49,15 +54,20 @@ fn default_cache_budget_leaves_room_for_the_paged_table_and_other_apps() {
     const GB: usize = 1 << 30;
     // The 128 GB machine: 115.4 GB working set, 73.0 GB weights, 32.0 GB
     // paged table. The arithmetic gives 2.4 GB; the floor lifts it to 8 GiB.
-    let (budget, floored) = derive_cache_budget(115_400_000_000, 73_000_000_000, 32_000_000_000);
+    let (budget, floored) =
+        derive_cache_budget(115_400_000_000, 73_000_000_000, 32_000_000_000);
     assert_eq!((budget, floored), (8 * GB, true));
     // With the table resident on the GPU (`--ngram-table resident`) it is in
     // the allocated bytes instead and counts once.
     let (budget, floored) = derive_cache_budget(115_400_000_000, 105_000_000_000, 0);
     assert_eq!((budget, floored), (8 * GB, true));
     // A small model on the same machine: working set - allocated - table - headroom.
-    let (budget, floored) = derive_cache_budget(115_400_000_000, 8_200_000_000, 32_000_000_000);
-    assert_eq!((budget, floored), (115_400_000_000 - 8_200_000_000 - 32_000_000_000 - 8 * GB, false));
+    let (budget, floored) =
+        derive_cache_budget(115_400_000_000, 8_200_000_000, 32_000_000_000);
+    assert_eq!(
+        (budget, floored),
+        (115_400_000_000 - 8_200_000_000 - 32_000_000_000 - 8 * GB, false)
+    );
     // No paged weights at all (the Qwen3.6 path).
     let (budget, floored) = derive_cache_budget(115_400_000_000, 20_000_000_000, 0);
     assert_eq!((budget, floored), (115_400_000_000 - 20_000_000_000 - 8 * GB, false));
@@ -107,7 +117,8 @@ fn chat_requests_parse_the_agent_surface() {
 
 #[test]
 fn sampling_defaults_apply_overrides() {
-    let dir = std::env::temp_dir().join(format!("lily-serve-test-{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("lily-serve-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("generation_config.json"),
@@ -116,9 +127,17 @@ fn sampling_defaults_apply_overrides() {
     .unwrap();
     let base = sampling_defaults(&dir, &SamplingOverrides::default()).unwrap();
     assert_eq!((base.temperature, base.top_k, base.top_p), (1.0, 20, 0.95));
-    let over = sampling_defaults(&dir, &SamplingOverrides { temperature: Some(0.0), ..Default::default() }).unwrap();
+    let over = sampling_defaults(
+        &dir,
+        &SamplingOverrides { temperature: Some(0.0), ..Default::default() },
+    )
+    .unwrap();
     assert!(over.is_greedy());
-    std::fs::write(dir.join("config.json"), br#"{"model_type": "x", "text_config": {"eos_token_id": [1, 2]}}"#).unwrap();
+    std::fs::write(
+        dir.join("config.json"),
+        br#"{"model_type": "x", "text_config": {"eos_token_id": [1, 2]}}"#,
+    )
+    .unwrap();
     assert_eq!(checkpoint_eos_ids(&dir).unwrap(), vec![1, 2]);
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -150,7 +169,9 @@ fn health_keeps_ok_and_loading_and_adds_the_state() {
     // the code is 503 so a monitor sees that something went wrong.
     assert_eq!(State::Recovering.health(), (503, "recovering"));
     assert!(State::Recovering.accepting());
-    for state in [State::Loading, State::Ready, State::Idle, State::Reloading, State::Stopping] {
+    for state in
+        [State::Loading, State::Ready, State::Idle, State::Reloading, State::Stopping]
+    {
         assert_eq!(state.accepting(), state.health().0 == 200, "{state:?}");
     }
     assert_eq!(State::Idle.as_str(), "idle");
@@ -162,7 +183,14 @@ fn health_keeps_ok_and_loading_and_adds_the_state() {
 fn lifecycle_round_trips_every_state() {
     let lifecycle = Lifecycle::new(State::Loading);
     assert_eq!(lifecycle.get(), State::Loading);
-    for state in [State::Ready, State::Idle, State::Reloading, State::Stopping, State::Recovering, State::Loading] {
+    for state in [
+        State::Ready,
+        State::Idle,
+        State::Reloading,
+        State::Stopping,
+        State::Recovering,
+        State::Loading,
+    ] {
         lifecycle.set(state);
         assert_eq!(lifecycle.get(), state);
     }

@@ -9,8 +9,8 @@ use anyhow::{Context as _, Result, ensure};
 use clap::Parser;
 use lily::chat::Message;
 use lily::engine::{DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi};
-use lily::kernels::sample::SamplingParams;
 use lily::generate::{Generator, Thinking};
+use lily::kernels::sample::SamplingParams;
 use lily::metal::MetalContext;
 use lily::model::Qwen3_5Model;
 use lily::qwen4exp::Qwen4ExpModel;
@@ -97,7 +97,13 @@ fn probe<M: LanguageModel>(cli: &Cli) -> Result<Record> {
 
     let started = Instant::now();
     let greedy = SamplingParams::greedy();
-    model.prefill(&ctx, &mut state, &mut scratch, &prompt, Some(Draw { params: &greedy, step: 0 }))?;
+    model.prefill(
+        &ctx,
+        &mut state,
+        &mut scratch,
+        &prompt,
+        Some(Draw { params: &greedy, step: 0 }),
+    )?;
     let prefill_seconds = started.elapsed().as_secs_f64();
 
     let read_step = |scratch: &M::Scratch,

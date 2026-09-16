@@ -56,7 +56,11 @@ pub struct OutputParser<D: FnMut(&[u32]) -> Result<String>> {
 
 impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
     pub fn new(detokenize: D, config: ParserConfig) -> Self {
-        let phase = if config.thinking_open && !config.raw { Phase::Reasoning } else { Phase::Content };
+        let phase = if config.thinking_open && !config.raw {
+            Phase::Reasoning
+        } else {
+            Phase::Content
+        };
         Self {
             detokenize,
             pending: Vec::new(),
@@ -116,7 +120,11 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
                     if let Some(idx) = self.buf.find(THINK_END) {
                         let reasoning = self.buf[..idx].to_string();
                         let rest = self.buf[idx + THINK_END.len()..].to_string();
-                        self.emit_text(&mut events, reasoning.trim_end_matches('\n'), Phase::Reasoning);
+                        self.emit_text(
+                            &mut events,
+                            reasoning.trim_end_matches('\n'),
+                            Phase::Reasoning,
+                        );
                         self.phase = Phase::Content;
                         self.phase_started = false;
                         self.buf = rest;
@@ -127,7 +135,8 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
                     let hold = if final_flush {
                         0
                     } else {
-                        partial_suffix_len(&self.buf, THINK_END).max(trailing_newlines(&self.buf))
+                        partial_suffix_len(&self.buf, THINK_END)
+                            .max(trailing_newlines(&self.buf))
                     };
                     let release = self.buf.len() - hold;
                     let out: String = self.buf.drain(..release).collect();
@@ -140,8 +149,13 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
                 }
                 Phase::Content => {
                     let tools_on = self.tools.is_some() && !self.raw;
-                    let tool_idx = if tools_on { self.buf.find(TOOL_START) } else { None };
-                    let stop_idx = self.stop_strings.iter().filter_map(|s| self.buf.find(s.as_str())).min();
+                    let tool_idx =
+                        if tools_on { self.buf.find(TOOL_START) } else { None };
+                    let stop_idx = self
+                        .stop_strings
+                        .iter()
+                        .filter_map(|s| self.buf.find(s.as_str()))
+                        .min();
                     if let Some(stop) = stop_idx
                         && tool_idx.is_none_or(|t| stop <= t)
                     {
@@ -165,7 +179,8 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
                             // A `<tool_call>` may still arrive, split across
                             // tokens or after the whitespace the template puts
                             // between content and call.
-                            hold = partial_suffix_len(&self.buf, TOOL_START).max(trailing_whitespace(&self.buf));
+                            hold = partial_suffix_len(&self.buf, TOOL_START)
+                                .max(trailing_whitespace(&self.buf));
                         }
                         let stop_hold = self
                             .stop_strings
@@ -184,7 +199,10 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
                     let Some(idx) = self.buf.find(TOOL_END) else {
                         if final_flush {
                             // Unterminated block: give the client the raw text.
-                            let raw = format!("{TOOL_START}{}", std::mem::take(&mut self.buf));
+                            let raw = format!(
+                                "{TOOL_START}{}",
+                                std::mem::take(&mut self.buf)
+                            );
                             self.phase = Phase::Content;
                             self.emit_text(&mut events, &raw, Phase::Content);
                         }
@@ -212,7 +230,8 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
     }
 
     fn emit_text(&mut self, events: &mut Vec<Event>, text: &str, phase: Phase) {
-        let text = if self.phase_started { text } else { text.trim_start_matches('\n') };
+        let text =
+            if self.phase_started { text } else { text.trim_start_matches('\n') };
         if text.is_empty() {
             return;
         }
@@ -229,7 +248,10 @@ fn partial_suffix_len(buf: &str, marker: &str) -> usize {
     let max = marker.len().saturating_sub(1).min(buf.len());
     (1..=max)
         .rev()
-        .find(|&n| buf.is_char_boundary(buf.len() - n) && marker.starts_with(&buf[buf.len() - n..]))
+        .find(|&n| {
+            buf.is_char_boundary(buf.len() - n)
+                && marker.starts_with(&buf[buf.len() - n..])
+        })
         .unwrap_or(0)
 }
 

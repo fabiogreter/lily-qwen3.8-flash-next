@@ -95,7 +95,10 @@ impl<'t> Pos<'t> {
         match self.arg {
             Arg::Const(p) => Ok(Pos::host(p + by)),
             Arg::Gpu(_) => {
-                anyhow::ensure!(by == 0, "a GPU-supplied position cannot be offset by {by} rows");
+                anyhow::ensure!(
+                    by == 0,
+                    "a GPU-supplied position cannot be offset by {by} rows"
+                );
                 Ok(self)
             }
         }

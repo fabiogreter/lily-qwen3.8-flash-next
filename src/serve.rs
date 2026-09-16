@@ -30,11 +30,15 @@ pub mod stream;
 pub mod timings;
 pub mod tools;
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{
+    IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs,
+};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::mpsc::{
+    self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError,
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, ensure};
@@ -72,8 +76,15 @@ const BUDGET_FLOOR_BYTES: usize = 8 << 30;
 /// set leaves after the weights already allocated, the paged weights that
 /// live in the page cache (the n-gram table) and the headroom, floored.
 /// Returns the budget and whether the floor applied.
-fn derive_cache_budget(working_set: usize, allocated: usize, paged: usize) -> (usize, bool) {
-    let derived = working_set.saturating_sub(allocated).saturating_sub(paged).saturating_sub(BUDGET_HEADROOM_BYTES);
+fn derive_cache_budget(
+    working_set: usize,
+    allocated: usize,
+    paged: usize,
+) -> (usize, bool) {
+    let derived = working_set
+        .saturating_sub(allocated)
+        .saturating_sub(paged)
+        .saturating_sub(BUDGET_HEADROOM_BYTES);
     (derived.max(BUDGET_FLOOR_BYTES), derived < BUDGET_FLOOR_BYTES)
 }
 /// How long a running request may keep going after a stop signal before it
@@ -89,7 +100,8 @@ pub fn parse_duration_secs(text: &str) -> Result<u64> {
     let (digits, unit) = text
         .find(|c: char| !c.is_ascii_digit() && c != '.')
         .map_or((text, ""), |i| text.split_at(i));
-    let value: f64 = digits.parse().with_context(|| format!("invalid duration {text:?}"))?;
+    let value: f64 =
+        digits.parse().with_context(|| format!("invalid duration {text:?}"))?;
     let scale = match unit.trim().to_ascii_lowercase().as_str() {
         "" | "s" => 1.0,
         "m" => 60.0,
@@ -183,7 +195,10 @@ impl State {
     /// Whether the server takes requests in this state (they may have to
     /// wait for a reload).
     pub fn accepting(self) -> bool {
-        matches!(self, State::Ready | State::Idle | State::Reloading | State::Recovering)
+        matches!(
+            self,
+            State::Ready | State::Idle | State::Reloading | State::Recovering
+        )
     }
 
     /// The `/health` status code and `status` field. `ok`/`loading` keep the
@@ -269,7 +284,10 @@ pub struct IdleTimer {
 impl IdleTimer {
     /// `timeout_secs == 0` never unloads.
     pub fn new(timeout_secs: u64, now: Instant) -> Self {
-        Self { timeout: (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs)), last_active: now }
+        Self {
+            timeout: (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs)),
+            last_active: now,
+        }
     }
 
     /// Records activity (a request just finished, or the engine just loaded).
@@ -323,8 +341,10 @@ struct ErrorBody {
 }
 
 fn error_json(kind: &'static str, message: impl Into<String>) -> Vec<u8> {
-    serde_json::to_vec(&ErrorEnvelope { error: ErrorBody { message: message.into(), kind } })
-        .unwrap_or_else(|_| b"{\"error\":{\"message\":\"error\"}}".to_vec())
+    serde_json::to_vec(&ErrorEnvelope {
+        error: ErrorBody { message: message.into(), kind },
+    })
+    .unwrap_or_else(|_| b"{\"error\":{\"message\":\"error\"}}".to_vec())
 }
 
 fn send_json<T: Serialize>(stream: TcpStream, status: u16, value: &T) {
@@ -334,15 +354,28 @@ fn send_json<T: Serialize>(stream: TcpStream, status: u16, value: &T) {
     }
 }
 
-fn send_error(stream: TcpStream, status: u16, kind: &'static str, message: impl Into<String>) {
-    if let Err(error) = http::respond(stream, status, "application/json", &error_json(kind, message)) {
+fn send_error(
+    stream: TcpStream,
+    status: u16,
+    kind: &'static str,
+    message: impl Into<String>,
+) {
+    if let Err(error) =
+        http::respond(stream, status, "application/json", &error_json(kind, message))
+    {
         eprintln!("response error: {error:#}");
     }
 }
 
 /// Answers a request the engine never sees and logs why, so a client that
 /// gives up on a 4xx/5xx can be traced in the server log.
-fn refuse(stream: TcpStream, request: &str, status: u16, kind: &'static str, message: impl Into<String>) {
+fn refuse(
+    stream: TcpStream,
+    request: &str,
+    status: u16,
+    kind: &'static str,
+    message: impl Into<String>,
+) {
     let message = message.into();
     eprintln!("rejected {request} with {status}: {message}");
     send_error(stream, status, kind, message);
@@ -376,7 +409,9 @@ impl Sink {
 
     fn sse(&self, value: &Value) {
         let mut line = b"data: ".to_vec();
-        line.extend_from_slice(serde_json::to_string(value).unwrap_or_default().as_bytes());
+        line.extend_from_slice(
+            serde_json::to_string(value).unwrap_or_default().as_bytes(),
+        );
         line.extend_from_slice(b"\n\n");
         self.send(line);
     }
@@ -424,7 +459,12 @@ fn relay(stream: TcpStream, rx: Receiver<Out>, cancelled: Arc<AtomicBool>) {
             return;
         }
     };
-    let mut response = match http::ChunkedResponse::start(stream, status, content_type, cancelled.clone()) {
+    let mut response = match http::ChunkedResponse::start(
+        stream,
+        status,
+        content_type,
+        cancelled.clone(),
+    ) {
         Ok(response) => response,
         Err(_) => {
             cancelled.store(true, Ordering::Relaxed);
@@ -477,18 +517,34 @@ struct Collected {
 }
 
 impl<M: LanguageModel> Engine<M> {
-    fn load(model_dir: &Path, options: &ServeOptions, shared: &Shared, next_id: u64) -> Result<Self> {
+    fn load(
+        model_dir: &Path,
+        options: &ServeOptions,
+        shared: &Shared,
+        next_id: u64,
+    ) -> Result<Self> {
         let Shared { generator, shutdown, timings } = shared.clone();
         let ctx = MetalContext::new()?;
         let started = Instant::now();
-        let model = M::load(&ctx, model_dir, &LoadOptions { ngram_storage: options.ngram_storage, mtp_drafts: options.mtp_drafts })?;
+        let model = M::load(
+            &ctx,
+            model_dir,
+            &LoadOptions {
+                ngram_storage: options.ngram_storage,
+                mtp_drafts: options.mtp_drafts,
+            },
+        )?;
         let drafts = options.mtp_drafts.min(model.max_drafts());
         eprintln!(
             "loaded {} in {:.1}s ({:.1} GB resident){}",
             M::MODEL_ID,
             started.elapsed().as_secs_f64(),
             ctx.current_allocated() as f64 / 1e9,
-            if drafts > 0 { format!(", speculative decoding with {drafts} drafts per step") } else { String::new() }
+            if drafts > 0 {
+                format!(", speculative decoding with {drafts} drafts per step")
+            } else {
+                String::new()
+            }
         );
         if options.ngram_preload || options.ngram_lock {
             let started = Instant::now();
@@ -502,7 +558,8 @@ impl<M: LanguageModel> Engine<M> {
                 );
             }
         }
-        let max_seq = effective_max_seq(options.max_seq, model.max_position_embeddings());
+        let max_seq =
+            effective_max_seq(options.max_seq, model.max_position_embeddings());
         ensure!(max_seq > 1, "max_seq must be at least 2");
         let mut scratch = model.new_scratch_with_capacity(&ctx, max_seq)?;
         warm_up(&ctx, &model, &mut scratch)?;
@@ -514,7 +571,8 @@ impl<M: LanguageModel> Engine<M> {
         let budget = match options.cache_bytes {
             Some(b) => b,
             None => {
-                let (budget, floored) = derive_cache_budget(working_set, allocated, paged);
+                let (budget, floored) =
+                    derive_cache_budget(working_set, allocated, paged);
                 eprintln!(
                     "session cache budget: {:.1} GB = {:.1} GB recommended working set - {:.1} GB allocated \
                      (weights, scratch) - {:.1} GB paged weights in the page cache - {:.1} GB headroom for \
@@ -524,7 +582,14 @@ impl<M: LanguageModel> Engine<M> {
                     gb(allocated),
                     gb(paged),
                     gb(BUDGET_HEADROOM_BYTES),
-                    if floored { format!(", raised to the {:.1} GB floor", gb(BUDGET_FLOOR_BYTES)) } else { String::new() },
+                    if floored {
+                        format!(
+                            ", raised to the {:.1} GB floor",
+                            gb(BUDGET_FLOOR_BYTES)
+                        )
+                    } else {
+                        String::new()
+                    },
                 );
                 budget
             }
@@ -546,11 +611,19 @@ impl<M: LanguageModel> Engine<M> {
                  lower --max-seq or raise --cache-bytes"
             );
         }
-        let mut sessions = SessionStore::new(budget, options.max_sessions, CHECKPOINTS_PER_SESSION);
-        if let (Some(dir), true) = (&options.disk_cache_dir, options.disk_cache_bytes > 0) {
+        let mut sessions =
+            SessionStore::new(budget, options.max_sessions, CHECKPOINTS_PER_SESSION);
+        if let (Some(dir), true) =
+            (&options.disk_cache_dir, options.disk_cache_bytes > 0)
+        {
             match model.persistence_format() {
                 Some(format) => {
-                    let disk = disk::DiskStore::open(dir, &format, options.disk_cache_bytes, options.disk_cache_ttl_secs)?;
+                    let disk = disk::DiskStore::open(
+                        dir,
+                        &format,
+                        options.disk_cache_bytes,
+                        options.disk_cache_ttl_secs,
+                    )?;
                     eprintln!(
                         "session cache: disk tier at {} ({} entries, {} durable, {:.1}/{:.1} GB, entries expire after {}; \
                          durable prefix entries {})",
@@ -559,16 +632,28 @@ impl<M: LanguageModel> Engine<M> {
                         disk.durable_len(),
                         disk.used_bytes() as f64 / 1e9,
                         disk.budget_bytes() as f64 / 1e9,
-                        if disk.max_age_secs() == 0 { "never".to_owned() } else { format!("{:.1} days unused", disk.max_age_secs() as f64 / 86_400.0) },
+                        if disk.max_age_secs() == 0 {
+                            "never".to_owned()
+                        } else {
+                            format!(
+                                "{:.1} days unused",
+                                disk.max_age_secs() as f64 / 86_400.0
+                            )
+                        },
                         if options.durable_min_tokens == 0 {
                             "off".to_owned()
                         } else {
                             format!("from {} shared tokens", options.durable_min_tokens)
                         },
                     );
-                    sessions = sessions.with_disk(disk).with_durable_min_tokens(options.durable_min_tokens);
+                    sessions = sessions
+                        .with_disk(disk)
+                        .with_durable_min_tokens(options.durable_min_tokens);
                 }
-                None => eprintln!("session cache: {} cannot persist sessions; disk tier off", M::MODEL_ID),
+                None => eprintln!(
+                    "session cache: {} cannot persist sessions; disk tier off",
+                    M::MODEL_ID
+                ),
             }
         }
         Ok(Self {
@@ -592,14 +677,16 @@ impl<M: LanguageModel> Engine<M> {
     /// ids stay unique across a reload.
     fn unload(self, reason: &str) -> u64 {
         let started = Instant::now();
-        let Engine { ctx, model, generator: _, mut sessions, scratch, next_id, .. } = self;
+        let Engine { ctx, model, generator: _, mut sessions, scratch, next_id, .. } =
+            self;
         let resident = ctx.current_allocated();
         // A faulted queue cannot run the snapshot blits, and what its last
         // command buffers left in the caches is not trustworthy either: the
         // sessions are dropped and clients re-prefill (the disk tier's
         // earlier copies were written by a healthy queue and stay valid).
         let faulted = ctx.fault().is_some();
-        let (spilled, dropped) = if faulted { (0, sessions.drop_all()) } else { sessions.spill_all(&ctx) };
+        let (spilled, dropped) =
+            if faulted { (0, sessions.drop_all()) } else { sessions.spill_all(&ctx) };
         let spill_secs = started.elapsed().as_secs_f64();
         drop(scratch);
         drop(sessions);
@@ -616,7 +703,11 @@ impl<M: LanguageModel> Engine<M> {
             M::MODEL_ID,
             started.elapsed().as_secs_f64(),
             resident as f64 / 1e9,
-            if faulted { " without spilling (GPU faulted; their state is not trustworthy)" } else { "" },
+            if faulted {
+                " without spilling (GPU faulted; their state is not trustworthy)"
+            } else {
+                ""
+            },
             left as f64 / 1e9,
         );
         next_id
@@ -641,8 +732,15 @@ impl<M: LanguageModel> Engine<M> {
         if let Err(error) = result {
             let (status, message) = match &fault {
                 Some(fault) => {
-                    eprintln!("request failed on a GPU fault (the engine reloads): {error:#}");
-                    (503, format!("the GPU command queue failed ({fault}); the engine is reloading, retry shortly"))
+                    eprintln!(
+                        "request failed on a GPU fault (the engine reloads): {error:#}"
+                    );
+                    (
+                        503,
+                        format!(
+                            "the GPU command queue failed ({fault}); the engine is reloading, retry shortly"
+                        ),
+                    )
                 }
                 None => {
                     eprintln!("request failed: {error:#}");
@@ -653,7 +751,9 @@ impl<M: LanguageModel> Engine<M> {
                 sink.start(status, "application/json");
                 sink.send(error_json("server_error", message));
             } else if stream {
-                sink.sse(&json!({"error": {"message": message, "type": "server_error"}}));
+                sink.sse(
+                    &json!({"error": {"message": message, "type": "server_error"}}),
+                );
                 sink.send(b"data: [DONE]\n\n".to_vec());
             }
         }
@@ -666,7 +766,18 @@ impl<M: LanguageModel> Engine<M> {
         if sink.cancelled() {
             return Ok(());
         }
-        let Engine { ctx, model, generator, sessions, scratch, max_seq, drafts, next_id, shutdown, timings } = self;
+        let Engine {
+            ctx,
+            model,
+            generator,
+            sessions,
+            scratch,
+            max_seq,
+            drafts,
+            next_id,
+            shutdown,
+            timings,
+        } = self;
         // The HTTP thread validated against the same limit; this only guards
         // the engine's buffers if the two ever disagree.
         ensure!(
@@ -676,12 +787,16 @@ impl<M: LanguageModel> Engine<M> {
         );
         let n = p.prompt.len();
         let started = Instant::now();
-        let acquired = sessions.acquire(ctx, model, &p.prompt, p.cache_key.as_deref())?;
+        let acquired =
+            sessions.acquire(ctx, model, &p.prompt, p.cache_key.as_deref())?;
         let mut session = acquired.session;
         let reused = acquired.reused;
         let agreement = acquired.agreement;
         ensure!(reused < n, "session cache returned the whole prompt");
-        ensure!(reused <= agreement, "session cache resumed at {reused} past the agreement {agreement}");
+        ensure!(
+            reused <= agreement,
+            "session cache resumed at {reused} past the agreement {agreement}"
+        );
 
         // A shared prefix the cache could not resume from becomes a durable
         // disk entry: prefill up to the boundary, write the caches and the
@@ -692,20 +807,39 @@ impl<M: LanguageModel> Engine<M> {
         // is dropped, not kept as a checkpoint: durable entries live on disk
         // only (see the session module).
         let min_tokens = sessions.durable_min_tokens();
-        let boundary = sessions.disk().and_then(|_| boundary_position(agreement, reused, n, min_tokens));
+        let boundary = sessions
+            .disk()
+            .and_then(|_| boundary_position(agreement, reused, n, min_tokens));
         let mut durable: Option<(usize, f64)> = None;
         let mut prefilled = reused;
         if let Some(b) = boundary {
             if prefilled < b {
-                model.prefill(ctx, &mut session.state, scratch, &p.prompt[prefilled..b], None)?;
+                model.prefill(
+                    ctx,
+                    &mut session.state,
+                    scratch,
+                    &p.prompt[prefilled..b],
+                    None,
+                )?;
                 prefilled = b;
             }
             let write_started = Instant::now();
             let snapshot = session.state.snapshot(ctx)?;
-            match sessions.store_durable(&p.prompt[..b], p.cache_key.as_deref(), &session.state, &snapshot) {
-                Ok(Some(_)) => durable = Some((b, write_started.elapsed().as_secs_f64())),
-                Ok(None) => eprintln!("session cache: the disk tier did not keep the durable prefix at {b}"),
-                Err(error) => eprintln!("session cache: writing the durable prefix at {b} failed: {error:#}"),
+            match sessions.store_durable(
+                &p.prompt[..b],
+                p.cache_key.as_deref(),
+                &session.state,
+                &snapshot,
+            ) {
+                Ok(Some(_)) => {
+                    durable = Some((b, write_started.elapsed().as_secs_f64()))
+                }
+                Ok(None) => eprintln!(
+                    "session cache: the disk tier did not keep the durable prefix at {b}"
+                ),
+                Err(error) => eprintln!(
+                    "session cache: writing the durable prefix at {b} failed: {error:#}"
+                ),
             }
             drop(snapshot);
         }
@@ -713,7 +847,13 @@ impl<M: LanguageModel> Engine<M> {
         // Prefix up to the last prompt token, then checkpoint there so an
         // identical or extended prompt can resume without re-feeding it.
         if prefilled < n - 1 {
-            model.prefill(ctx, &mut session.state, scratch, &p.prompt[prefilled..n - 1], None)?;
+            model.prefill(
+                ctx,
+                &mut session.state,
+                scratch,
+                &p.prompt[prefilled..n - 1],
+                None,
+            )?;
         }
         let snapshot = session.state.snapshot(ctx)?;
         session.add_checkpoint(snapshot);
@@ -725,20 +865,36 @@ impl<M: LanguageModel> Engine<M> {
         // the same preamble differently between runs is found at a glance.
         // An ordinary hit (`agreement == reused`) diverges too, at the user's
         // message, and says nothing worth a line of prompt text in the log.
-        if min_tokens > 0 && agreement >= min_tokens && agreement > reused && agreement < n - 1 {
+        if min_tokens > 0
+            && agreement >= min_tokens
+            && agreement > reused
+            && agreement < n - 1
+        {
             let tokenizer = generator.tokenizer();
-            let text = |ids: &[u32]| tokenizer.decode(ids, false).unwrap_or_else(|e| format!("<undecodable: {e}>"));
+            let text = |ids: &[u32]| {
+                tokenizer
+                    .decode(ids, false)
+                    .unwrap_or_else(|e| format!("<undecodable: {e}>"))
+            };
             let window = 12;
             eprintln!(
                 "divergence at {agreement}: prompt {:?} | {:?}, cached lineage continued {:?}",
                 text(&p.prompt[agreement.saturating_sub(window)..agreement]),
                 text(&p.prompt[agreement..(agreement + window).min(n)]),
-                text(&acquired.divergent_tail[..acquired.divergent_tail.len().min(window)]),
+                text(
+                    &acquired.divergent_tail
+                        [..acquired.divergent_tail.len().min(window)]
+                ),
             );
         }
 
         let created = now();
-        let id = format!("{}-{}-{}", if p.kind == Kind::Chat { "chatcmpl" } else { "cmpl" }, created, *next_id);
+        let id = format!(
+            "{}-{}-{}",
+            if p.kind == Kind::Chat { "chatcmpl" } else { "cmpl" },
+            created,
+            *next_id
+        );
         *next_id += 1;
         let tokenizer = generator.tokenizer();
         let mut parser = OutputParser::new(
@@ -755,7 +911,13 @@ impl<M: LanguageModel> Engine<M> {
         if p.stream {
             sink.start(200, "text/event-stream");
             if p.kind == Kind::Chat {
-                sink.sse(&chunk(&id, created, M::MODEL_ID, json!({"role": "assistant", "content": ""}), None));
+                sink.sse(&chunk(
+                    &id,
+                    created,
+                    M::MODEL_ID,
+                    json!({"role": "assistant", "content": ""}),
+                    None,
+                ));
             }
         }
         let mut deliver = |events: Vec<Event>, sink: &Sink| {
@@ -763,7 +925,13 @@ impl<M: LanguageModel> Engine<M> {
                 match event {
                     Event::Reasoning(text) => {
                         if p.stream {
-                            sink.sse(&chunk(&id, created, M::MODEL_ID, json!({"reasoning_content": text}), None));
+                            sink.sse(&chunk(
+                                &id,
+                                created,
+                                M::MODEL_ID,
+                                json!({"reasoning_content": text}),
+                                None,
+                            ));
                         } else {
                             collected.reasoning.push_str(&text);
                         }
@@ -771,9 +939,21 @@ impl<M: LanguageModel> Engine<M> {
                     Event::Content(text) => {
                         if p.stream {
                             if p.kind == Kind::Chat {
-                                sink.sse(&chunk(&id, created, M::MODEL_ID, json!({"content": text}), None));
+                                sink.sse(&chunk(
+                                    &id,
+                                    created,
+                                    M::MODEL_ID,
+                                    json!({"content": text}),
+                                    None,
+                                ));
                             } else {
-                                sink.sse(&text_chunk(&id, created, M::MODEL_ID, &text, None));
+                                sink.sse(&text_chunk(
+                                    &id,
+                                    created,
+                                    M::MODEL_ID,
+                                    &text,
+                                    None,
+                                ));
                             }
                         } else {
                             collected.content.push_str(&text);
@@ -797,7 +977,12 @@ impl<M: LanguageModel> Engine<M> {
             }
         };
 
-        let options = GenerateOptions { max_tokens: p.max_tokens, sampling: &p.sampling, stop_tokens: &[], drafts: *drafts };
+        let options = GenerateOptions {
+            max_tokens: p.max_tokens,
+            sampling: &p.sampling,
+            stop_tokens: &[],
+            drafts: *drafts,
+        };
         let decode_started = Instant::now();
         let generation = generator.generate(
             ctx,
@@ -820,9 +1005,13 @@ impl<M: LanguageModel> Engine<M> {
         // that were fed: all but the last (drawn, never fed), or all of them
         // when a parked step consumed the final one. `fed` counts the last
         // prompt token too.
-        let fed_generated = generation.fed.checked_sub(1).ok_or_else(|| anyhow::anyhow!("decode state did not advance"))?;
+        let fed_generated = generation
+            .fed
+            .checked_sub(1)
+            .ok_or_else(|| anyhow::anyhow!("decode state did not advance"))?;
         ensure!(
-            fed_generated + 1 == generation.tokens.len() || fed_generated == generation.tokens.len(),
+            fed_generated + 1 == generation.tokens.len()
+                || fed_generated == generation.tokens.len(),
             "decode state advanced {} tokens for {} drawn",
             generation.fed,
             generation.tokens.len()
@@ -830,7 +1019,10 @@ impl<M: LanguageModel> Engine<M> {
         session.tokens.truncate(reused);
         session.tokens.extend_from_slice(&p.prompt[reused..]);
         session.tokens.extend_from_slice(&generation.tokens[..fed_generated]);
-        ensure!(session.state.pos() == session.tokens.len(), "session token/state position mismatch");
+        ensure!(
+            session.state.pos() == session.tokens.len(),
+            "session token/state position mismatch"
+        );
         sessions.release(ctx, session, p.cache_key.as_deref());
 
         let completion_tokens = generation.tokens.len();
@@ -845,22 +1037,41 @@ impl<M: LanguageModel> Engine<M> {
             n,
             reused,
             if acquired.forked { ", forked" } else { "" },
-            acquired.from_disk.map(|d| format!(", from disk in {:.2}s", d.as_secs_f64())).unwrap_or_default(),
-            if agreement > reused { format!(", agreement {agreement}") } else { String::new() },
-            durable.map(|(b, secs)| format!(", durable prefix {b} written in {secs:.2}s")).unwrap_or_default(),
+            acquired
+                .from_disk
+                .map(|d| format!(", from disk in {:.2}s", d.as_secs_f64()))
+                .unwrap_or_default(),
+            if agreement > reused {
+                format!(", agreement {agreement}")
+            } else {
+                String::new()
+            },
+            durable
+                .map(|(b, secs)| format!(", durable prefix {b} written in {secs:.2}s"))
+                .unwrap_or_default(),
             completion_tokens,
             prefix_secs,
             decode_secs,
             completion_tokens as f64 / decode_secs.max(1e-9),
             if generation.drafted > 0 {
-                format!(", drafts {}/{} accepted", generation.accepted, generation.drafted)
+                format!(
+                    ", drafts {}/{} accepted",
+                    generation.accepted, generation.drafted
+                )
             } else {
                 String::new()
             },
             sessions.len(),
             sessions.used_bytes() as f64 / 1e9,
             sessions.budget_bytes() as f64 / 1e9,
-            sessions.disk().map(|d| format!(", disk {} ({:.1} GB)", d.len(), d.used_bytes() as f64 / 1e9)).unwrap_or_default(),
+            sessions
+                .disk()
+                .map(|d| format!(
+                    ", disk {} ({:.1} GB)",
+                    d.len(),
+                    d.used_bytes() as f64 / 1e9
+                ))
+                .unwrap_or_default(),
         );
         // The same numbers the line above prints, as JSON: attached to the
         // response below and kept for `GET /v1/timings`. Recorded before the
@@ -871,10 +1082,18 @@ impl<M: LanguageModel> Engine<M> {
             prefix_secs,
             completion_tokens,
             decode_secs,
-            (*drafts > 0).then_some(Speculation { drafted: generation.drafted, accepted: generation.accepted }),
+            (*drafts > 0).then_some(Speculation {
+                drafted: generation.drafted,
+                accepted: generation.accepted,
+            }),
         )
         .with_agreement(agreement, durable.map(|(b, _)| b));
-        timings.record(TimingsEntry { id: id.clone(), model: M::MODEL_ID, created, timings: measured });
+        timings.record(TimingsEntry {
+            id: id.clone(),
+            model: M::MODEL_ID,
+            created,
+            timings: measured,
+        });
         if sink.cancelled() {
             return Ok(());
         }
@@ -930,7 +1149,8 @@ impl<M: LanguageModel> Engine<M> {
             sink.send(b"data: [DONE]\n\n".to_vec());
         } else {
             let body = if p.kind == Kind::Chat {
-                let mut message = json!({"role": "assistant", "content": collected.content});
+                let mut message =
+                    json!({"role": "assistant", "content": collected.content});
                 if !collected.reasoning.is_empty() {
                     message["reasoning_content"] = Value::String(collected.reasoning);
                 }
@@ -981,11 +1201,19 @@ impl<M: LanguageModel> Engine<M> {
 }
 
 fn call_id(request_id: &str, index: usize) -> String {
-    let digest = request_id.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+    let digest = request_id.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
+    });
     format!("call_{:016x}{index:02}", digest)
 }
 
-fn chunk(id: &str, created: u64, model: &str, delta: Value, finish_reason: Option<&str>) -> Value {
+fn chunk(
+    id: &str,
+    created: u64,
+    model: &str,
+    delta: Value,
+    finish_reason: Option<&str>,
+) -> Value {
     json!({
         "id": id,
         "object": "chat.completion.chunk",
@@ -995,7 +1223,13 @@ fn chunk(id: &str, created: u64, model: &str, delta: Value, finish_reason: Optio
     })
 }
 
-fn text_chunk(id: &str, created: u64, model: &str, text: &str, finish_reason: Option<&str>) -> Value {
+fn text_chunk(
+    id: &str,
+    created: u64,
+    model: &str,
+    text: &str,
+    finish_reason: Option<&str>,
+) -> Value {
     json!({
         "id": id,
         "object": "text_completion",
@@ -1009,17 +1243,34 @@ fn text_chunk(id: &str, created: u64, model: &str, text: &str, finish_reason: Op
 /// two-token prompt and two decode steps, so the first real request does not
 /// pay the shader compile (tens of seconds on the 48-layer model). Kernels
 /// only long contexts reach (sparse attention) still compile on first use.
-fn warm_up<M: LanguageModel>(ctx: &MetalContext, model: &M, scratch: &mut M::Scratch) -> Result<()> {
+fn warm_up<M: LanguageModel>(
+    ctx: &MetalContext,
+    model: &M,
+    scratch: &mut M::Scratch,
+) -> Result<()> {
     let started = Instant::now();
     let greedy = SamplingParams::greedy();
     let mut state = model.new_state(ctx, 4)?;
     scratch.begin_request();
     // Two arbitrary in-vocabulary ids: the values do not matter, only that the
     // prefill and decode graphs get encoded once.
-    model.prefill(ctx, &mut state, scratch, &[1, 2], Some(Draw { params: &greedy, step: 0 }))?;
+    model.prefill(
+        ctx,
+        &mut state,
+        scratch,
+        &[1, 2],
+        Some(Draw { params: &greedy, step: 0 }),
+    )?;
     for (step, (slot_in, slot_out)) in [(0, 1), (1, 0)].into_iter().enumerate() {
         let token = scratch.next_token().view(slot_in, &[1])?.to_u32()?[0];
-        let encoded = model.encode_decode_step(ctx, &state, scratch, slot_in, slot_out, Draw { params: &greedy, step: step + 1 })?;
+        let encoded = model.encode_decode_step(
+            ctx,
+            &state,
+            scratch,
+            slot_in,
+            slot_out,
+            Draw { params: &greedy, step: step + 1 },
+        )?;
         model.prepare_step_inputs(&mut state, scratch, token)?;
         let pending = encoded.commit()?;
         state.advance(1);
@@ -1037,16 +1288,15 @@ fn warm_up<M: LanguageModel>(ctx: &MetalContext, model: &M, scratch: &mut M::Scr
 /// The `model_type` a checkpoint's `config.json` declares.
 pub fn checkpoint_model_type(model_dir: &Path) -> Result<String> {
     let config = read_config(model_dir)?;
-    config
-        .get("model_type")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .with_context(|| format!("{} has no model_type", model_dir.join("config.json").display()))
+    config.get("model_type").and_then(|v| v.as_str()).map(str::to_string).with_context(
+        || format!("{} has no model_type", model_dir.join("config.json").display()),
+    )
 }
 
 fn read_config(model_dir: &Path) -> Result<Value> {
     let path = model_dir.join("config.json");
-    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    let bytes =
+        std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_slice(&bytes).context("parsing config.json")
 }
 
@@ -1058,7 +1308,9 @@ fn checkpoint_eos_ids(model_dir: &Path) -> Result<Vec<u32>> {
         .or_else(|| config.get("text_config").and_then(|t| t.get("eos_token_id")));
     Ok(match value {
         Some(Value::Number(n)) => n.as_u64().map(|v| v as u32).into_iter().collect(),
-        Some(Value::Array(items)) => items.iter().filter_map(|v| v.as_u64()).map(|v| v as u32).collect(),
+        Some(Value::Array(items)) => {
+            items.iter().filter_map(|v| v.as_u64()).map(|v| v as u32).collect()
+        }
         _ => Vec::new(),
     })
 }
@@ -1069,7 +1321,9 @@ fn checkpoint_max_position_embeddings(model_dir: &Path) -> Result<usize> {
     let config = read_config(model_dir)?;
     Ok(config
         .get("max_position_embeddings")
-        .or_else(|| config.get("text_config").and_then(|t| t.get("max_position_embeddings")))
+        .or_else(|| {
+            config.get("text_config").and_then(|t| t.get("max_position_embeddings"))
+        })
         .and_then(Value::as_u64)
         .unwrap_or(0) as usize)
 }
@@ -1084,7 +1338,10 @@ fn effective_max_seq(requested: usize, declared: usize) -> usize {
 
 /// Sampling defaults: `generation_config.json` over OpenAI's defaults, then
 /// the command-line overrides.
-fn sampling_defaults(model_dir: &Path, overrides: &SamplingOverrides) -> Result<SamplingParams> {
+fn sampling_defaults(
+    model_dir: &Path,
+    overrides: &SamplingOverrides,
+) -> Result<SamplingParams> {
     let mut params = SamplingParams {
         temperature: 1.0,
         top_k: 0,
@@ -1097,7 +1354,8 @@ fn sampling_defaults(model_dir: &Path, overrides: &SamplingOverrides) -> Result<
     };
     let path = model_dir.join("generation_config.json");
     if let Ok(bytes) = std::fs::read(&path) {
-        let cfg: Value = serde_json::from_slice(&bytes).context("parsing generation_config.json")?;
+        let cfg: Value =
+            serde_json::from_slice(&bytes).context("parsing generation_config.json")?;
         let f = |key: &str| cfg.get(key).and_then(Value::as_f64).map(|v| v as f32);
         if cfg.get("do_sample").and_then(Value::as_bool) == Some(false) {
             params.temperature = 0.0;
@@ -1199,19 +1457,20 @@ fn engine_loop<M: LanguageModel>(
     let Shared { shutdown, .. } = &shared;
     // Exits with status 1 after logging `what` and refusing the queued
     // requests with `status`/`client_message`.
-    let exit_failed = |what: String, status: u16, client_message: &str, rx: &Receiver<Cmd>| -> ! {
-        eprintln!("{what}");
-        lifecycle.set(State::Stopping);
-        let mut refused = 0usize;
-        while let Ok(Cmd::Job(job)) = rx.try_recv() {
-            job.reject(status, client_message);
-            refused += 1;
-        }
-        if refused > 0 {
-            eprintln!("exiting: refused {refused} queued requests with {status}");
-        }
-        std::process::exit(1)
-    };
+    let exit_failed =
+        |what: String, status: u16, client_message: &str, rx: &Receiver<Cmd>| -> ! {
+            eprintln!("{what}");
+            lifecycle.set(State::Stopping);
+            let mut refused = 0usize;
+            while let Ok(Cmd::Job(job)) = rx.try_recv() {
+                job.reject(status, client_message);
+                refused += 1;
+            }
+            if refused > 0 {
+                eprintln!("exiting: refused {refused} queued requests with {status}");
+            }
+            std::process::exit(1)
+        };
     let fatal = |what: &str, error: anyhow::Error, rx: &Receiver<Cmd>| -> ! {
         exit_failed(format!("{what}: {error:#}"), 500, "the model failed to load", rx)
     };
@@ -1228,7 +1487,10 @@ fn engine_loop<M: LanguageModel>(
         "ready: serving {} on http://{address}{}",
         M::MODEL_ID,
         if options.idle_unload_secs > 0 {
-            format!(" (unloading after {} idle)", describe_secs(options.idle_unload_secs))
+            format!(
+                " (unloading after {} idle)",
+                describe_secs(options.idle_unload_secs)
+            )
         } else {
             String::new()
         }
@@ -1252,7 +1514,11 @@ fn engine_loop<M: LanguageModel>(
                     let started = Instant::now();
                     match Engine::<M>::load(model_dir, options, &shared, next_id) {
                         Ok(loaded) => {
-                            eprintln!("reloaded {} in {:.1}s for a waiting request", M::MODEL_ID, started.elapsed().as_secs_f64());
+                            eprintln!(
+                                "reloaded {} in {:.1}s for a waiting request",
+                                M::MODEL_ID,
+                                started.elapsed().as_secs_f64()
+                            );
                             engine = Some(loaded);
                             lifecycle.set(State::Ready);
                         }
@@ -1264,7 +1530,9 @@ fn engine_loop<M: LanguageModel>(
                 }
                 served += 1;
                 if inject_fault_at.take_if(|at| *at == served).is_some() {
-                    eprintln!("debug: injecting a Metal fault on request {served} (--debug-inject-metal-fault)");
+                    eprintln!(
+                        "debug: injecting a Metal fault on request {served} (--debug-inject-metal-fault)"
+                    );
                     engine.as_ref().expect("engine loaded").inject_fault();
                 }
                 let fault = engine.as_mut().expect("engine loaded").serve(*job);
@@ -1303,14 +1571,21 @@ fn engine_loop<M: LanguageModel>(
                             lifecycle.set(State::Ready);
                             idle.touch(Instant::now());
                         }
-                        Err(error) => fatal("engine failed to reload after a GPU fault", error, &rx),
+                        Err(error) => fatal(
+                            "engine failed to reload after a GPU fault",
+                            error,
+                            &rx,
+                        ),
                     }
                 }
             }
             Ok(Cmd::Wake) => {}
             Err(RecvTimeoutError::Timeout) => {
                 if let Some(loaded) = engine.take_if(|_| idle.expired(Instant::now())) {
-                    next_id = loaded.unload(&format!("idle for {}", describe_secs(options.idle_unload_secs)));
+                    next_id = loaded.unload(&format!(
+                        "idle for {}",
+                        describe_secs(options.idle_unload_secs)
+                    ));
                     lifecycle.set(State::Idle);
                 }
             }
@@ -1350,13 +1625,19 @@ fn loopback_of(address: SocketAddr) -> SocketAddr {
     SocketAddr::new(ip, address.port())
 }
 
-fn run_with<M: LanguageModel + 'static>(model_dir: &Path, options: ServeOptions, signals: signal::Signals) -> Result<()> {
+fn run_with<M: LanguageModel + 'static>(
+    model_dir: &Path,
+    options: ServeOptions,
+    signals: signal::Signals,
+) -> Result<()> {
     let address = options
         .bind
         .to_socket_addrs()
         .with_context(|| format!("resolving bind address {}", options.bind))?
         .next()
-        .with_context(|| format!("bind address {} resolved to nothing", options.bind))?;
+        .with_context(|| {
+            format!("bind address {} resolved to nothing", options.bind)
+        })?;
     let mut generator = Generator::from_model_dir(model_dir)?;
     generator.add_stop_tokens(&checkpoint_eos_ids(model_dir)?);
     let generator = Arc::new(generator);
@@ -1375,18 +1656,33 @@ fn run_with<M: LanguageModel + 'static>(model_dir: &Path, options: ServeOptions,
         defaults.sampling.presence_penalty,
         defaults.sampling.frequency_penalty,
         if defaults.thinking { "on" } else { "off" },
-        defaults.reasoning_effort.as_deref().map(|e| format!(" (effort {e})")).unwrap_or_default(),
+        defaults
+            .reasoning_effort
+            .as_deref()
+            .map(|e| format!(" (effort {e})"))
+            .unwrap_or_default(),
     );
-    let max_seq = effective_max_seq(options.max_seq, checkpoint_max_position_embeddings(model_dir)?);
+    let max_seq = effective_max_seq(
+        options.max_seq,
+        checkpoint_max_position_embeddings(model_dir)?,
+    );
     if max_seq < options.max_seq {
-        eprintln!("context: --max-seq {} capped to {max_seq} (the checkpoint's window or the kernel limit)", options.max_seq);
+        eprintln!(
+            "context: --max-seq {} capped to {max_seq} (the checkpoint's window or the kernel limit)",
+            options.max_seq
+        );
     }
 
-    let listener = TcpListener::bind(address).with_context(|| format!("binding http://{}", options.bind))?;
+    let listener = TcpListener::bind(address)
+        .with_context(|| format!("binding http://{}", options.bind))?;
     let (jobs, job_rx) = mpsc::sync_channel::<Cmd>(options.queue.max(1));
     let lifecycle = Arc::new(Lifecycle::new(State::Loading));
     let shutdown = Arc::new(Shutdown::default());
-    let shared = Shared { generator, shutdown: shutdown.clone(), timings: Arc::new(TimingsLog::new(TIMINGS_LOG_CAPACITY)) };
+    let shared = Shared {
+        generator,
+        shutdown: shutdown.clone(),
+        timings: Arc::new(TimingsLog::new(TIMINGS_LOG_CAPACITY)),
+    };
     let engine_thread = {
         let model_dir = model_dir.to_path_buf();
         let options = options.clone();
@@ -1394,7 +1690,11 @@ fn run_with<M: LanguageModel + 'static>(model_dir: &Path, options: ServeOptions,
         let shared = shared.clone();
         std::thread::Builder::new()
             .name("lily-engine".into())
-            .spawn(move || engine_loop::<M>(&model_dir, &options, shared, job_rx, &lifecycle, address))
+            .spawn(move || {
+                engine_loop::<M>(
+                    &model_dir, &options, shared, job_rx, &lifecycle, address,
+                )
+            })
             .context("spawning the engine thread")?
     };
     {
@@ -1445,10 +1745,12 @@ fn run_with<M: LanguageModel + 'static>(model_dir: &Path, options: ServeOptions,
         };
         let front = front.clone();
         connections.fetch_add(1, Ordering::AcqRel);
-        if let Err(error) = std::thread::Builder::new().name("lily-http".into()).spawn(move || {
-            handle(&front, stream);
-            front.connections.fetch_sub(1, Ordering::AcqRel);
-        }) {
+        if let Err(error) =
+            std::thread::Builder::new().name("lily-http".into()).spawn(move || {
+                handle(&front, stream);
+                front.connections.fetch_sub(1, Ordering::AcqRel);
+            })
+        {
             connections.fetch_sub(1, Ordering::AcqRel);
             eprintln!("failed to spawn connection thread: {error}");
         }
@@ -1468,13 +1770,23 @@ fn handle(front: &Front, mut stream: TcpStream) {
     let request = match http::read_request(&mut stream, MAX_REQUEST_BYTES) {
         Ok(request) => request,
         Err(error) => {
-            refuse(stream, "request", 400, "invalid_request_error", format!("{error:#}"));
+            refuse(
+                stream,
+                "request",
+                400,
+                "invalid_request_error",
+                format!("{error:#}"),
+            );
             return;
         }
     };
     let path = request.path.split('?').next().unwrap_or("").to_string();
     let what = format!("{} {path}", request.method);
-    let state = if front.shared.shutdown.requested() { State::Stopping } else { front.lifecycle.get() };
+    let state = if front.shared.shutdown.requested() {
+        State::Stopping
+    } else {
+        front.lifecycle.get()
+    };
     match (request.method.as_str(), path.as_str()) {
         ("GET", "/health") => {
             let (code, status) = state.health();
@@ -1493,7 +1805,11 @@ fn handle(front: &Front, mut stream: TcpStream) {
         // completed requests, newest first, for clients whose SDK drops
         // unknown response fields.
         ("GET", "/v1/timings") => {
-            send_json(stream, 200, &json!({"object": "list", "data": front.shared.timings.recent()}));
+            send_json(
+                stream,
+                200,
+                &json!({"object": "list", "data": front.shared.timings.recent()}),
+            );
         }
         ("GET", "/v1/models") => send_json(
             stream,
@@ -1507,16 +1823,36 @@ fn handle(front: &Front, mut stream: TcpStream) {
             let prepared = if path == "/v1/chat/completions" {
                 serde_json::from_slice::<api::ChatRequest>(&request.body)
                     .context("parsing the chat request")
-                    .and_then(|r| api::prepare_chat(r, front.shared.generator.tokenizer(), &front.defaults, front.max_seq))
+                    .and_then(|r| {
+                        api::prepare_chat(
+                            r,
+                            front.shared.generator.tokenizer(),
+                            &front.defaults,
+                            front.max_seq,
+                        )
+                    })
             } else {
                 serde_json::from_slice::<api::CompletionRequest>(&request.body)
                     .context("parsing the completion request")
-                    .and_then(|r| api::prepare_completion(r, front.shared.generator.tokenizer(), &front.defaults, front.max_seq))
+                    .and_then(|r| {
+                        api::prepare_completion(
+                            r,
+                            front.shared.generator.tokenizer(),
+                            &front.defaults,
+                            front.max_seq,
+                        )
+                    })
             };
             let prepared = match prepared {
                 Ok(p) => p,
                 Err(error) => {
-                    refuse(stream, &what, 400, "invalid_request_error", format!("{error:#}"));
+                    refuse(
+                        stream,
+                        &what,
+                        400,
+                        "invalid_request_error",
+                        format!("{error:#}"),
+                    );
                     return;
                 }
             };
@@ -1531,29 +1867,58 @@ fn handle(front: &Front, mut stream: TcpStream) {
             }
             match state {
                 State::Stopping => {
-                    refuse(stream, &what, 503, "server_error", "the server is shutting down");
+                    refuse(
+                        stream,
+                        &what,
+                        503,
+                        "server_error",
+                        "the server is shutting down",
+                    );
                     return;
                 }
                 State::Loading => {
-                    refuse(stream, &what, 503, "server_error", "model is still loading");
+                    refuse(
+                        stream,
+                        &what,
+                        503,
+                        "server_error",
+                        "model is still loading",
+                    );
                     return;
                 }
                 State::Ready | State::Idle | State::Reloading | State::Recovering => {}
             }
             let (tx, rx) = mpsc::channel();
             let cancelled = Arc::new(AtomicBool::new(false));
-            let job = Job { prepared, sink: Sink { tx, cancelled: cancelled.clone(), started: false }, queued_at: Instant::now() };
+            let job = Job {
+                prepared,
+                sink: Sink { tx, cancelled: cancelled.clone(), started: false },
+                queued_at: Instant::now(),
+            };
             match front.jobs.try_send(Cmd::Job(Box::new(job))) {
                 Ok(()) => relay(stream, rx, cancelled),
                 Err(TrySendError::Full(_)) => {
-                    refuse(stream, &what, 503, "server_error", "the request queue is full; retry later");
+                    refuse(
+                        stream,
+                        &what,
+                        503,
+                        "server_error",
+                        "the request queue is full; retry later",
+                    );
                 }
                 Err(TrySendError::Disconnected(_)) => {
                     refuse(stream, &what, 500, "server_error", "engine stopped");
                 }
             }
         }
-        (_, "/health" | "/v1/models" | "/v1/timings" | "/v1/chat/completions" | "/v1/completions") => {
+        (
+            _,
+            "/health"
+            | "/v1/models"
+            | "/v1/timings"
+            | "/v1/chat/completions"
+            | "/v1/completions",
+        ) => {
             refuse(stream, &what, 405, "invalid_request_error", "method not allowed");
         }
         _ => refuse(stream, &what, 404, "invalid_request_error", "not found"),
@@ -1593,8 +1958,16 @@ mod signal {
                 libc::sigemptyset(set.as_mut_ptr());
                 libc::sigaddset(set.as_mut_ptr(), libc::SIGTERM);
                 libc::sigaddset(set.as_mut_ptr(), libc::SIGINT);
-                let rc = libc::pthread_sigmask(libc::SIG_BLOCK, set.as_ptr(), std::ptr::null_mut());
-                ensure!(rc == 0, "blocking SIGTERM/SIGINT failed: {}", std::io::Error::from_raw_os_error(rc));
+                let rc = libc::pthread_sigmask(
+                    libc::SIG_BLOCK,
+                    set.as_ptr(),
+                    std::ptr::null_mut(),
+                );
+                ensure!(
+                    rc == 0,
+                    "blocking SIGTERM/SIGINT failed: {}",
+                    std::io::Error::from_raw_os_error(rc)
+                );
                 set.assume_init()
             };
             Ok(Self { set })
@@ -1602,7 +1975,10 @@ mod signal {
 
         /// Runs `on_signal` with the signal's name on a new thread each
         /// time one of the blocked signals arrives.
-        pub fn spawn_handler(self, mut on_signal: impl FnMut(&'static str) + Send + 'static) -> Result<()> {
+        pub fn spawn_handler(
+            self,
+            mut on_signal: impl FnMut(&'static str) + Send + 'static,
+        ) -> Result<()> {
             std::thread::Builder::new()
                 .name("lily-signals".into())
                 .spawn(move || {
@@ -1612,7 +1988,10 @@ mod signal {
                         // and `signal` a valid out-pointer.
                         let rc = unsafe { libc::sigwait(&self.set, &mut signal) };
                         if rc != 0 {
-                            eprintln!("sigwait failed: {}", std::io::Error::from_raw_os_error(rc));
+                            eprintln!(
+                                "sigwait failed: {}",
+                                std::io::Error::from_raw_os_error(rc)
+                            );
                             return;
                         }
                         on_signal(match signal {

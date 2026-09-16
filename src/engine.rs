@@ -63,7 +63,12 @@ pub trait DecodeStateApi: Sized {
     /// Copies the first `tokens` entries of every per-token cache from
     /// `from` (which must have fed at least that many). GPU idle; the caller
     /// follows up with [`Self::restore`] to set the recurrent part and position.
-    fn copy_prefix_from(&mut self, ctx: &MetalContext, from: &Self, tokens: usize) -> Result<()>;
+    fn copy_prefix_from(
+        &mut self,
+        ctx: &MetalContext,
+        from: &Self,
+        tokens: usize,
+    ) -> Result<()>;
 
     /// Streams the first `tokens` entries of every per-token cache to `w`, in
     /// the layout [`Self::read_prefix`] expects. GPU idle.
@@ -78,7 +83,13 @@ pub trait DecodeStateApi: Sized {
     /// that wants a shorter prefix has to skip each region's tail rather
     /// than stop early. Grows the capacity as needed. GPU idle; follow up
     /// with [`Self::restore`].
-    fn read_prefix(&mut self, ctx: &MetalContext, written: usize, tokens: usize, r: &mut dyn std::io::Read) -> Result<()> {
+    fn read_prefix(
+        &mut self,
+        ctx: &MetalContext,
+        written: usize,
+        tokens: usize,
+        r: &mut dyn std::io::Read,
+    ) -> Result<()> {
         let _ = (ctx, written, tokens, r);
         anyhow::bail!("this model does not persist sessions")
     }
@@ -156,7 +167,11 @@ pub trait LanguageModel: Sized {
     }
 
     /// Reads a snapshot [`SnapshotApi::write_to`] wrote.
-    fn read_snapshot(&self, ctx: &MetalContext, r: &mut dyn std::io::Read) -> Result<<Self::State as DecodeStateApi>::Snapshot> {
+    fn read_snapshot(
+        &self,
+        ctx: &MetalContext,
+        r: &mut dyn std::io::Read,
+    ) -> Result<<Self::State as DecodeStateApi>::Snapshot> {
         let _ = (ctx, r);
         anyhow::bail!("this model does not persist sessions")
     }
@@ -303,7 +318,8 @@ pub trait LanguageModel: Sized {
         parked: Option<PendingPass<'a>>,
         next_drafts: usize,
     ) -> Result<(Vec<u32>, PendingPass<'a>)> {
-        let _ = (ctx, state, scratch, pending, drafts, params, step0, parked, next_drafts);
+        let _ =
+            (ctx, state, scratch, pending, drafts, params, step0, parked, next_drafts);
         anyhow::bail!("this model has no draft head")
     }
 

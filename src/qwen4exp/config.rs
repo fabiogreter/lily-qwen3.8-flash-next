@@ -353,12 +353,16 @@ impl Qwen4ExpConfig {
             None => None,
             Some(m) => {
                 ensure!(
-                    m.layers == 1 && m.layer_types.as_slice() == [LayerType::FullAttention],
+                    m.layers == 1
+                        && m.layer_types.as_slice() == [LayerType::FullAttention],
                     "unsupported MTP head: {} layers of {:?} (lily runs one full-attention block)",
                     m.layers,
                     m.layer_types
                 );
-                ensure!(m.rope_theta.is_finite() && m.rope_theta > 0.0, "invalid MTP rope_theta");
+                ensure!(
+                    m.rope_theta.is_finite() && m.rope_theta > 0.0,
+                    "invalid MTP rope_theta"
+                );
                 Some(MtpConfig { layers: m.layers, rope_theta: m.rope_theta })
             }
         };

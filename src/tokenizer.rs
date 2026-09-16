@@ -143,7 +143,10 @@ impl Tokenizer {
         // `is undefined` defaults apply otherwise.
         let mut extra = serde_json::Map::new();
         if let Some(effort) = chat.reasoning_effort {
-            extra.insert("reasoning_effort".into(), serde_json::Value::String(effort.into()));
+            extra.insert(
+                "reasoning_effort".into(),
+                serde_json::Value::String(effort.into()),
+            );
         }
         if let Some(flag) = chat.preserve_thinking {
             extra.insert("preserve_thinking".into(), serde_json::Value::Bool(flag));

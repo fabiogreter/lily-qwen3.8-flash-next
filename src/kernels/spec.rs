@@ -60,9 +60,20 @@ pub fn spec_accept(
     chain: usize,
 ) -> Result<()> {
     let m = draws.numel();
-    ensure!(m > 0 && ids.numel() == m, "draws and ids must both hold the verified rows");
-    ensure!(draws.dtype() == DType::U32 && ids.dtype() == DType::U32 && ctrl.dtype() == DType::U32, "spec_accept works on U32 tensors");
-    ensure!(ctrl.numel() >= ctrl_words(chain), "control block too small for {chain} chain rows");
+    ensure!(
+        m > 0 && ids.numel() == m,
+        "draws and ids must both hold the verified rows"
+    );
+    ensure!(
+        draws.dtype() == DType::U32
+            && ids.dtype() == DType::U32
+            && ctrl.dtype() == DType::U32,
+        "spec_accept works on U32 tensors"
+    );
+    ensure!(
+        ctrl.numel() >= ctrl_words(chain),
+        "control block too small for {chain} chain rows"
+    );
     ensure!(ratio > 0, "indexer block ratio must be nonzero");
     let pipeline = ctx.pipeline("spec_accept", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_with(
@@ -82,12 +93,27 @@ pub fn spec_accept(
 /// Copies row `row` of `src` (`[rows, ...]`, word-sized elements) into `dst`
 /// (one row's worth of words). The row index may be GPU-supplied; a row at
 /// or past `rows` copies nothing.
-pub fn copy_row<'t>(ctx: &MetalContext, pass: &ComputePass<'_>, src: &Tensor, row: impl Into<Arg<'t>>, dst: &Tensor) -> Result<()> {
+pub fn copy_row<'t>(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    src: &Tensor,
+    row: impl Into<Arg<'t>>,
+    dst: &Tensor,
+) -> Result<()> {
     let row = row.into();
-    let rows = *src.shape().first().ok_or_else(|| anyhow::anyhow!("copy_row from a 0-d tensor"))?;
-    ensure!(rows > 0 && src.byte_len().is_multiple_of(4 * rows), "src must be [rows, ...] of word-sized elements");
+    let rows = *src
+        .shape()
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("copy_row from a 0-d tensor"))?;
+    ensure!(
+        rows > 0 && src.byte_len().is_multiple_of(4 * rows),
+        "src must be [rows, ...] of word-sized elements"
+    );
     let words = src.byte_len() / 4 / rows;
-    ensure!(dst.byte_len() == words * 4 && words > 0, "dst must hold one row ({words} words)");
+    ensure!(
+        dst.byte_len() == words * 4 && words > 0,
+        "dst must hold one row ({words} words)"
+    );
     if let Some(r) = row.constant() {
         ensure!(r < rows, "row {r} out of {rows}");
     }

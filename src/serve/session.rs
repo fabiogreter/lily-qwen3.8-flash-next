@@ -54,7 +54,10 @@ const DIVERGENT_TAIL_TOKENS: usize = 16;
 /// [`DIVERGENT_TAIL_TOKENS`] of that lineage's tokens from the agreement on,
 /// which is what the prompt would have had to continue with to keep
 /// matching; empty when nothing agrees.
-pub fn agreement<'a>(prompt: &[u32], lineages: impl IntoIterator<Item = &'a [u32]>) -> (usize, Vec<u32>) {
+pub fn agreement<'a>(
+    prompt: &[u32],
+    lineages: impl IntoIterator<Item = &'a [u32]>,
+) -> (usize, Vec<u32>) {
     let cap = prompt.len().saturating_sub(1);
     let mut best: Option<(usize, &[u32])> = None;
     for tokens in lineages {
@@ -64,7 +67,9 @@ pub fn agreement<'a>(prompt: &[u32], lineages: impl IntoIterator<Item = &'a [u32
         }
     }
     match best {
-        Some((lcp, tokens)) => (lcp, tokens[lcp..tokens.len().min(lcp + DIVERGENT_TAIL_TOKENS)].to_vec()),
+        Some((lcp, tokens)) => {
+            (lcp, tokens[lcp..tokens.len().min(lcp + DIVERGENT_TAIL_TOKENS)].to_vec())
+        }
         None => (0, Vec::new()),
     }
 }
@@ -77,16 +82,27 @@ pub fn agreement<'a>(prompt: &[u32], lineages: impl IntoIterator<Item = &'a [u32
 /// token to feed. Two real prompts shared that prefix, so a third is likely;
 /// within one growing conversation `reused == agreement` and nothing is
 /// written turn after turn.
-pub fn boundary_position(agreement: usize, reused: usize, prompt_len: usize, min_tokens: usize) -> Option<usize> {
+pub fn boundary_position(
+    agreement: usize,
+    reused: usize,
+    prompt_len: usize,
+    min_tokens: usize,
+) -> Option<usize> {
     let worth_it = min_tokens > 0 && agreement >= min_tokens;
-    (worth_it && agreement > reused && agreement <= prompt_len.checked_sub(1)?).then_some(agreement)
+    (worth_it && agreement > reused && agreement <= prompt_len.checked_sub(1)?)
+        .then_some(agreement)
 }
 
 /// The best position to resume `prompt` from given a lineage's tokens and
 /// its resumable positions: the live end when the lineage is a strict prefix
 /// of the prompt (and `live_end` is resumable), else the latest resumable
 /// position within the common prefix. Never `>= prompt.len()`.
-fn resume_position(tokens: &[u32], checkpoints: &[usize], live_end: bool, prompt: &[u32]) -> Option<usize> {
+fn resume_position(
+    tokens: &[u32],
+    checkpoints: &[usize],
+    live_end: bool,
+    prompt: &[u32],
+) -> Option<usize> {
     let lcp = common_prefix_len(tokens, prompt);
     let limit = lcp.min(prompt.len().checked_sub(1)?);
     if tokens.len() <= limit {
@@ -110,7 +126,13 @@ pub struct Session<M: LanguageModel> {
 
 impl<M: LanguageModel> Session<M> {
     fn new(state: M::State) -> Self {
-        Self { tokens: Vec::new(), state, checkpoints: Vec::new(), cache_key: None, last_used: 0 }
+        Self {
+            tokens: Vec::new(),
+            state,
+            checkpoints: Vec::new(),
+            cache_key: None,
+            last_used: 0,
+        }
     }
 
     /// Records a checkpoint of the state's current position. Duplicates by
@@ -167,7 +189,14 @@ impl<M: LanguageModel> Acquired<M> {
     /// A session nothing was reused for; the other fields are filled in by
     /// the path that built it.
     fn fresh(session: Session<M>) -> Self {
-        Self { session, reused: 0, forked: false, from_disk: None, agreement: 0, divergent_tail: Vec::new() }
+        Self {
+            session,
+            reused: 0,
+            forked: false,
+            from_disk: None,
+            agreement: 0,
+            divergent_tail: Vec::new(),
+        }
     }
 }
 
@@ -183,7 +212,11 @@ pub struct SessionStore<M: LanguageModel> {
 }
 
 impl<M: LanguageModel> SessionStore<M> {
-    pub fn new(budget_bytes: usize, max_sessions: usize, max_checkpoints: usize) -> Self {
+    pub fn new(
+        budget_bytes: usize,
+        max_sessions: usize,
+        max_checkpoints: usize,
+    ) -> Self {
         Self {
             entries: Vec::new(),
             budget_bytes,
@@ -246,10 +279,11 @@ impl<M: LanguageModel> SessionStore<M> {
         }
         let (agreement, divergent_tail) = agreement(
             prompt,
-            self.entries
-                .iter()
-                .map(|s| s.tokens.as_slice())
-                .chain(self.disk.iter().flat_map(|d| d.entries().iter().map(|e| e.tokens.as_slice()))),
+            self.entries.iter().map(|s| s.tokens.as_slice()).chain(
+                self.disk
+                    .iter()
+                    .flat_map(|d| d.entries().iter().map(|e| e.tokens.as_slice())),
+            ),
         );
         let mut acquired = self.acquire_resumable(ctx, model, prompt, cache_key)?;
         debug_assert!(acquired.reused <= agreement, "resumed past the agreement");
@@ -275,7 +309,8 @@ impl<M: LanguageModel> SessionStore<M> {
             .filter_map(|(i, s)| s.resume_position(prompt).map(|p| (i, p)))
             .max_by_key(|&(i, p)| {
                 let entry = &self.entries[i];
-                let key_match = cache_key.is_some_and(|k| entry.cache_key.as_deref() == Some(k));
+                let key_match =
+                    cache_key.is_some_and(|k| entry.cache_key.as_deref() == Some(k));
                 (p, key_match, entry.last_used)
             });
 
@@ -283,9 +318,16 @@ impl<M: LanguageModel> SessionStore<M> {
         let best_disk = self.disk.as_ref().and_then(|disk| {
             disk.entries()
                 .iter()
-                .filter_map(|e| resume_position(&e.tokens, &e.checkpoints, true, prompt).map(|p| (e.id.clone(), p, e.tokens.len())))
+                .filter_map(|e| {
+                    resume_position(&e.tokens, &e.checkpoints, true, prompt)
+                        .map(|p| (e.id.clone(), p, e.tokens.len()))
+                })
                 .max_by_key(|(id, p, _)| {
-                    let key_match = cache_key.is_some_and(|k| disk.entries().iter().any(|e| &e.id == id && e.cache_key.as_deref() == Some(k)));
+                    let key_match = cache_key.is_some_and(|k| {
+                        disk.entries()
+                            .iter()
+                            .any(|e| &e.id == id && e.cache_key.as_deref() == Some(k))
+                    });
                     (*p, key_match)
                 })
         });
@@ -305,7 +347,10 @@ impl<M: LanguageModel> SessionStore<M> {
         if resume_at == self.entries[index].tokens.len() {
             // Pure extension of the live end: take the session as is.
             let session = self.entries.swap_remove(index);
-            ensure!(session.state.pos() == resume_at, "cached decode state out of step with its tokens");
+            ensure!(
+                session.state.pos() == resume_at,
+                "cached decode state out of step with its tokens"
+            );
             return Ok(Acquired { reused: resume_at, ..Acquired::fresh(session) });
         }
 
@@ -343,7 +388,11 @@ impl<M: LanguageModel> SessionStore<M> {
     ) -> Result<Acquired<M>> {
         let started = Instant::now();
         let disk = self.disk.as_mut().expect("disk tier");
-        let entry = disk.entries().iter().find(|e| e.id == id).context("disk entry vanished")?;
+        let entry = disk
+            .entries()
+            .iter()
+            .find(|e| e.id == id)
+            .context("disk entry vanished")?;
         let (tokens, durable) = (entry.tokens[..pos].to_vec(), entry.durable);
         let mut state = model.new_state(ctx, prompt.len().max(pos))?;
         let result = (|| -> Result<SnapshotOf<M>> {
@@ -351,7 +400,11 @@ impl<M: LanguageModel> SessionStore<M> {
             state.read_prefix(ctx, len, pos, &mut prefix)?;
             let mut ckpt = disk.open_checkpoint(id, pos)?;
             let snapshot = model.read_snapshot(ctx, &mut ckpt)?;
-            ensure!(snapshot.pos() == pos, "checkpoint file at {pos} holds position {}", snapshot.pos());
+            ensure!(
+                snapshot.pos() == pos,
+                "checkpoint file at {pos} holds position {}",
+                snapshot.pos()
+            );
             state.restore(ctx, &snapshot)?;
             Ok(snapshot)
         })();
@@ -359,7 +412,9 @@ impl<M: LanguageModel> SessionStore<M> {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 // A damaged entry must not poison every later request.
-                eprintln!("session cache: dropping unreadable disk entry {id}: {error:#}");
+                eprintln!(
+                    "session cache: dropping unreadable disk entry {id}: {error:#}"
+                );
                 disk.remove(id);
                 let state = model.new_state(ctx, prompt.len())?;
                 let session = Session::new(state);
@@ -377,7 +432,12 @@ impl<M: LanguageModel> SessionStore<M> {
         session.tokens = tokens;
         session.checkpoints.push(Arc::new(snapshot));
         self.trim(ctx, session.bytes());
-        Ok(Acquired { reused: pos, forked, from_disk: Some(started.elapsed()), ..Acquired::fresh(session) })
+        Ok(Acquired {
+            reused: pos,
+            forked,
+            from_disk: Some(started.elapsed()),
+            ..Acquired::fresh(session)
+        })
     }
 
     /// Writes a durable prefix entry for `tokens`, whose per-token caches
@@ -396,15 +456,30 @@ impl<M: LanguageModel> SessionStore<M> {
     ) -> Result<Option<String>> {
         let disk = self.disk.as_mut().context("no disk tier")?;
         let n = tokens.len();
-        ensure!(n > 0 && snapshot.pos() == n, "durable snapshot at {} for {n} tokens", snapshot.pos());
-        ensure!(state.pos() >= n, "decode state at {} holds no caches for {n} tokens", state.pos());
-        disk.store_durable(tokens, cache_key, &[n], &mut |w| state.write_prefix(n, w), &mut |_, w| snapshot.write_to(w))
+        ensure!(
+            n > 0 && snapshot.pos() == n,
+            "durable snapshot at {} for {n} tokens",
+            snapshot.pos()
+        );
+        ensure!(
+            state.pos() >= n,
+            "decode state at {} holds no caches for {n} tokens",
+            state.pos()
+        );
+        disk.store_durable(
+            tokens,
+            cache_key,
+            &[n],
+            &mut |w| state.write_prefix(n, w),
+            &mut |_, w| snapshot.write_to(w),
+        )
     }
 
     /// Evicts least-recently-used sessions until `extra` more bytes fit the
     /// budget (or the store is empty), spilling them to the disk tier.
     fn trim(&mut self, ctx: &MetalContext, extra: usize) {
-        while !self.entries.is_empty() && self.used_bytes() + extra > self.budget_bytes {
+        while !self.entries.is_empty() && self.used_bytes() + extra > self.budget_bytes
+        {
             let Some(victim) = self.lru_index() else { break };
             let session = self.entries.swap_remove(victim);
             self.spill(ctx, session);
@@ -418,7 +493,10 @@ impl<M: LanguageModel> SessionStore<M> {
         let (mut spilled, mut dropped) = (0, 0);
         let entries = std::mem::take(&mut self.entries);
         if self.disk.is_none() && !entries.is_empty() {
-            eprintln!("session cache: no disk tier; {} resident sessions are lost", entries.len());
+            eprintln!(
+                "session cache: no disk tier; {} resident sessions are lost",
+                entries.len()
+            );
         }
         for session in entries {
             if self.spill(ctx, session) {
@@ -444,7 +522,9 @@ impl<M: LanguageModel> SessionStore<M> {
     /// Returns whether the session is now on disk.
     fn spill(&mut self, ctx: &MetalContext, session: Session<M>) -> bool {
         let Some(disk) = self.disk.as_mut() else { return false };
-        if session.tokens.len() < MIN_DISK_TOKENS || session.state.pos() != session.tokens.len() {
+        if session.tokens.len() < MIN_DISK_TOKENS
+            || session.state.pos() != session.tokens.len()
+        {
             return false;
         }
         // A faulted context cannot run the snapshot blit and its caches are
@@ -457,12 +537,19 @@ impl<M: LanguageModel> SessionStore<M> {
         let live = match session.state.snapshot(ctx) {
             Ok(live) => live,
             Err(error) => {
-                eprintln!("session cache: cannot snapshot an evicted session: {error:#}");
+                eprintln!(
+                    "session cache: cannot snapshot an evicted session: {error:#}"
+                );
                 return false;
             }
         };
         let n = session.tokens.len();
-        let mut positions: Vec<usize> = session.checkpoints.iter().map(|c| c.pos()).filter(|&p| p > 0 && p < n).collect();
+        let mut positions: Vec<usize> = session
+            .checkpoints
+            .iter()
+            .map(|c| c.pos())
+            .filter(|&p| p > 0 && p < n)
+            .collect();
         positions.push(n);
         let result = disk.store(
             &session.tokens,
@@ -473,7 +560,10 @@ impl<M: LanguageModel> SessionStore<M> {
                 if pos == n {
                     live.write_to(w)
                 } else {
-                    session.checkpoint_at(pos).context("checkpoint vanished")?.write_to(w)
+                    session
+                        .checkpoint_at(pos)
+                        .context("checkpoint vanished")?
+                        .write_to(w)
                 }
             },
         );
@@ -504,7 +594,12 @@ impl<M: LanguageModel> SessionStore<M> {
     /// `tokens.len()`. Old checkpoints beyond the per-session cap are dropped
     /// (the newest are the ones the next request most likely resumes from),
     /// and the store is trimmed to budget and count.
-    pub fn release(&mut self, ctx: &MetalContext, mut session: Session<M>, cache_key: Option<&str>) {
+    pub fn release(
+        &mut self,
+        ctx: &MetalContext,
+        mut session: Session<M>,
+        cache_key: Option<&str>,
+    ) {
         if session.state.pos() != session.tokens.len() || session.tokens.is_empty() {
             return;
         }

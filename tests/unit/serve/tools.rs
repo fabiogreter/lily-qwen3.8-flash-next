@@ -46,11 +46,13 @@ fn multiline_string_values_keep_inner_newlines() {
 
 #[test]
 fn unknown_functions_and_bad_json_fall_back_to_strings() {
-    let block = "<function=mystery>\n<parameter=x>\n{not json\n</parameter>\n</function>";
+    let block =
+        "<function=mystery>\n<parameter=x>\n{not json\n</parameter>\n</function>";
     let call = parse_tool_call(block, &schemas()).expect("parse");
     assert_eq!(call.name, "mystery");
     assert_eq!(call.arguments, r#"{"x":"{not json"}"#);
-    let call = parse_tool_call("<function=noargs>\n</function>", &schemas()).expect("parse");
+    let call =
+        parse_tool_call("<function=noargs>\n</function>", &schemas()).expect("parse");
     assert_eq!(call.arguments, "{}");
     let block = "<function=read_file>\n<parameter=offset>\nnot a number\n</parameter>\n</function>";
     let call = parse_tool_call(block, &schemas()).expect("parse");
@@ -60,7 +62,10 @@ fn unknown_functions_and_bad_json_fall_back_to_strings() {
 #[test]
 fn malformed_blocks_are_errors() {
     assert!(parse_tool_call("<functio=read_file></function>", &schemas()).is_err());
-    assert!(parse_tool_call("<function=read_file>\n<parameter=path>\nx\n", &schemas()).is_err());
+    assert!(
+        parse_tool_call("<function=read_file>\n<parameter=path>\nx\n", &schemas())
+            .is_err()
+    );
 }
 
 #[test]
@@ -74,6 +79,16 @@ fn incoming_tool_calls_are_shaped_for_the_template() {
     assert_eq!(calls[0]["function"]["arguments"]["a"], 1);
     assert_eq!(calls[1]["function"]["arguments"], serde_json::json!({}));
     assert_eq!(calls[2]["function"]["arguments"]["z"], true);
-    assert!(template_tool_calls(&[serde_json::json!({"function": {"name": "f", "arguments": "nope"}})]).is_err());
-    assert!(template_tool_calls(&[serde_json::json!({"function": {"name": "f", "arguments": "[1]"}})]).is_err());
+    assert!(
+        template_tool_calls(&[
+            serde_json::json!({"function": {"name": "f", "arguments": "nope"}})
+        ])
+        .is_err()
+    );
+    assert!(
+        template_tool_calls(&[
+            serde_json::json!({"function": {"name": "f", "arguments": "[1]"}})
+        ])
+        .is_err()
+    );
 }

@@ -26,7 +26,8 @@ fn accept_counts_leading_matches_and_describes_the_chain() {
         let ids_t = u32s(&ctx, ids);
         let ctrl = Tensor::zeros(&ctx, &[ctrl_words(chain)], DType::U32).expect("ctrl");
         let pass = ctx.begin().expect("pass");
-        spec_accept(&ctx, &pass, &draws_t, &ids_t, &ctrl, pos0, ratio, chain).expect("accept");
+        spec_accept(&ctx, &pass, &draws_t, &ids_t, &ctrl, pos0, ratio, chain)
+            .expect("accept");
         pass.commit_wait().expect("run");
         let words = ctrl.to_u32().expect("read");
         let slot = |s: usize| words[s * CTRL_STRIDE];
@@ -58,8 +59,11 @@ fn copy_row_reads_a_gpu_supplied_index() {
         // The index arrives through the accept kernel (a = wanted, capped at
         // the drafts), read by copy_row through Arg::Gpu.
         let m = 4usize;
-        let draws: Vec<u32> = (0..m as u32).map(|j| if (j as usize) < wanted { 100 + j } else { 0 }).collect();
-        let ids: Vec<u32> = std::iter::once(1).chain((0..m as u32 - 1).map(|j| 100 + j)).collect();
+        let draws: Vec<u32> = (0..m as u32)
+            .map(|j| if (j as usize) < wanted { 100 + j } else { 0 })
+            .collect();
+        let ids: Vec<u32> =
+            std::iter::once(1).chain((0..m as u32 - 1).map(|j| 100 + j)).collect();
         let ctrl = Tensor::zeros(&ctx, &[ctrl_words(0)], DType::U32).expect("ctrl");
         // Bound by address only: every buffer a pass reads must outlive it.
         let (draws_t, ids_t) = (u32s(&ctx, &draws), u32s(&ctx, &ids));

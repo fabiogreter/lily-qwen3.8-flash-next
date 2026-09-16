@@ -1037,8 +1037,11 @@ fn gdn_prefill_regscan_mid_states_match_prefix_scans() {
     let scale = 1.0 / (dim as f32).sqrt();
     let mut rng = StdRng::seed_from_u64(91);
     let c = (2 * hk + h) * dim;
-    let a_log = Tensor::from_f32(&ctx, &random_vec(&mut rng, h, -2.0, 0.5), &[h]).expect("a_log");
-    let dt_bias = Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, h, -0.5, 0.5), &[h]).expect("dt_bias");
+    let a_log = Tensor::from_f32(&ctx, &random_vec(&mut rng, h, -2.0, 0.5), &[h])
+        .expect("a_log");
+    let dt_bias =
+        Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, h, -0.5, 0.5), &[h])
+            .expect("dt_bias");
     let qkv = random_vec(&mut rng, m * c, -1.0, 1.0);
     let a = random_vec(&mut rng, m * h, -1.0, 1.0);
     let b = random_vec(&mut rng, m * h, -1.0, 1.0);
@@ -1054,23 +1057,64 @@ fn gdn_prefill_regscan_mid_states_match_prefix_scans() {
     let staging = GdnRegscanStaging { qk_norm: &qk_norm, decay: &decay, beta: &beta };
     let out = Tensor::zeros(&ctx, &[m, h, dim], DType::BF16).expect("out");
     let pass = ctx.begin().expect("pass");
-    gdn_prefill_mid(&ctx, &pass, &t_qkv, &ta, &tb, &a_log, &dt_bias, &staging, &state, &out, scale, hk, Some(&mid))
-        .expect("gdn_prefill_mid");
+    gdn_prefill_mid(
+        &ctx,
+        &pass,
+        &t_qkv,
+        &ta,
+        &tb,
+        &a_log,
+        &dt_bias,
+        &staging,
+        &state,
+        &out,
+        scale,
+        hk,
+        Some(&mid),
+    )
+    .expect("gdn_prefill_mid");
     pass.commit_wait().expect("commit");
     let mid_all = mid.to_f32().expect("read mid");
     let per = h * dim * dim;
 
     for n in 1..m {
-        let prefix_state = Tensor::from_f32(&ctx, &init_state, &[h, dim, dim]).expect("state");
+        let prefix_state =
+            Tensor::from_f32(&ctx, &init_state, &[h, dim, dim]).expect("state");
         let (_, got) = run_regscan(
-            &ctx, &qkv[..n * c], &a[..n * h], &b[..n * h], &a_log, &dt_bias, &prefix_state, scale, hk, h,
+            &ctx,
+            &qkv[..n * c],
+            &a[..n * h],
+            &b[..n * h],
+            &a_log,
+            &dt_bias,
+            &prefix_state,
+            scale,
+            hk,
+            h,
         );
         assert_eq!(got, mid_all[(n - 1) * per..n * per], "mid state after {n} tokens");
     }
     // A caller that passes more mid slots than tokens is rejected.
     let too_many = Tensor::zeros(&ctx, &[m + 1, h, dim, dim], DType::F32).expect("mid");
     let pass = ctx.begin().expect("pass");
-    assert!(gdn_prefill_mid(&ctx, &pass, &t_qkv, &ta, &tb, &a_log, &dt_bias, &staging, &state, &out, scale, hk, Some(&too_many)).is_err());
+    assert!(
+        gdn_prefill_mid(
+            &ctx,
+            &pass,
+            &t_qkv,
+            &ta,
+            &tb,
+            &a_log,
+            &dt_bias,
+            &staging,
+            &state,
+            &out,
+            scale,
+            hk,
+            Some(&too_many)
+        )
+        .is_err()
+    );
 }
 
 /// Rolling a conv window back to `n` rows equals running the conv over just
@@ -1088,31 +1132,41 @@ fn conv_window_rollback_matches_prefix_window() {
         let t_win0 = Tensor::from_f32_as_bf16(&ctx, &win0, &[c, s]).expect("win0");
         let t_x = Tensor::from_f32_as_bf16(&ctx, &x, &[m, c]).expect("x");
         let t_w = Tensor::from_f32_as_bf16(&ctx, &w, &[kd, c]).expect("w");
-        let (r_win0, r_x) = (t_win0.to_f32().expect("read"), t_x.to_f32().expect("read"));
+        let (r_win0, r_x) =
+            (t_win0.to_f32().expect("read"), t_x.to_f32().expect("read"));
         for n in 0..=m {
             // Host reference: the last S entries of win0 ++ x[..n] per channel.
             let host: Vec<f32> = (0..c)
                 .flat_map(|ch| {
-                    let seq: Vec<f32> = (0..s).map(|i| r_win0[ch * s + i]).chain((0..n).map(|r| r_x[r * c + ch])).collect();
+                    let seq: Vec<f32> = (0..s)
+                        .map(|i| r_win0[ch * s + i])
+                        .chain((0..n).map(|r| r_x[r * c + ch]))
+                        .collect();
                     seq[seq.len() - s..].to_vec()
                 })
                 .collect();
             let expected = if n == 0 || kd > 9 {
                 host
             } else {
-                let win_out = Tensor::zeros(&ctx, &[c, s], DType::BF16).expect("win_out");
+                let win_out =
+                    Tensor::zeros(&ctx, &[c, s], DType::BF16).expect("win_out");
                 let out = Tensor::zeros(&ctx, &[n, c], DType::BF16).expect("out");
                 let xn = t_x.view(0, &[n, c]).expect("prefix");
                 let pass = ctx.begin().expect("pass");
-                conv1d_prefill(&ctx, &pass, &t_win0, &win_out, &xn, &t_w, &out).expect("conv1d_prefill");
+                conv1d_prefill(&ctx, &pass, &t_win0, &win_out, &xn, &t_w, &out)
+                    .expect("conv1d_prefill");
                 pass.commit_wait().expect("commit");
                 let gpu = win_out.to_f32().expect("read");
-                assert_eq!(gpu, host, "host window reference vs conv1d_prefill, S={s} n={n}");
+                assert_eq!(
+                    gpu, host,
+                    "host window reference vs conv1d_prefill, S={s} n={n}"
+                );
                 gpu
             };
             let rolled = Tensor::zeros(&ctx, &[c, s], DType::BF16).expect("rolled");
             let pass = ctx.begin().expect("pass");
-            conv_window_rollback(&ctx, &pass, &t_win0, &t_x, &rolled, n).expect("rollback");
+            conv_window_rollback(&ctx, &pass, &t_win0, &t_x, &rolled, n)
+                .expect("rollback");
             pass.commit_wait().expect("commit");
             assert_eq!(rolled.to_f32().expect("read"), expected, "S={s} n={n}");
         }
@@ -1131,17 +1185,50 @@ fn gdn_small_m_timing() {
     let scale = 1.0 / (dim as f32).sqrt();
     let mut rng = StdRng::seed_from_u64(5);
     let c = (2 * hk + h) * dim;
-    let a_log = Tensor::from_f32(&ctx, &random_vec(&mut rng, h, -2.0, 0.5), &[h]).expect("a_log");
-    let dt_bias = Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, h, -0.5, 0.5), &[h]).expect("dt_bias");
+    let a_log = Tensor::from_f32(&ctx, &random_vec(&mut rng, h, -2.0, 0.5), &[h])
+        .expect("a_log");
+    let dt_bias =
+        Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, h, -0.5, 0.5), &[h])
+            .expect("dt_bias");
     let norm_w = Tensor::from_f32(&ctx, &vec![1.0; dim], &[dim]).expect("norm_w");
-    let states: Vec<Tensor> = (0..layers).map(|_| Tensor::from_f32(&ctx, &random_vec(&mut rng, h * dim * dim, -0.5, 0.5), &[h, dim, dim]).expect("state")).collect();
+    let states: Vec<Tensor> = (0..layers)
+        .map(|_| {
+            Tensor::from_f32(
+                &ctx,
+                &random_vec(&mut rng, h * dim * dim, -0.5, 0.5),
+                &[h, dim, dim],
+            )
+            .expect("state")
+        })
+        .collect();
     for m in [1usize, 2, 4] {
-        let qkv = Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, m * c, -1.0, 1.0), &[m, c]).expect("qkv");
-        let a = Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, m * h, -1.0, 1.0), &[m, h]).expect("a");
-        let b = Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, m * h, -1.0, 1.0), &[m, h]).expect("b");
-        let z = Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, m * h * dim, -1.0, 1.0), &[m, h * dim]).expect("z");
+        let qkv = Tensor::from_f32_as_bf16(
+            &ctx,
+            &random_vec(&mut rng, m * c, -1.0, 1.0),
+            &[m, c],
+        )
+        .expect("qkv");
+        let a = Tensor::from_f32_as_bf16(
+            &ctx,
+            &random_vec(&mut rng, m * h, -1.0, 1.0),
+            &[m, h],
+        )
+        .expect("a");
+        let b = Tensor::from_f32_as_bf16(
+            &ctx,
+            &random_vec(&mut rng, m * h, -1.0, 1.0),
+            &[m, h],
+        )
+        .expect("b");
+        let z = Tensor::from_f32_as_bf16(
+            &ctx,
+            &random_vec(&mut rng, m * h * dim, -1.0, 1.0),
+            &[m, h * dim],
+        )
+        .expect("z");
         let (qk_norm, decay, beta) = staging_tensors(&ctx, m, hk, h);
-        let staging = GdnRegscanStaging { qk_norm: &qk_norm, decay: &decay, beta: &beta };
+        let staging =
+            GdnRegscanStaging { qk_norm: &qk_norm, decay: &decay, beta: &beta };
         let out = Tensor::zeros(&ctx, &[m, h, dim], DType::BF16).expect("out");
         let gated = Tensor::zeros(&ctx, &[h * dim], DType::BF16).expect("gated");
         for variant in ["regscan", "step-loop"] {
@@ -1150,11 +1237,34 @@ fn gdn_small_m_timing() {
                 let pass = ctx.begin_concurrent().expect("pass");
                 for state in &states {
                     if variant == "regscan" {
-                        gdn_prefill(&ctx, &pass, &qkv, &a, &b, &a_log, &dt_bias, &staging, state, &out, scale, hk).expect("regscan");
+                        gdn_prefill(
+                            &ctx, &pass, &qkv, &a, &b, &a_log, &dt_bias, &staging,
+                            state, &out, scale, hk,
+                        )
+                        .expect("regscan");
                     } else {
                         for t in 0..m {
-                            let row = |x: &Tensor, w: usize| x.view(t * w, &[w]).expect("row");
-                            gdn_step_gated_fused(&ctx, &pass, &row(&qkv, c), &row(&a, h), &row(&b, h), &a_log, &dt_bias, state, &row(&z, h * dim), &norm_w, &gated, scale, hk, 1e-6, GdnGate::Sigmoid).expect("step");
+                            let row = |x: &Tensor, w: usize| {
+                                x.view(t * w, &[w]).expect("row")
+                            };
+                            gdn_step_gated_fused(
+                                &ctx,
+                                &pass,
+                                &row(&qkv, c),
+                                &row(&a, h),
+                                &row(&b, h),
+                                &a_log,
+                                &dt_bias,
+                                state,
+                                &row(&z, h * dim),
+                                &norm_w,
+                                &gated,
+                                scale,
+                                hk,
+                                1e-6,
+                                GdnGate::Sigmoid,
+                            )
+                            .expect("step");
                             pass.level_barrier(&[state]).expect("barrier");
                         }
                     }

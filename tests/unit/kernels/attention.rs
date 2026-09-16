@@ -307,13 +307,35 @@ fn sdpa_small_m_timing() {
     let mut rng = StdRng::seed_from_u64(9);
     for len in [1100usize, 2048] {
         let cap = 2048;
-        let k = Tensor::from_f32_as_bf16(&ctx, &(0..kvh * cap * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect::<Vec<_>>(), &[kvh, cap, d]).expect("k");
-        let v = Tensor::from_f32_as_bf16(&ctx, &(0..kvh * cap * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect::<Vec<_>>(), &[kvh, cap, d]).expect("v");
+        let k = Tensor::from_f32_as_bf16(
+            &ctx,
+            &(0..kvh * cap * d)
+                .map(|_| rng.gen_range(-1.0f32..1.0))
+                .collect::<Vec<_>>(),
+            &[kvh, cap, d],
+        )
+        .expect("k");
+        let v = Tensor::from_f32_as_bf16(
+            &ctx,
+            &(0..kvh * cap * d)
+                .map(|_| rng.gen_range(-1.0f32..1.0))
+                .collect::<Vec<_>>(),
+            &[kvh, cap, d],
+        )
+        .expect("v");
         let splits = sdpa_split_scratch_splits(cap);
-        let partials = Tensor::zeros(&ctx, &[nq, splits, d], DType::F32).expect("partials");
+        let partials =
+            Tensor::zeros(&ctx, &[nq, splits, d], DType::F32).expect("partials");
         let stats = Tensor::zeros(&ctx, &[nq, splits, 2], DType::F32).expect("stats");
         for m in [1usize, 2, 4] {
-            let q = Tensor::from_f32_as_bf16(&ctx, &(0..m * nq * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect::<Vec<_>>(), &[m, nq, d]).expect("q");
+            let q = Tensor::from_f32_as_bf16(
+                &ctx,
+                &(0..m * nq * d)
+                    .map(|_| rng.gen_range(-1.0f32..1.0))
+                    .collect::<Vec<_>>(),
+                &[m, nq, d],
+            )
+            .expect("q");
             let out = Tensor::zeros(&ctx, &[m, nq, d], DType::BF16).expect("out");
             for variant in ["prefill", "decode-per-row"] {
                 let mut best = f64::MAX;
@@ -321,22 +343,48 @@ fn sdpa_small_m_timing() {
                     let pass = ctx.begin_concurrent().expect("pass");
                     for _ in 0..layers {
                         if variant == "prefill" {
-                            sdpa_prefill(&ctx, &pass, &q, &k, &v, &out, len - m, 0.0625).expect("prefill");
+                            sdpa_prefill(
+                                &ctx,
+                                &pass,
+                                &q,
+                                &k,
+                                &v,
+                                &out,
+                                len - m,
+                                0.0625,
+                            )
+                            .expect("prefill");
                         } else {
                             for r in 0..m {
                                 let qr = q.view(r * nq * d, &[nq, d]).expect("q row");
-                                let outr = out.view(r * nq * d, &[nq, d]).expect("out row");
-                                sdpa_decode(&ctx, &pass, &qr, &k, &v, &outr, len - m + r + 1, 0.0625, Some((&partials, &stats))).expect("decode");
+                                let outr =
+                                    out.view(r * nq * d, &[nq, d]).expect("out row");
+                                sdpa_decode(
+                                    &ctx,
+                                    &pass,
+                                    &qr,
+                                    &k,
+                                    &v,
+                                    &outr,
+                                    len - m + r + 1,
+                                    0.0625,
+                                    Some((&partials, &stats)),
+                                )
+                                .expect("decode");
                                 pass.level_barrier(&[&outr]).expect("barrier");
                             }
                         }
                         pass.level_barrier(&[&out]).expect("barrier");
                     }
-                    let done = pass.commit().expect("commit").wait_retain().expect("wait");
+                    let done =
+                        pass.commit().expect("commit").wait_retain().expect("wait");
                     let t = done.timing().expect("timing");
                     best = best.min(t.gpu_end_secs - t.gpu_start_secs);
                 }
-                eprintln!("sdpa {layers} layers len={len} m={m} {variant}: {:.2} ms", best * 1e3);
+                eprintln!(
+                    "sdpa {layers} layers len={len} m={m} {variant}: {:.2} ms",
+                    best * 1e3
+                );
             }
         }
     }

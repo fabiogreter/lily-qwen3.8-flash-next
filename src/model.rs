@@ -7,21 +7,21 @@ use anyhow::{Result, ensure};
 use std::path::Path;
 
 use crate::config::TextConfig;
-use crate::engine::{DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, SnapshotApi};
+use crate::engine::{
+    DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, SnapshotApi,
+};
 use crate::kernels::attention::{
     MAX_SEQ, k_norm_rope_scatter_decode, q_norm_rope_split_decode, rope_neox,
     scatter_kv, sdpa_decode, sdpa_prefill, sdpa_split_scratch_splits, split_q_gate,
 };
-use crate::kernels::elementwise::{
-    add_bf16, gather_row_bf16, sigmoid_mul_bf16,
-};
+use crate::kernels::elementwise::{add_bf16, gather_row_bf16, sigmoid_mul_bf16};
 use crate::kernels::gdn::{
     GDN_HEAD_DIM, GDN_STATE_DTYPE, GdnGate, GdnRegscanStaging, conv1d_prefill,
     conv1d_step, gated_rmsnorm, gdn_prefill, gdn_step_gated_fused,
 };
 use crate::kernels::norm::{add_rmsnorm_bf16, rmsnorm_bf16};
-use crate::kernels::{quant, skinny};
 use crate::kernels::sample::{SamplerScratch, sample_f32};
+use crate::kernels::{quant, skinny};
 use crate::metal::{BlitCopy, ComputePass, EncodedPass, MetalContext};
 use crate::moe_ffn::{
     DecodeMoeIo, MoeDims, MoeScratch, PrefillMoeIo, PrefillMoeScratch, decode_moe,
@@ -101,7 +101,12 @@ impl DecodeState {
         self.conv_slot = 0;
     }
 
-    fn kv_caches(ctx: &MetalContext, kv_heads: usize, head_dim: usize, capacity: usize) -> Result<LayerState> {
+    fn kv_caches(
+        ctx: &MetalContext,
+        kv_heads: usize,
+        head_dim: usize,
+        capacity: usize,
+    ) -> Result<LayerState> {
         Ok(LayerState::Full {
             k_cache: Tensor::zeros(ctx, &[kv_heads, capacity, head_dim], DType::BF16)?,
             v_cache: Tensor::zeros(ctx, &[kv_heads, capacity, head_dim], DType::BF16)?,
@@ -135,15 +140,32 @@ impl SnapshotApi for Snapshot {
 
 fn clone_tensor(ctx: &MetalContext, t: &Tensor) -> Result<Tensor> {
     let out = Tensor::zeros(ctx, t.shape(), t.dtype())?;
-    ctx.blit_copy(&[BlitCopy { src: t, src_offset: 0, dst: &out, dst_offset: 0, len: t.byte_len() }])?;
+    ctx.blit_copy(&[BlitCopy {
+        src: t,
+        src_offset: 0,
+        dst: &out,
+        dst_offset: 0,
+        len: t.byte_len(),
+    }])?;
     Ok(out)
 }
 
 /// Copies the first `rows` rows of every `[heads, cap, d]` head block.
-fn head_block_copies<'t>(src: &'t Tensor, dst: &'t Tensor, rows: usize, out: &mut Vec<BlitCopy<'t>>) -> Result<()> {
+fn head_block_copies<'t>(
+    src: &'t Tensor,
+    dst: &'t Tensor,
+    rows: usize,
+    out: &mut Vec<BlitCopy<'t>>,
+) -> Result<()> {
     let (heads, src_cap, d) = (src.shape()[0], src.shape()[1], src.shape()[2]);
     let dst_cap = dst.shape()[1];
-    ensure!(rows <= src_cap && rows <= dst_cap && dst.shape()[0] == heads && dst.shape()[2] == d, "cache copy shape mismatch");
+    ensure!(
+        rows <= src_cap
+            && rows <= dst_cap
+            && dst.shape()[0] == heads
+            && dst.shape()[2] == d,
+        "cache copy shape mismatch"
+    );
     let row_bytes = d * src.dtype().size();
     for h in 0..heads {
         out.push(BlitCopy {
@@ -364,7 +386,11 @@ impl Qwen3_5Model {
         Ok(Self { config, weights, attn_scale, gdn_scale })
     }
 
-    pub fn new_state(&self, ctx: &MetalContext, capacity: usize) -> Result<DecodeState> {
+    pub fn new_state(
+        &self,
+        ctx: &MetalContext,
+        capacity: usize,
+    ) -> Result<DecodeState> {
         let capacity = round_capacity(capacity)?;
         let c = self.config.gdn_conv_channels();
         let kd = self.config.linear_conv_kernel_dim;
@@ -532,7 +558,13 @@ impl Qwen3_5Model {
         for chunk in tokens.chunks(PREFILL_CHUNK) {
             let ps = capacity.chunk(chunk)?;
             remaining -= chunk.len();
-            self.encode_prefill_chunk(ctx, state, s, &ps, if remaining == 0 { draw } else { None })?;
+            self.encode_prefill_chunk(
+                ctx,
+                state,
+                s,
+                &ps,
+                if remaining == 0 { draw } else { None },
+            )?;
             state.pos += chunk.len();
             // The chunk's conv kernels wrote the other window buffer.
             state.conv_slot = 1 - state.conv_slot;
@@ -766,7 +798,15 @@ impl Qwen3_5Model {
             // Slot 0 by convention: the pipelined loop's first decode step
             // consumes the prefill token from this slot.
             let out = s.next_token.view(0, &[1])?;
-            sample_f32(ctx, &pass, &s.logits, &s.sampler, draw.params, draw.step, &out)?;
+            sample_f32(
+                ctx,
+                &pass,
+                &s.logits,
+                &s.sampler,
+                draw.params,
+                draw.step,
+                &out,
+            )?;
         }
         pass.commit_wait()
     }
@@ -1031,9 +1071,13 @@ impl DecodeStateApi for DecodeState {
             .iter()
             .map(|l| match l {
                 LayerState::Gdn { state, conv_windows } => {
-                    state.byte_len() + conv_windows[0].byte_len() + conv_windows[1].byte_len()
+                    state.byte_len()
+                        + conv_windows[0].byte_len()
+                        + conv_windows[1].byte_len()
                 }
-                LayerState::Full { k_cache, v_cache } => k_cache.byte_len() + v_cache.byte_len(),
+                LayerState::Full { k_cache, v_cache } => {
+                    k_cache.byte_len() + v_cache.byte_len()
+                }
             })
             .sum()
     }
@@ -1042,7 +1086,10 @@ impl DecodeStateApi for DecodeState {
         let mut gdn = Vec::new();
         for lstate in &self.layers {
             if let LayerState::Gdn { state, conv_windows } = lstate {
-                gdn.push((clone_tensor(ctx, state)?, clone_tensor(ctx, &conv_windows[self.conv_slot])?));
+                gdn.push((
+                    clone_tensor(ctx, state)?,
+                    clone_tensor(ctx, &conv_windows[self.conv_slot])?,
+                ));
             }
         }
         Ok(Snapshot { pos: self.pos, gdn })
@@ -1054,9 +1101,23 @@ impl DecodeStateApi for DecodeState {
         let mut saved = snapshot.gdn.iter();
         for lstate in &self.layers {
             if let LayerState::Gdn { state, conv_windows } = lstate {
-                let (s, w) = saved.next().ok_or_else(|| anyhow::anyhow!("snapshot has too few GDN layers"))?;
-                copies.push(BlitCopy { src: s, src_offset: 0, dst: state, dst_offset: 0, len: state.byte_len() });
-                copies.push(BlitCopy { src: w, src_offset: 0, dst: &conv_windows[0], dst_offset: 0, len: w.byte_len() });
+                let (s, w) = saved.next().ok_or_else(|| {
+                    anyhow::anyhow!("snapshot has too few GDN layers")
+                })?;
+                copies.push(BlitCopy {
+                    src: s,
+                    src_offset: 0,
+                    dst: state,
+                    dst_offset: 0,
+                    len: state.byte_len(),
+                });
+                copies.push(BlitCopy {
+                    src: w,
+                    src_offset: 0,
+                    dst: &conv_windows[0],
+                    dst_offset: 0,
+                    len: w.byte_len(),
+                });
             }
         }
         ensure!(saved.next().is_none(), "snapshot has too many GDN layers");
@@ -1066,12 +1127,25 @@ impl DecodeStateApi for DecodeState {
         Ok(())
     }
 
-    fn copy_prefix_from(&mut self, ctx: &MetalContext, from: &Self, tokens: usize) -> Result<()> {
-        ensure!(tokens <= from.pos, "source state has fed {} tokens, {tokens} requested", from.pos);
+    fn copy_prefix_from(
+        &mut self,
+        ctx: &MetalContext,
+        from: &Self,
+        tokens: usize,
+    ) -> Result<()> {
+        ensure!(
+            tokens <= from.pos,
+            "source state has fed {} tokens, {tokens} requested",
+            from.pos
+        );
         self.ensure_capacity(ctx, tokens)?;
         let mut copies = Vec::new();
         for (dst, src) in self.layers.iter().zip(&from.layers) {
-            if let (LayerState::Full { k_cache, v_cache }, LayerState::Full { k_cache: k0, v_cache: v0 }) = (dst, src) {
+            if let (
+                LayerState::Full { k_cache, v_cache },
+                LayerState::Full { k_cache: k0, v_cache: v0 },
+            ) = (dst, src)
+            {
                 head_block_copies(k0, k_cache, tokens, &mut copies)?;
                 head_block_copies(v0, v_cache, tokens, &mut copies)?;
             }
@@ -1117,7 +1191,12 @@ impl LanguageModel for Qwen3_5Model {
     }
 
     fn bytes_per_token(&self) -> usize {
-        let full = self.weights.layers.iter().filter(|l| matches!(l, LayerWeights::Full(_))).count();
+        let full = self
+            .weights
+            .layers
+            .iter()
+            .filter(|l| matches!(l, LayerWeights::Full(_)))
+            .count();
         full * 2 * self.config.num_key_value_heads * self.config.head_dim * 2
     }
 
@@ -1144,7 +1223,12 @@ impl LanguageModel for Qwen3_5Model {
         Qwen3_5Model::prefill(self, ctx, state, scratch, tokens, draw)
     }
 
-    fn prepare_step_inputs(&self, _state: &mut DecodeState, _scratch: &Scratch, _token: u32) -> Result<()> {
+    fn prepare_step_inputs(
+        &self,
+        _state: &mut DecodeState,
+        _scratch: &Scratch,
+        _token: u32,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -1157,6 +1241,8 @@ impl LanguageModel for Qwen3_5Model {
         slot_out: usize,
         draw: Draw<'_>,
     ) -> Result<EncodedPass<'a>> {
-        Qwen3_5Model::encode_decode_step(self, ctx, state, scratch, slot_in, slot_out, draw)
+        Qwen3_5Model::encode_decode_step(
+            self, ctx, state, scratch, slot_in, slot_out, draw,
+        )
     }
 }

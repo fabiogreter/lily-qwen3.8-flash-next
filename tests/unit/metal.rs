@@ -128,7 +128,11 @@ fn event_handoff_latency() {
     }
     let base_med = median(&mut base);
     let mut value = iterations;
-    for (name, delay_ms) in [("satisfied before commit", None), ("signaled right after commit", Some(0.0)), ("signaled 1 ms after commit", Some(1.0))] {
+    for (name, delay_ms) in [
+        ("satisfied before commit", None),
+        ("signaled right after commit", Some(0.0)),
+        ("signaled 1 ms after commit", Some(1.0)),
+    ] {
         let mut spans = Vec::new();
         for _ in 0..iterations {
             value += 1;
@@ -162,7 +166,9 @@ fn event_handoff_latency() {
     // decode step's worth) after a satisfied wait versus in one encoder.
     let small = Tensor::zeros(&ctx, &[1024], DType::U32).expect("small");
     let small2 = Tensor::zeros(&ctx, &[1024], DType::U32).expect("small2");
-    for (name, with_wait) in [("one encoder", false), ("satisfied wait, then 800 dispatches", true)] {
+    for (name, with_wait) in
+        [("one encoder", false), ("satisfied wait, then 800 dispatches", true)]
+    {
         let mut spans = Vec::new();
         for _ in 0..50 {
             value += 1;
@@ -180,7 +186,10 @@ fn event_handoff_latency() {
             let t = done.timing().expect("t");
             spans.push(t.gpu_end_secs - t.gpu_start_secs);
         }
-        eprintln!("big second encoder, {name}: span {:.3} ms", median(&mut spans) * 1e3);
+        eprintln!(
+            "big second encoder, {name}: span {:.3} ms",
+            median(&mut spans) * 1e3
+        );
     }
 
     // Signal while the GPU is still busy before the wait: 16 cover copies
@@ -244,8 +253,20 @@ fn argument_table_binds_per_dispatch_and_params_read_back() {
     let ctx = MetalContext::new().expect("metal context");
     let kernel = ctx.pipeline("combine", SRC, MslVersion::V3_1).expect("kernel");
     let n = 1000usize;
-    let a1 = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&(0..n as u32).collect::<Vec<_>>()), &[n], DType::U32).expect("a1");
-    let a2 = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&(0..n as u32).map(|i| 3 * i).collect::<Vec<_>>()), &[n], DType::U32).expect("a2");
+    let a1 = Tensor::from_bytes(
+        &ctx,
+        bytemuck::cast_slice(&(0..n as u32).collect::<Vec<_>>()),
+        &[n],
+        DType::U32,
+    )
+    .expect("a1");
+    let a2 = Tensor::from_bytes(
+        &ctx,
+        bytemuck::cast_slice(&(0..n as u32).map(|i| 3 * i).collect::<Vec<_>>()),
+        &[n],
+        DType::U32,
+    )
+    .expect("a2");
     let o1 = Tensor::zeros(&ctx, &[n], DType::U32).expect("o1");
     let o2 = Tensor::zeros(&ctx, &[n], DType::U32).expect("o2");
     let grid = Grid::Threads { grid: (n, 1, 1), threadgroup: (256, 1, 1) };
@@ -256,18 +277,45 @@ fn argument_table_binds_per_dispatch_and_params_read_back() {
         b
     };
     for concurrent in [false, true] {
-        let pass = if concurrent { ctx.begin_concurrent() } else { ctx.begin() }.expect("pass");
-        pass.dispatch_at(&kernel, &[a1.binding(), o1.binding()], &[&3u32.to_ne_bytes(), &u4(1, 5), &2.0f32.to_ne_bytes()], grid).expect("d1");
-        pass.dispatch_at(&kernel, &[a2.binding(), o2.binding()], &[&7u32.to_ne_bytes(), &u4(2, 9), &4.0f32.to_ne_bytes()], grid).expect("d2");
+        let pass = if concurrent { ctx.begin_concurrent() } else { ctx.begin() }
+            .expect("pass");
+        pass.dispatch_at(
+            &kernel,
+            &[a1.binding(), o1.binding()],
+            &[&3u32.to_ne_bytes(), &u4(1, 5), &2.0f32.to_ne_bytes()],
+            grid,
+        )
+        .expect("d1");
+        pass.dispatch_at(
+            &kernel,
+            &[a2.binding(), o2.binding()],
+            &[&7u32.to_ne_bytes(), &u4(2, 9), &4.0f32.to_ne_bytes()],
+            grid,
+        )
+        .expect("d2");
         pass.level_barrier(&[]).expect("barrier");
         // In place, reading the first dispatch's result.
-        pass.dispatch_at(&kernel, &[o1.binding(), o1.binding()], &[&1u32.to_ne_bytes(), &u4(100, 0), &0.0f32.to_ne_bytes()], grid).expect("d3");
+        pass.dispatch_at(
+            &kernel,
+            &[o1.binding(), o1.binding()],
+            &[&1u32.to_ne_bytes(), &u4(100, 0), &0.0f32.to_ne_bytes()],
+            grid,
+        )
+        .expect("d3");
         pass.commit_wait().expect("run");
         let out1 = o1.to_u32().expect("o1");
         let out2 = o2.to_u32().expect("o2");
         for i in 0..n as u32 {
-            assert_eq!(out1[i as usize], i * 3 + 1 + 5 + 2 + 100, "o1[{i}] (concurrent={concurrent})");
-            assert_eq!(out2[i as usize], 3 * i * 7 + 2 + 9 + 4, "o2[{i}] (concurrent={concurrent})");
+            assert_eq!(
+                out1[i as usize],
+                i * 3 + 1 + 5 + 2 + 100,
+                "o1[{i}] (concurrent={concurrent})"
+            );
+            assert_eq!(
+                out2[i as usize],
+                3 * i * 7 + 2 + 9 + 4,
+                "o2[{i}] (concurrent={concurrent})"
+            );
         }
     }
 }
@@ -288,7 +336,8 @@ fn passes_order_dependent_dispatches() {
     let steps = 300usize;
     for concurrent in [false, true] {
         let x = Tensor::zeros(&ctx, &[n], DType::U32).expect("x");
-        let pass = if concurrent { ctx.begin_concurrent() } else { ctx.begin() }.expect("pass");
+        let pass = if concurrent { ctx.begin_concurrent() } else { ctx.begin() }
+            .expect("pass");
         for _ in 0..steps {
             pass.dispatch_at(&kernel, &[x.binding()], &[], grid).expect("bump");
             if concurrent {
@@ -296,7 +345,10 @@ fn passes_order_dependent_dispatches() {
             }
         }
         pass.commit_wait().expect("run");
-        assert!(x.to_u32().expect("x").iter().all(|&v| v == steps as u32), "concurrent={concurrent}");
+        assert!(
+            x.to_u32().expect("x").iter().all(|&v| v == steps as u32),
+            "concurrent={concurrent}"
+        );
     }
     // Across passes too: the next pass consumes the previous pass's writes.
     let x = Tensor::zeros(&ctx, &[n], DType::U32).expect("x");
@@ -332,7 +384,8 @@ fn profile_mode_records_every_dispatch() {
     let y = Tensor::zeros(&ctx, &[n], DType::U32).expect("y");
     let label = "unit-test-profile";
     for concurrent in [false, true] {
-        let pass = if concurrent { ctx.begin_concurrent() } else { ctx.begin() }.expect("pass");
+        let pass = if concurrent { ctx.begin_concurrent() } else { ctx.begin() }
+            .expect("pass");
         pass.set_label(label);
         for _ in 0..3 {
             pass.dispatch_at(&kernel, &[x.binding()], &[], grid).expect("bump");
@@ -345,16 +398,27 @@ fn profile_mode_records_every_dispatch() {
     }
     assert!(y.to_u32().expect("y").iter().all(|&v| v == 6));
 
-    let recorded: Vec<_> = profile::take().into_iter().filter(|p| p.label == label).collect();
+    let recorded: Vec<_> =
+        profile::take().into_iter().filter(|p| p.label == label).collect();
     assert_eq!(recorded.len(), 2, "one profile per committed pass");
     for pass in &recorded {
         let names: Vec<&str> = pass.kernels.iter().map(|k| k.name).collect();
         assert_eq!(names, ["bump", "bump", "bump", "copy_u32", "copy_buffer"]);
         let sum: f64 = pass.kernels.iter().map(|k| k.gpu_secs).sum();
         for k in &pass.kernels {
-            assert!(k.gpu_secs > 0.0 && k.gpu_secs.is_finite(), "{}: {} s", k.name, k.gpu_secs);
+            assert!(
+                k.gpu_secs > 0.0 && k.gpu_secs.is_finite(),
+                "{}: {} s",
+                k.name,
+                k.gpu_secs
+            );
         }
-        assert!(pass.span_secs >= sum, "span {} s covers the kernels {} s", pass.span_secs, sum);
+        assert!(
+            pass.span_secs >= sum,
+            "span {} s covers the kernels {} s",
+            pass.span_secs,
+            sum
+        );
     }
     assert!(profile::take().iter().all(|p| p.label != label), "take drains");
 
@@ -377,7 +441,13 @@ fn profile_mode_records_every_dispatch() {
 fn residency_follows_buffer_lifetimes() {
     let ctx = MetalContext::new().expect("metal context");
     let n = 4096usize;
-    let src = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&(0..n as u32).collect::<Vec<_>>()), &[n], DType::U32).expect("src");
+    let src = Tensor::from_bytes(
+        &ctx,
+        bytemuck::cast_slice(&(0..n as u32).collect::<Vec<_>>()),
+        &[n],
+        DType::U32,
+    )
+    .expect("src");
     let before = ctx.resident_allocations();
     let first = ctx.begin().expect("pass");
     let scratch = Tensor::zeros(&ctx, &[n], DType::U32).expect("scratch");
@@ -403,7 +473,13 @@ fn residency_follows_buffer_lifetimes() {
 fn uncommitted_and_unawaited_passes_release_cleanly() {
     let ctx = MetalContext::new().expect("metal context");
     let n = 4096usize;
-    let src = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&(0..n as u32).collect::<Vec<_>>()), &[n], DType::U32).expect("src");
+    let src = Tensor::from_bytes(
+        &ctx,
+        bytemuck::cast_slice(&(0..n as u32).collect::<Vec<_>>()),
+        &[n],
+        DType::U32,
+    )
+    .expect("src");
     let dst = Tensor::zeros(&ctx, &[n], DType::U32).expect("dst");
     for _ in 0..8 {
         let pass = ctx.begin_concurrent().expect("pass");
@@ -443,7 +519,11 @@ fn feedback_latency_and_residency_commit_cost() {
         done.timing().expect("timing");
         latency.push(t0.elapsed().as_secs_f64() * 1e3);
     }
-    eprintln!("commit feedback arrives {:.3} ms (median) after the fence, max {:.3} ms", median(&mut latency), latency.iter().cloned().fold(0.0, f64::max));
+    eprintln!(
+        "commit feedback arrives {:.3} ms (median) after the fence, max {:.3} ms",
+        median(&mut latency),
+        latency.iter().cloned().fold(0.0, f64::max)
+    );
 
     // Residency: grow the set to a model-sized population, then time the
     // allocate -> first submission path and the drop path.

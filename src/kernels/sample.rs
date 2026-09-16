@@ -84,7 +84,11 @@ impl SamplingParams {
         if self.is_greedy() {
             (1.0, 1)
         } else {
-            let k = if self.top_k == 0 { SAMPLE_K_CAP } else { self.top_k.min(SAMPLE_K_CAP) };
+            let k = if self.top_k == 0 {
+                SAMPLE_K_CAP
+            } else {
+                self.top_k.min(SAMPLE_K_CAP)
+            };
             (self.temperature, k)
         }
     }
@@ -176,7 +180,10 @@ pub fn sample_f32(
             &u32_bytes(v),
             &penalties,
         ],
-        Grid::Threadgroups { groups: (PREP_GROUPS, 1, 1), threadgroup: (PREP_TG, 1, 1) },
+        Grid::Threadgroups {
+            groups: (PREP_GROUPS, 1, 1),
+            threadgroup: (PREP_TG, 1, 1),
+        },
     )?;
     pass.level_barrier(&[&scratch.adjusted, &scratch.maxima])?;
     let select = ctx.pipeline("sample_f32", SOURCE, MslVersion::V3_1)?;

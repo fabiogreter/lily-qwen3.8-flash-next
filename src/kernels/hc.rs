@@ -293,9 +293,15 @@ fn dispatch_read_down(
     ];
     let inv_g = 1.0 / groups as f32;
     let mut params: Vec<&[u8]> = Vec::with_capacity(8);
-    let (h_b, g_b, r_b, n_b, gs_b) =
-        (u32_bytes(h), u32_bytes(groups), u32_bytes(r), u32_bytes(n_inj), u32_bytes(down.group_size));
-    let (eps_b, wb_b, ig_b) = (eps.to_ne_bytes(), w_bias.to_ne_bytes(), inv_g.to_ne_bytes());
+    let (h_b, g_b, r_b, n_b, gs_b) = (
+        u32_bytes(h),
+        u32_bytes(groups),
+        u32_bytes(r),
+        u32_bytes(n_inj),
+        u32_bytes(down.group_size),
+    );
+    let (eps_b, wb_b, ig_b) =
+        (eps.to_ne_bytes(), w_bias.to_ne_bytes(), inv_g.to_ne_bytes());
     params.extend_from_slice(&[&h_b, &g_b, &r_b, &n_b, &gs_b, &eps_b, &wb_b]);
     if let Some(act) = act_out {
         buffers.push(act.binding());
@@ -337,10 +343,26 @@ pub fn hc_read_down_q8(
     eps: f32,
     w_bias: f32,
 ) -> Result<()> {
-    let dims = check_read_down(hyper, w, down, inject, down_out, inj_out, inv_rms, h, groups, 1)?;
+    let dims = check_read_down(
+        hyper, w, down, inject, down_out, inj_out, inv_rms, h, groups, 1,
+    )?;
     dispatch_read_down(
-        ctx, pass, "hc_read_down_q8", hyper, w, down, inject, down_out, inj_out, inv_rms, None,
-        dims, h, groups, eps, w_bias,
+        ctx,
+        pass,
+        "hc_read_down_q8",
+        hyper,
+        w,
+        down,
+        inject,
+        down_out,
+        inj_out,
+        inv_rms,
+        None,
+        dims,
+        h,
+        groups,
+        eps,
+        w_bias,
     )
 }
 
@@ -367,7 +389,11 @@ pub fn hc_read_down_q8_rows(
     eps: f32,
     w_bias: f32,
 ) -> Result<()> {
-    ensure!(hyper.shape().len() == 2, "hyper must be [rows, G*H], got {:?}", hyper.shape());
+    ensure!(
+        hyper.shape().len() == 2,
+        "hyper must be [rows, G*H], got {:?}",
+        hyper.shape()
+    );
     let rows = hyper.shape()[0];
     let name: &'static str = match rows {
         1 => "hc_read_down_q8_m1",
@@ -376,28 +402,84 @@ pub fn hc_read_down_q8_rows(
         4 => "hc_read_down_q8_m4",
         _ => anyhow::bail!("rows {rows} outside 1..={HC_FUSED_MAX_ROWS}"),
     };
-    let dims = check_read_down(hyper, w, down, inject, down_out, inj_out, inv_rms, h, groups, rows)?;
+    let dims = check_read_down(
+        hyper, w, down, inject, down_out, inj_out, inv_rms, h, groups, rows,
+    )?;
     ensure!(
         act_out.numel() == down_out.numel() && act_out.dtype() == DType::BF16,
         "act output must be BF16 [{rows}, {}]",
         dims.0
     );
     dispatch_read_down(
-        ctx, pass, name, hyper, w, down, inject, down_out, inj_out, inv_rms, Some(act_out), dims,
-        h, groups, eps, w_bias,
+        ctx,
+        pass,
+        name,
+        hyper,
+        w,
+        down,
+        inject,
+        down_out,
+        inj_out,
+        inv_rms,
+        Some(act_out),
+        dims,
+        h,
+        groups,
+        eps,
+        w_bias,
     )
 }
 
 /// Kernel names of the small-batch up kernels, `[groups - 1][rows - 1]`.
 const HC_UP_MIX_ROWS_FNS: [[&str; HC_FUSED_MAX_ROWS]; HC_MAX_G] = [
-    ["hc_read_up_mix_q8_g1_m1", "hc_read_up_mix_q8_g1_m2", "hc_read_up_mix_q8_g1_m3", "hc_read_up_mix_q8_g1_m4"],
-    ["hc_read_up_mix_q8_g2_m1", "hc_read_up_mix_q8_g2_m2", "hc_read_up_mix_q8_g2_m3", "hc_read_up_mix_q8_g2_m4"],
-    ["hc_read_up_mix_q8_g3_m1", "hc_read_up_mix_q8_g3_m2", "hc_read_up_mix_q8_g3_m3", "hc_read_up_mix_q8_g3_m4"],
-    ["hc_read_up_mix_q8_g4_m1", "hc_read_up_mix_q8_g4_m2", "hc_read_up_mix_q8_g4_m3", "hc_read_up_mix_q8_g4_m4"],
-    ["hc_read_up_mix_q8_g5_m1", "hc_read_up_mix_q8_g5_m2", "hc_read_up_mix_q8_g5_m3", "hc_read_up_mix_q8_g5_m4"],
-    ["hc_read_up_mix_q8_g6_m1", "hc_read_up_mix_q8_g6_m2", "hc_read_up_mix_q8_g6_m3", "hc_read_up_mix_q8_g6_m4"],
-    ["hc_read_up_mix_q8_g7_m1", "hc_read_up_mix_q8_g7_m2", "hc_read_up_mix_q8_g7_m3", "hc_read_up_mix_q8_g7_m4"],
-    ["hc_read_up_mix_q8_g8_m1", "hc_read_up_mix_q8_g8_m2", "hc_read_up_mix_q8_g8_m3", "hc_read_up_mix_q8_g8_m4"],
+    [
+        "hc_read_up_mix_q8_g1_m1",
+        "hc_read_up_mix_q8_g1_m2",
+        "hc_read_up_mix_q8_g1_m3",
+        "hc_read_up_mix_q8_g1_m4",
+    ],
+    [
+        "hc_read_up_mix_q8_g2_m1",
+        "hc_read_up_mix_q8_g2_m2",
+        "hc_read_up_mix_q8_g2_m3",
+        "hc_read_up_mix_q8_g2_m4",
+    ],
+    [
+        "hc_read_up_mix_q8_g3_m1",
+        "hc_read_up_mix_q8_g3_m2",
+        "hc_read_up_mix_q8_g3_m3",
+        "hc_read_up_mix_q8_g3_m4",
+    ],
+    [
+        "hc_read_up_mix_q8_g4_m1",
+        "hc_read_up_mix_q8_g4_m2",
+        "hc_read_up_mix_q8_g4_m3",
+        "hc_read_up_mix_q8_g4_m4",
+    ],
+    [
+        "hc_read_up_mix_q8_g5_m1",
+        "hc_read_up_mix_q8_g5_m2",
+        "hc_read_up_mix_q8_g5_m3",
+        "hc_read_up_mix_q8_g5_m4",
+    ],
+    [
+        "hc_read_up_mix_q8_g6_m1",
+        "hc_read_up_mix_q8_g6_m2",
+        "hc_read_up_mix_q8_g6_m3",
+        "hc_read_up_mix_q8_g6_m4",
+    ],
+    [
+        "hc_read_up_mix_q8_g7_m1",
+        "hc_read_up_mix_q8_g7_m2",
+        "hc_read_up_mix_q8_g7_m3",
+        "hc_read_up_mix_q8_g7_m4",
+    ],
+    [
+        "hc_read_up_mix_q8_g8_m1",
+        "hc_read_up_mix_q8_g8_m2",
+        "hc_read_up_mix_q8_g8_m3",
+        "hc_read_up_mix_q8_g8_m4",
+    ],
 ];
 
 /// Validates and encodes a fused up+mix kernel (`name`) for `rows` rows;
@@ -507,7 +589,9 @@ pub fn hc_read_up_mix_q8(
         8 => "hc_read_up_mix_q8_g8",
         _ => anyhow::bail!("streams {groups} outside 1..={HC_MAX_G}"),
     };
-    dispatch_read_up_mix(ctx, pass, name, up, down, hyper, w, inv_rms, mixed, h, groups, 1, true, w_bias)
+    dispatch_read_up_mix(
+        ctx, pass, name, up, down, hyper, w, inv_rms, mixed, h, groups, 1, true, w_bias,
+    )
 }
 
 /// [`hc_read_up_mix_q8`] over `rows <= HC_FUSED_MAX_ROWS` rows at once, on
@@ -531,7 +615,11 @@ pub fn hc_read_up_mix_q8_rows(
     groups: usize,
     w_bias: f32,
 ) -> Result<()> {
-    ensure!(hyper.shape().len() == 2, "hyper must be [rows, G*H], got {:?}", hyper.shape());
+    ensure!(
+        hyper.shape().len() == 2,
+        "hyper must be [rows, G*H], got {:?}",
+        hyper.shape()
+    );
     let rows = hyper.shape()[0];
     ensure!(
         (1..=HC_FUSED_MAX_ROWS).contains(&rows),
@@ -542,7 +630,10 @@ pub fn hc_read_up_mix_q8_rows(
         "streams {groups} outside 1..={HC_MAX_G}"
     );
     let name = HC_UP_MIX_ROWS_FNS[groups - 1][rows - 1];
-    dispatch_read_up_mix(ctx, pass, name, up, act, hyper, w, inv_rms, mixed, h, groups, rows, false, w_bias)
+    dispatch_read_up_mix(
+        ctx, pass, name, up, act, hyper, w, inv_rms, mixed, h, groups, rows, false,
+        w_bias,
+    )
 }
 
 #[cfg(test)]

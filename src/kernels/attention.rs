@@ -151,7 +151,12 @@ pub fn scatter_kv<'t>(
     pass.dispatch_with(
         &pipeline,
         &[cache.binding(), rows.binding()],
-        &[Param::U32(d as u32), Param::U32(max_seq as u32), base_pos.param(), Param::U32(kvh as u32)],
+        &[
+            Param::U32(d as u32),
+            Param::U32(max_seq as u32),
+            base_pos.param(),
+            Param::U32(kvh as u32),
+        ],
         Grid::Threads { grid: (m * kvh * d, 1, 1), threadgroup: (256, 1, 1) },
     )
 }

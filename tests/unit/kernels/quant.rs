@@ -494,11 +494,31 @@ fn gemv_q4_bandwidth_probe() {
     let weights: Vec<QuantWeights> = (0..mats)
         .map(|_| {
             let codes: Vec<u32> = (0..n * words).map(|_| rng.r#gen()).collect();
-            let mut scale = |lo: f32, hi: f32| -> Vec<bf16> { (0..n * groups).map(|_| bf16::from_f32(rng.gen_range(lo..hi))).collect() };
+            let mut scale = |lo: f32, hi: f32| -> Vec<bf16> {
+                (0..n * groups).map(|_| bf16::from_f32(rng.gen_range(lo..hi))).collect()
+            };
             QuantWeights {
-                codes: Tensor::from_bytes(&ctx, bytemuck::cast_slice(&codes), &[n, words], DType::U32).expect("codes"),
-                scales: Tensor::from_bytes(&ctx, bytemuck::cast_slice(&scale(0.01, 0.5)), &[n, groups], DType::BF16).expect("scales"),
-                biases: Tensor::from_bytes(&ctx, bytemuck::cast_slice(&scale(-2.0, 0.0)), &[n, groups], DType::BF16).expect("biases"),
+                codes: Tensor::from_bytes(
+                    &ctx,
+                    bytemuck::cast_slice(&codes),
+                    &[n, words],
+                    DType::U32,
+                )
+                .expect("codes"),
+                scales: Tensor::from_bytes(
+                    &ctx,
+                    bytemuck::cast_slice(&scale(0.01, 0.5)),
+                    &[n, groups],
+                    DType::BF16,
+                )
+                .expect("scales"),
+                biases: Tensor::from_bytes(
+                    &ctx,
+                    bytemuck::cast_slice(&scale(-2.0, 0.0)),
+                    &[n, groups],
+                    DType::BF16,
+                )
+                .expect("biases"),
                 group_size: GROUP_SIZE,
                 bits: 4,
             }
@@ -507,7 +527,8 @@ fn gemv_q4_bandwidth_probe() {
     let per_matrix = (n * words * 4 + 2 * n * groups * 2) as f64;
     let x: Vec<f32> = (0..k).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
     let tx = Tensor::from_f32_as_bf16(&ctx, &x, &[k]).expect("x");
-    let ys: Vec<Tensor> = (0..mats).map(|_| Tensor::zeros(&ctx, &[n], DType::BF16).expect("y")).collect();
+    let ys: Vec<Tensor> =
+        (0..mats).map(|_| Tensor::zeros(&ctx, &[n], DType::BF16).expect("y")).collect();
     let mut times = Vec::new();
     for _ in 0..5 {
         let pass = ctx.begin_concurrent().expect("pass");

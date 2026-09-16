@@ -94,7 +94,8 @@ pub fn parse_tool_call(block: &str, tools: &[ToolSchema]) -> Result<ParsedToolCa
     let mut cursor = body;
     while let Some(start) = cursor.find("<parameter=") {
         let after = &cursor[start + "<parameter=".len()..];
-        let (key, after) = after.split_once('>').context("unterminated <parameter= tag")?;
+        let (key, after) =
+            after.split_once('>').context("unterminated <parameter= tag")?;
         let end = after.find("</parameter>").context("unterminated parameter")?;
         let raw = &after[..end];
         // The template writes one newline around the value; strip exactly that.
@@ -102,7 +103,8 @@ pub fn parse_tool_call(block: &str, tools: &[ToolSchema]) -> Result<ParsedToolCa
         let value = value.strip_suffix('\n').unwrap_or(value);
         let typed = match schema {
             Some(s) if s.param_is_string(key) => Value::String(value.to_string()),
-            Some(_) => serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string())),
+            Some(_) => serde_json::from_str(value)
+                .unwrap_or_else(|_| Value::String(value.to_string())),
             None => Value::String(value.to_string()),
         };
         arguments.insert(key.trim().to_string(), typed);
@@ -137,13 +139,17 @@ pub fn template_tool_calls(calls: &[Value]) -> Result<Vec<Value>> {
                     if text.trim().is_empty() {
                         Value::Object(Map::new())
                     } else {
-                        serde_json::from_str::<Value>(text)
-                            .with_context(|| format!("tool call {name}: arguments are not valid JSON"))?
+                        serde_json::from_str::<Value>(text).with_context(|| {
+                            format!("tool call {name}: arguments are not valid JSON")
+                        })?
                     }
                 }
                 Some(other) => other.clone(),
             };
-            anyhow::ensure!(arguments.is_object(), "tool call {name}: arguments must be a JSON object");
+            anyhow::ensure!(
+                arguments.is_object(),
+                "tool call {name}: arguments must be a JSON object"
+            );
             Ok(serde_json::json!({
                 "id": call.get("id").cloned().unwrap_or(Value::Null),
                 "type": "function",

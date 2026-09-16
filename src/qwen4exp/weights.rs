@@ -153,9 +153,11 @@ fn expected_bits(bases: &[&str]) -> usize {
 fn load_mtp(loader: &Loader<'_>, config: &Qwen4ExpConfig) -> Result<MtpWeights> {
     let h = config.hidden_size;
     let wide = config.hc_width();
-    let norm_embedding = loader.tensor(&format!("{MTP_PREFIX}pre_fc_norm_embedding.weight"))?;
+    let norm_embedding =
+        loader.tensor(&format!("{MTP_PREFIX}pre_fc_norm_embedding.weight"))?;
     expect_shape(&norm_embedding, &[h], "mtp pre_fc_norm_embedding")?;
-    let norm_hidden = loader.tensor(&format!("{MTP_PREFIX}pre_fc_norm_hidden.weight"))?;
+    let norm_hidden =
+        loader.tensor(&format!("{MTP_PREFIX}pre_fc_norm_hidden.weight"))?;
     expect_shape(&norm_hidden, &[wide], "mtp pre_fc_norm_hidden")?;
     let fc_embedding = loader.linear(&[&format!("{MTP_PREFIX}fc_embedding")], h)?;
     fc_embedding.expect_features(h, h, "mtp fc_embedding")?;
@@ -166,7 +168,12 @@ fn load_mtp(loader: &Loader<'_>, config: &Qwen4ExpConfig) -> Result<MtpWeights> 
     let mixer_w = Mixer::Attn(Box::new(load_attn(loader, &p, config)?));
     let mlp_hc = load_hc(loader, &format!("{p}mlp_hyper_connection."), config, true)?;
     let ffn = load_ffn(loader, &p, config)?;
-    let mixer = load_hc(loader, &format!("{MTP_PREFIX}hyper_connection_mixer."), config, false)?;
+    let mixer = load_hc(
+        loader,
+        &format!("{MTP_PREFIX}hyper_connection_mixer."),
+        config,
+        false,
+    )?;
     Ok(MtpWeights {
         norm_embedding,
         norm_hidden,
@@ -361,14 +368,22 @@ fn load_ple(
     let shard_names = ngram::shard_bases(&pp, ple.table_shards);
     let table = match storage {
         NgramStorage::Resident => {
-            let shard_refs: Vec<&str> = shard_names.iter().map(String::as_str).collect();
+            let shard_refs: Vec<&str> =
+                shard_names.iter().map(String::as_str).collect();
             let table = loader.linear_grouped(
                 &shard_refs,
                 ple.head_dim(),
                 ple.quantization.group_size,
             )?;
-            table.expect_features(ple.padded_vocab_size, ple.head_dim(), "ngram table")?;
-            ensure!(table.bits == ple.quantization.bits, "ngram table bit width mismatch");
+            table.expect_features(
+                ple.padded_vocab_size,
+                ple.head_dim(),
+                "ngram table",
+            )?;
+            ensure!(
+                table.bits == ple.quantization.bits,
+                "ngram table bit width mismatch"
+            );
             NgramTable::Resident(Box::new(table))
         }
         NgramStorage::Paged => {
@@ -382,10 +397,14 @@ fn load_ple(
                 loader.mark_consumed(&format!("{base}.scales"));
                 loader.mark_consumed(&format!("{base}.biases"));
             }
-            let table =
-                PagedTable::open(loader.checkpoint(), &shard_names, ple.quantization.group_size)?;
+            let table = PagedTable::open(
+                loader.checkpoint(),
+                &shard_names,
+                ple.quantization.group_size,
+            )?;
             ensure!(
-                table.rows() == ple.padded_vocab_size && table.width() == ple.head_dim(),
+                table.rows() == ple.padded_vocab_size
+                    && table.width() == ple.head_dim(),
                 "ngram table is [{}, {}], expected [{}, {}]",
                 table.rows(),
                 table.width(),

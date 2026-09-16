@@ -92,9 +92,21 @@ pub fn speculate<M: LanguageModel>(
     loop {
         let pending = *tokens.last().expect("tokens is never empty");
         let step0 = tokens.len();
-        let (sampled, draft) = model.verify(ctx, state, scratch, pending, &proposals, params, step0, parked.take(), k)?;
+        let (sampled, draft) = model.verify(
+            ctx,
+            state,
+            scratch,
+            pending,
+            &proposals,
+            params,
+            step0,
+            parked.take(),
+            k,
+        )?;
         if std::env::var_os("LILY_TRACE_SPEC").is_some() {
-            eprintln!("trace step0={step0} pending={pending} proposals={proposals:?} sampled={sampled:?}");
+            eprintln!(
+                "trace step0={step0} pending={pending} proposals={proposals:?} sampled={sampled:?}"
+            );
         }
         // Row j confirms draft j when its draw equals it; the first row that
         // does not (or the row after the last draft) supplies the fresh token.
@@ -122,8 +134,16 @@ pub fn speculate<M: LanguageModel>(
                 return Ok(Speculated { finish, drafted, accepted });
             }
             None => {
-                let next = NextStep { token: sampled[kept], params, step0: tokens.len() };
-                let (next_proposals, next_parked) = model.finish_speculation(ctx, state, scratch, kept, Some(next), draft)?;
+                let next =
+                    NextStep { token: sampled[kept], params, step0: tokens.len() };
+                let (next_proposals, next_parked) = model.finish_speculation(
+                    ctx,
+                    state,
+                    scratch,
+                    kept,
+                    Some(next),
+                    draft,
+                )?;
                 proposals = next_proposals;
                 parked = next_parked;
             }
@@ -191,9 +211,16 @@ impl Generator {
         let pos_before = state.pos();
         scratch.begin_request();
         let params = options.sampling;
-        model.prefill(ctx, state, scratch, prompt_ids, Some(Draw { params, step: 0 }))?;
+        model.prefill(
+            ctx,
+            state,
+            scratch,
+            prompt_ids,
+            Some(Draw { params, step: 0 }),
+        )?;
 
-        let is_stop = |t: u32| self.stop_tokens.contains(&t) || options.stop_tokens.contains(&t);
+        let is_stop =
+            |t: u32| self.stop_tokens.contains(&t) || options.stop_tokens.contains(&t);
         let read_slot = |scratch: &M::Scratch, slot: usize| -> Result<u32> {
             Ok(scratch.next_token().view(slot, &[1])?.to_u32()?[0])
         };
@@ -225,7 +252,15 @@ impl Generator {
                 drafted = outcome.drafted;
                 accepted = outcome.accepted;
             } else {
-                finish = self.decode_loop(ctx, model, state, scratch, options, &mut tokens, on_token)?;
+                finish = self.decode_loop(
+                    ctx,
+                    model,
+                    state,
+                    scratch,
+                    options,
+                    &mut tokens,
+                    on_token,
+                )?;
             }
         }
         let fed = state
@@ -234,7 +269,12 @@ impl Generator {
             .ok_or_else(|| anyhow::anyhow!("decode state moved backwards"))?;
         // The last drawn token is fed only when a parked step consumed it.
         let drawn = prompt_ids.len() + tokens.len();
-        ensure!(fed == drawn - 1 || fed == drawn, "state fed {fed} tokens for {} prompt and {} drawn", prompt_ids.len(), tokens.len());
+        ensure!(
+            fed == drawn - 1 || fed == drawn,
+            "state fed {fed} tokens for {} prompt and {} drawn",
+            prompt_ids.len(),
+            tokens.len()
+        );
         Ok(Generation { tokens, finish, fed, drafted, accepted })
     }
 
@@ -261,7 +301,8 @@ impl Generator {
         on_token: &mut dyn FnMut(u32) -> Result<bool>,
     ) -> Result<FinishReason> {
         let params = options.sampling;
-        let is_stop = |t: u32| self.stop_tokens.contains(&t) || options.stop_tokens.contains(&t);
+        let is_stop =
+            |t: u32| self.stop_tokens.contains(&t) || options.stop_tokens.contains(&t);
         let read_slot = |slot: usize| -> Result<u32> {
             Ok(scratch.next_token().view(slot, &[1])?.to_u32()?[0])
         };
@@ -299,7 +340,14 @@ impl Generator {
                 None => {
                     let encoded = match ahead.take() {
                         Some(pass) => pass,
-                        None => model.encode_decode_step(ctx, state, scratch, slot_in, 1 - slot_in, Draw { params, step })?,
+                        None => model.encode_decode_step(
+                            ctx,
+                            state,
+                            scratch,
+                            slot_in,
+                            1 - slot_in,
+                            Draw { params, step },
+                        )?,
                     };
                     model.prepare_step_inputs(state, scratch, input)?;
                     let pass = encoded.commit()?;
@@ -313,11 +361,27 @@ impl Generator {
             if tokens.len() + 1 < options.max_tokens && state.pos() < state.capacity() {
                 let draw = Draw { params, step: step + 1 };
                 if parking {
-                    let pass = model.encode_parked_step(ctx, state, scratch, 1 - slot_in, slot_in, draw)?.commit()?;
+                    let pass = model
+                        .encode_parked_step(
+                            ctx,
+                            state,
+                            scratch,
+                            1 - slot_in,
+                            slot_in,
+                            draw,
+                        )?
+                        .commit()?;
                     state.advance(1);
                     parked = Some(pass);
                 } else {
-                    ahead = Some(model.encode_decode_step(ctx, state, scratch, 1 - slot_in, slot_in, draw)?);
+                    ahead = Some(model.encode_decode_step(
+                        ctx,
+                        state,
+                        scratch,
+                        1 - slot_in,
+                        slot_in,
+                        draw,
+                    )?);
                 }
             }
             pending.wait_paced(&mut pacer)?;
