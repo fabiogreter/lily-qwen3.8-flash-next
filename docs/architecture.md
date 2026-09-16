@@ -337,6 +337,50 @@ a golden's `pixel_values`, writes the candidate record for
 `compare_vision.py`, and prints the per-kernel profile with
 `--kernel-profile`.
 
+**Preprocessing** (`src/qwen4exp/image.rs`) turns the request's PNG or JPEG
+bytes into those pixel rows on the host, following the reference processor
+(`tools/reference/VISION.md`, "Preprocessing"): decode to 8-bit RGB as
+`PIL.Image.convert("RGB")` does (alpha dropped without compositing,
+greyscale replicated, a palette looked up, 16-bit samples reduced to their
+high byte), `smart_resize` to a multiple of 32 on both sides under the pixel
+cap with Python's half-to-even rounding, PIL's `Image.resize(BICUBIC)`, then
+`(k - 127.5) / 127.5` in f32 into 1 536-wide rows in block-major patch
+order with the two temporal frames identical. The resampler is a
+transcription of Pillow 12.3.0's `libImaging/Resample.c`: the Keys cubic
+with a = -0.5, the support widened by the downscale factor, coefficients
+computed and normalised in f64 and then fixed to 22 fractional bits with
+half-away-from-zero rounding, the horizontal pass first and the vertical
+second, each accumulating in i32 from a half-unit offset and clamping to
+uint8, and a pass skipped altogether when its axis keeps its size. Every
+one of those details is load-bearing: against Pillow's own output on the
+four test images and seven synthetic sizes (up and down, per axis) lily's
+resized bytes are identical, and against the torchvision goldens lily's
+`pixel_values` differ on exactly the elements and by exactly the one level
+that VISION.md measured between PIL and torchvision (148 of 1.47 M on
+333 x 777, 282 of 12.5 M on 1920 x 1080, 26 of 12.2 M on the capped
+3840 x 2160, none on 640 x 480), so comparison 1 passes with room and the
+tower fed lily's own rows passes comparison 2 on all four images (merged
+relative L2 0.070 / 0.053 / 0.062 / 0.087, cosine 0.9976 / 0.9986 / 0.9981 /
+0.9963, within-fraction 99.92 / 99.997 / 99.98 / 99.88 %). Two things are
+not PIL: 16-bit greyscale PNGs, which Pillow saturates at 255 (I;16 to RGB
+goes through a clamp and the image comes out white) where lily keeps the
+high byte like the RGB case; and JPEG, decoded by `zune-jpeg` rather than
+libjpeg-turbo, which agrees with Pillow on all but about 1 % of greyscale
+samples by one level and on 4:2:0 colour differs on 2 to 16 % by one level
+and 1 to 10 % by two or three (chroma upsampling). Decoding is the server's
+first contact with untrusted binary data, so the format and dimensions are
+read off the header first: anything but PNG and JPEG is refused by name, so
+is a side over 16 384, an area over 64 megapixels, a zero-sized image or a
+frame over the allocation bound, all before either decoder allocates, and
+the decoders then run under that bound with truncated data an error. The
+whole chain is single-threaded plain loops and costs 3 ms for 333 x 777,
+under 1 ms for the identity 640 x 480, 3 to 6 ms for 1920 x 1080 and 34 to
+37 ms for the capped 3840 x 2160 (14 to 24 ms uncapped, where only the
+vertical pass runs), against 0.7 s for the tower at the cap. The dependency
+for this is `png` and `zune-jpeg` directly rather than the `image` facade,
+which with only those two formats still pulls colour management the server
+never applies.
+
 ## Speculative decoding
 
 With the draft head loaded, a decode step becomes two GPU passes.

@@ -90,19 +90,51 @@ was made with; the default is lily's server-side cap, `--image-max-pixels
 `goldens/large/` (not tracked); the JSON keeps shape, sha256, statistics and a
 seeded 4 096-element sample.
 
-`lily-vision-probe` is the Rust side of comparison 2: it loads only the tower
-from a converted checkpoint, runs it over a golden's `pixel_values` (the
-matching `goldens/large/preprocess_<img>_cap<max>.pixel_values.npy`, or
-`--pixels`), and writes the merged and pre-merger outputs as `.npy` plus a
-candidate JSON in the golden format, carrying the golden's own sample indices.
-`--repeat` times the runs, `--kernel-profile` prints GPU ms per kernel,
-`--blocks N` stops after N transformer blocks for block-by-block comparisons.
+`lily-vision-probe` is the Rust side of comparisons 1 and 2. With `--model`
+it loads only the tower from a converted checkpoint, runs it over a golden's
+`pixel_values` (the matching
+`goldens/large/preprocess_<img>_cap<max>.pixel_values.npy`, or `--pixels`),
+and writes the merged and pre-merger outputs as `.npy` plus a candidate JSON in
+the golden format, carrying the golden's own sample indices. `--repeat` times
+the runs, `--kernel-profile` prints GPU ms per kernel, `--blocks N` stops after
+N transformer blocks for block-by-block comparisons.
+
+With `--image <png or jpeg>` it runs lily's own preprocessing
+(`src/qwen4exp/image.rs`) under `--max-pixels` (default 2 097 152) and
+`--min-pixels` (default 65 536), writes a `preprocess` record plus
+`<out>.pixel_values.npy` for comparison 1, and reports the time it took. The
+record takes its sample indices from `--preprocess-golden`, or from the
+`hf_vision_preprocess_<img>_cap<max>.json` next to `--golden` when that is
+given; without either the sample is an even stride and the comparison needs
+the `.npy` files. With `--model` as well, the tower then runs on lily's own
+pixel rows (the grid must match the tower golden's, so use the golden's cap)
+and the preprocess record goes to `<out stem>.preprocess.json` next to the
+tower record (`--preprocess-out` overrides). No GPU is touched without
+`--model`.
 
 ```sh
+# comparison 2 on the reference's pixel_values
 cargo run --release --bin lily-vision-probe -- --model <dir>-l4 \
     --golden tools/reference/goldens/hf_vision_tower_333x777_cap2097152.json --out lily_tower.json
 .venv/bin/python tools/reference/compare_vision.py lily_tower.json tools/reference/goldens/hf_vision_tower_333x777_cap2097152.json
+
+# comparison 1 alone, no GPU
+cargo run --release --bin lily-vision-probe -- --image tools/reference/images/333x777.png \
+    --preprocess-golden tools/reference/goldens/hf_vision_preprocess_333x777_cap2097152.json --out lily_pre.json
+.venv/bin/python tools/reference/compare_vision.py lily_pre.json tools/reference/goldens/hf_vision_preprocess_333x777_cap2097152.json
+
+# comparisons 1 and 2 end to end: the tower on lily's own pixel rows
+cargo run --release --bin lily-vision-probe -- --model <dir>-l4 --image tools/reference/images/333x777.png \
+    --golden tools/reference/goldens/hf_vision_tower_333x777_cap2097152.json --out lily_tower.json
+.venv/bin/python tools/reference/compare_vision.py lily_tower.preprocess.json tools/reference/goldens/hf_vision_preprocess_333x777_cap2097152.json
+.venv/bin/python tools/reference/compare_vision.py lily_tower.json tools/reference/goldens/hf_vision_tower_333x777_cap2097152.json
 ```
+
+The Rust unit tests in `tests/unit/qwen4exp/image.rs` run comparison 1 on
+the five committed preprocess goldens from `cargo test` without Python; the
+exact check against Pillow's own `Image.resize` output reads raw dumps from
+`LILY_PIL_RESIZE_DIR` when set (`pil_<stem>_<w>x<h>.rgb`, with `<stem>.png`
+beside them or a test image of that name).
 
 ```sh
 .venv/bin/python tools/reference/hf_vision_reference.py preprocess --src ~/models/Qwen3.8-Flash-Next \

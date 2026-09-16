@@ -5,6 +5,7 @@
 //! Attention on top.
 
 pub mod config;
+pub mod image;
 pub mod model;
 pub mod ngram;
 mod spec;

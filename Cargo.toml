@@ -43,6 +43,16 @@ minijinja = { version = "2.5", features = ["loader", "json"] }
 # that Hugging Face chat templates use and that minijinja does not implement
 # natively. Without it the Qwen template dies on `content.startswith(...)`.
 minijinja-contrib = { version = "2.5", features = ["pycompat"] }
+# Decodes the PNG and JPEG bytes a chat request carries (vision preprocessing,
+# `src/qwen4exp/image.rs`). The two decoders directly rather than the `image`
+# facade: `image` 0.25 with only its `png` and `jpeg` features still pulls
+# `moxcms` and `pxfm` (colour management the server never applies), `num-traits`,
+# `byteorder-lite` and `bytemuck_derive` with `syn`, about three times the
+# dependency tree for a format sniff and a colour-type conversion that take
+# fifty lines here. Both crates are the ones `image` itself decodes with.
+# Resizing stays hand-written: no crate reproduces PIL's resampler.
+png = { version = "0.18.1", default-features = false }
+zune-jpeg = { version = "0.5.15", default-features = false, features = ["std"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
