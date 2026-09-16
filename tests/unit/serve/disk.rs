@@ -21,6 +21,92 @@ fn store_fake(store: &mut DiskStore, tokens: &[u32], prefix_bytes: usize, key: O
         .expect("store")
 }
 
+fn store_fake_durable(store: &mut DiskStore, tokens: &[u32], prefix_bytes: usize) -> String {
+    let n = tokens.len();
+    store
+        .store_durable(
+            tokens,
+            None,
+            &[n],
+            &mut |w| Ok(w.write_all(&vec![9u8; prefix_bytes])?),
+            &mut |pos, w| Ok(w.write_all(&(pos as u64).to_le_bytes())?),
+        )
+        .expect("store durable")
+        .expect("kept")
+}
+
+fn ids(store: &DiskStore) -> Vec<String> {
+    let mut ids: Vec<String> = store.entries().iter().map(|e| e.id.clone()).collect();
+    ids.sort();
+    ids
+}
+
+#[test]
+fn durable_flag_round_trips_and_old_meta_files_load_as_not_durable() {
+    let root = temp_root("durable-meta");
+    let mut store = DiskStore::open(&root, "fmt", 1 << 20, 0).expect("open");
+    let plain = store_fake(&mut store, &[1, 2, 3], 10, Some("k")).expect("plain");
+    let durable = store_fake_durable(&mut store, &[1, 2, 3, 4], 10);
+    assert_eq!((store.len(), store.durable_len()), (2, 1));
+    let flag = |store: &DiskStore, id: &str| store.entries().iter().find(|e| e.id == id).map(|e| e.durable);
+    assert_eq!((flag(&store, &plain), flag(&store, &durable)), (Some(false), Some(true)));
+
+    // The flag is in meta.json and survives a touch (which rewrites it).
+    let meta_path = |id: &str| root.join("fmt").join(id).join(META);
+    let read_meta = |id: &str| -> serde_json::Value { serde_json::from_slice(&fs::read(meta_path(id)).expect("meta")).expect("json") };
+    assert_eq!(read_meta(&durable)["durable"], serde_json::Value::Bool(true));
+    assert_eq!(read_meta(&plain)["durable"], serde_json::Value::Bool(false));
+    store.touch(&durable);
+    assert_eq!(read_meta(&durable)["durable"], serde_json::Value::Bool(true));
+
+    // Reopening rebuilds the index with the flag.
+    let reopened = DiskStore::open(&root, "fmt", 1 << 20, 0).expect("reopen");
+    assert_eq!((flag(&reopened, &plain), flag(&reopened, &durable)), (Some(false), Some(true)));
+    assert_eq!(reopened.durable_len(), 1);
+    drop(reopened);
+
+    // A meta file from before the field existed has no `durable` key: it is
+    // an evicted session, not a durable entry.
+    let mut old = read_meta(&durable);
+    old.as_object_mut().expect("object").remove("durable");
+    fs::write(meta_path(&durable), serde_json::to_vec(&old).expect("json")).expect("write");
+    let legacy = DiskStore::open(&root, "fmt", 1 << 20, 0).expect("reopen legacy");
+    assert_eq!(flag(&legacy, &durable), Some(false));
+    assert_eq!(legacy.durable_len(), 0);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_durable_cap_evicts_the_least_recently_used_durable_entry_only() {
+    let root = temp_root("durable-cap");
+    let mut store = DiskStore::open(&root, "fmt", 1 << 20, 0).expect("open");
+    // An evicted session first: older than everything, yet never a victim of
+    // the durable cap.
+    let plain = store_fake(&mut store, &[100], 10, None).expect("plain");
+    let durables: Vec<String> = (0..DURABLE_MAX_ENTRIES as u32).map(|i| store_fake_durable(&mut store, &[i, i + 1], 10)).collect();
+    assert_eq!((store.len(), store.durable_len()), (DURABLE_MAX_ENTRIES + 1, DURABLE_MAX_ENTRIES));
+    // A normal store on top does not count toward the cap and evicts nothing.
+    let plain2 = store_fake(&mut store, &[200], 10, None).expect("plain2");
+    assert_eq!((store.len(), store.durable_len()), (DURABLE_MAX_ENTRIES + 2, DURABLE_MAX_ENTRIES));
+    drop(store);
+
+    // Make the third durable entry the least recently used one (the plain
+    // entries older still) and reopen so the index carries the timestamps.
+    backdate(&root, &durables[2], 60);
+    backdate(&root, &plain, 600);
+    backdate(&root, &plain2, 600);
+    let mut store = DiskStore::open(&root, "fmt", 1 << 20, 0).expect("reopen");
+    let newest = store_fake_durable(&mut store, &[7, 7, 7], 10);
+    assert_eq!((store.len(), store.durable_len()), (DURABLE_MAX_ENTRIES + 2, DURABLE_MAX_ENTRIES));
+    let present = ids(&store);
+    assert!(!present.contains(&durables[2]), "the least recently used durable entry goes: {present:?}");
+    assert!(!root.join("fmt").join(&durables[2]).exists());
+    for keep in durables.iter().filter(|id| **id != durables[2]).chain([&plain, &plain2, &newest]) {
+        assert!(present.contains(keep), "{keep} must survive: {present:?}");
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[test]
 fn store_reopen_and_read_back() {
     let root = temp_root("roundtrip");

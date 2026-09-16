@@ -78,8 +78,29 @@ fn the_json_shape_is_the_documented_one() {
             "drafted_tokens": 14,
             "accepted_tokens": 11,
             "acceptance_ratio": 0.7857,
+            "agreement_tokens": 0,
         })
     );
+}
+
+#[test]
+fn agreement_never_reads_below_the_cached_prefix_and_the_durable_field_is_absent_unless_written() {
+    // Without the session cache's word, the agreement is what was reused.
+    let plain = Timings::measure(1000, 300, 1.0, 5, 0.1, None);
+    assert_eq!((plain.agreement_tokens, plain.durable_prefix_tokens), (300, None));
+    let json = serde_json::to_value(plain).unwrap();
+    assert_eq!(json["agreement_tokens"], json!(300));
+    assert!(json.get("durable_prefix_tokens").is_none(), "absent, never a zero-length write");
+
+    // A run that shared 900 tokens, resumed none and wrote the entry there.
+    let written = Timings::measure(1000, 0, 1.0, 5, 0.1, None).with_agreement(900, Some(900));
+    assert_eq!((written.agreement_tokens, written.durable_prefix_tokens), (900, Some(900)));
+    assert_eq!(serde_json::to_value(written).unwrap()["durable_prefix_tokens"], json!(900));
+
+    // Clamped into [cached, prompt] whatever the caller passes.
+    let t = Timings::measure(1000, 300, 1.0, 5, 0.1, None).with_agreement(10, None);
+    assert_eq!(t.agreement_tokens, 300);
+    assert_eq!(Timings::measure(1000, 300, 1.0, 5, 0.1, None).with_agreement(5000, None).agreement_tokens, 1000);
 }
 
 #[test]

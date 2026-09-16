@@ -19,6 +19,16 @@
 //! a prefix reads them back instead of recomputing it. A disk hit at the live
 //! end moves the session back to the GPU (the file copy is dropped); a hit at
 //! an earlier checkpoint forks from the file and leaves it in place.
+//!
+//! The disk tier also holds **durable prefix entries**: a prefix that two
+//! prompts shared (the `agreement`) but that no lineage could resume from,
+//! because checkpoints sit at the end of served prompts and two agent runs
+//! diverge before that. The engine materialises such a boundary once, as a
+//! disk entry whose live end is the boundary, and every later prompt with the
+//! same preamble resumes there. These entries live only on disk, never as
+//! resident sessions or extra checkpoints: they are hit far more rarely than
+//! the live conversation's cache and must not compete with it for the GPU
+//! budget. A hit never consumes them.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -33,6 +43,44 @@ type SnapshotOf<M> = <<M as LanguageModel>::State as DecodeStateApi>::Snapshot;
 
 /// Sessions shorter than this are not worth a round trip to disk.
 const MIN_DISK_TOKENS: usize = 256;
+
+/// Tokens of the best-agreeing lineage returned past the agreement, enough
+/// for the divergence diagnostic to show a line of text.
+const DIVERGENT_TAIL_TOKENS: usize = 16;
+
+/// How far `prompt` agrees with the closest of `lineages`: the longest
+/// common prefix with any of them, capped at `prompt.len() - 1` like every
+/// resume position (the last prompt token is always fed). Also returns up to
+/// [`DIVERGENT_TAIL_TOKENS`] of that lineage's tokens from the agreement on,
+/// which is what the prompt would have had to continue with to keep
+/// matching; empty when nothing agrees.
+pub fn agreement<'a>(prompt: &[u32], lineages: impl IntoIterator<Item = &'a [u32]>) -> (usize, Vec<u32>) {
+    let cap = prompt.len().saturating_sub(1);
+    let mut best: Option<(usize, &[u32])> = None;
+    for tokens in lineages {
+        let lcp = common_prefix_len(tokens, prompt).min(cap);
+        if lcp > 0 && best.is_none_or(|(b, _)| lcp > b) {
+            best = Some((lcp, tokens));
+        }
+    }
+    match best {
+        Some((lcp, tokens)) => (lcp, tokens[lcp..tokens.len().min(lcp + DIVERGENT_TAIL_TOKENS)].to_vec()),
+        None => (0, Vec::new()),
+    }
+}
+
+/// Where a durable prefix entry should be materialised for a prompt that
+/// agreed with a cached lineage for `agreement` tokens but resumed at
+/// `reused`: the agreement itself when it is long enough to be worth a disk
+/// entry (`min_tokens`; 0 turns the feature off), lies beyond where the run
+/// resumed (so no resumable state exists there yet) and leaves at least one
+/// token to feed. Two real prompts shared that prefix, so a third is likely;
+/// within one growing conversation `reused == agreement` and nothing is
+/// written turn after turn.
+pub fn boundary_position(agreement: usize, reused: usize, prompt_len: usize, min_tokens: usize) -> Option<usize> {
+    let worth_it = min_tokens > 0 && agreement >= min_tokens;
+    (worth_it && agreement > reused && agreement <= prompt_len.checked_sub(1)?).then_some(agreement)
+}
 
 /// The best position to resume `prompt` from given a lineage's tokens and
 /// its resumable positions: the live end when the lineage is a strict prefix
@@ -104,6 +152,23 @@ pub struct Acquired<M: LanguageModel> {
     /// Whether the reused prefix was read from the disk tier, and how long
     /// that took.
     pub from_disk: Option<std::time::Duration>,
+    /// The longest common prefix between the prompt and any lineage the store
+    /// knows (resident or on disk), capped at `prompt.len() - 1`. Always
+    /// `>= reused`; the gap is a prefix that was shared but not resumable,
+    /// which is what a durable prefix entry fixes (see [`boundary_position`]).
+    pub agreement: usize,
+    /// The best-agreeing lineage's tokens from `agreement` on (at most
+    /// [`DIVERGENT_TAIL_TOKENS`]), for the divergence diagnostic. Empty when
+    /// nothing agreed.
+    pub divergent_tail: Vec<u32>,
+}
+
+impl<M: LanguageModel> Acquired<M> {
+    /// A session nothing was reused for; the other fields are filled in by
+    /// the path that built it.
+    fn fresh(session: Session<M>) -> Self {
+        Self { session, reused: 0, forked: false, from_disk: None, agreement: 0, divergent_tail: Vec::new() }
+    }
 }
 
 pub struct SessionStore<M: LanguageModel> {
@@ -113,17 +178,38 @@ pub struct SessionStore<M: LanguageModel> {
     max_checkpoints: usize,
     clock: u64,
     disk: Option<DiskStore>,
+    /// Shortest shared prefix worth a durable disk entry (0: never).
+    durable_min_tokens: usize,
 }
 
 impl<M: LanguageModel> SessionStore<M> {
     pub fn new(budget_bytes: usize, max_sessions: usize, max_checkpoints: usize) -> Self {
-        Self { entries: Vec::new(), budget_bytes, max_sessions, max_checkpoints: max_checkpoints.max(1), clock: 0, disk: None }
+        Self {
+            entries: Vec::new(),
+            budget_bytes,
+            max_sessions,
+            max_checkpoints: max_checkpoints.max(1),
+            clock: 0,
+            disk: None,
+            durable_min_tokens: 0,
+        }
     }
 
     /// Attaches the disk tier.
     pub fn with_disk(mut self, disk: DiskStore) -> Self {
         self.disk = Some(disk);
         self
+    }
+
+    /// Sets the shortest shared prefix worth a durable disk entry (0 turns
+    /// durable entries off). Only meaningful with a disk tier attached.
+    pub fn with_durable_min_tokens(mut self, min_tokens: usize) -> Self {
+        self.durable_min_tokens = min_tokens;
+        self
+    }
+
+    pub fn durable_min_tokens(&self) -> usize {
+        self.durable_min_tokens
     }
 
     pub fn disk(&self) -> Option<&DiskStore> {
@@ -144,7 +230,9 @@ impl<M: LanguageModel> SessionStore<M> {
 
     /// Checks out the session that can resume `prompt` from the furthest
     /// position, forking when that position is not the live end. `cache_key`
-    /// only breaks ties between equally good candidates.
+    /// only breaks ties between equally good candidates. Also reports how far
+    /// the prompt agreed with any lineage at all (`agreement`), which the
+    /// engine compares with `reused` to decide on a durable prefix entry.
     pub fn acquire(
         &mut self,
         ctx: &MetalContext,
@@ -153,6 +241,33 @@ impl<M: LanguageModel> SessionStore<M> {
         cache_key: Option<&str>,
     ) -> Result<Acquired<M>> {
         ensure!(!prompt.is_empty(), "empty prompt");
+        if let Some(disk) = self.disk.as_mut() {
+            disk.expire();
+        }
+        let (agreement, divergent_tail) = agreement(
+            prompt,
+            self.entries
+                .iter()
+                .map(|s| s.tokens.as_slice())
+                .chain(self.disk.iter().flat_map(|d| d.entries().iter().map(|e| e.tokens.as_slice()))),
+        );
+        let mut acquired = self.acquire_resumable(ctx, model, prompt, cache_key)?;
+        debug_assert!(acquired.reused <= agreement, "resumed past the agreement");
+        acquired.agreement = agreement;
+        acquired.divergent_tail = divergent_tail;
+        Ok(acquired)
+    }
+
+    /// [`Self::acquire`] without the agreement: picks the lineage and builds
+    /// the session. `agreement` and `divergent_tail` are left at their
+    /// defaults for the caller to fill in.
+    fn acquire_resumable(
+        &mut self,
+        ctx: &MetalContext,
+        model: &M,
+        prompt: &[u32],
+        cache_key: Option<&str>,
+    ) -> Result<Acquired<M>> {
         let best = self
             .entries
             .iter()
@@ -165,9 +280,6 @@ impl<M: LanguageModel> SessionStore<M> {
             });
 
         // The disk tier competes on resume position; ties go to the GPU.
-        if let Some(disk) = self.disk.as_mut() {
-            disk.expire();
-        }
         let best_disk = self.disk.as_ref().and_then(|disk| {
             disk.entries()
                 .iter()
@@ -187,14 +299,14 @@ impl<M: LanguageModel> SessionStore<M> {
             let state = model.new_state(ctx, prompt.len())?;
             let session = Session::new(state);
             self.trim(ctx, session.bytes());
-            return Ok(Acquired { session, reused: 0, forked: false, from_disk: None });
+            return Ok(Acquired::fresh(session));
         };
 
         if resume_at == self.entries[index].tokens.len() {
             // Pure extension of the live end: take the session as is.
             let session = self.entries.swap_remove(index);
             ensure!(session.state.pos() == resume_at, "cached decode state out of step with its tokens");
-            return Ok(Acquired { session, reused: resume_at, forked: false, from_disk: None });
+            return Ok(Acquired { reused: resume_at, ..Acquired::fresh(session) });
         }
 
         // Fork: copy the per-token prefix, restore the recurrent checkpoint.
@@ -212,12 +324,14 @@ impl<M: LanguageModel> SessionStore<M> {
         session.tokens = source.tokens[..resume_at].to_vec();
         session.checkpoints.push(checkpoint);
         self.trim(ctx, session.bytes());
-        Ok(Acquired { session, reused: resume_at, forked: true, from_disk: None })
+        Ok(Acquired { reused: resume_at, forked: true, ..Acquired::fresh(session) })
     }
 
     /// Builds a session from disk entry `id` resumed at `pos`: the per-token
     /// caches up to `pos` and the checkpoint there. A live-end hit consumes
-    /// the entry; a checkpoint hit forks from it and leaves it on disk.
+    /// the entry; a checkpoint hit forks from it and leaves it on disk. A
+    /// durable prefix entry is forked from even at its live end: it exists to
+    /// be hit again, and every hit is a lineage of its own.
     fn acquire_from_disk(
         &mut self,
         ctx: &MetalContext,
@@ -229,11 +343,12 @@ impl<M: LanguageModel> SessionStore<M> {
     ) -> Result<Acquired<M>> {
         let started = Instant::now();
         let disk = self.disk.as_mut().expect("disk tier");
-        let tokens = disk.entries().iter().find(|e| e.id == id).map(|e| e.tokens[..pos].to_vec()).context("disk entry vanished")?;
+        let entry = disk.entries().iter().find(|e| e.id == id).context("disk entry vanished")?;
+        let (tokens, durable) = (entry.tokens[..pos].to_vec(), entry.durable);
         let mut state = model.new_state(ctx, prompt.len().max(pos))?;
         let result = (|| -> Result<SnapshotOf<M>> {
             let mut prefix = disk.open_prefix(id)?;
-            state.read_prefix(ctx, pos, &mut prefix)?;
+            state.read_prefix(ctx, len, pos, &mut prefix)?;
             let mut ckpt = disk.open_checkpoint(id, pos)?;
             let snapshot = model.read_snapshot(ctx, &mut ckpt)?;
             ensure!(snapshot.pos() == pos, "checkpoint file at {pos} holds position {}", snapshot.pos());
@@ -249,10 +364,10 @@ impl<M: LanguageModel> SessionStore<M> {
                 let state = model.new_state(ctx, prompt.len())?;
                 let session = Session::new(state);
                 self.trim(ctx, session.bytes());
-                return Ok(Acquired { session, reused: 0, forked: false, from_disk: None });
+                return Ok(Acquired::fresh(session));
             }
         };
-        let forked = pos != len;
+        let forked = pos != len || durable;
         if forked {
             disk.touch(id);
         } else {
@@ -262,7 +377,28 @@ impl<M: LanguageModel> SessionStore<M> {
         session.tokens = tokens;
         session.checkpoints.push(Arc::new(snapshot));
         self.trim(ctx, session.bytes());
-        Ok(Acquired { session, reused: pos, forked, from_disk: Some(started.elapsed()) })
+        Ok(Acquired { reused: pos, forked, from_disk: Some(started.elapsed()), ..Acquired::fresh(session) })
+    }
+
+    /// Writes a durable prefix entry for `tokens`, whose per-token caches
+    /// `state` holds and whose recurrent state at `tokens.len()` is
+    /// `snapshot`: the boundary [`boundary_position`] found, materialised so
+    /// later prompts with the same prefix resume there. Only the disk tier
+    /// keeps it (see the module docs for why). Returns the entry id, `None`
+    /// when the tier did not take it, or the write error; failures only cost
+    /// the entry, so the caller logs and carries on.
+    pub fn store_durable(
+        &mut self,
+        tokens: &[u32],
+        cache_key: Option<&str>,
+        state: &M::State,
+        snapshot: &SnapshotOf<M>,
+    ) -> Result<Option<String>> {
+        let disk = self.disk.as_mut().context("no disk tier")?;
+        let n = tokens.len();
+        ensure!(n > 0 && snapshot.pos() == n, "durable snapshot at {} for {n} tokens", snapshot.pos());
+        ensure!(state.pos() >= n, "decode state at {} holds no caches for {n} tokens", state.pos());
+        disk.store_durable(tokens, cache_key, &[n], &mut |w| state.write_prefix(n, w), &mut |_, w| snapshot.write_to(w))
     }
 
     /// Evicts least-recently-used sessions until `extra` more bytes fit the

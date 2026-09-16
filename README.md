@@ -239,6 +239,7 @@ decode and acceptance numbers in the opencode terminal UI.
 | `--disk-cache-dir` | `~/Library/Caches/lily/sessions` | where evicted sessions are kept |
 | `--disk-cache-bytes` | 100G | disk tier budget, LRU; `0` disables the tier |
 | `--disk-cache-ttl` | 3d | delete disk entries unused this long (`0`: never) |
+| `--durable-min-tokens` | 1024 | a shared prefix at least this long that nothing could resume from becomes a durable disk entry (`0`: off) |
 | `--idle-unload` | 0 | unload the model after this long without a request (`30m`, `2h`; `0`: never) |
 | `--thinking` | true | open a reasoning block unless the request says otherwise |
 | `--reasoning-effort` | template default | `low`, `medium`, `xhigh` |
@@ -275,6 +276,23 @@ prefix reads it back in about a second per few gigabytes instead of
 recomputing it; the tier survives restarts and is keyed by the model's cache
 layout, so other models never read it. Only sessions of 256 tokens or more
 are kept, and an 8 GB free-space margin is respected.
+
+The disk tier also learns where agent runs diverge. Two runs of the same
+client share their preamble (system prompt, tool schemas, instructions
+files) and differ from the user's message on, which is before any
+checkpoint, so the second run could not resume from the first. When a prompt
+agrees with a cached lineage for at least `--durable-min-tokens` (default
+1 024; `0` turns it off) beyond where it resumed, the server writes that
+prefix as a **durable prefix entry** to the disk tier, and every later run
+with the same preamble resumes from it. Durable entries never occupy GPU
+memory; at most 16 exist, least recently used first, and they age out like
+any entry once the preamble stops matching. The `timings` object reports
+`agreement_tokens` on every request and `durable_prefix_tokens` on the one
+that wrote the entry; the log prints a `divergence at N` line with the text
+either side of the seam whenever a long shared prefix could not be resumed
+from, which is how a client that renders its preamble differently between
+runs is found. See
+`docs/architecture.md` for the rule.
 
 ### Idle unloading, health states and stopping
 

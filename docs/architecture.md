@@ -368,6 +368,62 @@ changed cache shape never reads the files.
 Writes happen on the engine thread at eviction time, at a few gigabytes per
 second, which puts them on the request path.
 
+### Durable prefix entries
+
+Checkpoints sit at `prompt_len - 1` of served prompts, which is always past
+the point where two fresh agent runs diverge: both send the same preamble
+(system prompt, tool schemas, instructions files) and differ from the user's
+message on. The second run therefore shares 20 000 tokens with the first and
+can resume from none of them, and every run after it pays the same prefill.
+
+The store already computes how far a prompt agrees with each lineage and
+threw the number away. Now `acquire` returns the **agreement**: the longest
+common prefix between the prompt and any lineage, resident or on disk,
+capped at `prompt_len - 1`. It is never below the reused position. When the
+agreement is at least `--durable-min-tokens` (default 1 024) and strictly
+beyond where the request resumed, the engine materialises it: it prefills to
+the agreement, writes a **durable prefix entry** to the disk tier (the
+per-token caches for the shared prefix and a snapshot of the recurrent state
+at its end, with the boundary as the entry's live end), drops the snapshot,
+and prefills the rest as usual. Two real prompts shared that prefix, so a
+third is likely. Within one growing conversation the agreement equals the
+reused position and nothing is written turn after turn; a parallel run that
+shares only the preamble writes it once, and the third run resumes from it.
+The prefill is split at the boundary on purpose: chunks are 4 096 tokens and
+the batched kernels are not row-count invariant, so a run resuming at the
+boundary must process the remainder in the same chunks the materialising run
+did, and it does, because both start a chunk there.
+
+Durable entries live **only on disk**. They are never kept as resident
+sessions or as extra checkpoints on a live session, because they are hit far
+more rarely than the running conversation's cache and would otherwise
+displace it from the GPU budget without anyone noticing. Reading one back
+costs the disk read of its prefix, about a second per few gigabytes, against
+tens of seconds of prefill. A hit on a durable entry always forks from the
+file and leaves it in place, even at its live end, where a hit on an evicted
+session would move it back to the GPU and delete the files.
+
+At most 16 durable entries exist at a time; storing one more deletes the
+least recently used durable entry, and evicted sessions are never chosen for
+that. Otherwise they are ordinary entries: the byte budget trims them and the
+TTL expires them, which is what retires a preamble once the client's prompt
+has changed. Nothing has to be invalidated by hand. The meta file carries a
+`durable` flag that older files lack and load as `false`; the cache bytes are
+laid out the same, so the format tag does not change.
+
+Two diagnostics come with it. The request's `timings` object and
+`GET /v1/timings` carry `agreement_tokens` on every request and
+`durable_prefix_tokens` on the one that wrote an entry; the log line adds
+`agreement N` whenever it exceeds the cached count and `durable prefix N
+written in Ts`. And when a prompt agreed for at least the threshold beyond
+where it could resume, the server prints one `divergence at N` line with the
+decoded text either side of the seam and what the cached lineage continued
+with. An ordinary hit diverges too, at the user's message, and prints
+nothing: the line is for shared text that was not reusable. A client
+that renders the same preamble differently between runs, which sets the
+ceiling on what any cache can share, shows up in that line rather than in a
+capturing proxy.
+
 ## The server
 
 One engine thread owns the model's lifetime and runs one generation at a

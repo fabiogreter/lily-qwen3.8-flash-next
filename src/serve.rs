@@ -49,7 +49,7 @@ use crate::metal::MetalContext;
 use crate::model::Qwen3_5Model;
 use crate::qwen4exp::{NgramStorage, Qwen4ExpModel};
 use api::{Defaults, Kind, Prepared};
-use session::SessionStore;
+use session::{SessionStore, boundary_position};
 use stream::{Event, OutputParser, ParserConfig};
 use timings::{Speculation, Timings, TimingsEntry, TimingsLog};
 use tools::ParsedToolCall;
@@ -131,6 +131,10 @@ pub struct ServeOptions {
     pub disk_cache_bytes: u64,
     /// Seconds an entry may go unused on disk before it is deleted (0: never).
     pub disk_cache_ttl_secs: u64,
+    /// A prefix at least this long that two prompts shared without either
+    /// being able to resume there is written to the disk tier as a durable
+    /// prefix entry, so later prompts resume from it (0 disables).
+    pub durable_min_tokens: usize,
     pub thinking: bool,
     pub reasoning_effort: Option<String>,
     pub queue: usize,
@@ -548,14 +552,21 @@ impl<M: LanguageModel> Engine<M> {
                 Some(format) => {
                     let disk = disk::DiskStore::open(dir, &format, options.disk_cache_bytes, options.disk_cache_ttl_secs)?;
                     eprintln!(
-                        "session cache: disk tier at {} ({} entries, {:.1}/{:.1} GB, entries expire after {})",
+                        "session cache: disk tier at {} ({} entries, {} durable, {:.1}/{:.1} GB, entries expire after {}; \
+                         durable prefix entries {})",
                         disk.dir().display(),
                         disk.len(),
+                        disk.durable_len(),
                         disk.used_bytes() as f64 / 1e9,
                         disk.budget_bytes() as f64 / 1e9,
-                        if disk.max_age_secs() == 0 { "never".to_owned() } else { format!("{:.1} days unused", disk.max_age_secs() as f64 / 86_400.0) }
+                        if disk.max_age_secs() == 0 { "never".to_owned() } else { format!("{:.1} days unused", disk.max_age_secs() as f64 / 86_400.0) },
+                        if options.durable_min_tokens == 0 {
+                            "off".to_owned()
+                        } else {
+                            format!("from {} shared tokens", options.durable_min_tokens)
+                        },
                     );
-                    sessions = sessions.with_disk(disk);
+                    sessions = sessions.with_disk(disk).with_durable_min_tokens(options.durable_min_tokens);
                 }
                 None => eprintln!("session cache: {} cannot persist sessions; disk tier off", M::MODEL_ID),
             }
@@ -668,16 +679,63 @@ impl<M: LanguageModel> Engine<M> {
         let acquired = sessions.acquire(ctx, model, &p.prompt, p.cache_key.as_deref())?;
         let mut session = acquired.session;
         let reused = acquired.reused;
+        let agreement = acquired.agreement;
         ensure!(reused < n, "session cache returned the whole prompt");
+        ensure!(reused <= agreement, "session cache resumed at {reused} past the agreement {agreement}");
+
+        // A shared prefix the cache could not resume from becomes a durable
+        // disk entry: prefill up to the boundary, write the caches and the
+        // recurrent state there, then carry on. The prefill is split at the
+        // boundary on purpose: chunks are 4 096 tokens and the kernels are
+        // not row-count invariant, so a later run that resumes at the boundary
+        // must prefill the rest in the same chunks this run did. The snapshot
+        // is dropped, not kept as a checkpoint: durable entries live on disk
+        // only (see the session module).
+        let min_tokens = sessions.durable_min_tokens();
+        let boundary = sessions.disk().and_then(|_| boundary_position(agreement, reused, n, min_tokens));
+        let mut durable: Option<(usize, f64)> = None;
+        let mut prefilled = reused;
+        if let Some(b) = boundary {
+            if prefilled < b {
+                model.prefill(ctx, &mut session.state, scratch, &p.prompt[prefilled..b], None)?;
+                prefilled = b;
+            }
+            let write_started = Instant::now();
+            let snapshot = session.state.snapshot(ctx)?;
+            match sessions.store_durable(&p.prompt[..b], p.cache_key.as_deref(), &session.state, &snapshot) {
+                Ok(Some(_)) => durable = Some((b, write_started.elapsed().as_secs_f64())),
+                Ok(None) => eprintln!("session cache: the disk tier did not keep the durable prefix at {b}"),
+                Err(error) => eprintln!("session cache: writing the durable prefix at {b} failed: {error:#}"),
+            }
+            drop(snapshot);
+        }
 
         // Prefix up to the last prompt token, then checkpoint there so an
         // identical or extended prompt can resume without re-feeding it.
-        if reused < n - 1 {
-            model.prefill(ctx, &mut session.state, scratch, &p.prompt[reused..n - 1], None)?;
+        if prefilled < n - 1 {
+            model.prefill(ctx, &mut session.state, scratch, &p.prompt[prefilled..n - 1], None)?;
         }
         let snapshot = session.state.snapshot(ctx)?;
         session.add_checkpoint(snapshot);
         let prefix_secs = started.elapsed().as_secs_f64();
+
+        // A long shared prefix that nothing could resume from: show the seam
+        // once, as the text either side of it in this prompt and what the
+        // cached lineage continued with. This is how a client that renders
+        // the same preamble differently between runs is found at a glance.
+        // An ordinary hit (`agreement == reused`) diverges too, at the user's
+        // message, and says nothing worth a line of prompt text in the log.
+        if min_tokens > 0 && agreement >= min_tokens && agreement > reused && agreement < n - 1 {
+            let tokenizer = generator.tokenizer();
+            let text = |ids: &[u32]| tokenizer.decode(ids, false).unwrap_or_else(|e| format!("<undecodable: {e}>"));
+            let window = 12;
+            eprintln!(
+                "divergence at {agreement}: prompt {:?} | {:?}, cached lineage continued {:?}",
+                text(&p.prompt[agreement.saturating_sub(window)..agreement]),
+                text(&p.prompt[agreement..(agreement + window).min(n)]),
+                text(&acquired.divergent_tail[..acquired.divergent_tail.len().min(window)]),
+            );
+        }
 
         let created = now();
         let id = format!("{}-{}-{}", if p.kind == Kind::Chat { "chatcmpl" } else { "cmpl" }, created, *next_id);
@@ -782,12 +840,14 @@ impl<M: LanguageModel> Engine<M> {
             _ => "stop",
         };
         eprintln!(
-            "{}: {} prompt tokens ({} cached{}{}), {} generated, prefix {:.2}s, decode {:.2}s ({:.1} tok/s){}, finish={finish_reason}, sessions={} ({:.1}/{:.1} GB){}",
+            "{}: {} prompt tokens ({} cached{}{}{}{}), {} generated, prefix {:.2}s, decode {:.2}s ({:.1} tok/s){}, finish={finish_reason}, sessions={} ({:.1}/{:.1} GB){}",
             id,
             n,
             reused,
             if acquired.forked { ", forked" } else { "" },
             acquired.from_disk.map(|d| format!(", from disk in {:.2}s", d.as_secs_f64())).unwrap_or_default(),
+            if agreement > reused { format!(", agreement {agreement}") } else { String::new() },
+            durable.map(|(b, secs)| format!(", durable prefix {b} written in {secs:.2}s")).unwrap_or_default(),
             completion_tokens,
             prefix_secs,
             decode_secs,
@@ -812,7 +872,8 @@ impl<M: LanguageModel> Engine<M> {
             completion_tokens,
             decode_secs,
             (*drafts > 0).then_some(Speculation { drafted: generation.drafted, accepted: generation.accepted }),
-        );
+        )
+        .with_agreement(agreement, durable.map(|(b, _)| b));
         timings.record(TimingsEntry { id: id.clone(), model: M::MODEL_ID, created, timings: measured });
         if sink.cancelled() {
             return Ok(());

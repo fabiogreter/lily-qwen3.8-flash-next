@@ -13,6 +13,15 @@
 //! the meta files at startup, so the tier survives restarts. Entries whose
 //! format tag differs are left alone (they belong to another model or layout)
 //! but never read.
+//!
+//! A **durable** entry is a materialised prefix boundary rather than an
+//! evicted session (see the session module). It is written the same way,
+//! with the boundary as its live end, and differs only in lifecycle: a hit
+//! never consumes it, and at most [`DURABLE_MAX_ENTRIES`] exist at a time,
+//! the least recently used going first, because every shared prefix an agent
+//! client ever sent is a candidate and only the ones still being hit matter.
+//! Otherwise it ages and trims like any entry, which is what retires a
+//! preamble once the client's prompt has changed.
 
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -26,6 +35,11 @@ use serde::{Deserialize, Serialize};
 const FREE_SPACE_MARGIN: u64 = 8 << 30;
 const META: &str = "meta.json";
 const PREFIX: &str = "prefix.bin";
+/// Most durable prefix entries kept at a time; the least recently used goes
+/// when one more is stored. Sixteen covers a handful of agent clients and
+/// projects each with a preamble or two, while keeping what a run of
+/// nondeterministic prompts could pile up bounded.
+pub const DURABLE_MAX_ENTRIES: usize = 16;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Meta {
@@ -37,6 +51,11 @@ struct Meta {
     /// Seconds since the epoch of the last store or hit.
     last_used: u64,
     cache_key: Option<String>,
+    /// A materialised prefix boundary rather than an evicted session. Meta
+    /// files written before the field existed load as `false`; the format
+    /// tag stays, since the cache bytes are laid out the same.
+    #[serde(default)]
+    durable: bool,
 }
 
 /// One persisted session (its token list stays in memory for prefix matching).
@@ -47,6 +66,17 @@ pub struct DiskEntry {
     pub bytes: u64,
     pub last_used: u64,
     pub cache_key: Option<String>,
+    /// Whether this is a durable prefix entry (never consumed by a hit).
+    pub durable: bool,
+}
+
+/// What a store call describes about the entry it is about to write.
+#[derive(Clone, Copy)]
+struct NewEntry<'a> {
+    tokens: &'a [u32],
+    cache_key: Option<&'a str>,
+    checkpoints: &'a [usize],
+    durable: bool,
 }
 
 pub struct DiskStore {
@@ -96,6 +126,7 @@ impl DiskStore {
                         bytes: meta.bytes,
                         last_used: meta.last_used,
                         cache_key: meta.cache_key,
+                        durable: meta.durable,
                     });
                 }
                 Err(error) => {
@@ -168,6 +199,11 @@ impl DiskStore {
         &self.entries
     }
 
+    /// Durable prefix entries currently held (at most [`DURABLE_MAX_ENTRIES`]).
+    pub fn durable_len(&self) -> usize {
+        self.entries.iter().filter(|e| e.durable).count()
+    }
+
     /// Writes a session: `prefix` streams the per-token caches for all of
     /// `tokens`, `checkpoint(pos, w)` streams the snapshot at each position in
     /// `checkpoints` (which must include `tokens.len()`). Returns the new id,
@@ -180,16 +216,49 @@ impl DiskStore {
         prefix: &mut dyn FnMut(&mut dyn Write) -> Result<()>,
         checkpoint: &mut dyn FnMut(usize, &mut dyn Write) -> Result<()>,
     ) -> Result<Option<String>> {
+        self.store_with(false, tokens, cache_key, checkpoints, prefix, checkpoint)
+    }
+
+    /// [`Self::store`] for a durable prefix entry: `tokens` is the shared
+    /// prefix and its length the one checkpoint. Storing the entry that takes
+    /// the count past [`DURABLE_MAX_ENTRIES`] deletes the least recently used
+    /// durable entry; evicted sessions are never touched for it.
+    pub fn store_durable(
+        &mut self,
+        tokens: &[u32],
+        cache_key: Option<&str>,
+        checkpoints: &[usize],
+        prefix: &mut dyn FnMut(&mut dyn Write) -> Result<()>,
+        checkpoint: &mut dyn FnMut(usize, &mut dyn Write) -> Result<()>,
+    ) -> Result<Option<String>> {
+        self.store_with(true, tokens, cache_key, checkpoints, prefix, checkpoint)
+    }
+
+    fn store_with(
+        &mut self,
+        durable: bool,
+        tokens: &[u32],
+        cache_key: Option<&str>,
+        checkpoints: &[usize],
+        prefix: &mut dyn FnMut(&mut dyn Write) -> Result<()>,
+        checkpoint: &mut dyn FnMut(usize, &mut dyn Write) -> Result<()>,
+    ) -> Result<Option<String>> {
         ensure!(!tokens.is_empty(), "empty session");
         ensure!(checkpoints.contains(&tokens.len()), "the live end must be a checkpoint");
         self.expire();
         let id = format!("s{}", self.next_id);
         let path = self.dir.join(&id);
-        let result = self.write_entry(&path, tokens, cache_key, checkpoints, prefix, checkpoint);
+        let new = NewEntry { tokens, cache_key, checkpoints, durable };
+        let result = self.write_entry(&path, &new, prefix, checkpoint);
         match result {
             Ok(Some(entry)) => {
                 self.next_id += 1;
                 self.entries.push(entry);
+                // The cap first, so the new entry (the most recent) is what
+                // stays when the budget trim below has to choose.
+                if durable {
+                    self.trim_durable();
+                }
                 self.trim(0);
                 Ok(Some(id))
             }
@@ -207,12 +276,11 @@ impl DiskStore {
     fn write_entry(
         &mut self,
         path: &Path,
-        tokens: &[u32],
-        cache_key: Option<&str>,
-        checkpoints: &[usize],
+        new: &NewEntry<'_>,
         prefix: &mut dyn FnMut(&mut dyn Write) -> Result<()>,
         checkpoint: &mut dyn FnMut(usize, &mut dyn Write) -> Result<()>,
     ) -> Result<Option<DiskEntry>> {
+        let NewEntry { tokens, cache_key, checkpoints, durable } = *new;
         fs::create_dir_all(path)?;
         let mut bytes = 0u64;
         {
@@ -248,6 +316,7 @@ impl DiskStore {
             bytes,
             last_used: now_secs(),
             cache_key: cache_key.map(str::to_owned),
+            durable,
         };
         fs::write(path.join(META), serde_json::to_vec(&meta)?)?;
         Ok(Some(DiskEntry {
@@ -257,6 +326,7 @@ impl DiskStore {
             bytes,
             last_used: meta.last_used,
             cache_key: meta.cache_key,
+            durable,
         }))
     }
 
@@ -286,10 +356,20 @@ impl DiskStore {
                 bytes: entry.bytes,
                 last_used: now,
                 cache_key: entry.cache_key.clone(),
+                durable: entry.durable,
             };
             if let Ok(json) = serde_json::to_vec(&meta) {
                 let _ = fs::write(dir.join(id).join(META), json);
             }
+        }
+    }
+
+    /// Deletes least-recently-used durable entries until at most
+    /// [`DURABLE_MAX_ENTRIES`] remain. Evicted sessions are not candidates.
+    fn trim_durable(&mut self) {
+        while self.durable_len() > DURABLE_MAX_ENTRIES {
+            let Some(victim) = self.entries.iter().filter(|e| e.durable).min_by_key(|e| e.last_used).map(|e| e.id.clone()) else { break };
+            self.remove(&victim);
         }
     }
 

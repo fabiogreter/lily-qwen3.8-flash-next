@@ -55,6 +55,14 @@ struct Cli {
     #[arg(long, default_value = "3d")]
     disk_cache_ttl: String,
 
+    /// A prefix at least this many tokens long that two prompts shared but
+    /// that no cached session could resume from (two agent runs with the
+    /// same preamble diverge before any checkpoint) is written to the disk
+    /// tier as a durable prefix entry, so later runs resume from it instead
+    /// of prefilling it again. Needs the disk tier; `0` turns it off.
+    #[arg(long, default_value_t = 1024)]
+    durable_min_tokens: usize,
+
     /// Unload the model (weights, caches, the n-gram table) after this long
     /// without a request, e.g. `30m`, `2h`; resident sessions go to the disk
     /// tier first and the next request reloads it while it waits. `0` keeps
@@ -153,6 +161,7 @@ fn main() -> Result<()> {
         disk_cache_dir: Some(cli.disk_cache_dir.unwrap_or_else(default_disk_cache_dir)),
         disk_cache_bytes: parse_bytes(&cli.disk_cache_bytes)? as u64,
         disk_cache_ttl_secs: parse_duration_secs(&cli.disk_cache_ttl)?,
+        durable_min_tokens: cli.durable_min_tokens,
         ngram_storage: cli.ngram_table,
         ngram_preload: cli.ngram_preload,
         ngram_lock: cli.ngram_lock,

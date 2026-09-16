@@ -72,11 +72,14 @@ pub trait DecodeStateApi: Sized {
         anyhow::bail!("this model does not persist sessions")
     }
 
-    /// Fills the first `tokens` entries of every per-token cache from `r`
-    /// (capacity permitting; grow first). GPU idle; follow up with
-    /// [`Self::restore`].
-    fn read_prefix(&mut self, ctx: &MetalContext, tokens: usize, r: &mut dyn std::io::Read) -> Result<()> {
-        let _ = (ctx, tokens, r);
+    /// Fills the first `tokens` entries of every per-token cache from `r`,
+    /// which holds what [`Self::write_prefix`] wrote for `written` tokens
+    /// (`tokens <= written`): the layout is region by region, so a reader
+    /// that wants a shorter prefix has to skip each region's tail rather
+    /// than stop early. Grows the capacity as needed. GPU idle; follow up
+    /// with [`Self::restore`].
+    fn read_prefix(&mut self, ctx: &MetalContext, written: usize, tokens: usize, r: &mut dyn std::io::Read) -> Result<()> {
+        let _ = (ctx, written, tokens, r);
         anyhow::bail!("this model does not persist sessions")
     }
 }

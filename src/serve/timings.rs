@@ -62,6 +62,15 @@ pub struct Timings {
     /// `accepted_tokens / drafted_tokens` in `0.0..=1.0`, `null` when
     /// speculative decoding is off or proposed nothing.
     pub acceptance_ratio: Option<f64>,
+    /// How far the prompt agreed with any lineage the session cache knew,
+    /// resident or on disk, capped at `prompt_tokens - 1`. Always at least
+    /// `cached_tokens`; a gap between the two is a shared prefix nothing
+    /// could resume from (a durable prefix entry closes it for later runs).
+    pub agreement_tokens: usize,
+    /// Position of the durable prefix entry this request wrote, when it
+    /// wrote one; absent otherwise, so nothing reads as a zero-length write.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub durable_prefix_tokens: Option<usize>,
 }
 
 /// Tokens per second, or `None` when either side is zero: a rate over no
@@ -103,7 +112,18 @@ impl Timings {
             acceptance_ratio: speculation
                 .filter(|s| s.drafted > 0)
                 .map(|s| round(s.accepted.min(s.drafted) as f64 / s.drafted as f64, 1e4)),
+            agreement_tokens: cached_tokens,
+            durable_prefix_tokens: None,
         }
+    }
+
+    /// Adds what the session cache saw beyond the reused prefix: the
+    /// agreement with any lineage (never less than `cached_tokens`) and the
+    /// durable prefix entry written for it, if one was.
+    pub fn with_agreement(mut self, agreement_tokens: usize, durable_prefix_tokens: Option<usize>) -> Self {
+        self.agreement_tokens = agreement_tokens.clamp(self.cached_tokens, self.prompt_tokens);
+        self.durable_prefix_tokens = durable_prefix_tokens;
+        self
     }
 }
 

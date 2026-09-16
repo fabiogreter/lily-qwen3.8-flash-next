@@ -85,7 +85,7 @@ fn persisted_session_continues_like_the_original() -> Result<()> {
 
     // Restored from the bytes into a fresh state.
     let mut restored = model.new_state(&ctx, 8)?;
-    restored.read_prefix(&ctx, n - 1, &mut Cursor::new(&prefix_bytes))?;
+    restored.read_prefix(&ctx, n - 1, n - 1, &mut Cursor::new(&prefix_bytes))?;
     let read_back = model.read_snapshot(&ctx, &mut Cursor::new(&snapshot_bytes))?;
     assert_eq!(read_back.pos(), n - 1);
     restored.restore(&ctx, &read_back)?;
@@ -93,5 +93,20 @@ fn persisted_session_continues_like_the_original() -> Result<()> {
     let actual = generator.generate(&ctx, &model, &mut restored, &mut scratch, &prompt[n - 1..], &options, &mut |_| Ok(true))?;
     assert_eq!(actual.tokens, expected.tokens);
     assert!(model.persistence_format().is_some());
+
+    // A checkpoint hit inside a longer entry: the disk tier writes an evicted
+    // session at its live end (the generated tokens included) and a later
+    // prompt resumes at an earlier checkpoint. The regions of the longer
+    // layout must be skipped, not read back to back.
+    let live_end = original.pos();
+    assert!(live_end > n - 1, "generation advanced the state");
+    let mut longer_bytes = Vec::new();
+    original.write_prefix(live_end, &mut longer_bytes)?;
+    assert!(longer_bytes.len() > prefix_bytes.len());
+    let mut from_longer = model.new_state(&ctx, 8)?;
+    from_longer.read_prefix(&ctx, live_end, n - 1, &mut Cursor::new(&longer_bytes))?;
+    from_longer.restore(&ctx, &read_back)?;
+    let from_checkpoint = generator.generate(&ctx, &model, &mut from_longer, &mut scratch, &prompt[n - 1..], &options, &mut |_| Ok(true))?;
+    assert_eq!(from_checkpoint.tokens, expected.tokens, "a prefix read out of a longer layout must match");
     Ok(())
 }

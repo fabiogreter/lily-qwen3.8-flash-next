@@ -370,19 +370,33 @@ impl SnapshotApi for Snapshot {
 
 /// Visits an attention layer's cache regions holding the first `tokens`
 /// entries, in the fixed persistence order: K per head, V per head, indexer
-/// keys, block keys of the blocks those tokens start.
-fn attn_prefix_regions(lstate: &LayerState, tokens: usize, ratio: usize, f: &mut dyn FnMut(&Tensor) -> Result<()>) -> Result<()> {
+/// keys, block keys of the blocks those tokens start. `written` is how many
+/// tokens the persisted layout was produced for (`>= tokens`); `f` gets each
+/// region's view of `tokens` rows and the bytes the layout holds after them
+/// for that region, so a reader of a shorter prefix can skip them. Writers
+/// pass `written == tokens` and get zero.
+fn attn_prefix_regions(
+    lstate: &LayerState,
+    tokens: usize,
+    written: usize,
+    ratio: usize,
+    f: &mut dyn FnMut(&Tensor, usize) -> Result<()>,
+) -> Result<()> {
     let LayerState::Attn { k_cache, v_cache, idx_keys, blk_keys } = lstate else { return Ok(()) };
+    ensure!(tokens <= written, "prefix of {tokens} tokens from a layout of {written}");
     for cache in [k_cache, v_cache] {
         let (heads, cap, d) = (cache.shape()[0], cache.shape()[1], cache.shape()[2]);
         ensure!(tokens <= cap, "prefix of {tokens} exceeds capacity {cap}");
+        let tail = (written - tokens) * d * cache.dtype().size();
         for h in 0..heads {
-            f(&cache.view(h * cap * d, &[tokens, d])?)?;
+            f(&cache.view(h * cap * d, &[tokens, d])?, tail)?;
         }
     }
-    f(&idx_keys.view(0, &[tokens, INDEXER_D])?)?;
+    let row = INDEXER_D * idx_keys.dtype().size();
+    f(&idx_keys.view(0, &[tokens, INDEXER_D])?, (written - tokens) * row)?;
     let blocks = tokens.div_ceil(ratio).min(blk_keys.shape()[0]);
-    f(&blk_keys.view(0, &[blocks, INDEXER_D])?)
+    let written_blocks = written.div_ceil(ratio).min(blk_keys.shape()[0]);
+    f(&blk_keys.view(0, &[blocks, INDEXER_D])?, (written_blocks - blocks) * INDEXER_D * blk_keys.dtype().size())
 }
 
 fn clone_tensor(ctx: &MetalContext, t: &Tensor) -> Result<Tensor> {
@@ -2413,18 +2427,31 @@ impl DecodeStateApi for DecodeState {
 
     fn write_prefix(&self, tokens: usize, w: &mut dyn std::io::Write) -> Result<()> {
         ensure!(tokens <= self.pos, "state has fed {} tokens, {tokens} requested", self.pos);
-        let mut sink = |t: &Tensor| t.write_to(w);
+        let mut sink = |t: &Tensor, _: usize| t.write_to(w);
         for lstate in self.layers.iter().chain(self.mtp.as_ref().map(|m| &m.layer)) {
-            attn_prefix_regions(lstate, tokens, self.ratio, &mut sink)?;
+            attn_prefix_regions(lstate, tokens, tokens, self.ratio, &mut sink)?;
         }
         Ok(())
     }
 
-    fn read_prefix(&mut self, ctx: &MetalContext, tokens: usize, r: &mut dyn std::io::Read) -> Result<()> {
+    /// Reads a `tokens`-token prefix out of a layout written for `written`
+    /// tokens. Each region's rows past `tokens` are skipped, not stopped at:
+    /// the regions follow one another, so stopping early would read the next
+    /// head's rows as this one's (a checkpoint hit inside a longer disk entry
+    /// once did exactly that).
+    fn read_prefix(&mut self, ctx: &MetalContext, written: usize, tokens: usize, r: &mut dyn std::io::Read) -> Result<()> {
+        ensure!(tokens <= written, "prefix of {tokens} tokens from a layout of {written}");
         self.ensure_capacity(ctx, tokens)?;
-        let mut source = |t: &Tensor| t.fill_from(r);
+        let mut source = |t: &Tensor, tail: usize| {
+            t.fill_from(r)?;
+            if tail > 0 {
+                let skipped = std::io::copy(&mut std::io::Read::take(&mut *r, tail as u64), &mut std::io::sink())?;
+                ensure!(skipped == tail as u64, "prefix file ends {} bytes early", tail as u64 - skipped);
+            }
+            Ok(())
+        };
         for lstate in self.layers.iter().chain(self.mtp.as_ref().map(|m| &m.layer)) {
-            attn_prefix_regions(lstate, tokens, self.ratio, &mut source)?;
+            attn_prefix_regions(lstate, tokens, written, self.ratio, &mut source)?;
         }
         Ok(())
     }

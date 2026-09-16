@@ -16,7 +16,7 @@ fn copy_state(ctx: &MetalContext, model: &Qwen4ExpModel, src: &DecodeState, toke
     src.write_prefix(tokens, &mut bytes).expect("prefix");
     let snap = src.snapshot(ctx).expect("snapshot");
     let mut dst = model.new_state(ctx, capacity).expect("state");
-    dst.read_prefix(ctx, tokens, &mut std::io::Cursor::new(&bytes)).expect("read prefix");
+    dst.read_prefix(ctx, tokens, tokens, &mut std::io::Cursor::new(&bytes)).expect("read prefix");
     dst.restore(ctx, &snap).expect("restore");
     dst
 }
