@@ -2,7 +2,9 @@
 
 Python helpers around the Qwen3.8-Flash-Next port. They run from the project
 venv (`uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python
-mlx safetensors numpy torch "transformers @ git+https://github.com/huggingface/transformers"`).
+mlx safetensors numpy torch torchvision pillow "transformers @ git+https://github.com/huggingface/transformers"`;
+`torchvision` and `pillow` are for the vision reference: the checkpoint's image
+processor is the torchvision-backed `Qwen2VLImageProcessorFast`).
 
 ## convert/convert_qwen38_flash_next.py
 
@@ -55,6 +57,38 @@ Result on the 4-layer model, prompt "The capital of Switzerland is", 8 greedy
 steps: against the dequantized weights lily agrees at 9/9 positions with a
 worst shared-id logit gap of 0.26; against the raw bf16 weights 7/9, the rest
 being quantization error.
+
+## reference/hf_vision_reference.py, compare_vision.py, make_images.py
+
+The vision counterpart (docs/vision-support-plan.md, item 1). `make_images.py`
+writes the four synthetic test images in `reference/images/` (333 x 777,
+640 x 480, 1920 x 1080, 3840 x 2160; `images.json` has their sha256).
+`hf_vision_reference.py` produces one golden per comparison in the plan from
+`Qwen4ExpForConditionalGeneration` and its parts: `preprocess` (pixel_values,
+image_grid_thw), `tower` (`Qwen4ExpVisionModel` in float32 on the CPU),
+`positions` (expanded input_ids, 3-axis position_ids, rope_deltas) and
+`forward` (4-layer logits with the image, or the text-only control), plus
+`measure-preprocess` and `measure-tower`, which write the tolerance floors to
+`goldens/vision_tolerance_floors.json`. Every golden records the pixel cap it
+was made with; the default is lily's server-side cap, `--image-max-pixels
+2097152` (2 048 tokens) and `--image-min-pixels 65536`. Full tensors go to
+`goldens/large/` (not tracked); the JSON keeps shape, sha256, statistics and a
+seeded 4 096-element sample.
+
+```sh
+.venv/bin/python tools/reference/hf_vision_reference.py preprocess --src ~/models/Qwen3.8-Flash-Next \
+    --image tools/reference/images/333x777.png
+.venv/bin/python tools/reference/hf_vision_reference.py tower      --src ... --image ...
+.venv/bin/python tools/reference/hf_vision_reference.py positions  --src ... --image ...
+.venv/bin/python tools/reference/hf_vision_reference.py forward    --src ... --lily <dir>-l4 --image ... --greedy 4
+.venv/bin/python tools/reference/compare_vision.py lily_record.json tools/reference/goldens/hf_vision_tower_333x777_cap2097152.json
+```
+
+`compare_vision.py` judges a candidate in the same JSON format: comparisons 1
+and 2 within tolerance (max abs and rel error, cosine, relative L2, fraction
+within tolerance), comparison 3 exactly, comparison 4 through `compare.py`.
+The facts lily's implementation has to reproduce, with the tolerances and the
+numbers behind them, are in `reference/VISION.md`.
 
 ## bench/timeline.sh and bench/summarize.py
 

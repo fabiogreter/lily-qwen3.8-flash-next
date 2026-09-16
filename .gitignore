@@ -8,6 +8,10 @@ tools/.venv/
 .venv/
 __pycache__/
 
+# Full tensors behind the vision goldens (pixel_values, tower embeddings); the
+# committed JSON keeps their shape, sha256, statistics and a seeded sample.
+tools/reference/goldens/large/
+
 # Benchmark and profiling output.
 bench-results/
 *.gputrace

@@ -1,0 +1,30 @@
+{
+ "333x777": {
+  "file": "333x777.png",
+  "width": 333,
+  "height": 777,
+  "bytes": 6575,
+  "sha256": "177822b51dbbc33443bce37e1d00ea3ccf051d1fb5b8076a4c18507d8b5cffca"
+ },
+ "640x480": {
+  "file": "640x480.png",
+  "width": 640,
+  "height": 480,
+  "bytes": 9102,
+  "sha256": "fee5f708df5918e087b3d95c92fe3233e7580dcea0b32fa890b1b3d2abfc3ab5"
+ },
+ "1920x1080": {
+  "file": "1920x1080.png",
+  "width": 1920,
+  "height": 1080,
+  "bytes": 38569,
+  "sha256": "c968d10dc61a812bc2e49e4238bd3a26c29f3271dc72bd1312ddb8efb9d38999"
+ },
+ "3840x2160": {
+  "file": "3840x2160.png",
+  "width": 3840,
+  "height": 2160,
+  "bytes": 77930,
+  "sha256": "8e2e553d598ec7d3cad9bdaa3fd3139511f4ce1bd97c2c40195df2fb8e81efe1"
+ }
+}

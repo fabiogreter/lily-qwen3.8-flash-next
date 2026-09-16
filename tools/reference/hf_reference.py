@@ -31,6 +31,7 @@ import math
 import struct
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -250,10 +251,20 @@ _PLE_CONSTS = ("layer_multipliers", "ngram_heads_vocab_sizes", "ngram_heads_offs
 
 
 def build_state_dict(
-    model, store: Store, lily: LilyWeights | None, text_cfg: dict, ple_consts: dict | None
+    model,
+    store: Store,
+    lily: LilyWeights | None,
+    text_cfg: dict,
+    ple_consts: dict | None,
+    rename: Callable[[str], str] | None = None,
 ) -> dict[str, torch.Tensor]:
     """HF parameter names -> tensors, from either weight source. lily's
-    checkpoint carries the PLE hash constants in config.json, not as tensors."""
+    checkpoint carries the PLE hash constants in config.json, not as tensors.
+
+    `rename` maps a parameter name of `model` to its checkpoint name; the
+    default is the `Qwen4ExpForCausalLM` layout (`model.` -> `model.language_model.`).
+    `hf_vision_reference.py` passes its own for the submodules of
+    `Qwen4ExpForConditionalGeneration`."""
     h = text_cfg["hidden_size"]
     inter = text_cfg["moe_intermediate_size"]
     state: dict[str, torch.Tensor] = {}
@@ -262,7 +273,10 @@ def build_state_dict(
     for name, param in wanted.items():
         if "ngram_embedding.weight" in name:
             continue
-        src = "model.language_model." + name[len("model."):] if name.startswith("model.") else name
+        if rename is not None:
+            src = rename(name)
+        else:
+            src = "model.language_model." + name[len("model."):] if name.startswith("model.") else name
         if name.endswith(_PLE_CONSTS) and not store.has(src):
             key = name.rsplit(".", 1)[1]
             if not ple_consts or key not in ple_consts:
