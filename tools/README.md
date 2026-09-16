@@ -90,6 +90,20 @@ was made with; the default is lily's server-side cap, `--image-max-pixels
 `goldens/large/` (not tracked); the JSON keeps shape, sha256, statistics and a
 seeded 4 096-element sample.
 
+`lily-vision-probe` is the Rust side of comparison 2: it loads only the tower
+from a converted checkpoint, runs it over a golden's `pixel_values` (the
+matching `goldens/large/preprocess_<img>_cap<max>.pixel_values.npy`, or
+`--pixels`), and writes the merged and pre-merger outputs as `.npy` plus a
+candidate JSON in the golden format, carrying the golden's own sample indices.
+`--repeat` times the runs, `--kernel-profile` prints GPU ms per kernel,
+`--blocks N` stops after N transformer blocks for block-by-block comparisons.
+
+```sh
+cargo run --release --bin lily-vision-probe -- --model <dir>-l4 \
+    --golden tools/reference/goldens/hf_vision_tower_333x777_cap2097152.json --out lily_tower.json
+.venv/bin/python tools/reference/compare_vision.py lily_tower.json tools/reference/goldens/hf_vision_tower_333x777_cap2097152.json
+```
+
 ```sh
 .venv/bin/python tools/reference/hf_vision_reference.py preprocess --src ~/models/Qwen3.8-Flash-Next \
     --image tools/reference/images/333x777.png

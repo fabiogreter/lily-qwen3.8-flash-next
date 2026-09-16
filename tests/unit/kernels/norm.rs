@@ -73,3 +73,42 @@ fn add_rmsnorm_matches_unfused_pair() {
         1e-2,
     );
 }
+
+#[test]
+fn layernorm_matches_cpu() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(5);
+    // The tower's width, with rows offset far from zero (pre-merger states
+    // reach 1e4 with a std of 1e2), where a one-pass variance would cancel.
+    let (m, h) = (4, 1152);
+    let x: Vec<f32> = (0..m * h)
+        .map(|i| 1000.0 * (i / h) as f32 + rng.gen_range(-100.0f32..100.0))
+        .collect();
+    let w: Vec<f32> = (0..h).map(|_| rng.gen_range(0.5f32..1.5)).collect();
+    let b: Vec<f32> = (0..h).map(|_| rng.gen_range(-0.5f32..0.5)).collect();
+    let eps = 1e-6;
+
+    let tx = Tensor::from_f32_as_bf16(&ctx, &x, &[m, h]).expect("x");
+    let tw = Tensor::from_f32_as_bf16(&ctx, &w, &[h]).expect("w");
+    let tb = Tensor::from_f32_as_bf16(&ctx, &b, &[h]).expect("b");
+    let out = Tensor::zeros(&ctx, &[m, h], DType::BF16).expect("out");
+
+    let pass = ctx.begin().expect("pass");
+    layernorm_bf16(&ctx, &pass, &tx, &tw, &tb, &out, eps).expect("layernorm");
+    pass.commit_wait().expect("commit");
+
+    let (rx, rw, rb) =
+        (cpu_ref::round_bf16(&x), cpu_ref::round_bf16(&w), cpu_ref::round_bf16(&b));
+    let mut expected = vec![0.0f32; m * h];
+    for row in 0..m {
+        let xs = &rx[row * h..(row + 1) * h];
+        let mean = xs.iter().sum::<f32>() / h as f32;
+        let var = xs.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / h as f32;
+        let inv = 1.0 / (var + eps).sqrt();
+        for i in 0..h {
+            expected[row * h + i] = (xs[i] - mean) * inv * rw[i] + rb[i];
+        }
+    }
+    // Normalized values of order 1 in bf16: one ulp is 2^-8.
+    cpu_ref::assert_close(&out.to_f32().expect("read"), &expected, 1e-2, 1e-2);
+}

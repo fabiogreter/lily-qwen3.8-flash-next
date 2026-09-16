@@ -186,3 +186,36 @@ kernel void argmax_f32_final(device const ArgMaxPair* partials [[buffer(0)]],
         out[0] = bi;
     }
 }
+
+// erf for the exact GELU: Metal's standard library has none. Abramowitz and
+// Stegun 7.1.26, absolute error below 1.5e-7, three orders under a bf16 ulp
+// of any GELU output.
+static inline float erf_f32(float x) {
+    const float sign = x < 0.0f ? -1.0f : 1.0f;
+    const float a = abs(x);
+    const float t = 1.0f / (1.0f + 0.3275911f * a);
+    const float poly = t * (0.254829592f
+        + t * (-0.284496736f
+        + t * (1.421413741f
+        + t * (-1.453152027f + t * 1.061405429f))));
+    return sign * (1.0f - poly * exp(-a * a));
+}
+
+// x = gelu(x) in place. `erf_form` 0 is the tanh approximation
+// (`gelu_pytorch_tanh`, the vision tower's blocks), 1 the exact erf form
+// (`nn.GELU()`, its merger); the activation runs in fp32.
+kernel void gelu_bf16(device bfloat*  x        [[buffer(0)]],
+                      constant uint&  erf_form [[buffer(1)]],
+                      uint gid [[thread_position_in_grid]]) {
+    const float v = float(x[gid]);
+    float g;
+    if (erf_form != 0u) {
+        g = 0.5f * v * (1.0f + erf_f32(v * 0.70710678118654752f));
+    } else {
+        // 0.5 x (1 + tanh(u)) written as x * sigmoid(2u): the same function
+        // without the `1 + tanh` cancellation in the negative tail.
+        const float u = 0.79788456080286536f * (v + 0.044715f * v * v * v);
+        g = v / (1.0f + exp(-2.0f * u));
+    }
+    x[gid] = bfloat(g);
+}

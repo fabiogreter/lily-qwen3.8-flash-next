@@ -16,6 +16,7 @@ pub mod quant;
 pub mod sample;
 pub mod skinny;
 pub mod spec;
+pub mod vision;
 
 pub fn u32_bytes(v: usize) -> [u8; 4] {
     (v as u32).to_ne_bytes()

@@ -27,6 +27,10 @@ path = "src/bin/lily-bench.rs"
 name = "lily-probe"
 path = "src/bin/lily-probe.rs"
 
+[[bin]]
+name = "lily-vision-probe"
+path = "src/bin/lily-vision-probe.rs"
+
 [dependencies]
 anyhow = { version = "1.0.102", features = ["backtrace"] }
 bytemuck = { version = "1.25.0", features = ["extern_crate_alloc"] }

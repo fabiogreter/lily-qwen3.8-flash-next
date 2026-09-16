@@ -52,11 +52,43 @@ PREPROCESS_TOLERANCE = {"atol": 2 / 255 + 0.002, "rtol": 0.0, "max_atol": 3 * 2 
 # 0.127, and 99.94 % or more of the elements within 0.02 + 0.05 |golden|. The
 # pre-merger hidden states have per-token norms spanning four orders of
 # magnitude, so they are reported, not judged.
-TOWER_TOLERANCE = {"atol": 0.02, "rtol": 0.05, "max_atol": None, "min_frac": 0.999, "min_cosine": 0.995, "max_rel_l2": 0.10}
+#
+# The within-fraction gate is measured, not fixed: the elements outside the
+# tolerance sit in a handful of tokens whose massive-activation channel (near 1e4
+# in the residual) flips by about 1 000 under bf16 rounding, in the reference as
+# much as in a port, so an absolute fraction does not separate a correct bf16
+# implementation from a wrong one (the reference itself with an f32 residual
+# stream lands at 0.99878 on 333 x 777, under the old 0.999). The threshold is
+# the bf16 reference's own fraction on that image and cap
+# (`goldens/vision_tolerance_floors.json`, `tower_bf16_vs_f32`) minus
+# `frac_margin`. The margin of 0.002 covers the run-to-run spread of the bf16
+# reference with room: bf16 on the CPU against bf16 on MPS moved the fraction by
+# about 0.0005 on the small images, the f32-residual variant above by 0.0008,
+# and lily's own attention tile variants by 0.0001. `min_frac` is the absolute
+# fallback for an image with no recorded floor, and compare_vision.py says when
+# it falls back.
+TOWER_TOLERANCE = {"atol": 0.02, "rtol": 0.05, "max_atol": None, "min_frac": 0.999, "frac_margin": 0.002, "min_cosine": 0.995, "max_rel_l2": 0.10}
 
 GOLDENS_DIR = Path(__file__).resolve().parent / "goldens"
 LARGE_DIR = GOLDENS_DIR / "large"
 IMAGES_DIR = Path(__file__).resolve().parent / "images"
+FLOORS_PATH = GOLDENS_DIR / "vision_tolerance_floors.json"
+
+
+def tower_floor_within(image: str, cap: dict, floors_path: Path = FLOORS_PATH) -> float | None:
+    """The within-fraction the bf16 reference tower achieved against the f32 tower on
+    `image` (a stem such as "333x777") at `cap` ({"min_pixels", "max_pixels"}), from
+    `vision_tolerance_floors.json`; None when no floor is recorded for that image
+    and cap."""
+    if not floors_path.exists():
+        return None
+    block = json.loads(floors_path.read_text()).get("tower_bf16_vs_f32")
+    if not block or block.get("cap") != {"min_pixels": int(cap["min_pixels"]), "max_pixels": int(cap["max_pixels"])}:
+        return None
+    entry = (block.get("images") or {}).get(image)
+    if not entry:
+        return None
+    return float(entry["merged_bf16_vs_f32"]["fraction_within"])
 
 
 def sha256_bytes(data: bytes | memoryview) -> str:

@@ -71,6 +71,39 @@ pub fn rmsnorm_bf16(
     )
 }
 
+/// LayerNorm over the last dimension with weight and bias, statistics in
+/// f32 (two-pass): `out = (x - mean) / sqrt(var + eps) * w + b`.
+pub fn layernorm_bf16(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    x: &Tensor,
+    w: &Tensor,
+    b: &Tensor,
+    out: &Tensor,
+    eps: f32,
+) -> Result<()> {
+    let h =
+        *x.shape().last().ok_or_else(|| anyhow::anyhow!("layernorm on 0-d tensor"))?;
+    let m = x.numel() / h;
+    ensure!(w.numel() == h, "weight numel {} != H {h}", w.numel());
+    ensure!(b.numel() == h, "bias numel {} != H {h}", b.numel());
+    ensure!(out.numel() == x.numel(), "output numel mismatch");
+    for t in [x, w, b, out] {
+        ensure!(
+            t.dtype() == DType::BF16,
+            "layernorm expects BF16, got {:?}",
+            t.dtype()
+        );
+    }
+    let pipeline = ctx.pipeline("layernorm_bf16", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[x.binding(), w.binding(), b.binding(), out.binding()],
+        &[&u32_bytes(h), &eps.to_ne_bytes()],
+        Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (TG, 1, 1) },
+    )
+}
+
 #[cfg(test)]
 #[path = "../../tests/unit/kernels/norm.rs"]
 mod tests;

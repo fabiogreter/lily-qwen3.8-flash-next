@@ -45,6 +45,33 @@ pub fn gemm_bf16_nt(
     )
 }
 
+/// [`gemm_bf16_nt`] with a bias epilogue: `C = bf16(A B^T + bias)`, rounded
+/// once (a Linear layer's output).
+pub fn gemm_bf16_nt_bias(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    a: &Tensor,
+    b: &Tensor,
+    bias: &Tensor,
+    c: &Tensor,
+) -> Result<()> {
+    let (m, k) = (a.shape()[0], a.shape()[1]);
+    let n = b.shape()[0];
+    ensure!(b.shape() == [n, k], "B shape {:?} != [{n}, {k}]", b.shape());
+    ensure!(bias.numel() == n, "bias numel {} != N {n}", bias.numel());
+    ensure!(c.numel() == m * n, "C numel {} != {m}x{n}", c.numel());
+    let pipeline = ctx.pipeline("gemm_bf16_nt_bias_nax", SOURCE, nax_version(ctx)?)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[a.binding(), b.binding(), c.binding(), bias.binding()],
+        &[&u32_bytes(k), &u32_bytes(n), &u32_bytes(m)],
+        Grid::Threadgroups {
+            groups: (n.div_ceil(64), m.div_ceil(64), 1),
+            threadgroup: (128, 1, 1),
+        },
+    )
+}
+
 #[cfg(test)]
 #[path = "../../tests/unit/kernels/gemm.rs"]
 mod tests;

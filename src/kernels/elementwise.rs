@@ -272,6 +272,33 @@ pub fn argmax_f32(
     argmax_f32_final(ctx, pass, partials, out)
 }
 
+/// Which GELU [`gelu_bf16`] applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gelu {
+    /// `gelu_pytorch_tanh`: `0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))`.
+    Tanh,
+    /// `nn.GELU()`: `0.5 x (1 + erf(x / sqrt 2))`.
+    Erf,
+}
+
+/// `x = gelu(x)` in place, in f32 from and to bf16.
+pub fn gelu_bf16(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    x: &Tensor,
+    form: Gelu,
+) -> Result<()> {
+    let n = x.numel();
+    ensure!(n > 0 && x.dtype() == DType::BF16, "gelu expects a non-empty BF16 tensor");
+    let pipeline = ctx.pipeline("gelu_bf16", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[x.binding()],
+        &[&u32_bytes(usize::from(form == Gelu::Erf))],
+        Grid::Threads { grid: (n, 1, 1), threadgroup: (256.min(n), 1, 1) },
+    )
+}
+
 #[cfg(test)]
 #[path = "../../tests/unit/kernels/elementwise.rs"]
 mod tests;

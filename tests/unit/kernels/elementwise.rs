@@ -229,3 +229,69 @@ fn silu_mul_rows_matches_split_silu_mul_bitwise() {
         assert_eq!(bits(&rows_out), bits(&split_out), "m={m} n={n}");
     }
 }
+
+/// The textbook form in f64, so the reference carries no f32 cancellation of
+/// its own in the tail.
+fn gelu_tanh(x: f32) -> f32 {
+    let x = x as f64;
+    let u = (2.0f64 / std::f64::consts::PI).sqrt() * (x + 0.044715 * x * x * x);
+    (0.5 * x * (1.0 + u.tanh())) as f32
+}
+
+/// erf by Simpson integration of the Gaussian in f64 (2 000 steps, error far
+/// below 1e-9): deliberately not the closed-form approximation the kernel
+/// uses, so a coefficient slip there is caught.
+fn erf(x: f32) -> f32 {
+    let x = x as f64;
+    let steps = 2000;
+    let h = x / steps as f64;
+    let f = |t: f64| (-t * t).exp();
+    let mut sum = f(0.0) + f(x);
+    for i in 1..steps {
+        sum += f(i as f64 * h) * if i % 2 == 1 { 4.0 } else { 2.0 };
+    }
+    (sum * h / 3.0 * 2.0 / std::f64::consts::PI.sqrt()) as f32
+}
+
+fn gelu_erf(x: f32) -> f32 {
+    let x = x as f64;
+    (0.5 * x * (1.0 + erf((x / std::f64::consts::SQRT_2) as f32) as f64)) as f32
+}
+
+#[test]
+fn gelu_forms_match_cpu() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(7);
+    let n = 1500;
+    let x: Vec<f32> = (0..n).map(|_| rng.gen_range(-5.0f32..5.0)).collect();
+    let rx = cpu_ref::round_bf16(&x);
+
+    for (form, f) in [(Gelu::Tanh, gelu_tanh as fn(f32) -> f32), (Gelu::Erf, gelu_erf)]
+    {
+        let tx = Tensor::from_f32_as_bf16(&ctx, &x, &[n]).expect("x");
+        let pass = ctx.begin().expect("pass");
+        gelu_bf16(&ctx, &pass, &tx, form).expect("gelu");
+        pass.commit_wait().expect("commit");
+        let expected: Vec<f32> = rx.iter().map(|&v| f(v)).collect();
+        let got = tx.to_f32().expect("read");
+        // Output rounded to bf16 on values up to 5.
+        cpu_ref::assert_close(&got, &expected, 2e-2, 1e-2);
+        // Where the tail is tiny the two forms differ by nearly a factor of
+        // two (gelu_erf(-4) = -1.27e-4, gelu_tanh(-4) = -7.0e-5), which the
+        // absolute tolerance above cannot see; a relative check there pins
+        // which form ran. bf16 carries 0.4 %, the erf approximation 1.5e-7
+        // absolute on values of 1e-4 and above, so 5 % is generous.
+        let mut tails = 0;
+        for (i, &v) in rx.iter().enumerate() {
+            if (-4.2..-3.5).contains(&v) {
+                tails += 1;
+                let (g, e) = (got[i], expected[i]);
+                assert!(
+                    (g - e).abs() <= 0.05 * e.abs(),
+                    "{form:?} tail at {i}: {g} vs {e}"
+                );
+            }
+        }
+        assert!(tails > 10, "the input must reach into the tail");
+    }
+}

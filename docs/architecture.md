@@ -174,8 +174,9 @@ GEMMs for batched passes (`skinny`), MoE gather and combine (`moe`),
 hyper-connection read and inject (`hc`), the n-gram gather (`ple`), sparse
 attention scoring, selection and attention (`qsa`), dense attention
 (`attention`), the Gated DeltaNet step and prefill scan (`gdn`), norms and
-elementwise passes, the GPU sampler (`sample`), and the speculative accept
-and rollback kernels (`spec`).
+elementwise passes, the GPU sampler (`sample`), the speculative accept
+and rollback kernels (`spec`), and the vision tower's position blend, 2-D
+rotary and bidirectional attention (`vision`).
 
 ### Decode
 
@@ -241,6 +242,100 @@ sub-batches: score, select, then attend per query, gathering that query's
 512 blocks of K and V with no reuse across queries and no tensor operations.
 At 2.1 TFLOP/s next to a dense kernel at 29 on the same head shapes, it is
 the single largest remaining item in the engine.
+
+## The vision tower
+
+Qwen3.8-Flash-Next's image encoder runs on the GPU as its own graph
+(`src/qwen4exp/vision.rs`, `tools/reference/VISION.md` "The tower"). Its
+input is the preprocessed image: one row of 1 536 pixel values per 16 x 16
+patch, `N = gh x gw` rows in block-major order, cast to bf16 on upload. Its
+output is one 2 560-wide bf16 row per 2 x 2 block of patches, `N / 4` rows,
+which replace the prompt's `<|image_pad|>` rows; the `[N, 1152]` residual
+after the last block is exposed for diagnostics. The server-side pixel cap
+makes `N` at most 8 192.
+
+What runs, in one serial pass per image: the patch embedding as a dense
+bf16 GEMM with the flattened `Conv3d` weight; the learned 48 x 48 position
+table resampled bilinearly (align_corners) to the image grid and added;
+27 blocks of `x += proj(attn(rope(qkv(LayerNorm1(x)))))` and
+`x += fc2(gelu_tanh(fc1(LayerNorm2(x))))` with LayerNorm statistics in f32;
+and the merger, a LayerNorm per patch, four consecutive rows read as one
+4 608-wide row, `fc1`, the exact erf GELU, `fc2`. Nothing of the text
+path's GPU work was reusable except the GEMM, so the kernels are new:
+LayerNorm with bias (`norm`), the GELUs (`elementwise`; Metal has no `erf`,
+so the exact form uses a 1.5e-7 polynomial), a bias epilogue on the tensor-op
+GEMM (`gemm`), and in `vision.metal` the position blend (taps and weights
+computed in the kernel from the patch's grid coordinates, no host table), the
+2-D rotary over the fused qkv rows (absolute row and column per patch, 18
+frequencies each, `rotate_half` pairing over the 72-wide head, in f32), and
+full bidirectional attention.
+
+**Attention is a fused online-softmax kernel**, a copy of the text path's
+tensor-op flash kernel with the causal limit and the KV cache removed, reading
+q, k and v straight out of the fused `[N, 3456]` projection at row stride
+3 456 and writing `[N, 1152]`. The alternative, scores through the GEMM per
+head with a row softmax between, moves about 0.5 GB per head and layer at
+8 192 patches, 230 GB for the tower, which alone is the latency budget; the
+fused kernel reads K and V once per query tile and holds nothing but a
+32 x 64 score tile. The head dim of 72 is not a multiple of 16, so the QK
+reduction extent is dynamic (the PV output width may stay static at a
+multiple of 8). Tile shapes 16 x 128, 32 x 128, 32 x 64 and 64 x 64 measure
+within 3 % of each other; 32 x 64 is the fastest and 256-key tiles exceed the
+32 KB threadgroup memory.
+
+**The bias is added inside the GEMM.** A first version added it in a
+separate pass over the bf16 GEMM output, which rounds every Linear output
+twice where the reference rounds once, and that alone moved the merged
+output's relative L2 error against the f32 reference from 0.077 to 0.063 on
+the 333 x 777 image. Everything else rounds where the reference in bf16
+rounds: the residual stream is bf16, the LayerNorm and GELU outputs are bf16,
+attention probabilities are bf16 with f32 scores and sums.
+
+Measured against the f32 reference goldens (`compare_vision.py`, full
+tensors), merged output: 333 x 777 relative L2 0.067, cosine 0.9977, 99.95 %
+of the elements within `0.02 + 0.05 |golden|`; 640 x 480 0.053, 0.9986,
+99.997 %; 1920 x 1080 0.062, 0.9981, 99.97 %; 3840 x 2160 (capped) 0.090,
+0.9960, 99.87 %. The reference tower in bf16 against itself in f32 sits at
+0.054 / 0.050 / 0.065 / 0.078 and 99.95 / 99.999 / 99.96 / 99.94 %. The
+within-fraction gate is that measured floor minus 0.002 per image rather
+than a fixed number, because a fixed one did not separate correct
+implementations from wrong ones: the elements outside the tolerance sit in
+a handful of tokens (5 of 240, 15 of 1 980) whose massive-activation
+channel, near 1e4 in the residual, flips by about 1 000 in the bf16
+reference as well, and the reference itself with an f32 residual stream
+comes out at 99.88 % on 333 x 777. Block by block, lily's residual tracks
+the f32 reference exactly as closely as the bf16 reference does (relative
+L2 0.036 against 0.035 after 27 blocks), and the merger kernels reproduce
+the reference merger on lily's own input to 0.0005. All four images pass
+the measured gate (`tools/reference/VISION.md`, "Comparison 2").
+
+| image | patches | tokens | GPU | host | attention | GEMMs |
+|---|---|---|---|---|---|---|
+| 333 x 777 | 960 | 240 | 27.1 ms | 27.8 ms | 31 % | 55 % |
+| 640 x 480 | 1 200 | 300 | 38.5 ms | 39.1 ms | | |
+| 1920 x 1080 | 8 160 | 2 040 | 707 ms | 710 ms | 77 % | 19 % |
+| 3840 x 2160, capped | 7 920 | 1 980 | 671 ms | 675 ms | | |
+
+GPU time is the pass span, host time includes the bf16 cast and upload of
+the pixel rows and the encoding of about 300 dispatches; the shares are from
+the per-kernel profile. At 8 160 patches the GEMMs run 6.9 TFLOP in 133 ms
+(52 TFLOP/s) and attention 8.3 TFLOP in 548 ms (15 TFLOP/s): with a head dim
+of 72 the softmax bookkeeping per score is 3.5 times larger relative to the
+matmul work than at the text path's 256, and the tile shape does not move
+it. The tower therefore takes 0.7 s at the cap, under a second but not well
+under; with the 1.5 s of language-model prefill the image path stays inside
+"a few seconds". What would cut the attention time is a kernel that
+amortizes the softmax bookkeeping over more work per threadgroup (two heads
+or two query tiles sharing the K and V tiles), not tiling.
+
+Scratch is a `VisionScratch` grown to the largest patch count seen: the
+pixel rows, two `[N, 1152]` buffers for the residual and the normed input,
+`[N, 3456]` for qkv, two more `[N, 1152]`, `[N, 4304]` for the MLP (the
+merger's `fc1` output reuses it) and `[N / 4, 2560]`; 237 MB at 8 160
+patches, under the plan's 1 GB. `lily-vision-probe` runs the tower alone over
+a golden's `pixel_values`, writes the candidate record for
+`compare_vision.py`, and prints the per-kernel profile with
+`--kernel-profile`.
 
 ## Speculative decoding
 
@@ -483,5 +578,8 @@ bounds the loop; the fourth fault exits 1 for the supervisor.
 ## What is deliberately not here
 
 Constrained decoding (`response_format: json_schema`), batching across
-requests, the vision tower, and session persistence for the Qwen3.6-35B path
-(the engine trait's defaults disable the disk tier for it).
+requests, the image path from the API to the tower and into the prompt (the
+tower itself runs; preprocessing, positions and the server work are the
+remaining items of `docs/vision-support-plan.md`), and session persistence
+for the Qwen3.6-35B path (the engine trait's defaults disable the disk tier
+for it).

@@ -382,6 +382,12 @@ LILY_MODEL_DIR_FLASH=~/models/Qwen3.8-Flash-Next-lily-q4-l4 \
 # conversion with the tower appended):
 LILY_MODEL_DIR_FLASH=~/models/Qwen3.8-Flash-Next-lily-q4-l4 \
   cargo test --release --lib the_four_layer_checkpoint_tower -- --ignored --test-threads=1
+
+# The tower's output on the 333 x 777 image against the reference golden's
+# sample (needs tools/reference/goldens/large/*.pixel_values.npy, untracked;
+# tools/README.md says how to regenerate it):
+LILY_MODEL_DIR_FLASH=~/models/Qwen3.8-Flash-Next-lily-q4-l4 \
+  cargo test --release --lib the_tower_reproduces -- --ignored --nocapture --test-threads=1
 ```
 
 Two things to know before trusting a green run are in

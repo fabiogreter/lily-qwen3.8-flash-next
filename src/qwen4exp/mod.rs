@@ -8,6 +8,7 @@ pub mod config;
 pub mod model;
 pub mod ngram;
 mod spec;
+pub mod vision;
 pub mod vision_weights;
 pub mod weights;
 

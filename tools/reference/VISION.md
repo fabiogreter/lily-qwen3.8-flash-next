@@ -188,10 +188,22 @@ the CPU was abandoned after 50 minutes on the first large image). Merged output,
 0.99789 / 0.99694, max abs error 0.055 / 0.033 / 0.127 / 0.076, fraction within `0.02 + 0.05 |golden|`
 0.9995 / 1.0000 / 0.9996 / 0.9994. Pre-merger relative L2 0.042 to 0.061. The CPU bf16 run on the small
 images gave the same picture (relative L2 0.053 / 0.064, cosine 0.99859 / 0.99866; per-token relative
-L2 up to 0.51 on flat-colour tokens with tiny norms). Defaults: `atol` 0.02, `rtol` 0.05, `min_frac`
-0.999, `min_cosine` 0.995, `max_rel_l2` 0.10 on the merged output; the pre-merger states are reported,
-not judged. A candidate with Gaussian noise at the bf16 level (std 0.0016) passes, three times that
-fails on cosine and relative L2.
+L2 up to 0.51 on flat-colour tokens with tiny norms). Defaults: `atol` 0.02, `rtol` 0.05,
+`min_cosine` 0.995, `max_rel_l2` 0.10 on the merged output; the pre-merger states are reported, not
+judged. The within-fraction gate is relative to the measured floor: the threshold is the bf16
+reference's own fraction on that image and cap (`vision_tolerance_floors.json`,
+`tower_bf16_vs_f32.images.<img>.merged_bf16_vs_f32.fraction_within`: 0.99954 / 0.99999 / 0.99961 /
+0.99937) minus a margin of 0.002; an image with no recorded floor falls back to an absolute 0.999 and
+`compare_vision.py` says so. The absolute gate was not separable: the elements outside the tolerance
+sit in a handful of tokens (5 of 240 on 333 x 777) whose massive-activation channel, near 1e4 in the
+residual, flips by about 1 000 under bf16 rounding in the reference as much as in lily's port, and the
+reference itself with an f32 residual stream lands at 0.99878 on 333 x 777. lily's residual tracks the
+f32 tower block by block as closely as the bf16 reference does (relative L2 0.036 against 0.035 after 27
+blocks) and its merger reproduces the reference merger on the same input to 0.0005, so the spread is
+rounding, not a defect. The margin covers the measured run-to-run spread of the bf16 reference with
+room: CPU against MPS about 0.0005 on the small images, the f32-residual variant 0.0008. A candidate
+with Gaussian noise at the bf16 level (std 0.0016) passes, three times that fails on cosine and
+relative L2.
 
 **Comparison 3, positions**: exact on `input_ids`, `mm_token_type_ids`, `image_grid_thw`, the three
 position axes and `rope_deltas`.

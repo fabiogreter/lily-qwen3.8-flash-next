@@ -37,8 +37,13 @@ fn check_gemm(seed: u64) {
         let tb = Tensor::from_f32_as_bf16(&ctx, &b, &[n, k]).expect("b");
         let tc = Tensor::zeros(&ctx, &[m, n], DType::BF16).expect("c");
 
+        let bias = random_vec(&mut rng, n);
+        let tbias = Tensor::from_f32_as_bf16(&ctx, &bias, &[n]).expect("bias");
+        let tcb = Tensor::zeros(&ctx, &[m, n], DType::BF16).expect("c + bias");
+
         let pass = ctx.begin().expect("pass");
         gemm_bf16_nt(&ctx, &pass, &ta, &tb, &tc).expect("gemm");
+        gemm_bf16_nt_bias(&ctx, &pass, &ta, &tb, &tbias, &tcb).expect("gemm + bias");
         pass.commit_wait().expect("commit");
 
         let expected = cpu_ref::gemm_nt(
@@ -49,6 +54,10 @@ fn check_gemm(seed: u64) {
             n,
         );
         cpu_ref::assert_close(&tc.to_f32().expect("read"), &expected, 2e-2, 2e-2);
+        let rb = cpu_ref::round_bf16(&bias);
+        let biased: Vec<f32> =
+            expected.iter().enumerate().map(|(i, v)| v + rb[i % n]).collect();
+        cpu_ref::assert_close(&tcb.to_f32().expect("read"), &biased, 2e-2, 2e-2);
     }
 }
 

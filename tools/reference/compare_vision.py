@@ -10,7 +10,11 @@ The golden's `kind` selects the comparison from docs/vision-support-plan.md:
   preprocess  (1) image_grid_thw and resized size exact; pixel_values within
               tolerance: max abs error, max rel error, cosine, fraction within atol
   tower       (2) merged embeddings within tolerance (same metrics); the
-              pre-merger hidden states are reported when both records carry them
+              within-fraction threshold is the bf16 reference's own fraction on
+              that image and cap (goldens/vision_tolerance_floors.json) minus
+              TOWER_TOLERANCE["frac_margin"], falling back to the absolute
+              min_frac when no floor is recorded; the pre-merger hidden states
+              are reported when both records carry them
   positions   (3) input_ids, mm_token_type_ids, position_ids and rope_deltas exact
   forward     (4) argmax agreement through compare.py; the candidate may be a
               lily-probe record (`steps`) or an hf_reference.py golden (`argmax`),
@@ -34,7 +38,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import compare  # noqa: E402
-from vision_golden import PREPROCESS_TOLERANCE, TOWER_TOLERANCE, compare_records, fmt  # noqa: E402
+from vision_golden import PREPROCESS_TOLERANCE, TOWER_TOLERANCE, compare_records, fmt, tower_floor_within  # noqa: E402
 
 
 def tolerances(args, golden: dict, defaults: dict) -> dict:
@@ -110,6 +114,17 @@ def cmp_preprocess(cand: dict, gold: dict, cand_dir: Path, gold_dir: Path, args)
 def cmp_tower(cand: dict, gold: dict, cand_dir: Path, gold_dir: Path, args) -> bool:
     tol = tolerances(args, gold, TOWER_TOLERANCE)
     ok = True
+    # The within-fraction gate relative to the measured bf16 floor (see
+    # vision_golden.TOWER_TOLERANCE); a --min-frac on the command line wins.
+    image = Path(gold["image"]["file"]).stem
+    floor = tower_floor_within(image, gold["cap"])
+    if getattr(args, "min_frac", None) is not None:
+        print(f"within-fraction threshold {tol['min_frac']} from the command line")
+    elif floor is None:
+        print(f"no bf16 floor recorded for {image} at cap {gold['cap']}: using the absolute min_frac {tol['min_frac']}")
+    else:
+        tol["min_frac"] = floor - tol["frac_margin"]
+        print(f"within-fraction floor (bf16 reference vs f32 on {image}) {floor:.6f}, margin {tol['frac_margin']}, threshold {tol['min_frac']:.6f}")
     if cand.get("input") and cand["input"].get("pixel_values_sha256") != gold["input"]["pixel_values_sha256"]:
         print("note: the candidate tower ran on different pixel_values than the golden (expected when it is fed lily's own preprocessing)")
     metrics = compare_records(cand["merged"], gold["merged"], cand_dir, gold_dir, tol["atol"], tol["rtol"])

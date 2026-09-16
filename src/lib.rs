@@ -19,6 +19,7 @@ pub mod metal;
 pub mod model;
 #[cfg(target_os = "macos")]
 pub mod moe_ffn;
+pub mod npy;
 #[cfg(target_os = "macos")]
 pub mod qwen4exp;
 pub mod safetensors;
