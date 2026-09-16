@@ -122,6 +122,39 @@ pub trait ScratchApi {
     }
 }
 
+/// Whether to load a checkpoint's vision tower.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum VisionMode {
+    /// Load the tower when the checkpoint carries one (default).
+    #[default]
+    Auto,
+    /// Leave it on disk and save its memory; image requests are refused.
+    Off,
+}
+
+impl std::str::FromStr for VisionMode {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "off" => Ok(Self::Off),
+            other => anyhow::bail!("unknown vision mode {other:?}; use auto or off"),
+        }
+    }
+}
+
+/// What became of the vision tower at load, for the startup log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VisionTower {
+    /// The checkpoint does not carry one.
+    Absent,
+    /// The checkpoint carries one and [`VisionMode::Off`] skipped it.
+    Off,
+    /// Resident on the GPU.
+    Loaded { bytes: usize, blocks: usize },
+}
+
 /// Engine-wide load options; architectures ignore what does not apply.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LoadOptions {
@@ -129,6 +162,8 @@ pub struct LoadOptions {
     pub ngram_storage: crate::qwen4exp::NgramStorage,
     /// Draft tokens per speculative step; `0` leaves the draft head unloaded.
     pub mtp_drafts: usize,
+    /// Whether to load the vision tower when the checkpoint has one.
+    pub vision: VisionMode,
 }
 
 /// Which draw a decode pass ends with.
@@ -190,6 +225,12 @@ pub trait LanguageModel: Sized {
     /// cache for physical memory; 0 for models without such weights.
     fn paged_storage_bytes(&self) -> usize {
         0
+    }
+
+    /// The vision tower's fate at load; `None` for architectures whose
+    /// checkpoints lily reads text-only.
+    fn vision_tower(&self) -> Option<VisionTower> {
+        None
     }
 
     /// A state with capacity for `capacity` tokens (grown later on demand).

@@ -45,7 +45,10 @@ use anyhow::{Context as _, Result, ensure};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::engine::{DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi};
+use crate::engine::{
+    DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, VisionMode,
+    VisionTower,
+};
 use crate::generate::{FinishReason, GenerateOptions, Generator};
 use crate::kernels::attention::MAX_SEQ;
 use crate::kernels::sample::SamplingParams;
@@ -137,6 +140,8 @@ pub struct ServeOptions {
     pub ngram_lock: bool,
     /// Draft tokens per speculative step (0 disables the draft head).
     pub mtp_drafts: usize,
+    /// Whether to load the vision tower when the checkpoint has one.
+    pub vision: VisionMode,
     /// Where evicted sessions are kept on disk (`None` disables the tier).
     pub disk_cache_dir: Option<std::path::PathBuf>,
     /// Most bytes the disk tier may hold.
@@ -532,20 +537,43 @@ impl<M: LanguageModel> Engine<M> {
             &LoadOptions {
                 ngram_storage: options.ngram_storage,
                 mtp_drafts: options.mtp_drafts,
+                vision: options.vision,
             },
         )?;
         let drafts = options.mtp_drafts.min(model.max_drafts());
+        let tower = model.vision_tower();
         eprintln!(
-            "loaded {} in {:.1}s ({:.1} GB resident){}",
+            "loaded {} in {:.1}s ({:.1} GB resident{}){}",
             M::MODEL_ID,
             started.elapsed().as_secs_f64(),
             ctx.current_allocated() as f64 / 1e9,
+            match tower {
+                Some(VisionTower::Loaded { bytes, .. }) => {
+                    format!(", {:.2} GB of it the vision tower", bytes as f64 / 1e9)
+                }
+                _ => String::new(),
+            },
             if drafts > 0 {
                 format!(", speculative decoding with {drafts} drafts per step")
             } else {
                 String::new()
             }
         );
+        if let Some(tower) = tower {
+            eprintln!(
+                "vision tower: {}",
+                match tower {
+                    VisionTower::Loaded { bytes, blocks } => {
+                        format!(
+                            "loaded ({:.2} GB, {blocks} blocks)",
+                            bytes as f64 / 1e9
+                        )
+                    }
+                    VisionTower::Absent => "absent from the checkpoint".to_string(),
+                    VisionTower::Off => "off".to_string(),
+                }
+            );
+        }
         if options.ngram_preload || options.ngram_lock {
             let started = Instant::now();
             let bytes = model.warm_storage(options.ngram_lock)?;

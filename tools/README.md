@@ -15,7 +15,7 @@ Converts the raw Hugging Face BF16 checkpoint into lily's
 .venv/bin/python tools/convert/convert_qwen38_flash_next.py \
     --src ~/models/Qwen3.8-Flash-Next \
     --dst ~/models/Qwen3.8-Flash-Next-lily-q4 \
-    [--layers 4] [--dry-run] [--ngram-bits 4 --ngram-group 32]
+    [--layers 4] [--dry-run] [--ngram-bits 4 --ngram-group 32] [--no-mtp] [--no-vision]
 ```
 
 `mlx` needs a Metal device even for CPU arrays, so a real conversion cannot run
@@ -28,7 +28,22 @@ in a GPU-less sandbox; `--dry-run` never imports it. Measured on the M5 Max:
 | `--layers 1` (smoke)   | 2.2 GB    | 2 s  |
 
 Output categories for the full model: experts 67.95 GB, n-gram table 32.00 GB,
-dense 2.45 GB, embeddings + LM head 0.72 GB.
+dense 2.45 GB, embeddings + LM head 0.72 GB, plus the draft head 1.48 GB and
+the vision tower 0.90 GB (105.49 GB with both; the table above predates them).
+
+Two optional parts can be appended to a finished conversion instead of being
+written with it, each as its own shard family merged into the index and
+`config.json`: `--mtp-only` for the draft head (`mtp-*.safetensors`, quantized
+like the trunk) and `--vision-only` for the vision tower (`vision-*.safetensors`,
+333 bf16 tensors copied byte for byte, 0.90 GB, in under a second). Both refuse
+to run twice. `--no-mtp` and `--no-vision` drop the part from a full conversion,
+and `config.json` then loses `vision_config` and the vision token ids so that it
+matches the weights (`docs/qwen38-flash-next-checkpoint-format.md`).
+
+```sh
+.venv/bin/python tools/convert/convert_qwen38_flash_next.py \
+    --src ~/models/Qwen3.8-Flash-Next --dst ~/models/Qwen3.8-Flash-Next-lily-q4 --vision-only
+```
 
 ## reference/hf_reference.py
 

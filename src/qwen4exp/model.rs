@@ -17,6 +17,7 @@ use std::rc::Rc;
 
 use crate::engine::{
     DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, SnapshotApi,
+    VisionMode, VisionTower,
 };
 use crate::kernels::attention::{
     MAX_SEQ, k_norm_rope_scatter_decode, q_norm_rope_split_decode, rope_neox,
@@ -1101,16 +1102,18 @@ pub(super) struct Capture {
 
 impl Qwen4ExpModel {
     pub fn load(ctx: &MetalContext, dir: impl AsRef<Path>) -> Result<Self> {
-        Self::load_with(ctx, dir, NgramStorage::default(), true)
+        Self::load_with(ctx, dir, NgramStorage::default(), true, VisionMode::Auto)
     }
 
-    /// Loads with the n-gram table `storage` of choice, and the draft head
-    /// when `with_mtp` and the checkpoint has one.
+    /// Loads with the n-gram table `storage` of choice, the draft head when
+    /// `with_mtp` and the checkpoint has one, and the vision tower when
+    /// `vision` allows it and the checkpoint has one.
     pub fn load_with(
         ctx: &MetalContext,
         dir: impl AsRef<Path>,
         storage: NgramStorage,
         with_mtp: bool,
+        vision: VisionMode,
     ) -> Result<Self> {
         let config = Qwen4ExpConfig::from_model_dir(&dir)?;
         ensure!(
@@ -1124,7 +1127,14 @@ impl Qwen4ExpModel {
             "indexer head dim {} unsupported (kernels are compiled for {INDEXER_D})",
             config.indexer.head_dim
         );
-        let weights = weights::load(ctx, &dir, &config, storage, with_mtp)?;
+        let weights = weights::load(
+            ctx,
+            &dir,
+            &config,
+            storage,
+            with_mtp,
+            vision == VisionMode::Auto,
+        )?;
         let hasher = match &config.ple {
             Some(p) => Some(NgramHasher::new(
                 &p.layer_multipliers,
@@ -1147,6 +1157,11 @@ impl Qwen4ExpModel {
     /// Whether the draft head is loaded.
     pub fn has_mtp(&self) -> bool {
         self.weights.mtp.is_some()
+    }
+
+    /// Whether the vision tower is loaded.
+    pub fn has_vision(&self) -> bool {
+        self.weights.vision.is_some()
     }
 
     fn begin_batched<'a>(
@@ -3077,7 +3092,18 @@ impl LanguageModel for Qwen4ExpModel {
             dir,
             options.ngram_storage,
             options.mtp_drafts > 0,
+            options.vision,
         )
+    }
+
+    fn vision_tower(&self) -> Option<VisionTower> {
+        Some(match (&self.config.vision, &self.weights.vision) {
+            (None, _) => VisionTower::Absent,
+            (Some(_), None) => VisionTower::Off,
+            (Some(v), Some(w)) => {
+                VisionTower::Loaded { bytes: w.bytes(), blocks: v.depth }
+            }
+        })
     }
 
     fn max_position_embeddings(&self) -> usize {

@@ -1,8 +1,9 @@
 //! HF `config.json` parsing for Qwen3.8-Flash-Next, Qwen's `qwen4_exp` preview
 //! architecture, as written by `tools/convert/convert_qwen38_flash_next.py`
 //! (see `docs/qwen38-flash-next-checkpoint-format.md`). The file is a
-//! multimodal wrapper; lily reads `text_config` plus the converter's `lily`
-//! block and ignores the vision tower.
+//! multimodal wrapper; lily reads `text_config`, the converter's `lily`
+//! block, and `vision_config` plus the vision token ids when the converter
+//! kept the tower (`lily.vision` says so; a conversion without it strips them).
 
 use std::path::Path;
 
@@ -22,6 +23,69 @@ pub enum GateAct {
 pub struct RopeParameters {
     pub rope_theta: f32,
     pub partial_rotary_factor: f32,
+    /// Multimodal RoPE: rotary pairs per (temporal, height, width) axis. For
+    /// text-only prompts all three axes carry the same position, so the
+    /// engine's scalar RoPE is exact; an image makes the axes differ.
+    #[serde(default)]
+    pub mrope_section: Option<Vec<usize>>,
+    /// Interleaved assignment of pairs to axes (pair `i` takes axis `i % 3`
+    /// within each section's budget), as opposed to contiguous sections.
+    #[serde(default)]
+    pub mrope_interleaved: Option<bool>,
+}
+
+/// The vision tower the converter keeps in bf16 (`docs/vision-support-plan.md`
+/// item 2; `tools/reference/VISION.md` for what each field means for the
+/// compute). Present only when the checkpoint carries the tensors.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisionConfig {
+    /// Transformer blocks.
+    pub depth: usize,
+    pub hidden_size: usize,
+    pub num_heads: usize,
+    pub intermediate_size: usize,
+    /// Pixels per patch side.
+    pub patch_size: usize,
+    /// Frames folded into one patch row (a still image is copied twice).
+    pub temporal_patch_size: usize,
+    /// Patches folded per side into one language token by the merger.
+    pub spatial_merge_size: usize,
+    pub in_channels: usize,
+    /// Rows of the learned position table (a square grid).
+    pub num_position_embeddings: usize,
+    /// Merger output width: the language model's hidden size.
+    pub out_hidden_size: usize,
+    pub hidden_act: String,
+    /// Blocks whose states are injected into later text layers (empty here).
+    pub deepstack_visual_indexes: Vec<usize>,
+    pub image_token_id: u32,
+    pub video_token_id: u32,
+    pub vision_start_token_id: u32,
+    pub vision_end_token_id: u32,
+    /// Tensors under `model.visual.` the converter copied.
+    pub tensors: usize,
+}
+
+impl VisionConfig {
+    pub fn head_dim(&self) -> usize {
+        self.hidden_size / self.num_heads
+    }
+
+    /// Input width of the patch embedding: one patch row of pixels.
+    pub fn patch_dim(&self) -> usize {
+        self.in_channels * self.temporal_patch_size * self.patch_size * self.patch_size
+    }
+
+    /// Input width of the merger: one merge block of hidden states.
+    pub fn merge_dim(&self) -> usize {
+        self.hidden_size * self.spatial_merge_size * self.spatial_merge_size
+    }
+
+    /// Tensor count the tower's structure implies: patch embedding weight and
+    /// bias, the position table, twelve per block, six in the merger.
+    pub fn expected_tensors(&self) -> usize {
+        3 + 12 * self.depth + 6
+    }
 }
 
 /// The multi-token-prediction draft head the converter appends with
@@ -198,6 +262,12 @@ struct MtpJson {
 }
 
 #[derive(Deserialize)]
+struct LilyVisionJson {
+    dtype: String,
+    tensors: usize,
+}
+
+#[derive(Deserialize)]
 struct LilyJson {
     format: String,
     quantization: QuantBlockJson,
@@ -206,6 +276,30 @@ struct LilyJson {
     /// Present (non-null) when the checkpoint carries the `mtp.*` tensors.
     #[serde(default)]
     mtp: Option<MtpJson>,
+    /// Present (non-null) when the checkpoint carries the `model.visual.*`
+    /// tensors.
+    #[serde(default)]
+    vision: Option<LilyVisionJson>,
+    /// Tensor name prefixes the converter dropped.
+    #[serde(default)]
+    dropped: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct VisionConfigJson {
+    depth: usize,
+    hidden_size: usize,
+    num_heads: usize,
+    intermediate_size: usize,
+    patch_size: usize,
+    temporal_patch_size: usize,
+    spatial_merge_size: usize,
+    in_channels: usize,
+    num_position_embeddings: usize,
+    out_hidden_size: usize,
+    hidden_act: String,
+    #[serde(default)]
+    deepstack_visual_indexes: Vec<usize>,
 }
 
 #[derive(Deserialize)]
@@ -213,9 +307,26 @@ struct WrapperJson {
     model_type: String,
     text_config: TextConfigJson,
     lily: LilyJson,
+    #[serde(default)]
+    vision_config: Option<VisionConfigJson>,
+    #[serde(default)]
+    image_token_id: Option<u32>,
+    #[serde(default)]
+    video_token_id: Option<u32>,
+    #[serde(default)]
+    vision_start_token_id: Option<u32>,
+    #[serde(default)]
+    vision_end_token_id: Option<u32>,
 }
 
+/// The tensor name prefix of the vision tower.
+pub const VISION_PREFIX: &str = "model.visual.";
+
 pub const FORMAT: &str = "qwen4_exp-affine-v1";
+
+/// Rotary pairs per (temporal, height, width) axis of the text model's
+/// M-RoPE, the only layout the vision path is written for (VISION.md).
+pub const MROPE_SECTION: &[usize] = &[11, 11, 10];
 
 /// The parsed, validated Qwen3.8-Flash-Next text model configuration.
 #[derive(Debug)]
@@ -251,6 +362,8 @@ pub struct Qwen4ExpConfig {
     pub quantization: QuantizationConfig,
     /// The draft head, when the checkpoint includes it.
     pub mtp: Option<MtpConfig>,
+    /// The vision tower, when the checkpoint includes it.
+    pub vision: Option<VisionConfig>,
 }
 
 impl Qwen4ExpConfig {
@@ -258,8 +371,13 @@ impl Qwen4ExpConfig {
         let path = dir.as_ref().join("config.json");
         let bytes = std::fs::read(&path)
             .with_context(|| format!("reading {}", path.display()))?;
+        Self::from_json(&bytes)
+    }
+
+    /// Parses and validates the contents of a converted `config.json`.
+    pub fn from_json(bytes: &[u8]) -> Result<Self> {
         let wrapper: WrapperJson =
-            serde_json::from_slice(&bytes).context("parsing config.json")?;
+            serde_json::from_slice(bytes).context("parsing config.json")?;
         ensure!(
             wrapper.model_type == "qwen4_exp",
             "unsupported model_type {:?}; this loader is for Qwen3.8-Flash-Next (qwen4_exp)",
@@ -367,6 +485,54 @@ impl Qwen4ExpConfig {
             }
         };
 
+        let vision = match wrapper.lily.vision {
+            None => None,
+            Some(v) => {
+                ensure!(
+                    !wrapper.lily.dropped.iter().any(|p| p == VISION_PREFIX),
+                    "config.json declares lily.vision but lists {VISION_PREFIX} in lily.dropped"
+                );
+                ensure!(
+                    v.dtype == "bf16",
+                    "unsupported vision tower storage dtype {:?} (lily loads bf16)",
+                    v.dtype
+                );
+                let vc = wrapper.vision_config.context(
+                    "config.json declares lily.vision but has no vision_config",
+                )?;
+                let token = |id: Option<u32>, name: &str| {
+                    id.with_context(|| {
+                        format!("config.json declares lily.vision but has no {name}")
+                    })
+                };
+                Some(VisionConfig {
+                    depth: vc.depth,
+                    hidden_size: vc.hidden_size,
+                    num_heads: vc.num_heads,
+                    intermediate_size: vc.intermediate_size,
+                    patch_size: vc.patch_size,
+                    temporal_patch_size: vc.temporal_patch_size,
+                    spatial_merge_size: vc.spatial_merge_size,
+                    in_channels: vc.in_channels,
+                    num_position_embeddings: vc.num_position_embeddings,
+                    out_hidden_size: vc.out_hidden_size,
+                    hidden_act: vc.hidden_act,
+                    deepstack_visual_indexes: vc.deepstack_visual_indexes,
+                    image_token_id: token(wrapper.image_token_id, "image_token_id")?,
+                    video_token_id: token(wrapper.video_token_id, "video_token_id")?,
+                    vision_start_token_id: token(
+                        wrapper.vision_start_token_id,
+                        "vision_start_token_id",
+                    )?,
+                    vision_end_token_id: token(
+                        wrapper.vision_end_token_id,
+                        "vision_end_token_id",
+                    )?,
+                    tensors: v.tensors,
+                })
+            }
+        };
+
         let config = Self {
             hidden_size: t.hidden_size,
             num_hidden_layers: t.num_hidden_layers,
@@ -401,9 +567,92 @@ impl Qwen4ExpConfig {
             },
             quantization,
             mtp,
+            vision,
         };
         config.validate_flash_next()?;
+        config.validate_vision()?;
         Ok(config)
+    }
+
+    /// What lily's vision path (plan items 3 to 5) is written for: tanh-GELU
+    /// blocks, no deepstack injection into the trunk, a merger that lands in
+    /// the text hidden size, 2 x 2 merge over 2-frame patches, and the
+    /// interleaved 3-axis RoPE VISION.md describes. Names the field that is
+    /// off so a new checkpoint fails clearly.
+    fn validate_vision(&self) -> Result<()> {
+        let Some(v) = &self.vision else {
+            return Ok(());
+        };
+        ensure!(
+            v.hidden_act == "gelu_pytorch_tanh",
+            "vision_config.hidden_act {:?} is not supported (lily implements gelu_pytorch_tanh)",
+            v.hidden_act
+        );
+        ensure!(
+            v.deepstack_visual_indexes.is_empty(),
+            "vision_config.deepstack_visual_indexes {:?} is not supported (lily injects \
+             vision features only at the placeholder rows)",
+            v.deepstack_visual_indexes
+        );
+        ensure!(
+            v.out_hidden_size == self.hidden_size,
+            "vision_config.out_hidden_size {} != text hidden_size {}",
+            v.out_hidden_size,
+            self.hidden_size
+        );
+        ensure!(
+            v.spatial_merge_size == 2,
+            "vision_config.spatial_merge_size {} is not supported (lily merges 2 x 2)",
+            v.spatial_merge_size
+        );
+        ensure!(
+            v.temporal_patch_size == 2,
+            "vision_config.temporal_patch_size {} is not supported (lily folds 2 frames)",
+            v.temporal_patch_size
+        );
+        ensure!(
+            v.depth > 0
+                && v.num_heads > 0
+                && v.hidden_size.is_multiple_of(v.num_heads)
+                && v.head_dim().is_multiple_of(2),
+            "vision_config.hidden_size {} / num_heads {} is not an even head dim",
+            v.hidden_size,
+            v.num_heads
+        );
+        let side = (v.num_position_embeddings as f64).sqrt() as usize;
+        ensure!(
+            side * side == v.num_position_embeddings,
+            "vision_config.num_position_embeddings {} is not a square grid",
+            v.num_position_embeddings
+        );
+        ensure!(
+            v.tensors == v.expected_tensors(),
+            "lily.vision.tensors {} != {} implied by vision_config.depth {}",
+            v.tensors,
+            v.expected_tensors(),
+            v.depth
+        );
+        let rope = &self.rope_parameters;
+        let section = rope.mrope_section.as_deref().context(
+            "text_config.rope_parameters.mrope_section is missing (required with a vision tower)",
+        )?;
+        ensure!(
+            section == MROPE_SECTION,
+            "text_config.rope_parameters.mrope_section {section:?} is not supported \
+             (lily's interleaved M-RoPE is written for {MROPE_SECTION:?})"
+        );
+        ensure!(
+            section.iter().sum::<usize>() * 2 == self.rotary_dim(),
+            "text_config.rope_parameters.mrope_section {section:?} does not sum to rotary_dim / 2 = {}",
+            self.rotary_dim() / 2
+        );
+        ensure!(
+            rope.mrope_interleaved == Some(true),
+            "text_config.rope_parameters.mrope_interleaved {:?} is not supported (lily implements \
+             the interleaved layout)",
+            rope.mrope_interleaved
+        );
+        Ok(())
     }
 
     /// The kernels are written for Qwen3.8-Flash-Next's exact shape; refuse
@@ -473,3 +722,7 @@ impl Qwen4ExpConfig {
         self.hc_count * self.hidden_size
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/qwen4exp/config.rs"]
+mod tests;

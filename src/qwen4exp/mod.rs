@@ -8,6 +8,7 @@ pub mod config;
 pub mod model;
 pub mod ngram;
 mod spec;
+pub mod vision_weights;
 pub mod weights;
 
 pub use model::{DecodeState, Encoder, MAX_DRAFTS, Qwen4ExpModel, Scratch};

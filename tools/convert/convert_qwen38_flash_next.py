@@ -18,6 +18,15 @@ outside any GPU-less sandbox; `--dry-run` never imports it.
 one attention+MoE block plus its input projections and output mixer) to an
 existing conversion as extra `mtp-*.safetensors` shards, merging them into the
 index and config so the engine can run speculative decoding.
+
+The vision tower (`model.visual.*`, 333 bf16 tensors, 0.90 GB) is kept
+unquantized and copied byte for byte: it is 1.3 % of the checkpoint, runs once
+per image, and quantization noise would eat into a tolerance floor that is
+already only relative L2 0.05 (tools/reference/VISION.md). `--no-vision` drops
+it; `--vision-only` appends it to an existing conversion as `vision-*.safetensors`
+shards, the counterpart of `--mtp-only`. `config.json` carries `vision_config`
+and the four vision token ids only when the tower is present, so the file
+matches the weights in both directions.
 """
 
 from __future__ import annotations
@@ -38,8 +47,10 @@ import numpy as np
 FORMAT_NAME = "qwen4_exp-affine-v1"
 SOURCE_REPOSITORY = "Qwen/Qwen3.8-Flash-Next"
 LAYER_PREFIX = "model.language_model.layers."
-DROP_PREFIXES = ("model.visual.",)
+VISION_PREFIX = "model.visual."
 MTP_PREFIX = "mtp."
+# Wrapper-level config keys that only mean something with the tower present.
+VISION_TOKEN_KEYS = ("image_token_id", "video_token_id", "vision_start_token_id", "vision_end_token_id")
 COPIED_FILES = (
     "tokenizer.json",
     "tokenizer_config.json",
@@ -191,9 +202,12 @@ _PLE_CONSTS = (
 _NGRAM_SHARD = re.compile(r"\.ple\.ple_embedding\.ngram_embedding\.shard_\d+\.weight$")
 
 
-def plan_tensor(t: SourceTensor, keep_layers: int, ngram: Quant, mtp: bool = True) -> Plan:
+def plan_tensor(t: SourceTensor, keep_layers: int, ngram: Quant, mtp: bool = True, vision: bool = True) -> Plan:
     name = t.name
-    if name.startswith(DROP_PREFIXES) or (not mtp and name.startswith(MTP_PREFIX)):
+    if name.startswith(VISION_PREFIX):
+        # The tower stays bf16, byte for byte (see the module docstring).
+        return Plan("copy") if vision else Plan("drop")
+    if not mtp and name.startswith(MTP_PREFIX):
         return Plan("drop")
     li = layer_index(name)
     if li is not None and li >= keep_layers:
@@ -219,6 +233,8 @@ def plan_tensor(t: SourceTensor, keep_layers: int, ngram: Quant, mtp: bool = Tru
 
 
 def category(name: str) -> str:
+    if name.startswith(VISION_PREFIX):
+        return "vision"
     if name.startswith(MTP_PREFIX):
         return "mtp"
     if "ngram_embedding.shard_" in name:
@@ -235,10 +251,10 @@ def gate_up_output_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
     return (e, two_i // 2, h)
 
 
-def estimate(tensors: list[SourceTensor], keep_layers: int, ngram: Quant, mtp: bool = True) -> Totals:
+def estimate(tensors: list[SourceTensor], keep_layers: int, ngram: Quant, mtp: bool = True, vision: bool = True) -> Totals:
     totals = Totals()
     for t in tensors:
-        plan = plan_tensor(t, keep_layers, ngram, mtp)
+        plan = plan_tensor(t, keep_layers, ngram, mtp, vision)
         cat = category(t.name)
         if plan.kind in ("drop", "ple_const"):
             continue
@@ -462,11 +478,41 @@ def mtp_block(text_cfg: dict) -> dict:
     }
 
 
-def write_config(src: Path, dst: Path, keep_layers: int, ngram: Quant, ple: dict, revision: str | None, mtp: bool) -> None:
+def vision_block(tensors: list[SourceTensor]) -> dict:
+    """What the engine needs to know about the copied tower: its storage dtype
+    and tensor count, so the loader can tell presence without scanning the index."""
+    tower = [t for t in tensors if t.name.startswith(VISION_PREFIX)]
+    dtypes = sorted({t.dtype for t in tower})
+    if dtypes != ["BF16"]:
+        raise SystemExit(f"vision tower is stored as {dtypes}, expected BF16 only")
+    return {"dtype": "bf16", "tensors": len(tower), "bytes": sum(t.nbytes for t in tower)}
+
+
+def strip_vision_from_config(cfg: dict) -> None:
+    """Removes the wrapper keys that describe the tower, so a config without
+    the tensors does not advertise them."""
+    cfg.pop("vision_config", None)
+    for key in VISION_TOKEN_KEYS:
+        cfg.pop(key, None)
+
+
+def write_config(
+    src: Path,
+    dst: Path,
+    keep_layers: int,
+    ngram: Quant,
+    ple: dict,
+    revision: str | None,
+    mtp: bool,
+    vision: list[SourceTensor] | None,
+) -> None:
+    """`vision` is the list of copied tower tensors, or None when the tower was dropped."""
     cfg = json.loads((src / "config.json").read_text())
     text = cfg["text_config"]
     text["num_hidden_layers"] = keep_layers
     text["layer_types"] = text["layer_types"][:keep_layers]
+    if vision is None:
+        strip_vision_from_config(cfg)
     cfg["lily"] = {
         "format": FORMAT_NAME,
         "source_repository": SOURCE_REPOSITORY,
@@ -479,7 +525,8 @@ def write_config(src: Path, dst: Path, keep_layers: int, ngram: Quant, ple: dict
         },
         "ple": ple,
         "mtp": mtp_block(text) if mtp else None,
-        "dropped": list(DROP_PREFIXES) + ([] if mtp else [MTP_PREFIX]),
+        "vision": vision_block(vision) if vision is not None else None,
+        "dropped": ([] if vision is not None else [VISION_PREFIX]) + ([] if mtp else [MTP_PREFIX]),
     }
     (dst / "config.json").write_text(json.dumps(cfg, indent=2))
 
@@ -493,6 +540,24 @@ def add_mtp_to_config(dst: Path) -> None:
         raise SystemExit(f"{path} already declares an MTP block")
     lily["mtp"] = mtp_block(cfg["text_config"])
     lily["dropped"] = [p for p in lily.get("dropped", []) if p != MTP_PREFIX]
+    path.write_text(json.dumps(cfg, indent=2))
+
+
+def add_vision_to_config(src: Path, dst: Path, vision: list[SourceTensor]) -> None:
+    """Marks an existing conversion's config as carrying the tower: restores
+    `vision_config` and the vision token ids from the source config (a
+    `--no-vision` conversion stripped them) and adds the `lily.vision` block."""
+    path = dst / "config.json"
+    cfg = json.loads(path.read_text())
+    lily = cfg["lily"]
+    if lily.get("vision"):
+        raise SystemExit(f"{path} already declares a vision block")
+    source = json.loads((src / "config.json").read_text())
+    cfg["vision_config"] = source["vision_config"]
+    for key in VISION_TOKEN_KEYS:
+        cfg[key] = source[key]
+    lily["vision"] = vision_block(vision)
+    lily["dropped"] = [p for p in lily.get("dropped", []) if p != VISION_PREFIX]
     path.write_text(json.dumps(cfg, indent=2))
 
 
@@ -527,37 +592,50 @@ def convert(args: argparse.Namespace) -> None:
         raise SystemExit(f"--layers must be in 1..{text_cfg['num_hidden_layers']}")
 
     mtp = not args.no_mtp
-    if args.mtp_only:
-        # Only the draft head, appended to a finished conversion.
-        tensors = [t for t in tensors if t.name.startswith(MTP_PREFIX)]
+    vision = not args.no_vision
+    append_only = args.mtp_only or args.vision_only
+    if args.mtp_only and args.vision_only:
+        raise SystemExit("--mtp-only and --vision-only are separate append runs; pass one at a time")
+    if append_only:
+        # One optional part, appended to a finished conversion.
+        prefix, stem = (MTP_PREFIX, "mtp") if args.mtp_only else (VISION_PREFIX, "vision")
+        tensors = [t for t in tensors if t.name.startswith(prefix)]
         if not tensors:
-            raise SystemExit("source has no mtp.* tensors")
+            raise SystemExit(f"source has no {prefix}* tensors")
         if not (dst / "model.safetensors.index.json").exists():
             raise SystemExit(f"{dst} is not a finished conversion (no index); run a full conversion first")
-        if any(dst.glob("mtp-*.safetensors")):
-            raise SystemExit(f"{dst} already holds mtp shards; refusing to overwrite")
-        mtp = True
-    totals = estimate(tensors, keep_layers, ngram, mtp)
-    what = "the MTP draft head" if args.mtp_only else f"{keep_layers} layers (ngram {ngram.bits}-bit g{ngram.group_size}{', no mtp' if not mtp else ''})"
+        if any(dst.glob(f"{stem}-*.safetensors")):
+            raise SystemExit(f"{dst} already holds {stem} shards; refusing to overwrite")
+        mtp = vision = True
+    else:
+        stem = "model"
+    totals = estimate(tensors, keep_layers, ngram, mtp, vision)
+    if args.mtp_only:
+        what = "the MTP draft head"
+    elif args.vision_only:
+        what = "the vision tower"
+    else:
+        dropped = (", no mtp" if not mtp else "") + (", no vision" if not vision else "")
+        what = f"{keep_layers} layers (ngram {ngram.bits}-bit g{ngram.group_size}{dropped})"
     print_totals(f"planned output for {what}", totals)
     if args.dry_run:
         return
 
     dst.mkdir(parents=True, exist_ok=True)
-    if not args.mtp_only:
+    if not append_only:
         if any(dst.glob("model-*.safetensors")):
             raise SystemExit(f"{dst} already holds shards; refusing to overwrite")
         for name in COPIED_FILES:
             if (src / name).exists():
                 shutil.copy2(src / name, dst / name)
 
-    planned = [(t, plan_tensor(t, keep_layers, ngram, mtp)) for t in tensors]
+    planned = [(t, plan_tensor(t, keep_layers, ngram, mtp, vision)) for t in tensors]
     planned = [(t, p) for t, p in planned if p.kind != "drop"]
     src_bytes = sum(t.nbytes for t, _ in planned)
     quant_positions = [i for i, (_, p) in enumerate(planned) if p.kind == "quant"]
-    check_idx = set(np.random.default_rng(0).choice(quant_positions, size=min(3, len(quant_positions)), replace=False).tolist())
+    check_idx = set(np.random.default_rng(0).choice(quant_positions, size=min(3, len(quant_positions)), replace=False).tolist()) if quant_positions else set()
 
-    writer = ShardWriter(dst, int(args.shard_bytes), stem="mtp" if args.mtp_only else "model")
+    writer = ShardWriter(dst, int(args.shard_bytes), stem=stem)
     ple_consts: dict[str, list[int]] = {}
     checked: list[tuple[str, float]] = []
     started = time.time()
@@ -598,13 +676,16 @@ def convert(args: argparse.Namespace) -> None:
                 f"{done_bytes / max(elapsed, 1e-9) / 1e9:5.2f} GB/s, {elapsed:6.0f}s  {t.name[-64:]}",
                 flush=True,
             )
-    writer.finish(merge=args.mtp_only)
+    writer.finish(merge=append_only)
 
+    vision_tensors = [t for t, p in planned if p.kind == "copy" and t.name.startswith(VISION_PREFIX)]
     if args.mtp_only:
         add_mtp_to_config(dst)
+    elif args.vision_only:
+        add_vision_to_config(src, dst, vision_tensors)
     else:
         ple = verify_ple_constants(text_cfg, ple_consts) if ple_consts else {}
-        write_config(src, dst, keep_layers, ngram, ple, source_revision(src), mtp)
+        write_config(src, dst, keep_layers, ngram, ple, source_revision(src), mtp, vision_tensors if vision else None)
 
     elapsed = time.time() - started
     print(f"\nwrote {len(writer.files)} shards, {fmt_gb(writer.total_bytes)} in {elapsed:.0f}s to {dst}")
@@ -622,6 +703,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--shard-bytes", type=float, default=2e9)
     parser.add_argument("--no-mtp", action="store_true", help="drop the mtp.* draft head (it is converted by default)")
     parser.add_argument("--mtp-only", action="store_true", help="append only the mtp.* draft head to an existing conversion in --dst")
+    parser.add_argument("--no-vision", action="store_true", help="drop the model.visual.* vision tower (it is copied in bf16 by default)")
+    parser.add_argument("--vision-only", action="store_true", help="append only the model.visual.* vision tower to an existing conversion in --dst")
     parser.add_argument("--dry-run", action="store_true", help="only print the size plan")
     convert(parser.parse_args(argv))
 

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
+use lily::engine::VisionMode;
 use lily::qwen4exp::NgramStorage;
 use lily::serve::{SamplingOverrides, ServeOptions, parse_duration_secs};
 
@@ -92,6 +93,11 @@ struct Cli {
     #[arg(long, default_value_t = 2)]
     mtp_drafts: usize,
 
+    /// The vision tower of a Qwen3.8-Flash-Next conversion that carries it:
+    /// `auto` loads it (0.9 GB), `off` leaves it on disk.
+    #[arg(long, default_value = "auto")]
+    vision: VisionMode,
+
     /// Chat prompts open a reasoning block unless the request says otherwise.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     thinking: bool,
@@ -169,6 +175,7 @@ fn main() -> Result<()> {
         ngram_preload: cli.ngram_preload,
         ngram_lock: cli.ngram_lock,
         mtp_drafts: cli.mtp_drafts,
+        vision: cli.vision,
         thinking: cli.thinking,
         reasoning_effort: cli.reasoning_effort,
         queue: cli.queue,

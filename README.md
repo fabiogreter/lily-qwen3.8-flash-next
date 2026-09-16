@@ -41,8 +41,9 @@ The layout is written out in
 
 ### What is not supported
 
-- **The vision tower.** `model.visual.*` is dropped at conversion, and the
-  API rejects image content.
+- **Image input.** The converter now keeps the vision tower and the engine
+  loads it (`--vision`), but nothing runs it yet: the API still rejects image
+  content. Vision support is in progress (`docs/vision-support-plan.md`).
 - **Batch size 1.** One generation runs at a time; further requests queue.
   There is no batching across requests.
 - **Greedy drafts only.** The draft head proposes with argmax, so a request
@@ -236,6 +237,7 @@ decode and acceptance numbers in the opencode terminal UI.
 | `--ngram-preload` | true | read the table at startup so no request pays cold reads |
 | `--ngram-lock` | false | `mlock` the table (32 GB other apps cannot reclaim) |
 | `--mtp-drafts` | 2 | draft tokens per speculative step (0 turns the draft head off) |
+| `--vision` | `auto` | load the vision tower when the checkpoint carries it (0.9 GB); `off` leaves it on disk |
 | `--disk-cache-dir` | `~/Library/Caches/lily/sessions` | where evicted sessions are kept |
 | `--disk-cache-bytes` | 100G | disk tier budget, LRU; `0` disables the tier |
 | `--disk-cache-ttl` | 3d | delete disk entries unused this long (`0`: never) |
@@ -375,6 +377,11 @@ LILY_MODEL_DIR_FLASH=~/models/Qwen3.8-Flash-Next-lily-q4 \
 # with the draft head is enough):
 LILY_MODEL_DIR_FLASH=~/models/Qwen3.8-Flash-Next-lily-q4-l4 \
   cargo test --release --test test_speculative_flash -- --ignored --test-threads=1
+
+# The vision tower's tensors against the source checkpoint's values (a
+# conversion with the tower appended):
+LILY_MODEL_DIR_FLASH=~/models/Qwen3.8-Flash-Next-lily-q4-l4 \
+  cargo test --release --lib the_four_layer_checkpoint_tower -- --ignored --test-threads=1
 ```
 
 Two things to know before trusting a green run are in

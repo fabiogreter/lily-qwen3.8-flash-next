@@ -12,19 +12,39 @@ MLX-community convention to match.
 config.json                       HF config.json + a top-level "lily" block (see below)
 model-XXXXX-of-YYYYY.safetensors  quantized text-model tensors, ~2 GB shards
 mtp-XXXXX-of-YYYYY.safetensors    the multi-token-prediction draft head (optional, see below)
-model.safetensors.index.json      standard HF weight_map (covers both shard families)
+vision-XXXXX-of-YYYYY.safetensors the vision tower, unquantized bf16 (optional, see below)
+model.safetensors.index.json      standard HF weight_map (covers all shard families)
 tokenizer.json, tokenizer_config.json, chat_template.jinja,
 generation_config.json            copied verbatim from the source checkpoint
 ```
 
-Everything under `model.visual.*` (vision tower) is dropped. The `mtp.*`
-draft head (one full-attention decoder block, `pre_fc_norm_embedding`,
-`pre_fc_norm_hidden`, `fc_embedding`, `fc_hidden`, and its own
-`hyper_connection_mixer`) is converted with the same rules as the trunk
+The `mtp.*` draft head (one full-attention decoder block,
+`pre_fc_norm_embedding`, `pre_fc_norm_hidden`, `fc_embedding`, `fc_hidden`, and
+its own `hyper_connection_mixer`) is converted with the same rules as the trunk
 (`fc_embedding`/`fc_hidden` at 8 bits, the two `pre_fc_norm_*` weights
 verbatim) and written to `mtp-*` shards: by default in the same run, or later
 with `--mtp-only` into an existing conversion, which merges the index and adds
 a `lily.mtp` block to `config.json`. `--no-mtp` drops it.
+
+The vision tower (`model.visual.*`: 333 bf16 tensors, 0.90 GB; 27 blocks of
+hidden size 1152, the patch embedding, the 2304-row position table and the
+merger, see `tools/reference/VISION.md`) is **copied byte for byte, unquantized**,
+to `vision-*` shards. It is 1.3 % of the checkpoint and runs once per image,
+and the tower's tolerance floor against the reference is already only relative
+L2 0.05, so quantization noise has no room there. By default it is written in
+the same run; `--vision-only` appends it to an existing conversion (merging the
+index, refusing if `vision-*` shards exist) and `--no-vision` drops it. Names
+and shapes are the Hugging Face ones verbatim (`patch_embed.proj.weight` stays
+`[1152, 3, 2, 16, 16]`; lily views it as `[1152, 1536]` at load, which is the
+same bytes).
+
+`config.json` matches the weights in both directions: with the tower present
+it keeps the wrapper's `vision_config` and the four token ids (`image_token_id`,
+`video_token_id`, `vision_start_token_id`, `vision_end_token_id`) and carries a
+`lily.vision` block; without it those keys are removed and `model.visual.` is
+listed in `lily.dropped`. The loader reads `lily.vision` to decide whether to
+expect the tensors, and refuses a checkpoint whose files hold `model.visual.*`
+tensors without the block (or the reverse).
 
 ## Tensor naming
 
@@ -109,9 +129,19 @@ converter asserts they match the formulas in
   "layers": 48,                       // number of decoder layers kept (truncation for tests)
   "quantization": {"default": {"bits": 4, "group_size": 64}, ...per-tensor overrides...},
   "ple": {"layer_multipliers": [...], "ngram_heads_vocab_sizes": [...], "ngram_heads_offsets": [...]},
-  "mtp": {"layers": 1, "layer_types": ["full_attention"], "rope_theta": 10000000, ...} // or null
+  "mtp": {"layers": 1, "layer_types": ["full_attention"], "rope_theta": 10000000, ...}, // or null
+  "vision": {"dtype": "bf16", "tensors": 333, "bytes": 897862112},                  // or null
+  "dropped": []                       // tensor name prefixes left out: "model.visual." and/or "mtp."
 }
 ```
+
+The engine (`src/qwen4exp/config.rs`) ignores keys it does not know, so a
+binary from before a block was added still reads a newer `config.json`. With
+`lily.vision` set it also parses `vision_config` and the token ids and checks
+what lily's vision path is written for (`gelu_pytorch_tanh`, no deepstack
+injection, `out_hidden_size` equal to the text hidden size, 2 x 2 merge over
+2-frame patches, `rope_parameters.mrope_section` `[11, 11, 10]` interleaved);
+a checkpoint outside that fails at load naming the field.
 
 `text_config.num_hidden_layers` and `text_config.layer_types` are rewritten to
 the kept layer count when the converter truncates (`--layers N`), so a

@@ -1,8 +1,9 @@
 //! Checkpoint loading for Qwen3.8-Flash-Next in lily's `qwen4_exp-affine-v1`
 //! layout (`docs/qwen38-flash-next-checkpoint-format.md`). Tensor names are
 //! the Hugging Face names; every linear projection and both embedding tables
-//! are affine `{weight, scales, biases}` triples. Every tensor in the file must
-//! be consumed or explicitly skip-listed so a name-scheme drift fails loudly.
+//! are affine `{weight, scales, biases}` triples, the vision tower stays bf16.
+//! Every tensor in the file must be consumed or explicitly skip-listed so a
+//! name-scheme drift fails loudly.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -14,13 +15,15 @@ use crate::safetensors::Checkpoint;
 use crate::tensor::Tensor;
 use crate::weights::{LinearWeights, Loader, MlpWeights, MoeWeights, expect_shape};
 
-use super::config::{LayerType, Qwen4ExpConfig};
+use super::config::{LayerType, Qwen4ExpConfig, VISION_PREFIX};
 use super::ngram::{self, NgramStorage, NgramTable, PagedTable};
+use super::vision_weights::{self, VisionWeights};
 
 const PREFIX: &str = "model.language_model.";
-/// Skipped tensors: the vision tower is never converted, and the draft head
-/// (`mtp.*`) is only read when the caller asks for it.
-const SKIP_PREFIXES: &[&str] = &["model.visual.", "mtp."];
+/// Skipped tensors: the draft head (`mtp.*`) is only read when the caller
+/// asks for it, and the vision tower only when it is loaded.
+const SKIP_PREFIXES_TEXT_ONLY: &[&str] = &[VISION_PREFIX, "mtp."];
+const SKIP_PREFIXES_WITH_VISION: &[&str] = &["mtp."];
 const MTP_PREFIX: &str = "mtp.";
 
 /// One hyper-connection (gated residual) block: a grouped norm over the
@@ -129,6 +132,8 @@ pub struct ModelWeights {
     pub layers: Vec<LayerWeights>,
     /// The draft head, when the checkpoint has it and the caller wanted it.
     pub mtp: Option<Box<MtpWeights>>,
+    /// The vision tower, when the checkpoint has it and the caller wanted it.
+    pub vision: Option<Box<VisionWeights>>,
 }
 
 /// The converter's storage policy: routers, gates and the small mixing
@@ -443,22 +448,37 @@ fn load_ple(
     })
 }
 
-/// Loads the trunk, and the draft head when `with_mtp` is set and the
-/// checkpoint declares one (the `mtp.*` tensors are skipped otherwise).
+/// Loads the trunk, the draft head when `with_mtp` is set and the checkpoint
+/// declares one (the `mtp.*` tensors are skipped otherwise), and the vision
+/// tower when `with_vision` is set and the checkpoint declares one.
 pub fn load(
     ctx: &MetalContext,
     dir: impl AsRef<Path>,
     config: &Qwen4ExpConfig,
     storage: NgramStorage,
     with_mtp: bool,
+    with_vision: bool,
 ) -> Result<ModelWeights> {
     let ckpt = Checkpoint::open(&dir)?;
     ensure!(
         ckpt.meta(&format!("{PREFIX}embed_tokens.weight")).is_some(),
         "unsupported checkpoint layout; expected lily's qwen4_exp-affine-v1"
     );
-    let loader =
-        Loader::new(ctx, ckpt, config.quantization, SKIP_PREFIXES, expected_bits);
+    // The config must match the weights in both directions: a tower in the
+    // files that config.json does not declare would otherwise be skipped
+    // silently; a declared tower whose tensors are missing fails below.
+    if config.vision.is_none() {
+        let stray = ckpt.names().filter(|n| n.starts_with(VISION_PREFIX)).count();
+        ensure!(
+            stray == 0,
+            "checkpoint holds {stray} {VISION_PREFIX}* tensors but config.json declares no \
+             lily.vision block; re-run the converter's --vision-only or fix the config"
+        );
+    }
+    let load_vision = with_vision && config.vision.is_some();
+    let skip =
+        if load_vision { SKIP_PREFIXES_WITH_VISION } else { SKIP_PREFIXES_TEXT_ONLY };
+    let loader = Loader::new(ctx, ckpt, config.quantization, skip, expected_bits);
     let h = config.hidden_size;
 
     let embed_tokens = loader.linear(&[&format!("{PREFIX}embed_tokens")], h)?;
@@ -497,7 +517,11 @@ pub fn load(
         (Some(_), true) => Some(Box::new(load_mtp(&loader, config)?)),
         _ => None,
     };
+    let vision = match (&config.vision, load_vision) {
+        (Some(v), true) => Some(Box::new(vision_weights::load(&loader, v)?)),
+        _ => None,
+    };
 
     loader.finish()?;
-    Ok(ModelWeights { embed_tokens, lm_head, final_mixer, layers, mtp })
+    Ok(ModelWeights { embed_tokens, lm_head, final_mixer, layers, mtp, vision })
 }
