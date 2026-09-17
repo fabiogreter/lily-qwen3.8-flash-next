@@ -292,7 +292,14 @@ estimate with its assumption named.
    ms (the Q8 one from 1.41 to 1.14), about 5% of the pass, so most of the
    gap is elsewhere in the pass. Splitting each stream of the
    hyper-connection down kernels over two simdgroups was measured slower
-   (9.2 to 9.8 us at one row, 12.8 to 14.2 at three) and not kept. Routing
+   (9.2 to 9.8 us at one row, 12.8 to 14.2 at three) and not kept; so were
+   three more variants of the single-row pair, timed per dispatch on the
+   profile transport against the shipped kernels (which measure 8.7 to 9.3
+   us for the down read and 10.0 to 10.6 for the up read, 320 to 360 GB/s):
+   the down kernel's five weight blocks per lane requested up front (20.5
+   us), an unroll pragma on its loop (11.7), and the up kernel's epilogue
+   loads hoisted ahead of its weight walk (13.4). The `fused_read_kernels_
+   dispatch_timing` test is the harness for that comparison. Routing
    the decode step's own matvecs through the one-row register-A kernel was
    measured in the profiled 8K step and not kept either: the 192 dense Q4
    projections took 4.08 to 4.12 ms against 3.90 to 4.07 with the packed

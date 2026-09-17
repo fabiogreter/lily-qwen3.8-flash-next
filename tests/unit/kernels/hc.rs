@@ -440,22 +440,25 @@ fn fused_read_gate_timing() {
     let up = zeros(&[k], DType::BF16);
     let mixed = zeros(&[h], DType::BF16);
     let inv_rms = zeros(&[g], DType::F32);
-    let iters = 256;
+    // Short passes, many of them, and the minimum: display work and other
+    // GPU clients interrupt some passes, and the clean ones show the kernel.
+    let iters = 64;
+    let passes = 16;
     type Read<'a> =
         dyn Fn(&ComputePass<'_>, &QuantWeights, &QuantWeights, &QuantWeights) + 'a;
     let time = |name: &str, f: &Read<'_>| {
         let mut best = f64::MAX;
-        for _ in 0..3 {
+        for p in 0..passes {
             let pass = ctx.begin_concurrent().expect("pass");
             for i in 0..iters {
-                let (d, u, j) = &weights[i % sets];
+                let (d, u, j) = &weights[(p * iters + i) % sets];
                 f(&pass, d, u, j);
             }
             let start = std::time::Instant::now();
             pass.commit_wait().expect("commit");
             best = best.min(start.elapsed().as_secs_f64() * 1e6 / iters as f64);
         }
-        eprintln!("{name}: {best:.1} us per read (best of 3)");
+        eprintln!("{name}: {best:.1} us per read (best of {passes} passes of {iters})");
     };
     time("unfused (6 dispatches)", &|pass, down_w, up_w, inj_w| {
         rmsnorm_grouped_bf16(&ctx, pass, &t_hyper, &t_norm, &hn, h, g, 1e-6, 1.0)
@@ -1156,5 +1159,111 @@ fn fused_batched_read_gate_timing() {
             }
             pass.level_barrier(&[&mixed]).unwrap();
         });
+    }
+}
+
+/// Per-dispatch GPU timestamps of the fused read kernels on the profile
+/// transport (one command buffer per dispatch), reported as minimum and
+/// percentiles over the samples, so GPU contention (display work, other
+/// clients) that hits some samples does not decide a comparison. To A/B a
+/// variant, add it to `names` under its own kernel name: every entry
+/// streams its own weight set and the order rotates.
+#[test]
+#[ignore = "timing only"]
+fn fused_read_kernels_dispatch_timing() {
+    let ctx = MetalContext::new_with_profile(true).expect("metal context");
+    let mut rng = StdRng::seed_from_u64(25);
+    let (h, g, r) = (2560usize, 4usize, 320usize);
+    let k = g * h;
+    let sets = 64;
+    let hyper = cpu_ref::round_bf16(&random(&mut rng, k, -3.0, 3.0));
+    let norm_w = cpu_ref::round_bf16(&random(&mut rng, k, -0.5, 0.5));
+    let weights: Vec<(QuantWeights, QuantWeights, QuantWeights)> = (0..sets)
+        .map(|_| {
+            (
+                random_q8(&ctx, &mut rng, r, k).0,
+                random_q8(&ctx, &mut rng, k, r).0,
+                random_q8(&ctx, &mut rng, g, k).0,
+            )
+        })
+        .collect();
+    let t_hyper = Tensor::from_f32_as_bf16(&ctx, &hyper, &[k]).expect("hyper");
+    let t_norm = Tensor::from_f32_as_bf16(&ctx, &norm_w, &[k]).expect("norm");
+    let zeros =
+        |shape: &[usize], dtype| Tensor::zeros(&ctx, shape, dtype).expect("scratch");
+    let down = zeros(&[r], DType::BF16);
+    let inj = zeros(&[g], DType::BF16);
+    let mixed = zeros(&[h], DType::BF16);
+    let inv_rms = zeros(&[g], DType::F32);
+    // (kernel name, is a down kernel)
+    let names = [("hc_read_down_q8", true), ("hc_read_up_mix_q8_g4", false)];
+    let iters = 512;
+    crate::metal::profile::take();
+    let pass = ctx.begin().expect("pass");
+    for i in 0..iters {
+        for slot in 0..names.len() {
+            let which = (slot + i) % names.len();
+            let (name, is_down) = names[which];
+            let (d, u, j) = &weights[(names.len() * i + which) % sets];
+            if is_down {
+                let dims = check_read_down(
+                    &t_hyper,
+                    &t_norm,
+                    d,
+                    Some(j),
+                    &down,
+                    &inj,
+                    &inv_rms,
+                    h,
+                    g,
+                    1,
+                )
+                .unwrap();
+                dispatch_read_down(
+                    &ctx,
+                    &pass,
+                    name,
+                    &t_hyper,
+                    &t_norm,
+                    d,
+                    Some(j),
+                    &down,
+                    &inj,
+                    &inv_rms,
+                    None,
+                    dims,
+                    h,
+                    g,
+                    1e-6,
+                    1.0,
+                )
+                .unwrap();
+            } else {
+                dispatch_read_up_mix(
+                    &ctx, &pass, name, u, &down, &t_hyper, &t_norm, &inv_rms, &mixed,
+                    h, g, 1, true, 1.0,
+                )
+                .unwrap();
+            }
+        }
+    }
+    pass.commit_wait().expect("commit");
+    let passes = crate::metal::profile::take();
+    for (name, _) in names {
+        let mut us: Vec<f64> = passes
+            .iter()
+            .flat_map(|p| p.kernels.iter())
+            .filter(|s| s.name == name)
+            .map(|s| s.gpu_secs * 1e6)
+            .collect();
+        us.sort_by(|a, b| a.total_cmp(b));
+        let n = us.len();
+        eprintln!(
+            "{name}: min {:.1} us, p10 {:.1}, median {:.1}, p90 {:.1} over {n} dispatches",
+            us[0],
+            us[n / 10],
+            us[n / 2],
+            us[n * 9 / 10]
+        );
     }
 }
