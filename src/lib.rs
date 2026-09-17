@@ -16,8 +16,6 @@ pub mod kernels;
 #[cfg(target_os = "macos")]
 pub mod metal;
 #[cfg(target_os = "macos")]
-pub mod model;
-#[cfg(target_os = "macos")]
 pub mod moe_ffn;
 pub mod npy;
 #[cfg(target_os = "macos")]

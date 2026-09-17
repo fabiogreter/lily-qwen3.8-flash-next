@@ -838,7 +838,7 @@ bounds the loop; the fourth fault exits 1 for the supervisor.
 ## What is deliberately not here
 
 Constrained decoding (`response_format: json_schema`), batching across
-requests, video input (the template's `<|video_pad|>` is refused), fetching
-images by URL (data URIs only, by design), and session persistence for the
-Qwen3.6-35B path (the engine trait's defaults disable the disk tier for
-it).
+requests, video input (the template's `<|video_pad|>` is refused), and
+fetching images by URL (data URIs only, by design). The engine trait's
+persistence methods keep defaults that refuse, so an architecture added
+later runs without the disk tier until it implements them.

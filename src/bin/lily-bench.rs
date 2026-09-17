@@ -13,7 +13,6 @@ use lily::kernels::sample::SamplingParams;
 use lily::metal::MetalContext;
 use lily::metal::profile::{self, PassProfile};
 use lily::metal::{EncodedPass, Pacer, PendingPass};
-use lily::model::Qwen3_5Model;
 use lily::qwen4exp::Qwen4ExpModel;
 use lily::serve::checkpoint_model_type;
 
@@ -65,7 +64,6 @@ fn main() -> Result<()> {
         if cli.sample { server_sampling(cli.seed) } else { SamplingParams::greedy() };
     SAMPLER.set(params).expect("sampler set once");
     match checkpoint_model_type(&cli.model)?.as_str() {
-        "qwen3_5_moe" => bench::<Qwen3_5Model>(&cli),
         "qwen4_exp" => bench::<Qwen4ExpModel>(&cli),
         other => anyhow::bail!("unsupported model_type {other:?}"),
     }

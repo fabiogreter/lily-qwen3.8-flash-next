@@ -12,7 +12,6 @@ use lily::engine::{DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi}
 use lily::generate::{Generator, Thinking};
 use lily::kernels::sample::SamplingParams;
 use lily::metal::MetalContext;
-use lily::model::Qwen3_5Model;
 use lily::qwen4exp::Qwen4ExpModel;
 use lily::serve::checkpoint_model_type;
 use serde::Serialize;
@@ -154,7 +153,6 @@ fn probe<M: LanguageModel>(cli: &Cli) -> Result<Record> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let record = match checkpoint_model_type(&cli.model)?.as_str() {
-        "qwen3_5_moe" => probe::<Qwen3_5Model>(&cli)?,
         "qwen4_exp" => probe::<Qwen4ExpModel>(&cli)?,
         other => anyhow::bail!("unsupported model_type {other:?}"),
     };

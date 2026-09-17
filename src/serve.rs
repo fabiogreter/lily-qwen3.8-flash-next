@@ -54,7 +54,6 @@ use crate::generate::{FinishReason, GenerateOptions, Generator};
 use crate::kernels::attention::MAX_SEQ;
 use crate::kernels::sample::SamplingParams;
 use crate::metal::MetalContext;
-use crate::model::Qwen3_5Model;
 use crate::qwen4exp::image::ImageLimits;
 use crate::qwen4exp::{
     ImageEmbeds, NgramStorage, Qwen4ExpModel, VisionInput, positions_for_prompt,
@@ -1553,11 +1552,10 @@ pub fn run(model_dir: &Path, options: ServeOptions) -> Result<()> {
     // stop signals only ever reach the thread that waits for them.
     let signals = signal::Signals::block()?;
     match checkpoint_model_type(model_dir)?.as_str() {
-        "qwen3_5_moe" => run_with::<Qwen3_5Model>(model_dir, options, signals),
         "qwen4_exp" => run_with::<Qwen4ExpModel>(model_dir, options, signals),
         other => anyhow::bail!(
-            "unsupported model_type {other:?}; lily serves qwen3_5_moe \
-             (Qwen3.6-35B-A3B) and qwen4_exp (Qwen3.8-Flash-Next)"
+            "unsupported model_type {other:?}; lily serves qwen4_exp \
+             (Qwen3.8-Flash-Next)"
         ),
     }
 }

@@ -110,7 +110,9 @@ There is **no mlx-lm comparison for Qwen3.8-Flash-Next**: upstream mlx-lm has
 no `qwen4_exp` implementation, which is why lily's checkpoint format is its
 own. The comparison that exists is on the upstream model, Qwen3.6-35B-A3B,
 from `mlx-community/Qwen3.6-35B-A3B-4bit`, where both engines read the same
-MLX affine Q4 weights.
+MLX affine Q4 weights. That path has since been removed from lily, so the
+numbers below are a historical measurement of a model the engine no longer
+serves, kept because no comparable measurement can replace them.
 
 Measured with mlx 0.32.2 and mlx-lm 0.31.3, median of two rounds, ratios are
 lily divided by mlx-lm:

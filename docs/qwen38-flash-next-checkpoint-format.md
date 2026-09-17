@@ -104,8 +104,7 @@ so lily's separate gate/up expert stacks apply unchanged.
 - Every RMSNorm weight (`input`-less here: `hc_norm`, `q_norm`, `k_norm`,
   indexer `q_layernorm`/`k_layernorm`, PLE `norm_key`/`norm_query`/`norm_conv`).
   These are **zero-centered**: the gain is `1 + w`. lily applies the `+1` in
-  the kernel (`w_bias = 1.0`) and does not subtract anything at load, unlike
-  the MLX-community Qwen3.6 path.
+  the kernel (`w_bias = 1.0`) and does not subtract anything at load.
 - GDN `norm.weight` (plain gain, init ones), `A_log`, `dt_bias`, `conv1d.weight`
   (`[C, 1, KD]`, transposed to tap-major at load).
 - PLE `conv1d.weight` (`[4H, 1, 4]`, dilation 3).

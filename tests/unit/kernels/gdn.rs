@@ -124,9 +124,10 @@ fn gdn_step_matches_cpu_over_sequence() {
     let scale = 1.0 / (dim as f32).sqrt();
     let steps = 64;
 
-    // nk == nv, plus GVA layouts (v-heads a multiple of k-heads) incl.
-    // the 35B ratio.
-    for (seed, hk, h) in [(10, 4, 4), (20, 2, 4), (21, 4, 8)] {
+    // nk == nv, plus GVA layouts (v-heads a multiple of k-heads), including
+    // the 1:3 ratio the Qwen3.8-Flash-Next checkpoint uses (16 key heads,
+    // 48 value heads).
+    for (seed, hk, h) in [(10, 4, 4), (20, 2, 4), (21, 4, 8), (22, 2, 6)] {
         let mut rng = StdRng::seed_from_u64(seed);
         let a_log = random_vec(&mut rng, h, -2.0, 0.5);
         let dt_bias = random_vec(&mut rng, h, -0.5, 0.5);

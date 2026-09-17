@@ -7,8 +7,9 @@
 //! template produces, which is the only way a golden recorded elsewhere can
 //! be replayed here.
 //!
-//! `tests/test_tokenizer.rs` pins rendering against the supported 35B
-//! checkpoint and verifies that direct-answer histories remain prefix-cacheable.
+//! `tests/test_tokenizer.rs` pins rendering against the checkpoint's own
+//! tokenizer and verifies that direct-answer histories remain
+//! prefix-cacheable.
 
 use std::path::Path;
 
@@ -52,7 +53,7 @@ pub struct Tokenizer {
     /// caller adds from the checkpoint config.
     stop_tokens: Vec<u32>,
     /// The template drops the reasoning block from older assistant turns
-    /// (Qwen3.6), so [`Self::render_chat`] writes an empty one in under
+    /// (Qwen3), so [`Self::render_chat`] writes an empty one in under
     /// nothink to keep histories prefix-cacheable. Newer templates
     /// (`preserve_thinking`) keep every block themselves.
     legacy_nothink_rewrite: bool,

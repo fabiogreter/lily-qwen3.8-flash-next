@@ -1,27 +1,22 @@
-//! Checkpoint loading: maps Qwen3.5 tensor names onto device tensors, reading
-//! each byte range straight into a shared-storage Metal buffer. Only the
-//! MLX-converted Qwen3.6-35B-A3B layout is supported: every linear projection
-//! and the embedding use affine packed `{weight, scales, biases}` triples.
-//! Every tensor in the
-//! file must be consumed or explicitly skip-listed — a name-scheme drift
-//! fails loudly at load instead of silently dropping weights.
+//! The checkpoint loader the architectures share: it maps tensor names onto
+//! device tensors, reading each byte range straight into a shared-storage
+//! Metal buffer, and holds the weight structs (affine packed
+//! `{weight, scales, biases}` triples) the kernels consume. Every tensor in
+//! the file must be consumed or explicitly skip-listed by the caller — a
+//! name-scheme drift fails loudly at load instead of silently dropping
+//! weights.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::path::Path;
 
 use anyhow::{Context as _, Result, ensure};
 use half::bf16;
 use objc2_metal::MTLBuffer;
 
-use crate::config::{LayerType, QuantizationConfig, TextConfig};
+use crate::config::QuantizationConfig;
 use crate::metal::MetalContext;
 use crate::safetensors::{Checkpoint, SafetensorsDType};
 use crate::tensor::{DType, Tensor};
-
-const MLX_PREFIX: &str = "language_model.model.";
-/// The text-only engine deliberately ignores the vision tower.
-const MLX_SKIP_PREFIXES: &[&str] = &["vision_tower."];
 
 /// One linear layer's weights in MLX affine form: `codes` packs `32 / bits`
 /// elements per u32 along the input dim (low element first), dequantized per
@@ -80,13 +75,6 @@ impl QuantWeights {
 
 pub type LinearWeights = QuantWeights;
 
-fn expected_projection_bits(bases: &[&str]) -> usize {
-    let q8 = bases.len() == 1
-        && (bases[0].ends_with(".mlp.gate")
-            || bases[0].ends_with(".mlp.shared_expert_gate"));
-    if q8 { 8 } else { 4 }
-}
-
 pub struct MlpWeights {
     /// `[2*inter, h]` — gate rows then up rows; `gate_proj`/`up_proj` are
     /// row-range views of it, so prefill's separate GEMMs and decode's single
@@ -114,55 +102,6 @@ pub struct MoeWeights {
     pub shared: MlpWeights,
     /// `[1, h]`, sigmoid-gating the shared expert's output.
     pub shared_gate: LinearWeights,
-}
-
-pub struct GdnWeights {
-    pub input_norm: Tensor,
-    pub post_norm: Tensor,
-    /// `[conv_c + dim_v + 2*heads, h]` — qkv | z | a | b rows fused; the four
-    /// named projections below are row-range views.
-    pub in_proj: LinearWeights,
-    pub in_proj_qkv: LinearWeights,
-    pub in_proj_z: LinearWeights,
-    pub in_proj_a: LinearWeights,
-    pub in_proj_b: LinearWeights,
-    /// Tap-major `[kernel_dim, conv_channels]` (transposed from the
-    /// checkpoint layout at load).
-    pub conv_w: Tensor,
-    pub a_log: Tensor,
-    pub dt_bias: Tensor,
-    pub norm_w: Tensor,
-    pub out_proj: LinearWeights,
-    pub ffn: Box<MoeWeights>,
-}
-
-pub struct AttnWeights {
-    pub input_norm: Tensor,
-    pub post_norm: Tensor,
-    /// `[nq*2*hd + 2*nkv*hd, h]` — q(|gate) | k | v rows fused; the three
-    /// named projections below are row-range views.
-    pub qkv_proj: LinearWeights,
-    pub q_proj: LinearWeights,
-    pub k_proj: LinearWeights,
-    pub v_proj: LinearWeights,
-    pub q_norm: Tensor,
-    pub k_norm: Tensor,
-    pub o_proj: LinearWeights,
-    pub ffn: Box<MoeWeights>,
-}
-
-pub enum LayerWeights {
-    Gdn(Box<GdnWeights>),
-    Full(Box<AttnWeights>),
-}
-
-pub struct ModelWeights {
-    /// `[vocab, h]` token table.
-    pub embed_tokens: LinearWeights,
-    /// Untied LM head.
-    pub lm_head: LinearWeights,
-    pub final_norm: Tensor,
-    pub layers: Vec<LayerWeights>,
 }
 
 fn to_dtype(dtype: &SafetensorsDType) -> Result<DType> {
@@ -251,16 +190,6 @@ impl Loader<'_> {
             DType::BF16 => Tensor::from_f32(self.ctx, &t.to_f32()?, t.shape()),
             DType::U32 => anyhow::bail!("{name} is U32, expected float"),
         }
-    }
-
-    /// Loads a zero-centered RMSNorm weight, undoing mlx's baked-in `+1.0`
-    /// where present. `bf16(1 + w) - 1.0` has at most bf16-around-1.0
-    /// precision, so the subtraction round-trips exactly.
-    fn zero_centered_norm(&self, name: &str) -> Result<Tensor> {
-        let t = self.tensor(name)?;
-        ensure!(t.dtype() == DType::BF16, "{name} norm weight must be BF16");
-        let shifted: Vec<f32> = t.to_f32()?.iter().map(|v| v - 1.0).collect();
-        Tensor::from_f32_as_bf16(self.ctx, &shifted, t.shape())
     }
 
     /// Loads several `[n_i, k]` row-major tensors of one dtype into a single
@@ -430,208 +359,3 @@ pub(crate) fn expect_shape(t: &Tensor, shape: &[usize], name: &str) -> Result<()
     ensure!(t.shape() == shape, "{name} shape {:?} != expected {shape:?}", t.shape());
     Ok(())
 }
-
-/// Loads a dense SwiGLU MLP whose tensors live at `{prefix}gate_proj` etc.
-/// (`prefix` includes the trailing dot), fusing gate|up along output rows.
-fn load_mlp(
-    loader: &Loader<'_>,
-    prefix: &str,
-    h: usize,
-    i: usize,
-) -> Result<MlpWeights> {
-    let gate_up_proj = loader
-        .linear(&[&format!("{prefix}gate_proj"), &format!("{prefix}up_proj")], h)?;
-    gate_up_proj.expect_features(2 * i, h, "gate_up_proj")?;
-    let gate_proj = gate_up_proj.view_rows(0, i)?;
-    let up_proj = gate_up_proj.view_rows(i, i)?;
-    let down_proj = loader.linear(&[&format!("{prefix}down_proj")], i)?;
-    down_proj.expect_features(h, i, "down_proj")?;
-    Ok(MlpWeights { gate_up_proj, gate_proj, up_proj, down_proj })
-}
-
-/// Loads the fixed sparse-MoE block: router, stacked experts and shared expert.
-fn load_ffn(
-    loader: &Loader<'_>,
-    p: &str,
-    config: &TextConfig,
-) -> Result<Box<MoeWeights>> {
-    let h = config.hidden_size;
-    let (e, i) = (config.num_experts, config.moe_intermediate_size);
-    let gate = loader.linear(&[&format!("{p}mlp.gate")], h)?;
-    gate.expect_features(e, h, "router gate")?;
-    let expert_gate = loader.linear(&[&format!("{p}mlp.switch_mlp.gate_proj")], h)?;
-    expert_gate.expect_features(e * i, h, "expert gate_proj")?;
-    let expert_up = loader.linear(&[&format!("{p}mlp.switch_mlp.up_proj")], h)?;
-    expert_up.expect_features(e * i, h, "expert up_proj")?;
-    let expert_down = loader.linear(&[&format!("{p}mlp.switch_mlp.down_proj")], i)?;
-    expert_down.expect_features(e * h, i, "expert down_proj")?;
-    let shared = load_mlp(
-        loader,
-        &format!("{p}mlp.shared_expert."),
-        h,
-        config.shared_expert_intermediate_size,
-    )?;
-    let shared_gate = loader.linear(&[&format!("{p}mlp.shared_expert_gate")], h)?;
-    shared_gate.expect_features(1, h, "shared_expert_gate")?;
-    Ok(Box::new(MoeWeights {
-        gate,
-        expert_gate,
-        expert_up,
-        expert_down,
-        shared,
-        shared_gate,
-    }))
-}
-
-/// Loads one Gated-DeltaNet (linear-attention) block whose tensors live at
-/// `{p}` (a `layers.{i}.` prefix including the trailing dot).
-fn load_gdn(loader: &Loader<'_>, p: &str, config: &TextConfig) -> Result<GdnWeights> {
-    let h = config.hidden_size;
-    let input_norm =
-        loader.zero_centered_norm(&format!("{p}input_layernorm.weight"))?;
-    let post_norm =
-        loader.zero_centered_norm(&format!("{p}post_attention_layernorm.weight"))?;
-    let ffn = load_ffn(loader, p, config)?;
-
-    let la = format!("{p}linear_attn.");
-    let heads = config.linear_num_value_heads;
-    let dim_v = heads * config.linear_value_head_dim;
-    let conv_c = config.gdn_conv_channels();
-
-    let in_proj = loader.linear(
-        &[
-            &format!("{la}in_proj_qkv"),
-            &format!("{la}in_proj_z"),
-            &format!("{la}in_proj_a"),
-            &format!("{la}in_proj_b"),
-        ],
-        h,
-    )?;
-    in_proj.expect_features(conv_c + dim_v + 2 * heads, h, "in_proj")?;
-    let in_proj_qkv = in_proj.view_rows(0, conv_c)?;
-    let in_proj_z = in_proj.view_rows(conv_c, dim_v)?;
-    let in_proj_a = in_proj.view_rows(conv_c + dim_v, heads)?;
-    let in_proj_b = in_proj.view_rows(conv_c + dim_v + heads, heads)?;
-    let conv_w = loader.conv_weight(&format!("{la}conv1d.weight"))?;
-    // Some mlx conversions store A_log in bf16 (the 35B lmstudio one); the GDN
-    // kernels read f32.
-    let a_log = loader.tensor_f32(&format!("{la}A_log"))?;
-    let dt_bias = loader.tensor(&format!("{la}dt_bias"))?;
-    let norm_w = loader.tensor_f32(&format!("{la}norm.weight"))?;
-    let out_proj = loader.linear(&[&format!("{la}out_proj")], dim_v)?;
-
-    expect_shape(&conv_w, &[config.linear_conv_kernel_dim, conv_c], "conv_w")?;
-    expect_shape(&a_log, &[heads], "A_log")?;
-    expect_shape(&dt_bias, &[heads], "dt_bias")?;
-    expect_shape(&norm_w, &[config.linear_value_head_dim], "gdn norm")?;
-    out_proj.expect_features(h, dim_v, "out_proj")?;
-
-    Ok(GdnWeights {
-        input_norm,
-        post_norm,
-        in_proj,
-        in_proj_qkv,
-        in_proj_z,
-        in_proj_a,
-        in_proj_b,
-        conv_w,
-        a_log,
-        dt_bias,
-        norm_w,
-        out_proj,
-        ffn,
-    })
-}
-
-/// Loads one full-attention + FFN block whose tensors live at `{p}`.
-fn load_attn(loader: &Loader<'_>, p: &str, config: &TextConfig) -> Result<AttnWeights> {
-    let h = config.hidden_size;
-    let input_norm =
-        loader.zero_centered_norm(&format!("{p}input_layernorm.weight"))?;
-    let post_norm =
-        loader.zero_centered_norm(&format!("{p}post_attention_layernorm.weight"))?;
-    let ffn = load_ffn(loader, p, config)?;
-
-    let sa = format!("{p}self_attn.");
-    let (hd, nq, nkv) =
-        (config.head_dim, config.num_attention_heads, config.num_key_value_heads);
-    let q_rows = if config.attn_output_gate { 2 * nq * hd } else { nq * hd };
-
-    let qkv_proj = loader.linear(
-        &[&format!("{sa}q_proj"), &format!("{sa}k_proj"), &format!("{sa}v_proj")],
-        h,
-    )?;
-    qkv_proj.expect_features(q_rows + 2 * nkv * hd, h, "qkv_proj")?;
-    let q_proj = qkv_proj.view_rows(0, q_rows)?;
-    let k_proj = qkv_proj.view_rows(q_rows, nkv * hd)?;
-    let v_proj = qkv_proj.view_rows(q_rows + nkv * hd, nkv * hd)?;
-    let q_norm = loader.zero_centered_norm(&format!("{sa}q_norm.weight"))?;
-    let k_norm = loader.zero_centered_norm(&format!("{sa}k_norm.weight"))?;
-    let o_proj = loader.linear(&[&format!("{sa}o_proj")], nq * hd)?;
-
-    expect_shape(&q_norm, &[hd], "q_norm")?;
-    expect_shape(&k_norm, &[hd], "k_norm")?;
-    o_proj.expect_features(h, nq * hd, "o_proj")?;
-
-    Ok(AttnWeights {
-        input_norm,
-        post_norm,
-        qkv_proj,
-        q_proj,
-        k_proj,
-        v_proj,
-        q_norm,
-        k_norm,
-        o_proj,
-        ffn,
-    })
-}
-
-pub fn load(
-    ctx: &MetalContext,
-    dir: impl AsRef<Path>,
-    config: &TextConfig,
-) -> Result<ModelWeights> {
-    let ckpt = Checkpoint::open(&dir)?;
-    ensure!(
-        ckpt.meta(&format!("{MLX_PREFIX}embed_tokens.weight")).is_some(),
-        "unsupported checkpoint layout; expected MLX Qwen3.6-35B-A3B"
-    );
-    let prefix = MLX_PREFIX;
-    let loader = Loader::new(
-        ctx,
-        ckpt,
-        config.quantization.expect("validated config"),
-        MLX_SKIP_PREFIXES,
-        expected_projection_bits,
-    );
-    let h = config.hidden_size;
-
-    let embed_tokens = loader.linear(&[&format!("{prefix}embed_tokens")], h)?;
-    embed_tokens.expect_features(config.vocab_size, h, "embed_tokens")?;
-    let lm_head = loader.linear(&["language_model.lm_head"], h)?;
-    lm_head.expect_features(config.vocab_size, h, "lm_head")?;
-    let final_norm = loader.zero_centered_norm(&format!("{prefix}norm.weight"))?;
-    expect_shape(&final_norm, &[h], "final norm")?;
-
-    let mut layers = Vec::with_capacity(config.num_hidden_layers);
-    for (idx, layer_type) in config.layer_types.iter().enumerate() {
-        let p = format!("{prefix}layers.{idx}.");
-        let layer = match layer_type {
-            LayerType::LinearAttention => {
-                LayerWeights::Gdn(Box::new(load_gdn(&loader, &p, config)?))
-            }
-            LayerType::FullAttention => {
-                LayerWeights::Full(Box::new(load_attn(&loader, &p, config)?))
-            }
-        };
-        layers.push(layer);
-    }
-
-    loader.finish()?;
-    Ok(ModelWeights { embed_tokens, lm_head, final_norm, layers })
-}
-
-#[cfg(test)]
-#[path = "../tests/unit/weights.rs"]
-mod tests;

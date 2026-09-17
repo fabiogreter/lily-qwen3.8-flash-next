@@ -9,13 +9,10 @@ use lily::qwen4exp::NgramStorage;
 use lily::serve::{SamplingOverrides, ServeOptions, parse_duration_secs};
 
 #[derive(Parser)]
-#[command(
-    name = "lily",
-    about = "Qwen3.6-35B-A3B / Qwen3.8-Flash-Next inference server"
-)]
+#[command(name = "lily", about = "Qwen3.8-Flash-Next inference server")]
 struct Cli {
-    /// Checkpoint directory: an MLX affine 4-bit Qwen3.6-35B-A3B export, or
-    /// a Qwen3.8-Flash-Next conversion from `tools/convert`.
+    /// Checkpoint directory: a Qwen3.8-Flash-Next conversion from
+    /// `tools/convert`.
     #[arg(long)]
     model: PathBuf,
 

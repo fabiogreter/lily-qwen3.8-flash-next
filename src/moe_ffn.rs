@@ -1,7 +1,7 @@
-//! The sparse-MoE FFN graph shared by the Qwen3.5 and Qwen3.8-Flash-Next
-//! models: quantized projection dispatch, the decode gather-GEMV path, and the
-//! GPU-resident batched prefill path (router → top-k → counting sort → grouped
-//! GEMMs → combine), plus the scratch buffers both paths own.
+//! The model-agnostic sparse-MoE FFN graph: quantized projection dispatch,
+//! the decode gather-GEMV path, and the GPU-resident batched prefill path
+//! (router → top-k → counting sort → grouped GEMMs → combine), plus the
+//! scratch buffers both paths own.
 
 use anyhow::{Result, ensure};
 

@@ -69,7 +69,7 @@ fn default_cache_budget_leaves_room_for_the_paged_table_and_other_apps() {
         (budget, floored),
         (115_400_000_000 - 8_200_000_000 - 32_000_000_000 - 8 * GB, false)
     );
-    // No paged weights at all (the Qwen3.6 path).
+    // No paged weights at all (an in-GPU n-gram table, or none).
     let (budget, floored) = derive_cache_budget(115_400_000_000, 20_000_000_000, 0);
     assert_eq!((budget, floored), (115_400_000_000 - 20_000_000_000 - 8 * GB, false));
     // Nothing underflows when the weights alone exceed the working set.

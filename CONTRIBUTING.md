@@ -19,9 +19,8 @@ cargo test --locked --test test_shader_compile # every kernel builds a pipeline
 ```
 
 Those two need a Metal device and nothing else. The checkpoint-backed
-tokenizer, 35B golden and Qwen3.8-Flash-Next tests read
-`LILY_MODEL_DIR_35B` and `LILY_MODEL_DIR_FLASH` and are ignored when those
-are unset; the README lists the invocations.
+tokenizer and Qwen3.8-Flash-Next tests read `LILY_MODEL_DIR_FLASH` and are
+ignored when it is unset; the README lists the invocations.
 
 Two things to know before trusting a green run:
 
