@@ -31,6 +31,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 
+use super::session::CachedImage;
+
 /// Free space to leave on the volume after a write.
 const FREE_SPACE_MARGIN: u64 = 8 << 30;
 const META: &str = "meta.json";
@@ -56,6 +58,12 @@ struct Meta {
     /// tag stays, since the cache bytes are laid out the same.
     #[serde(default)]
     durable: bool,
+    /// The images among `tokens` (position, length, grid, pixel digest),
+    /// which a lookup matches alongside the tokens. Meta files written
+    /// before the field existed load as text-only lineages, which is what
+    /// they are; the cache bytes are the same, so the format tag stays.
+    #[serde(default)]
+    images: Vec<CachedImage>,
 }
 
 /// One persisted session (its token list stays in memory for prefix matching).
@@ -68,12 +76,15 @@ pub struct DiskEntry {
     pub cache_key: Option<String>,
     /// Whether this is a durable prefix entry (never consumed by a hit).
     pub durable: bool,
+    /// The images among `tokens`, matched alongside them on lookup.
+    pub images: Vec<CachedImage>,
 }
 
 /// What a store call describes about the entry it is about to write.
 #[derive(Clone, Copy)]
 struct NewEntry<'a> {
     tokens: &'a [u32],
+    images: &'a [CachedImage],
     cache_key: Option<&'a str>,
     checkpoints: &'a [usize],
     durable: bool,
@@ -137,6 +148,7 @@ impl DiskStore {
                         last_used: meta.last_used,
                         cache_key: meta.cache_key,
                         durable: meta.durable,
+                        images: meta.images,
                     });
                 }
                 Err(error) => {
@@ -224,38 +236,61 @@ impl DiskStore {
 
     /// Writes a session: `prefix` streams the per-token caches for all of
     /// `tokens`, `checkpoint(pos, w)` streams the snapshot at each position in
-    /// `checkpoints` (which must include `tokens.len()`). Returns the new id,
-    /// or `None` when the entry does not fit the budget or the volume.
+    /// `checkpoints` (which must include `tokens.len()`), `images` are the
+    /// spans among `tokens`. Returns the new id, or `None` when the entry
+    /// does not fit the budget or the volume.
+    #[allow(clippy::too_many_arguments)]
     pub fn store(
         &mut self,
         tokens: &[u32],
+        images: &[CachedImage],
         cache_key: Option<&str>,
         checkpoints: &[usize],
         prefix: &mut dyn FnMut(&mut dyn Write) -> Result<()>,
         checkpoint: &mut dyn FnMut(usize, &mut dyn Write) -> Result<()>,
     ) -> Result<Option<String>> {
-        self.store_with(false, tokens, cache_key, checkpoints, prefix, checkpoint)
+        self.store_with(
+            false,
+            tokens,
+            images,
+            cache_key,
+            checkpoints,
+            prefix,
+            checkpoint,
+        )
     }
 
     /// [`Self::store`] for a durable prefix entry: `tokens` is the shared
     /// prefix and its length the one checkpoint. Storing the entry that takes
     /// the count past [`DURABLE_MAX_ENTRIES`] deletes the least recently used
     /// durable entry; evicted sessions are never touched for it.
+    #[allow(clippy::too_many_arguments)]
     pub fn store_durable(
         &mut self,
         tokens: &[u32],
+        images: &[CachedImage],
         cache_key: Option<&str>,
         checkpoints: &[usize],
         prefix: &mut dyn FnMut(&mut dyn Write) -> Result<()>,
         checkpoint: &mut dyn FnMut(usize, &mut dyn Write) -> Result<()>,
     ) -> Result<Option<String>> {
-        self.store_with(true, tokens, cache_key, checkpoints, prefix, checkpoint)
+        self.store_with(
+            true,
+            tokens,
+            images,
+            cache_key,
+            checkpoints,
+            prefix,
+            checkpoint,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn store_with(
         &mut self,
         durable: bool,
         tokens: &[u32],
+        images: &[CachedImage],
         cache_key: Option<&str>,
         checkpoints: &[usize],
         prefix: &mut dyn FnMut(&mut dyn Write) -> Result<()>,
@@ -266,10 +301,14 @@ impl DiskStore {
             checkpoints.contains(&tokens.len()),
             "the live end must be a checkpoint"
         );
+        ensure!(
+            images.iter().all(|i| i.end() <= tokens.len()),
+            "an image span extends past the session's tokens"
+        );
         self.expire();
         let id = format!("s{}", self.next_id);
         let path = self.dir.join(&id);
-        let new = NewEntry { tokens, cache_key, checkpoints, durable };
+        let new = NewEntry { tokens, images, cache_key, checkpoints, durable };
         let result = self.write_entry(&path, &new, prefix, checkpoint);
         match result {
             Ok(Some(entry)) => {
@@ -301,7 +340,7 @@ impl DiskStore {
         prefix: &mut dyn FnMut(&mut dyn Write) -> Result<()>,
         checkpoint: &mut dyn FnMut(usize, &mut dyn Write) -> Result<()>,
     ) -> Result<Option<DiskEntry>> {
-        let NewEntry { tokens, cache_key, checkpoints, durable } = *new;
+        let NewEntry { tokens, images, cache_key, checkpoints, durable } = *new;
         fs::create_dir_all(path)?;
         let mut bytes = 0u64;
         {
@@ -345,6 +384,7 @@ impl DiskStore {
             last_used: now_secs(),
             cache_key: cache_key.map(str::to_owned),
             durable,
+            images: images.to_vec(),
         };
         fs::write(path.join(META), serde_json::to_vec(&meta)?)?;
         Ok(Some(DiskEntry {
@@ -358,6 +398,7 @@ impl DiskStore {
             last_used: meta.last_used,
             cache_key: meta.cache_key,
             durable,
+            images: meta.images,
         }))
     }
 
@@ -394,6 +435,7 @@ impl DiskStore {
                 last_used: now,
                 cache_key: entry.cache_key.clone(),
                 durable: entry.durable,
+                images: entry.images.clone(),
             };
             if let Ok(json) = serde_json::to_vec(&meta) {
                 let _ = fs::write(dir.join(id).join(META), json);

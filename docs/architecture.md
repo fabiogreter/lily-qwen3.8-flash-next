@@ -398,8 +398,8 @@ of the prompt, nothing about them is stored with a session: the snapshot and
 the disk tier keep their byte layout and the persistence format tag is
 unchanged, the decode state carries only `rope_delta`, set when the prompt is
 prefilled and never persisted, and a resumed session's cached keys are valid
-whenever its tokens and image spans match the prompt's, which the cache
-identity work (`docs/vision-support-plan.md` item 7) makes the cache check.
+whenever its tokens and image spans match the prompt's, which is exactly
+what the session cache checks (see "The session cache").
 In the kernels the cache slot and the rotary position used to be one number;
 they are now two roles. Cache slots, indexer blocks and causal limits stay
 the sequence index. The rotary angle takes a `Rope` argument: for decode rows
@@ -571,6 +571,31 @@ changed cache shape never reads the files.
 Writes happen on the engine thread at eviction time, at a few gigabytes per
 second, which puts them on the request path.
 
+**Image identity.** An image in a prompt is a run of identical
+`<|image_pad|>` tokens, so two requests carrying different screenshots have
+identical prompt tokens and, by tokens alone, the caches would happily
+answer a question about one with the other's cached state. Tokens stay the
+identity, and every lineage (a resident session, a disk entry, a durable
+entry) also carries its image spans: position, length, patch grid and a
+SHA-256 over the preprocessed f32 pixel rows and the grid. The digest is
+over the rows and not the file because two files that preprocess to the
+same rows are the same image to the model. Wherever two lineages are
+matched (`shared_prefix` in `src/serve/session.rs`: the agreement, the
+resume position, the disk lookup and hence the durable boundary), the token
+prefix they share is cut back to the start of the first span in either that
+the other does not match exactly, a span with no counterpart included. A
+fork or a disk restore inherits the spans within the reused prefix, a
+release records the served prompt's spans, and a durable entry stores the
+spans within its boundary. Because a resume position is never inside a
+span (checkpoints sit after the prompt's last image and a boundary is an
+agreement, which is cut to a span start when the images differ), a
+different image behind a shared preamble resumes from before the image and
+a durable entry can end exactly at an image start, from which every later
+screenshot behind that preamble resumes. Text-only lineages have no spans
+and match as before. The disk meta file carries the spans in an `images`
+field that older files lack and load as empty; the cache bytes are the
+same, so the format tag does not change.
+
 ### Durable prefix entries
 
 Checkpoints sit at `prompt_len - 1` of served prompts, which is always past
@@ -635,6 +660,47 @@ rendering run on the connection thread, so they never touch the engine
 thread. Detokenization and the output parser run per token inside the token
 callback, which executes while the parked next step is already running.
 
+**Images.** Image parts (`image_url` with a `{url, detail}` object or
+`input_image` with a string) are accepted in user messages only and their
+URL must be a base64 data URI of type `image/png` or `image/jpeg`: the
+server makes no outbound request for an image, ever (a fetch from the server
+is a request-forgery surface, and the agent clients send data URIs anyway),
+and `http(s)`, `file` and other schemes are refused with a 400 that says so,
+as are other media types, more than `--max-images` images, and any image
+when the tower is not loaded (`--vision off`, or a checkpoint without one;
+the front decides this from the flag and the checkpoint's `lily.vision`
+block before the engine has loaded). Decoding, resizing and patchifying
+(`src/qwen4exp/image.rs`, under `--image-max-pixels` and
+`--image-min-pixels`) and the SHA-256 of the result run on the connection
+thread with tokenisation, about 35 ms plus the digest for a Retina capture;
+decoder errors and limit violations become 400s with the module's message.
+A message with an image reaches the chat template as structured content
+(`{type: text}` and `{type: image}` items in order) so it writes
+`<|vision_start|><|image_pad|><|vision_end|>` where the image sits; a
+text-only message is flattened to one string exactly as before, so text
+prompts are byte-identical. After tokenisation the single pad is expanded
+to `grid_h * grid_w / 4` copies per image, in order, which is what the
+reference processor does before tokenising, and the prompt's counts of the
+three marker tokens (and `<|video_pad|>`) are checked against the number of
+images, so a placeholder typed into message text is refused instead of
+tokenised into a fake span or fed to the model bare. The expanded prompt is
+what the context limit counts.
+
+On the engine thread the request carries the pixel rows, grids and spans.
+After the session lookup the engine sets the state's rope delta from the
+prompt's positions for every acquired session, text (delta 0) or image, so
+a session restored from disk or forked decodes at the right positions; it
+then runs the tower once per image whose span has rows at or beyond the
+reused prefix (an image entirely inside it is already in the caches, its
+span and digest matched by the lookup), copies each merged output out of
+the tower's scratch into its own tensor, and prefills the rest of the prompt
+with the whole prompt's per-row positions and the image rows, including the
+split at a durable boundary, which works when the boundary falls at or
+after a span. The tower's scratch lives with the engine's and is dropped
+with it. The log line adds `images N (T tokens), tower Ts` and the `timings`
+object `image_tokens` and `vision_ms` (both absent for text); `prefill_ms`
+includes the tower time.
+
 The HTTP layer is a small HTTP/1.1 implementation over `std::net`, one
 connection per thread with `Connection: close`. It is hand-written because
 disconnect detection needs the socket: a general-purpose crate buffered
@@ -686,9 +752,7 @@ bounds the loop; the fourth fault exits 1 for the supervisor.
 ## What is deliberately not here
 
 Constrained decoding (`response_format: json_schema`), batching across
-requests, the image path from the API to the tower and into the prompt (the
-tower, preprocessing, positions and the placeholder override run at the
-engine level; the server work and the caches' image identity are the
-remaining items of `docs/vision-support-plan.md`), and session persistence
-for the Qwen3.6-35B path (the engine trait's defaults disable the disk tier
-for it).
+requests, video input (the template's `<|video_pad|>` is refused), fetching
+images by URL (data URIs only, by design), and session persistence for the
+Qwen3.6-35B path (the engine trait's defaults disable the disk tier for
+it).

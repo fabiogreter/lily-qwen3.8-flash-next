@@ -29,15 +29,27 @@
 //! resident sessions or extra checkpoints: they are hit far more rarely than
 //! the live conversation's cache and must not compete with it for the GPU
 //! budget. A hit never consumes them.
+//!
+//! **Images** (`docs/vision-support-plan.md` item 7). An image is a run of
+//! identical `<|image_pad|>` tokens, so two prompts with different
+//! screenshots have identical tokens there. Tokens stay the identity, and
+//! every lineage (a session, a disk entry, a durable entry) also carries its
+//! image spans, each with the position, the length, the patch grid and a
+//! digest of the preprocessed pixel rows. Wherever two lineages are matched
+//! ([`shared_prefix`]), the token prefix they share is cut back to the start
+//! of the first span one has that the other does not match exactly. A
+//! text-only lineage has no spans and matches exactly as before.
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context as _, Result, ensure};
+use serde::{Deserialize, Serialize};
 
 use super::disk::DiskStore;
 use crate::engine::{DecodeStateApi, LanguageModel, SnapshotApi};
 use crate::metal::MetalContext;
+use crate::qwen4exp::ImageSpan;
 
 type SnapshotOf<M> = <<M as LanguageModel>::State as DecodeStateApi>::Snapshot;
 
@@ -48,20 +60,91 @@ const MIN_DISK_TOKENS: usize = 256;
 /// for the divergence diagnostic to show a line of text.
 const DIVERGENT_TAIL_TOKENS: usize = 16;
 
-/// How far `prompt` agrees with the closest of `lineages`: the longest
-/// common prefix with any of them, capped at `prompt.len() - 1` like every
-/// resume position (the last prompt token is always fed). Also returns up to
-/// [`DIVERGENT_TAIL_TOKENS`] of that lineage's tokens from the agreement on,
-/// which is what the prompt would have had to continue with to keep
-/// matching; empty when nothing agrees.
+/// One image of a lineage, as the caches identify it: where its
+/// placeholders sit, what the tower was given (the grid) and what the pixel
+/// rows were (a SHA-256 over the preprocessed rows and the grid). Two
+/// lineages share an image only when all of it is equal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedImage {
+    /// Sequence index of the first `<|image_pad|>`.
+    pub start: usize,
+    /// Placeholders, `grid_h * grid_w / 4`.
+    pub len: usize,
+    pub grid_h: usize,
+    pub grid_w: usize,
+    /// SHA-256 of the preprocessed f32 pixel rows followed by the grid.
+    pub digest: [u8; 32],
+}
+
+impl CachedImage {
+    pub fn new(span: ImageSpan, digest: [u8; 32]) -> Self {
+        Self {
+            start: span.start,
+            len: span.len,
+            grid_h: span.grid_h,
+            grid_w: span.grid_w,
+            digest,
+        }
+    }
+
+    /// Sequence index one past the last placeholder.
+    pub fn end(&self) -> usize {
+        self.start + self.len
+    }
+
+    pub fn span(&self) -> ImageSpan {
+        ImageSpan {
+            start: self.start,
+            len: self.len,
+            grid_h: self.grid_h,
+            grid_w: self.grid_w,
+        }
+    }
+}
+
+/// The spans of `images` that lie entirely within the first `n` tokens.
+pub fn images_within(images: &[CachedImage], n: usize) -> Vec<CachedImage> {
+    images.iter().filter(|i| i.end() <= n).cloned().collect()
+}
+
+/// How many leading tokens two lineages share, images included: the token
+/// prefix they have in common, cut back to the start of the first span in
+/// either that the other does not match exactly (same start, length, grid
+/// and digest), so a placeholder run is only ever shared between requests
+/// carrying the same preprocessed image. Text-only lineages share their
+/// token prefix, as before images existed.
+pub fn shared_prefix(
+    tokens_a: &[u32],
+    images_a: &[CachedImage],
+    tokens_b: &[u32],
+    images_b: &[CachedImage],
+) -> usize {
+    let mut shared = common_prefix_len(tokens_a, tokens_b);
+    for (mine, theirs) in [(images_a, images_b), (images_b, images_a)] {
+        for image in mine {
+            if image.start < shared && !theirs.contains(image) {
+                shared = image.start;
+            }
+        }
+    }
+    shared
+}
+
+/// How far `prompt` (with `images`) agrees with the closest of `lineages`:
+/// the longest [`shared_prefix`] with any of them, capped at
+/// `prompt.len() - 1` like every resume position (the last prompt token is
+/// always fed). Also returns up to [`DIVERGENT_TAIL_TOKENS`] of that
+/// lineage's tokens from the agreement on, which is what the prompt would
+/// have had to continue with to keep matching; empty when nothing agrees.
 pub fn agreement<'a>(
     prompt: &[u32],
-    lineages: impl IntoIterator<Item = &'a [u32]>,
+    images: &[CachedImage],
+    lineages: impl IntoIterator<Item = (&'a [u32], &'a [CachedImage])>,
 ) -> (usize, Vec<u32>) {
     let cap = prompt.len().saturating_sub(1);
     let mut best: Option<(usize, &[u32])> = None;
-    for tokens in lineages {
-        let lcp = common_prefix_len(tokens, prompt).min(cap);
+    for (tokens, lineage_images) in lineages {
+        let lcp = shared_prefix(tokens, lineage_images, prompt, images).min(cap);
         if lcp > 0 && best.is_none_or(|(b, _)| lcp > b) {
             best = Some((lcp, tokens));
         }
@@ -93,17 +176,20 @@ pub fn boundary_position(
         .then_some(agreement)
 }
 
-/// The best position to resume `prompt` from given a lineage's tokens and
-/// its resumable positions: the live end when the lineage is a strict prefix
-/// of the prompt (and `live_end` is resumable), else the latest resumable
-/// position within the common prefix. Never `>= prompt.len()`.
+/// The best position to resume `prompt` from given a lineage's tokens,
+/// images and resumable positions: the live end when the lineage is a
+/// strict prefix of the prompt (and `live_end` is resumable), else the
+/// latest resumable position within the [`shared_prefix`]. Never
+/// `>= prompt.len()`.
 fn resume_position(
     tokens: &[u32],
+    images: &[CachedImage],
     checkpoints: &[usize],
     live_end: bool,
     prompt: &[u32],
+    prompt_images: &[CachedImage],
 ) -> Option<usize> {
-    let lcp = common_prefix_len(tokens, prompt);
+    let lcp = shared_prefix(tokens, images, prompt, prompt_images);
     let limit = lcp.min(prompt.len().checked_sub(1)?);
     if tokens.len() <= limit {
         if live_end {
@@ -117,6 +203,8 @@ fn resume_position(
 pub struct Session<M: LanguageModel> {
     /// Tokens fed into `state`; `state.pos() == tokens.len()` when at rest.
     pub tokens: Vec<u32>,
+    /// The images among `tokens`, in order; every span ends within them.
+    pub images: Vec<CachedImage>,
     pub state: M::State,
     /// Recurrent-state checkpoints, ascending by position, all `<= tokens.len()`.
     checkpoints: Vec<Arc<SnapshotOf<M>>>,
@@ -128,6 +216,7 @@ impl<M: LanguageModel> Session<M> {
     fn new(state: M::State) -> Self {
         Self {
             tokens: Vec::new(),
+            images: Vec::new(),
             state,
             checkpoints: Vec::new(),
             cache_key: None,
@@ -153,10 +242,10 @@ impl<M: LanguageModel> Session<M> {
 
     /// The best position to resume `prompt` from: the live end when the
     /// session is a strict prefix of the prompt, else the latest checkpoint
-    /// within the common prefix. Never `>= prompt.len()`.
-    fn resume_position(&self, prompt: &[u32]) -> Option<usize> {
+    /// within the shared prefix. Never `>= prompt.len()`.
+    fn resume_position(&self, prompt: &[u32], images: &[CachedImage]) -> Option<usize> {
         let positions: Vec<usize> = self.checkpoints.iter().map(|c| c.pos()).collect();
-        resume_position(&self.tokens, &positions, true, prompt)
+        resume_position(&self.tokens, &self.images, &positions, true, prompt, images)
     }
 
     fn checkpoint_at(&self, pos: usize) -> Option<&Arc<SnapshotOf<M>>> {
@@ -261,16 +350,22 @@ impl<M: LanguageModel> SessionStore<M> {
         self.entries.len()
     }
 
-    /// Checks out the session that can resume `prompt` from the furthest
-    /// position, forking when that position is not the live end. `cache_key`
-    /// only breaks ties between equally good candidates. Also reports how far
-    /// the prompt agreed with any lineage at all (`agreement`), which the
-    /// engine compares with `reused` to decide on a durable prefix entry.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Checks out the session that can resume `prompt` (with `images` at
+    /// their spans) from the furthest position, forking when that position
+    /// is not the live end. `cache_key` only breaks ties between equally
+    /// good candidates. Also reports how far the prompt agreed with any
+    /// lineage at all (`agreement`), which the engine compares with `reused`
+    /// to decide on a durable prefix entry.
     pub fn acquire(
         &mut self,
         ctx: &MetalContext,
         model: &M,
         prompt: &[u32],
+        images: &[CachedImage],
         cache_key: Option<&str>,
     ) -> Result<Acquired<M>> {
         ensure!(!prompt.is_empty(), "empty prompt");
@@ -279,13 +374,18 @@ impl<M: LanguageModel> SessionStore<M> {
         }
         let (agreement, divergent_tail) = agreement(
             prompt,
-            self.entries.iter().map(|s| s.tokens.as_slice()).chain(
-                self.disk
-                    .iter()
-                    .flat_map(|d| d.entries().iter().map(|e| e.tokens.as_slice())),
-            ),
+            images,
+            self.entries
+                .iter()
+                .map(|s| (s.tokens.as_slice(), s.images.as_slice()))
+                .chain(self.disk.iter().flat_map(|d| {
+                    d.entries()
+                        .iter()
+                        .map(|e| (e.tokens.as_slice(), e.images.as_slice()))
+                })),
         );
-        let mut acquired = self.acquire_resumable(ctx, model, prompt, cache_key)?;
+        let mut acquired =
+            self.acquire_resumable(ctx, model, prompt, images, cache_key)?;
         debug_assert!(acquired.reused <= agreement, "resumed past the agreement");
         acquired.agreement = agreement;
         acquired.divergent_tail = divergent_tail;
@@ -300,13 +400,14 @@ impl<M: LanguageModel> SessionStore<M> {
         ctx: &MetalContext,
         model: &M,
         prompt: &[u32],
+        images: &[CachedImage],
         cache_key: Option<&str>,
     ) -> Result<Acquired<M>> {
         let best = self
             .entries
             .iter()
             .enumerate()
-            .filter_map(|(i, s)| s.resume_position(prompt).map(|p| (i, p)))
+            .filter_map(|(i, s)| s.resume_position(prompt, images).map(|p| (i, p)))
             .max_by_key(|&(i, p)| {
                 let entry = &self.entries[i];
                 let key_match =
@@ -319,8 +420,15 @@ impl<M: LanguageModel> SessionStore<M> {
             disk.entries()
                 .iter()
                 .filter_map(|e| {
-                    resume_position(&e.tokens, &e.checkpoints, true, prompt)
-                        .map(|p| (e.id.clone(), p, e.tokens.len()))
+                    resume_position(
+                        &e.tokens,
+                        &e.images,
+                        &e.checkpoints,
+                        true,
+                        prompt,
+                        images,
+                    )
+                    .map(|p| (e.id.clone(), p, e.tokens.len()))
                 })
                 .max_by_key(|(id, p, _)| {
                     let key_match = cache_key.is_some_and(|k| {
@@ -367,6 +475,7 @@ impl<M: LanguageModel> SessionStore<M> {
         state.restore(ctx, &checkpoint)?;
         let mut session = Session::new(state);
         session.tokens = source.tokens[..resume_at].to_vec();
+        session.images = images_within(&source.images, resume_at);
         session.checkpoints.push(checkpoint);
         self.trim(ctx, session.bytes());
         Ok(Acquired { reused: resume_at, forked: true, ..Acquired::fresh(session) })
@@ -394,6 +503,7 @@ impl<M: LanguageModel> SessionStore<M> {
             .find(|e| e.id == id)
             .context("disk entry vanished")?;
         let (tokens, durable) = (entry.tokens[..pos].to_vec(), entry.durable);
+        let images = images_within(&entry.images, pos);
         let mut state = model.new_state(ctx, prompt.len().max(pos))?;
         let result = (|| -> Result<SnapshotOf<M>> {
             let mut prefix = disk.open_prefix(id)?;
@@ -430,6 +540,7 @@ impl<M: LanguageModel> SessionStore<M> {
         }
         let mut session = Session::new(state);
         session.tokens = tokens;
+        session.images = images;
         session.checkpoints.push(Arc::new(snapshot));
         self.trim(ctx, session.bytes());
         Ok(Acquired {
@@ -443,13 +554,15 @@ impl<M: LanguageModel> SessionStore<M> {
     /// Writes a durable prefix entry for `tokens`, whose per-token caches
     /// `state` holds and whose recurrent state at `tokens.len()` is
     /// `snapshot`: the boundary [`boundary_position`] found, materialised so
-    /// later prompts with the same prefix resume there. Only the disk tier
-    /// keeps it (see the module docs for why). Returns the entry id, `None`
-    /// when the tier did not take it, or the write error; failures only cost
-    /// the entry, so the caller logs and carries on.
+    /// later prompts with the same prefix resume there. Of `images` (the
+    /// prompt's) the entry keeps the spans that lie within the boundary.
+    /// Only the disk tier keeps it (see the module docs for why). Returns the
+    /// entry id, `None` when the tier did not take it, or the write error;
+    /// failures only cost the entry, so the caller logs and carries on.
     pub fn store_durable(
         &mut self,
         tokens: &[u32],
+        images: &[CachedImage],
         cache_key: Option<&str>,
         state: &M::State,
         snapshot: &SnapshotOf<M>,
@@ -468,6 +581,7 @@ impl<M: LanguageModel> SessionStore<M> {
         );
         disk.store_durable(
             tokens,
+            &images_within(images, n),
             cache_key,
             &[n],
             &mut |w| state.write_prefix(n, w),
@@ -553,6 +667,7 @@ impl<M: LanguageModel> SessionStore<M> {
         positions.push(n);
         let result = disk.store(
             &session.tokens,
+            &session.images,
             session.cache_key.as_deref(),
             &positions,
             &mut |w| session.state.write_prefix(n, w),
@@ -591,18 +706,22 @@ impl<M: LanguageModel> SessionStore<M> {
     }
 
     /// Returns a session to the cache after a request. Its state must sit at
-    /// `tokens.len()`. Old checkpoints beyond the per-session cap are dropped
-    /// (the newest are the ones the next request most likely resumes from),
-    /// and the store is trimmed to budget and count.
+    /// `tokens.len()`, and `images` are the spans of the prompt it just
+    /// served (which are now the lineage's: every earlier span the prompt
+    /// kept is among them). Old checkpoints beyond the per-session cap are
+    /// dropped (the newest are the ones the next request most likely resumes
+    /// from), and the store is trimmed to budget and count.
     pub fn release(
         &mut self,
         ctx: &MetalContext,
         mut session: Session<M>,
+        images: &[CachedImage],
         cache_key: Option<&str>,
     ) {
         if session.state.pos() != session.tokens.len() || session.tokens.is_empty() {
             return;
         }
+        session.images = images_within(images, session.tokens.len());
         session.checkpoints.retain(|c| c.pos() <= session.tokens.len());
         while session.checkpoints.len() > self.max_checkpoints {
             session.checkpoints.remove(0);

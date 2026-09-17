@@ -25,6 +25,7 @@ pub mod qwen4exp;
 pub mod safetensors;
 #[cfg(target_os = "macos")]
 pub mod serve;
+pub mod sha256;
 #[cfg(target_os = "macos")]
 pub mod tensor;
 #[cfg(target_os = "macos")]

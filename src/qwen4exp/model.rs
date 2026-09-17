@@ -52,6 +52,8 @@ use crate::moe_ffn::{
 };
 use crate::tensor::{DType, Tensor};
 
+use super::vision::{self, VisionScratch};
+
 use super::config::{GateAct, Qwen4ExpConfig};
 use super::ngram::{NgramHasher, NgramStorage, NgramTable, StagedRows};
 use super::positions::{ImageSpan, Positions};
@@ -900,6 +902,9 @@ pub struct Scratch {
     pub(super) spec: Option<SpecScratch>,
     /// Handshake for passes committed ahead of their host inputs.
     pub(super) sync: StepSync,
+    /// The vision tower's intermediates, allocated by the first image and
+    /// grown to the largest patch count seen; `None` until then.
+    pub(super) vision: Option<VisionScratch>,
 }
 
 impl Scratch {
@@ -1267,6 +1272,42 @@ impl Qwen4ExpModel {
         Ok(Self { config, weights, attn_scale, gdn_scale, gdn_gate, hasher })
     }
 
+    /// Runs the vision tower over one preprocessed image and returns its
+    /// merged rows as an owned bf16 `[grid_h * grid_w / 4, hidden_size]`
+    /// tensor (the tower's output lives in the scratch only until the next
+    /// image, so the engine's copy is what a prompt with several images
+    /// hands to [`Self::prefill_with_vision`]). Waits for the GPU.
+    pub fn encode_image(
+        &self,
+        ctx: &MetalContext,
+        s: &mut Scratch,
+        pixels: &[f32],
+        grid_h: usize,
+        grid_w: usize,
+    ) -> Result<Tensor> {
+        let (Some(config), Some(weights)) = (&self.config.vision, &self.weights.vision)
+        else {
+            anyhow::bail!("the vision tower is not loaded");
+        };
+        let out = vision::forward_with(
+            ctx,
+            config,
+            weights,
+            &mut s.vision,
+            pixels,
+            grid_h,
+            grid_w,
+            config.depth,
+        )?;
+        let shape = [grid_h * grid_w / 4, self.config.hidden_size];
+        ensure!(
+            out.merged.shape() == shape,
+            "the tower produced {:?} rows for a ({grid_h}, {grid_w}) grid, expected {shape:?}",
+            out.merged.shape()
+        );
+        Tensor::from_bytes(ctx, out.merged.raw_bytes(), &shape, DType::BF16)
+    }
+
     /// Whether the draft head is loaded.
     pub fn has_mtp(&self) -> bool {
         self.weights.mtp.is_some()
@@ -1505,6 +1546,7 @@ impl Qwen4ExpModel {
             dequant: Tensor::zeros(ctx, &[dequant_numel], bf)?,
             moe: MoeScratch::new(ctx, &moe_dims(cfg))?,
             prefill: None,
+            vision: None,
             spec: self
                 .weights
                 .mtp
@@ -3077,6 +3119,11 @@ fn round_capacity(tokens: usize) -> Result<usize> {
 }
 
 impl DecodeStateApi for DecodeState {
+    fn set_rope_delta(&mut self, delta: i64) -> Result<()> {
+        self.rope_delta = delta;
+        Ok(())
+    }
+
     type Snapshot = Snapshot;
 
     fn pos(&self) -> usize {
@@ -3496,6 +3543,31 @@ impl LanguageModel for Qwen4ExpModel {
         draw: Option<Draw<'_>>,
     ) -> Result<()> {
         Qwen4ExpModel::prefill(self, ctx, state, scratch, tokens, draw)
+    }
+
+    fn prefill_with_vision(
+        &self,
+        ctx: &MetalContext,
+        state: &mut DecodeState,
+        scratch: &mut Scratch,
+        tokens: &[u32],
+        draw: Option<Draw<'_>>,
+        vision: Option<&VisionInput<'_>>,
+    ) -> Result<()> {
+        Qwen4ExpModel::prefill_with_vision(
+            self, ctx, state, scratch, tokens, draw, vision,
+        )
+    }
+
+    fn encode_image(
+        &self,
+        ctx: &MetalContext,
+        scratch: &mut Scratch,
+        pixels: &[f32],
+        grid_h: usize,
+        grid_w: usize,
+    ) -> Result<Tensor> {
+        Qwen4ExpModel::encode_image(self, ctx, scratch, pixels, grid_h, grid_w)
     }
 
     fn prepare_step_inputs(

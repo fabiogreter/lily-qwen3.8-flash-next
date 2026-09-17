@@ -157,6 +157,12 @@ impl Tokenizer {
         Ok(template.render(ctx)?)
     }
 
+    /// The id of the token spelled `text` (an added token such as
+    /// `<|image_pad|>`), if the vocabulary has one.
+    pub fn token_id(&self, text: &str) -> Option<u32> {
+        self.inner.token_to_id(text)
+    }
+
     /// Whether `id` is a special (control) token such as `<|im_end|>`.
     pub fn is_special(&self, id: u32) -> bool {
         self.inner

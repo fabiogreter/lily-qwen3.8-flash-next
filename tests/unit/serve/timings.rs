@@ -120,6 +120,23 @@ fn the_json_shape_is_the_documented_one() {
 }
 
 #[test]
+fn image_fields_are_absent_for_text_and_carry_the_tower_time_for_images() {
+    let text = Timings::measure(1000, 300, 1.0, 5, 0.1, None).with_vision(0, 0.0);
+    assert_eq!((text.image_tokens, text.vision_ms), (None, None));
+    let json = serde_json::to_value(text).unwrap();
+    assert!(json.get("image_tokens").is_none() && json.get("vision_ms").is_none());
+    // The tower ran 0.7124 s over an image of 1 980 placeholders.
+    let image = Timings::measure(2100, 0, 1.5, 5, 0.1, None).with_vision(1980, 0.7124);
+    assert_eq!((image.image_tokens, image.vision_ms), (Some(1980), Some(712.4)));
+    let json = serde_json::to_value(image).unwrap();
+    assert_eq!(json["image_tokens"], json!(1980));
+    assert_eq!(json["vision_ms"], json!(712.4));
+    // A cached image still counts its tokens; the tower time is then zero.
+    let cached = Timings::measure(2100, 2050, 0.2, 5, 0.1, None).with_vision(1980, 0.0);
+    assert_eq!((cached.image_tokens, cached.vision_ms), (Some(1980), Some(0.0)));
+}
+
+#[test]
 fn agreement_never_reads_below_the_cached_prefix_and_the_durable_field_is_absent_unless_written()
  {
     // Without the session cache's word, the agreement is what was reused.

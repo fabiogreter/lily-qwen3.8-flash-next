@@ -23,9 +23,10 @@
 //! process with status 1 for the supervisor to restart it.
 
 pub mod api;
+pub mod data_uri;
 pub mod disk;
 pub mod http;
-mod session;
+pub mod session;
 pub mod stream;
 pub mod timings;
 pub mod tools;
@@ -54,9 +55,12 @@ use crate::kernels::attention::MAX_SEQ;
 use crate::kernels::sample::SamplingParams;
 use crate::metal::MetalContext;
 use crate::model::Qwen3_5Model;
-use crate::qwen4exp::{NgramStorage, Qwen4ExpModel};
-use api::{Defaults, Kind, Prepared};
-use session::{SessionStore, boundary_position};
+use crate::qwen4exp::image::ImageLimits;
+use crate::qwen4exp::{
+    ImageEmbeds, NgramStorage, Qwen4ExpModel, VisionInput, positions_for_prompt,
+};
+use api::{Defaults, ImagePolicy, Kind, Prepared};
+use session::{CachedImage, SessionStore, boundary_position};
 use stream::{Event, OutputParser, ParserConfig};
 use timings::{Speculation, Timings, TimingsEntry, TimingsLog};
 use tools::ParsedToolCall;
@@ -142,6 +146,12 @@ pub struct ServeOptions {
     pub mtp_drafts: usize,
     /// Whether to load the vision tower when the checkpoint has one.
     pub vision: VisionMode,
+    /// An image with more pixels is scaled down to fit before the tower.
+    pub image_max_pixels: usize,
+    /// An image with fewer pixels is scaled up to reach it.
+    pub image_min_pixels: usize,
+    /// Most images one chat request may carry.
+    pub max_images: usize,
     /// Where evicted sessions are kept on disk (`None` disables the tier).
     pub disk_cache_dir: Option<std::path::PathBuf>,
     /// Most bytes the disk tier may hold.
@@ -814,9 +824,12 @@ impl<M: LanguageModel> Engine<M> {
             p.prompt.len()
         );
         let n = p.prompt.len();
+        let images: Vec<CachedImage> =
+            p.images.iter().map(|i| CachedImage::new(i.span, i.digest)).collect();
+        let image_tokens: usize = p.images.iter().map(|i| i.span.len).sum();
         let started = Instant::now();
         let acquired =
-            sessions.acquire(ctx, model, &p.prompt, p.cache_key.as_deref())?;
+            sessions.acquire(ctx, model, &p.prompt, &images, p.cache_key.as_deref())?;
         let mut session = acquired.session;
         let reused = acquired.reused;
         let agreement = acquired.agreement;
@@ -825,6 +838,47 @@ impl<M: LanguageModel> Engine<M> {
             reused <= agreement,
             "session cache resumed at {reused} past the agreement {agreement}"
         );
+
+        // Rotary positions are a pure function of the prompt, so every
+        // acquired session takes the prompt's delta here, whatever state it
+        // was restored from (text gives 0). With images, the tower runs for
+        // every image that has rows at or beyond the reused prefix; an image
+        // entirely inside it is already in the caches, span and digest
+        // matched by the cache lookup.
+        let spans: Vec<_> = p.images.iter().map(|i| i.span).collect();
+        let positions = if spans.is_empty() {
+            None
+        } else {
+            Some(positions_for_prompt(&p.prompt, &spans).context("image positions")?)
+        };
+        session
+            .state
+            .set_rope_delta(positions.as_ref().map_or(0, |pos| pos.rope_delta))?;
+        let vision_started = Instant::now();
+        let mut encoded: Vec<(usize, crate::tensor::Tensor)> = Vec::new();
+        for (k, image) in p.images.iter().enumerate() {
+            if image.span.end() > reused {
+                let rows = model
+                    .encode_image(
+                        ctx,
+                        scratch,
+                        &image.pixels,
+                        image.span.grid_h,
+                        image.span.grid_w,
+                    )
+                    .with_context(|| format!("vision tower over image {}", k + 1))?;
+                encoded.push((k, rows));
+            }
+        }
+        let vision_secs = vision_started.elapsed().as_secs_f64();
+        let encoded_images = encoded.len();
+        let embeds: Vec<ImageEmbeds<'_>> = encoded
+            .iter()
+            .map(|(k, rows)| ImageEmbeds { span: p.images[*k].span, rows })
+            .collect();
+        let vision = positions
+            .as_ref()
+            .map(|pos| VisionInput { positions: pos, images: &embeds });
 
         // A shared prefix the cache could not resume from becomes a durable
         // disk entry: prefill up to the boundary, write the caches and the
@@ -842,12 +896,13 @@ impl<M: LanguageModel> Engine<M> {
         let mut prefilled = reused;
         if let Some(b) = boundary {
             if prefilled < b {
-                model.prefill(
+                model.prefill_with_vision(
                     ctx,
                     &mut session.state,
                     scratch,
                     &p.prompt[prefilled..b],
                     None,
+                    vision.as_ref(),
                 )?;
                 prefilled = b;
             }
@@ -855,6 +910,7 @@ impl<M: LanguageModel> Engine<M> {
             let snapshot = session.state.snapshot(ctx)?;
             match sessions.store_durable(
                 &p.prompt[..b],
+                &images,
                 p.cache_key.as_deref(),
                 &session.state,
                 &snapshot,
@@ -875,14 +931,20 @@ impl<M: LanguageModel> Engine<M> {
         // Prefix up to the last prompt token, then checkpoint there so an
         // identical or extended prompt can resume without re-feeding it.
         if prefilled < n - 1 {
-            model.prefill(
+            model.prefill_with_vision(
                 ctx,
                 &mut session.state,
                 scratch,
                 &p.prompt[prefilled..n - 1],
                 None,
+                vision.as_ref(),
             )?;
         }
+        // The last prompt token is fed by the generator through the text
+        // prefill: it is text after every image, and the state's rope delta
+        // places it. The image rows are no longer needed.
+        drop(embeds);
+        drop(encoded);
         let snapshot = session.state.snapshot(ctx)?;
         session.add_checkpoint(snapshot);
         let prefix_secs = started.elapsed().as_secs_f64();
@@ -1051,7 +1113,7 @@ impl<M: LanguageModel> Engine<M> {
             session.state.pos() == session.tokens.len(),
             "session token/state position mismatch"
         );
-        sessions.release(ctx, session, p.cache_key.as_deref());
+        sessions.release(ctx, session, &images, p.cache_key.as_deref());
 
         let completion_tokens = generation.tokens.len();
         let finish_reason = match generation.finish {
@@ -1060,7 +1122,7 @@ impl<M: LanguageModel> Engine<M> {
             _ => "stop",
         };
         eprintln!(
-            "{}: {} prompt tokens ({} cached{}{}{}{}), {} generated, prefix {:.2}s, decode {:.2}s ({:.1} tok/s){}, finish={finish_reason}, sessions={} ({:.1}/{:.1} GB){}",
+            "{}: {} prompt tokens ({} cached{}{}{}{}){}, {} generated, prefix {:.2}s, decode {:.2}s ({:.1} tok/s){}, finish={finish_reason}, sessions={} ({:.1}/{:.1} GB){}",
             id,
             n,
             reused,
@@ -1077,6 +1139,19 @@ impl<M: LanguageModel> Engine<M> {
             durable
                 .map(|(b, secs)| format!(", durable prefix {b} written in {secs:.2}s"))
                 .unwrap_or_default(),
+            if p.images.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", images {} ({image_tokens} tokens{}), tower {vision_secs:.2}s",
+                    p.images.len(),
+                    if encoded_images < p.images.len() {
+                        format!(", {encoded_images} encoded")
+                    } else {
+                        String::new()
+                    }
+                )
+            },
             completion_tokens,
             prefix_secs,
             decode_secs,
@@ -1115,7 +1190,8 @@ impl<M: LanguageModel> Engine<M> {
                 accepted: generation.accepted,
             }),
         )
-        .with_agreement(agreement, durable.map(|(b, _)| b));
+        .with_agreement(agreement, durable.map(|(b, _)| b))
+        .with_vision(image_tokens, vision_secs);
         timings.record(TimingsEntry {
             id: id.clone(),
             model: M::MODEL_ID,
@@ -1364,6 +1440,45 @@ fn effective_max_seq(requested: usize, declared: usize) -> usize {
     if declared > 0 { max_seq.min(declared) } else { max_seq }
 }
 
+/// Whether the checkpoint carries a vision tower lily can load: the
+/// converter's `lily.vision` block in `config.json` (the engine checks the
+/// same block against the weights when it loads).
+fn checkpoint_has_vision_tower(model_dir: &Path) -> Result<bool> {
+    let config = read_config(model_dir)?;
+    Ok(config.get("lily").and_then(|l| l.get("vision")).is_some_and(Value::is_object))
+}
+
+/// What the HTTP threads may accept as image content, decided before the
+/// engine loads from the same facts the engine's load applies: the flag and
+/// the checkpoint. A request with an image is refused with the reason
+/// otherwise, and never reaches the engine.
+fn image_policy(model_dir: &Path, options: &ServeOptions) -> Result<ImagePolicy> {
+    let available = if options.vision == VisionMode::Off {
+        Err("the vision tower is not loaded (--vision off)".to_owned())
+    } else if !checkpoint_has_vision_tower(model_dir)? {
+        Err("this checkpoint carries no vision tower; images are not supported"
+            .to_owned())
+    } else {
+        Ok(())
+    };
+    ensure!(
+        options.image_min_pixels > 0
+            && options.image_min_pixels <= options.image_max_pixels,
+        "--image-min-pixels ({}) must be positive and at most --image-max-pixels ({})",
+        options.image_min_pixels,
+        options.image_max_pixels
+    );
+    Ok(ImagePolicy {
+        limits: ImageLimits {
+            max_pixels: options.image_max_pixels,
+            min_pixels: options.image_min_pixels,
+            ..ImageLimits::default()
+        },
+        max_images: options.max_images,
+        available,
+    })
+}
+
 /// Sampling defaults: `generation_config.json` over OpenAI's defaults, then
 /// the command-line overrides.
 fn sampling_defaults(
@@ -1460,6 +1575,8 @@ struct Shared {
 struct Front {
     shared: Shared,
     defaults: Defaults,
+    /// What chat requests may carry as images.
+    images: ImagePolicy,
     max_seq: usize,
     jobs: SyncSender<Cmd>,
     lifecycle: Arc<Lifecycle>,
@@ -1690,6 +1807,19 @@ fn run_with<M: LanguageModel + 'static>(
             .map(|e| format!(" (effort {e})"))
             .unwrap_or_default(),
     );
+    // Decided here, before any thread exists, so a bad flag fails the start
+    // instead of a server that is already loading.
+    let images = image_policy(model_dir, &options)?;
+    eprintln!(
+        "images: {}",
+        match &images.available {
+            Ok(()) => format!(
+                "PNG and JPEG data URIs, at most {} per request, {} to {} pixels after resizing",
+                images.max_images, images.limits.min_pixels, images.limits.max_pixels
+            ),
+            Err(why) => format!("refused ({why})"),
+        }
+    );
     let max_seq = effective_max_seq(
         options.max_seq,
         checkpoint_max_position_embeddings(model_dir)?,
@@ -1753,6 +1883,7 @@ fn run_with<M: LanguageModel + 'static>(
     let front = Arc::new(Front {
         shared,
         defaults,
+        images,
         max_seq,
         jobs,
         lifecycle,
@@ -1857,6 +1988,7 @@ fn handle(front: &Front, mut stream: TcpStream) {
                             front.shared.generator.tokenizer(),
                             &front.defaults,
                             front.max_seq,
+                            &front.images,
                         )
                     })
             } else {

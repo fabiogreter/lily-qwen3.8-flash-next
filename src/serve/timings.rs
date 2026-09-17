@@ -71,6 +71,14 @@ pub struct Timings {
     /// wrote one; absent otherwise, so nothing reads as a zero-length write.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub durable_prefix_tokens: Option<usize>,
+    /// Prompt tokens that are image placeholders (all of the request's
+    /// images, cached or not); absent for a text request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_tokens: Option<usize>,
+    /// Wall time of the vision tower over the images the session cache did
+    /// not already hold (part of `prefill_ms`); absent for a text request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vision_ms: Option<f64>,
 }
 
 /// Tokens per second, or `None` when either side is zero: a rate over no
@@ -115,7 +123,20 @@ impl Timings {
             }),
             agreement_tokens: cached_tokens,
             durable_prefix_tokens: None,
+            image_tokens: None,
+            vision_ms: None,
         }
+    }
+
+    /// Adds the request's images: how many prompt tokens they take and how
+    /// long the tower ran for the ones that had to be encoded. A request
+    /// without images (`image_tokens == 0`) leaves both fields absent.
+    pub fn with_vision(mut self, image_tokens: usize, vision_secs: f64) -> Self {
+        if image_tokens > 0 {
+            self.image_tokens = Some(image_tokens);
+            self.vision_ms = Some(round(vision_secs * 1e3, 1e3));
+        }
+        self
     }
 
     /// Adds what the session cache saw beyond the reused prefix: the

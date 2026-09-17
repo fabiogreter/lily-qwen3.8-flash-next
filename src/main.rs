@@ -98,6 +98,20 @@ struct Cli {
     #[arg(long, default_value = "auto")]
     vision: VisionMode,
 
+    /// An image larger than this many pixels is scaled down to fit before
+    /// it reaches the tower (32 x 32 pixels per prompt token: the default is
+    /// 2 048 tokens; a 1920 x 1080 screenshot passes untouched).
+    #[arg(long, default_value_t = lily::qwen4exp::image::DEFAULT_MAX_PIXELS)]
+    image_max_pixels: usize,
+
+    /// An image smaller than this many pixels is scaled up to reach it.
+    #[arg(long, default_value_t = lily::qwen4exp::image::DEFAULT_MIN_PIXELS)]
+    image_min_pixels: usize,
+
+    /// Most images one chat request may carry.
+    #[arg(long, default_value_t = 8)]
+    max_images: usize,
+
     /// Chat prompts open a reasoning block unless the request says otherwise.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     thinking: bool,
@@ -176,6 +190,9 @@ fn main() -> Result<()> {
         ngram_lock: cli.ngram_lock,
         mtp_drafts: cli.mtp_drafts,
         vision: cli.vision,
+        image_max_pixels: cli.image_max_pixels,
+        image_min_pixels: cli.image_min_pixels,
+        max_images: cli.max_images,
         thinking: cli.thinking,
         reasoning_effort: cli.reasoning_effort,
         queue: cli.queue,

@@ -19,6 +19,7 @@ fn store_fake(
     store
         .store(
             tokens,
+            &[],
             key,
             &[n],
             &mut |w| Ok(w.write_all(&vec![7u8; prefix_bytes])?),
@@ -36,6 +37,7 @@ fn store_fake_durable(
     store
         .store_durable(
             tokens,
+            &[],
             None,
             &[n],
             &mut |w| Ok(w.write_all(&vec![9u8; prefix_bytes])?),
@@ -143,6 +145,66 @@ fn the_durable_cap_evicts_the_least_recently_used_durable_entry_only() {
     {
         assert!(present.contains(keep), "{keep} must survive: {present:?}");
     }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn image_spans_round_trip_through_meta_and_old_meta_files_load_as_text() {
+    let root = temp_root("images-meta");
+    let mut store = DiskStore::open(&root, "fmt", 1 << 20, 0).expect("open");
+    let images = vec![
+        CachedImage { start: 2, len: 4, grid_h: 2, grid_w: 8, digest: [7; 32] },
+        CachedImage { start: 9, len: 1, grid_h: 2, grid_w: 2, digest: [9; 32] },
+    ];
+    let tokens = [1, 2, 99, 99, 99, 99, 3, 4, 5, 99, 6];
+    let id = store
+        .store(
+            &tokens,
+            &images,
+            None,
+            &[tokens.len()],
+            &mut |w| Ok(w.write_all(&[1u8; 10])?),
+            &mut |pos, w| Ok(w.write_all(&(pos as u64).to_le_bytes())?),
+        )
+        .expect("store")
+        .expect("kept");
+    assert_eq!(store.entries()[0].images, images);
+    // A span past the tokens is refused.
+    let err = store
+        .store(
+            &tokens,
+            &[CachedImage { start: 8, len: 4, grid_h: 2, grid_w: 8, digest: [0; 32] }],
+            None,
+            &[tokens.len()],
+            &mut |w| Ok(w.write_all(&[1u8; 10])?),
+            &mut |pos, w| Ok(w.write_all(&(pos as u64).to_le_bytes())?),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("extends past"), "{err}");
+
+    // The spans are in meta.json, survive a touch and come back on reopen.
+    let meta_path = root.join("fmt").join(&id).join(META);
+    let read_meta = || -> serde_json::Value {
+        serde_json::from_slice(&fs::read(&meta_path).expect("meta")).expect("json")
+    };
+    assert_eq!(read_meta()["images"].as_array().map(Vec::len), Some(2));
+    assert_eq!(read_meta()["images"][0]["start"], serde_json::json!(2));
+    store.touch(&id);
+    assert_eq!(read_meta()["images"][1]["digest"][0], serde_json::json!(9));
+    let reopened = DiskStore::open(&root, "fmt", 1 << 20, 0).expect("reopen");
+    assert_eq!(reopened.entries()[0].images, images);
+
+    // A meta file from before the field existed (no `images`) loads as a
+    // text-only lineage.
+    let mut legacy = read_meta();
+    legacy.as_object_mut().unwrap().remove("images");
+    fs::write(&meta_path, serde_json::to_vec(&legacy).unwrap()).expect("write");
+    let legacy_store =
+        DiskStore::open(&root, "fmt", 1 << 20, 0).expect("reopen legacy");
+    assert_eq!(legacy_store.len(), 1);
+    assert!(legacy_store.entries()[0].images.is_empty());
+    assert_eq!(legacy_store.entries()[0].tokens, tokens);
     let _ = fs::remove_dir_all(&root);
 }
 

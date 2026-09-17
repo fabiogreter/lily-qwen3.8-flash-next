@@ -41,9 +41,13 @@ The layout is written out in
 
 ### What is not supported
 
-- **Image input.** The converter now keeps the vision tower and the engine
-  loads it (`--vision`), but nothing runs it yet: the API still rejects image
-  content. Vision support is in progress (`docs/vision-support-plan.md`).
+- **Video input.** Images are supported (see "Request surface"); video parts
+  and the `<|video_pad|>` placeholder are rejected.
+- **Image URLs.** An image must arrive as a base64 data URI (PNG or JPEG).
+  The server never fetches `http(s)` or `file` URLs, at most `--max-images`
+  (8) images per request are accepted, and an image is scaled down to
+  `--image-max-pixels` (2 097 152, 2 048 prompt tokens) before the tower;
+  a 1920 x 1080 screenshot passes untouched, a Retina capture is halved.
 - **Batch size 1.** One generation runs at a time; further requests queue.
   There is no batching across requests.
 - **Greedy drafts only.** The draft head proposes with argmax, so a request
@@ -151,9 +155,17 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 ### Request surface
 
-Chat requests take text messages (string content or `type: text` parts) with
-roles `system`, `user`, `assistant` (with `tool_calls` and `reasoning_content`)
-and `tool`; `tools` and `tool_choice` (`none` hides the tools, anything else
+Chat requests take text messages (string content or `type: text` /
+`input_text` parts) and, in `user` messages, image parts: `type: image_url`
+with `image_url: {url, detail}` (OpenAI's shape; `detail` is accepted and
+ignored, the server-side pixel cap decides the resolution) or
+`type: input_image` with `image_url` as a string. The URL must be a data URI,
+`data:image/png;base64,...` or `data:image/jpeg;base64,...` (`image/jpg` is
+JPEG); standard and URL-safe base64 with or without padding are read. Text
+and image parts are rendered in order, so an image can sit before, between
+or after the text of its message. Roles are `system`, `user`, `assistant`
+(with `tool_calls` and `reasoning_content`) and `tool`; `tools` and
+`tool_choice` (`none` hides the tools, anything else
 renders them); `temperature`, `top_p`, `top_k`, `min_p`, `seed`,
 `presence_penalty`, `frequency_penalty`, `repetition_penalty` (penalties
 apply to generated tokens); `stop` strings; `max_tokens` /
@@ -173,9 +185,24 @@ XML, typed by the tool's JSON schema, and returned as OpenAI `tool_calls`
 with `finish_reason: "tool_calls"`. The final message must be `user` or
 `tool`.
 
-Rejected with 400: images, `n > 1`, `logprobs`, `response_format` other than
-`text`, `echo`, and a prompt that fills the whole context (`prompt exceeds
-the server context: N prompt tokens, M tokens of context`). Every rejected
+An image becomes `grid_h * grid_w / 4` prompt tokens (one per 32 x 32 pixels
+after resizing: 300 for 640 x 480, 2 040 for 1920 x 1080), counted against
+the context like any token and reported as `image_tokens` in `timings`;
+`usage.prompt_tokens` includes them.
+
+Rejected with 400: an image URL that is not a data URI (`image URLs are not
+fetched (https: refused); the server accepts data URIs only`), a data URI of
+another type (`image data URIs of type "image/gif" are not accepted`), an
+image that is not a PNG or JPEG or exceeds the source limits (16 384 pixels
+a side, 64 megapixels; `PNG image is 100000 x 100000: a side exceeds the
+limit of 16384`), more than `--max-images` images, an image in a non-user
+message, an image when the tower is not loaded (`--vision off`, or a
+checkpoint without one), a `<|vision_start|>`, `<|image_pad|>`,
+`<|vision_end|>` or `<|video_pad|>` typed into message text (`these
+placeholder tokens are reserved for image content`), `n > 1`, `logprobs`,
+`response_format` other than `text`, `echo`, and a prompt that fills the
+whole context (`prompt exceeds the server context: N prompt tokens, M tokens
+of context`). `/v1/completions` is text only. Every rejected
 request leaves a `rejected POST /v1/chat/completions with 400: ...` line in
 the log, and a clamped `max_tokens` a `warning:` line. Requests wait in a
 bounded queue (`--queue`, 503 when full) and run one at a time; a client
@@ -199,6 +226,8 @@ client that ignores the field sees exactly the response it saw before.
 | `prefill_per_second` | `prefill_tokens` per second, `null` when nothing was prefilled (never over the whole prompt, which a cache hit would inflate) |
 | `generated_tokens`, `decode_ms`, `decode_per_second` | the decode loop, rate `null` when nothing was generated |
 | `drafted_tokens`, `accepted_tokens`, `acceptance_ratio` | speculative decoding, all three `null` when the draft head is off for the request, so they never read as a 0 % acceptance; the ratio is `null` when nothing was proposed |
+| `agreement_tokens`, `durable_prefix_tokens` | how far the prompt agreed with any cached lineage, and the durable prefix entry this request wrote (absent otherwise); see "Session cache and disk tier" |
+| `image_tokens`, `vision_ms` | image requests only (both absent for text): the prompt tokens that are image placeholders, and the wall time of the vision tower over the images the cache did not already hold (`0` when it held them all); `prefill_ms` includes it |
 
 Durations are milliseconds, rates tokens per second, and the final prompt
 token is fed by the first decode step rather than the prefill, so
@@ -237,7 +266,10 @@ decode and acceptance numbers in the opencode terminal UI.
 | `--ngram-preload` | true | read the table at startup so no request pays cold reads |
 | `--ngram-lock` | false | `mlock` the table (32 GB other apps cannot reclaim) |
 | `--mtp-drafts` | 2 | draft tokens per speculative step (0 turns the draft head off) |
-| `--vision` | `auto` | load the vision tower when the checkpoint carries it (0.9 GB); `off` leaves it on disk |
+| `--vision` | `auto` | load the vision tower when the checkpoint carries it (0.9 GB); `off` leaves it on disk and refuses image requests |
+| `--image-max-pixels` | 2097152 | an image with more pixels is scaled down to fit before the tower (32 x 32 pixels per prompt token: 2 048 tokens) |
+| `--image-min-pixels` | 65536 | an image with fewer pixels is scaled up to reach it |
+| `--max-images` | 8 | most images one chat request may carry |
 | `--disk-cache-dir` | `~/Library/Caches/lily/sessions` | where evicted sessions are kept |
 | `--disk-cache-bytes` | 100G | disk tier budget, LRU; `0` disables the tier |
 | `--disk-cache-ttl` | 3d | delete disk entries unused this long (`0`: never) |
@@ -268,6 +300,15 @@ end) and a common prefix. Extending a conversation reuses its session in
 place; regenerating, editing, or branching forks a copy of the shared prefix,
 so parallel conversations never destroy each other's context. Per-token
 caches grow in 8 192-token steps.
+
+An image is a run of identical placeholder tokens, so two prompts with
+different screenshots are token-identical there. Every session and disk
+entry therefore also records its image spans (position, length, patch grid
+and a SHA-256 of the preprocessed pixel rows), and a shared prefix ends at
+the first span the other lineage does not match exactly: a different image
+behind the same preamble resumes from before the image and never from
+another image's cached state, the same image resumes past it. Text-only
+lineages match as before.
 
 Sessions evicted from GPU memory go to a disk tier
 (`--disk-cache-dir`, default `~/Library/Caches/lily/sessions`;
@@ -395,7 +436,9 @@ Two things to know before trusting a green run are in
 tests share one GPU.
 
 End-to-end scripts against a running server live in `tools/e2e/` (`e2e.sh`,
-`longctx.py`, `disk.py`). Correctness against Hugging Face transformers on
+`longctx.py`, `disk.py`); `durable.py` and `vision.py` start their own server
+on a small checkpoint (the latter checks image input and the caches' image
+identity). Correctness against Hugging Face transformers on
 the same dequantized weights is checked with `tools/reference/`; see
 [tools/README.md](tools/README.md).
 
@@ -414,7 +457,9 @@ src/engine.rs         the model-agnostic trait the server drives
 src/generate.rs       tokenizer wrapper and the pipelined decode loop
 src/serve.rs          engine thread, request flow, OpenAI response shapes
 src/serve/http.rs     minimal HTTP/1.1 on std::net (chunked streaming, disconnects)
-src/serve/api.rs      request schemas and validation
+src/serve/api.rs      request schemas and validation, image parts and placeholder expansion
+src/serve/data_uri.rs base64 data URIs (the only image URL form accepted)
+src/sha256.rs         SHA-256 for the caches' image identity and the probe's records
 src/serve/stream.rs   detokenizer, reasoning split, tool-call blocks, stop strings
 src/serve/tools.rs    tool schemas and the <tool_call> XML parser
 src/serve/session.rs  session cache with checkpoints, forks and a byte budget

@@ -219,13 +219,42 @@ impl VisionTower {
         gw: usize,
         blocks: usize,
     ) -> Result<VisionOutput> {
+        forward_with(
+            ctx,
+            &self.config,
+            &self.weights,
+            &mut self.scratch,
+            pixels,
+            gh,
+            gw,
+            blocks,
+        )
+    }
+}
+
+/// [`VisionTower::forward_blocks`] over borrowed parts: the engine keeps the
+/// tower's weights inside the language model's weights and its scratch with
+/// the engine's, so the tower is not loaded twice. `scratch` grows to the
+/// image's patch count and is kept for the next image.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn forward_with(
+    ctx: &MetalContext,
+    config: &VisionConfig,
+    weights: &VisionWeights,
+    scratch: &mut Option<VisionScratch>,
+    pixels: &[f32],
+    gh: usize,
+    gw: usize,
+    blocks: usize,
+) -> Result<VisionOutput> {
+    {
         let started = Instant::now();
         ensure!(
-            blocks <= self.config.depth,
+            blocks <= config.depth,
             "{blocks} blocks exceed depth {}",
-            self.config.depth
+            config.depth
         );
-        let v = &self.config;
+        let v = config;
         let (hid, patch_dim, heads) = (v.hidden_size, v.patch_dim(), v.num_heads);
         let merge = v.spatial_merge_size * v.spatial_merge_size;
         let n = gh * gw;
@@ -243,9 +272,9 @@ impl VisionTower {
         let depth = blocks;
         let merge_dim = v.merge_dim();
         let out_hidden = v.out_hidden_size;
-        Self::ensure_scratch(ctx, &mut self.scratch, &self.config, n)?;
-        let s = self.scratch.as_ref().expect("scratch allocated");
-        let w = &self.weights;
+        VisionTower::ensure_scratch(ctx, scratch, config, n)?;
+        let s = scratch.as_ref().expect("scratch allocated");
+        let w = weights;
 
         let px = s.pixels.view(0, &[n, patch_dim])?;
         let x = s.x.view(0, &[n, hid])?;

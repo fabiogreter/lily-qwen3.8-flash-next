@@ -1,4 +1,5 @@
 use super::*;
+use crate::qwen4exp::ImageSpan;
 
 #[test]
 fn call_ids_are_stable_per_request_and_index() {
@@ -259,4 +260,125 @@ fn unspecified_bind_addresses_are_reached_on_loopback() {
     assert_eq!(loopback_of(any6), "[::1]:8000".parse().unwrap());
     let local: SocketAddr = "192.168.1.5:8000".parse().unwrap();
     assert_eq!(loopback_of(local), local);
+}
+
+/// The placeholder ids of the Qwen3.8 vocabulary (config.json).
+const IDS: api::PlaceholderIds = api::PlaceholderIds {
+    image_pad: 248056,
+    vision_start: 248053,
+    vision_end: 248054,
+    video_pad: Some(248057),
+};
+
+#[test]
+fn image_parts_are_read_in_both_shapes_and_text_only_content_flattens_as_before() {
+    use api::{Content, ContentItem, template_content};
+    let parts: Content = serde_json::from_value(json!([
+        {"type": "text", "text": "Look at "},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA==", "detail": "high"}},
+        {"type": "input_text", "text": " and "},
+        {"type": "input_image", "image_url": "data:image/jpeg;base64,AA=="},
+        {"type": "image_url", "image_url": "data:image/png;base64,AQ=="},
+    ]))
+    .unwrap();
+    let items = parts.into_items().unwrap();
+    assert_eq!(
+        items,
+        vec![
+            ContentItem::Text("Look at ".into()),
+            ContentItem::Image("data:image/png;base64,AA==".into()),
+            ContentItem::Text(" and ".into()),
+            ContentItem::Image("data:image/jpeg;base64,AA==".into()),
+            ContentItem::Image("data:image/png;base64,AQ==".into()),
+        ]
+    );
+    // With images the template gets structured items, in order.
+    assert_eq!(
+        template_content(items),
+        json!([
+            {"type": "text", "text": "Look at "},
+            {"type": "image"},
+            {"type": "text", "text": " and "},
+            {"type": "image"},
+            {"type": "image"},
+        ])
+    );
+    // Text-only parts flatten to one string, exactly as before images.
+    let text: Content = serde_json::from_value(json!([
+        {"type": "text", "text": "a"},
+        {"type": "input_text", "text": "b"},
+        {"type": "text"},
+    ]))
+    .unwrap();
+    assert_eq!(template_content(text.into_items().unwrap()), json!("ab"));
+    let plain: Content = serde_json::from_value(json!("hello")).unwrap();
+    assert_eq!(template_content(plain.into_items().unwrap()), json!("hello"));
+    // An image part without its URL, and an unknown part type, are refused.
+    let missing: Content =
+        serde_json::from_value(json!([{"type": "image_url"}])).unwrap();
+    assert!(missing.into_items().unwrap_err().to_string().contains("has no image_url"));
+    let unknown: Content =
+        serde_json::from_value(json!([{"type": "input_audio", "text": "x"}])).unwrap();
+    let err = unknown.into_items().unwrap_err().to_string();
+    assert!(err.contains("\"input_audio\" is not supported"), "{err}");
+}
+
+#[test]
+fn placeholders_are_expanded_per_image_and_refused_in_text() {
+    // A rendered prompt with two images: text, marker triple, text, triple, text.
+    let prompt = [1, 2, 248053, 248056, 248054, 3, 248053, 248056, 248054, 4];
+    // Grids (4, 6) -> 6 placeholders and (2, 4) -> 2.
+    let (expanded, spans) =
+        api::expand_image_pads(&prompt, &IDS, &[(4, 6), (2, 4)]).unwrap();
+    let mut want = vec![1, 2, 248053];
+    want.extend(std::iter::repeat_n(248056, 6));
+    want.extend([248054, 3, 248053, 248056, 248056, 248054, 4]);
+    assert_eq!(expanded, want);
+    assert_eq!(
+        spans,
+        vec![
+            ImageSpan { start: 3, len: 6, grid_h: 4, grid_w: 6 },
+            ImageSpan { start: 12, len: 2, grid_h: 2, grid_w: 4 },
+        ]
+    );
+    // Fewer or more markers than images: the text carried one (or the
+    // template dropped one); both are refused, never mapped.
+    let err = api::expand_image_pads(&prompt, &IDS, &[(4, 6)]).unwrap_err().to_string();
+    assert!(err.contains("2 <|image_pad|>, 2 <|vision_start|> and 2 <|vision_end|> tokens for 1 images"), "{err}");
+    assert!(err.contains("reserved for image content"), "{err}");
+    assert!(api::expand_image_pads(&prompt, &IDS, &[(4, 6), (2, 4), (2, 2)]).is_err());
+    // A lone pad typed into text (no start/end around it) is caught by the
+    // marker counts even when the pad count happens to match.
+    let typed = [1, 248056, 2, 248053, 248056, 248054];
+    assert!(api::expand_image_pads(&typed, &IDS, &[(2, 2), (2, 2)]).is_err());
+    // A text request may carry none of them.
+    assert!(api::check_placeholders(&[1, 2, 3], &IDS, 0).is_ok());
+    for reserved in [248053, 248054, 248056, 248057] {
+        let err = api::check_placeholders(&[1, reserved, 3], &IDS, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot appear in message text"), "{reserved}: {err}");
+    }
+    // A grid that is not made of 2 x 2 blocks is refused.
+    assert!(
+        api::expand_image_pads(&[248053, 248056, 248054], &IDS, &[(3, 4)]).is_err()
+    );
+}
+
+#[test]
+fn the_image_digest_covers_the_rows_and_the_grid() {
+    let rows = vec![0.5f32; 1536 * 4];
+    let a = api::image_digest(&rows, 2, 2);
+    assert_eq!(a, api::image_digest(&rows.clone(), 2, 2));
+    // The same rows read as another grid are another image.
+    assert_ne!(a, api::image_digest(&rows, 4, 1));
+    let mut other = rows.clone();
+    other[100] = 0.25;
+    assert_ne!(a, api::image_digest(&other, 2, 2));
+    // Pinned so a change in what is digested is noticed: SHA-256 of the
+    // 24 576 little-endian f32 0.5 bytes followed by two u64 2s.
+    let mut bytes: Vec<u8> = rows.iter().flat_map(|v| v.to_le_bytes()).collect();
+    bytes.extend(2u64.to_le_bytes());
+    bytes.extend(2u64.to_le_bytes());
+    assert_eq!(a, crate::sha256::sha256(&bytes));
 }

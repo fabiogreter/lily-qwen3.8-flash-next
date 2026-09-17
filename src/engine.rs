@@ -38,6 +38,20 @@ pub trait DecodeStateApi: Sized {
     /// passes that write them).
     fn advance(&mut self, n: usize);
 
+    /// Sets what every token fed from now on adds to its sequence index to
+    /// get its rotary position: the prompt's `rope_delta`
+    /// ([`crate::qwen4exp::Positions`]), 0 for text. A pure function of the
+    /// prompt, so the engine sets it whenever it acquires a session, and a
+    /// resumed session decodes at the right positions whatever state it was
+    /// restored from. Models without image positions accept only 0.
+    fn set_rope_delta(&mut self, delta: i64) -> Result<()> {
+        anyhow::ensure!(
+            delta == 0,
+            "this model has no image positions (rope delta {delta})"
+        );
+        Ok(())
+    }
+
     /// Returns to position zero so the buffers can be recycled. The GPU must
     /// be idle on this state's buffers.
     fn reset(&mut self) -> Result<()>;
@@ -253,6 +267,45 @@ pub trait LanguageModel: Sized {
         tokens: &[u32],
         draw: Option<Draw<'_>>,
     ) -> Result<()>;
+
+    /// [`Self::prefill`] for a prompt that may carry images: `vision` holds
+    /// the whole prompt's per-token rotary positions and the images' merged
+    /// rows (from [`Self::encode_image`]) that replace the placeholder rows
+    /// the fed range covers. `None` is exactly [`Self::prefill`], so a text
+    /// request takes the text path untouched. Models without a vision path
+    /// refuse a `Some`.
+    fn prefill_with_vision(
+        &self,
+        ctx: &MetalContext,
+        state: &mut Self::State,
+        scratch: &mut Self::Scratch,
+        tokens: &[u32],
+        draw: Option<Draw<'_>>,
+        vision: Option<&crate::qwen4exp::VisionInput<'_>>,
+    ) -> Result<()> {
+        match vision {
+            None => self.prefill(ctx, state, scratch, tokens, draw),
+            Some(_) => anyhow::bail!("this model has no vision path"),
+        }
+    }
+
+    /// Runs the vision tower over one preprocessed image
+    /// (`[grid_h * grid_w, patch_dim]` f32 rows in block-major patch order,
+    /// [`crate::qwen4exp::image::preprocess`]) and returns its merged rows
+    /// as an owned bf16 `[grid_h * grid_w / 4, hidden]` tensor, one row per
+    /// `<|image_pad|>` of the image's span, valid for as long as the caller
+    /// keeps it. Waits for the GPU. Models without a loaded tower refuse.
+    fn encode_image(
+        &self,
+        ctx: &MetalContext,
+        scratch: &mut Self::Scratch,
+        pixels: &[f32],
+        grid_h: usize,
+        grid_w: usize,
+    ) -> Result<Tensor> {
+        let _ = (ctx, scratch, pixels, grid_h, grid_w);
+        anyhow::bail!("this model has no vision tower loaded")
+    }
 
     /// Host work for the step that consumes `token` at the current position
     /// (e.g. staging its n-gram rows). Must run after the pass that produced
