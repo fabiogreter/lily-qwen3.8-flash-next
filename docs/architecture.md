@@ -243,6 +243,28 @@ sub-batches: score, select, then attend per query, gathering that query's
 At 2.1 TFLOP/s next to a dense kernel at 29 on the same head shapes, it is
 the single largest remaining item in the engine.
 
+Two things address it. The rows of a chunk whose causal window still fits
+the budget (the prefix up to the dense limit) take the dense kernel, which
+is exact for them, and only the rest goes through the indexer. And the
+default route past the limit is now **tiled**: `qsa_tile_union` merges the
+selections of 16 consecutive queries into one ascending block list with a
+query mask per block, and `qsa_attn_tile_nax_h1` runs the dense kernel's
+tensor-op flash loop over that union, gathering its K/V rows into
+threadgroup memory 32 at a time and masking each query to its own selection.
+The gain rests on how much neighbouring queries' selections overlap, which
+the union kernel measures: on real text (this repository's documentation) a
+tile's union is 1.9 times one query's 512 blocks at 8K and 3.2 times at 32K,
+against 16 for disjoint selections. Measured on the full model in the
+per-kernel profile: the sparse attention of a 4096-token chunk drops from
+about 1 200 to 350 ms at 8K and from 1 480 to 850 ms at 32K, prefill from
+about 1 250 to 1 700 tok/s at 8K and from 1 150 to 1 450 at 32K, with the
+same tokens drawn. The variants that share a staged K/V slice across two or
+four query heads (`tile2`, `tile4`) are slower than one head per slice at
+both lengths, so the accumulators' register pressure outweighs the saved
+gathers. `LILY_QSA_ROUTE=split` restores the per-query kernel; `tile2` and
+`tile4` select the other variants. Sub-batches under 16 rows (the verify
+pass) keep the split kernel.
+
 ## The vision tower
 
 Qwen3.8-Flash-Next's image encoder runs on the GPU as its own graph

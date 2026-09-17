@@ -37,7 +37,9 @@ use crate::kernels::hc::{
 };
 use crate::kernels::norm::rmsnorm_bf16;
 use crate::kernels::ple;
-use crate::kernels::qsa::{self, INDEXER_D, SparseSplitScratch};
+use crate::kernels::qsa::{
+    self, INDEXER_D, SparseAttnRoute, SparseSplitScratch, SparseTileScratch,
+};
 use crate::kernels::sample::{SamplerScratch, SamplingParams, sample_f32};
 use crate::kernels::spec::ctrl_words;
 use crate::kernels::{Arg, Pos, Rope};
@@ -702,6 +704,10 @@ struct QsaScratch {
     partials: Tensor,
     /// F32 `[QB * NQ, splits, 2]`.
     stats: Tensor,
+    /// Per-tile unions for the tiled route.
+    tiles: SparseTileScratch,
+    /// How sub-batches past the dense limit attend (`LILY_QSA_ROUTE`).
+    route: SparseAttnRoute,
 }
 
 impl QsaScratch {
@@ -722,6 +728,8 @@ impl QsaScratch {
             n_sel: Tensor::zeros(ctx, &[qb], DType::U32)?,
             partials: Tensor::zeros(ctx, &[qb * nq, splits, cfg.head_dim], DType::F32)?,
             stats: Tensor::zeros(ctx, &[qb * nq, splits, 2], DType::F32)?,
+            tiles: SparseTileScratch::new(ctx, qb, max_blocks, k_max)?,
+            route: SparseAttnRoute::from_env(),
         })
     }
 
@@ -1191,6 +1199,8 @@ impl PrefillScratch {
                 n_sel: self.qsa.n_sel.view(0, self.qsa.n_sel.shape())?,
                 partials: self.qsa.partials.view(0, self.qsa.partials.shape())?,
                 stats: self.qsa.stats.view(0, self.qsa.stats.shape())?,
+                tiles: self.qsa.tiles.share()?,
+                route: self.qsa.route,
             },
             ple: self.ple.as_ref().map(|p| p.rows(m)).transpose()?,
             mtp_hyper: self
@@ -2456,10 +2466,27 @@ impl Qwen4ExpModel {
                 self.attn_scale,
             )?;
         } else {
-            // (Exact below the dense limit too: fewer visible blocks than the
-            // budget means all of them are selected.)
+            // Rows whose causal window still fits the budget select every
+            // visible block, so the dense kernel is exact for them: the
+            // chunk's prefix up to the dense limit (empty when the chunk
+            // starts past it). The rest goes through the indexer.
+            let dense_rows = idx.dense_limit().saturating_sub(pos.max).min(m);
+            if dense_rows > 0 {
+                let q = ps.q.view(0, &[dense_rows, nq, hd])?;
+                let out = ps.attn_o.view(0, &[dense_rows, nq, hd])?;
+                sdpa_prefill(
+                    ctx,
+                    pass,
+                    &q,
+                    k_cache,
+                    v_cache,
+                    &out,
+                    pos,
+                    self.attn_scale,
+                )?;
+            }
             let qb_cap = ps.qsa.n_sel.numel();
-            for q0 in (0..m).step_by(qb_cap) {
+            for q0 in (dense_rows..m).step_by(qb_cap) {
                 let qb = qb_cap.min(m - q0);
                 let base = pos.offset(q0)?;
                 let nb_max = qsa::visible_blocks(base.max + qb - 1, idx.compress_ratio);
@@ -2494,23 +2521,59 @@ impl Qwen4ExpModel {
                     idx.block_topk(),
                 )?;
                 pass.level_barrier(&[&ps.qsa.sel, &ps.qsa.n_sel])?;
-                qsa::qsa_attention(
-                    ctx,
-                    pass,
-                    &q,
-                    k_cache,
-                    v_cache,
-                    &ps.qsa.sel,
-                    &ps.qsa.n_sel,
-                    &out,
-                    &ps.qsa.split_scratch(),
-                    qb,
-                    idx.block_topk(),
-                    idx.compress_ratio,
-                    base,
-                    self.attn_scale,
-                )?;
-                // The next sub-batch reuses the score/selection scratch.
+                match ps.qsa.route.for_rows(qb) {
+                    SparseAttnRoute::Split => qsa::qsa_attention(
+                        ctx,
+                        pass,
+                        &q,
+                        k_cache,
+                        v_cache,
+                        &ps.qsa.sel,
+                        &ps.qsa.n_sel,
+                        &out,
+                        &ps.qsa.split_scratch(),
+                        qb,
+                        idx.block_topk(),
+                        idx.compress_ratio,
+                        base,
+                        self.attn_scale,
+                    )?,
+                    SparseAttnRoute::Tiled { heads_per_pass } => {
+                        let tiles = &ps.qsa.tiles;
+                        qsa::qsa_tile_union(
+                            ctx,
+                            pass,
+                            &ps.qsa.sel,
+                            &ps.qsa.n_sel,
+                            tiles,
+                            qb,
+                            idx.block_topk(),
+                            idx.compress_ratio,
+                            base,
+                        )?;
+                        pass.level_barrier(&[
+                            &tiles.union_blk,
+                            &tiles.union_mask,
+                            &tiles.n_union,
+                            &tiles.tail_mask,
+                        ])?;
+                        qsa::qsa_attention_tiled(
+                            ctx,
+                            pass,
+                            &q,
+                            k_cache,
+                            v_cache,
+                            tiles,
+                            &out,
+                            qb,
+                            idx.compress_ratio,
+                            base,
+                            self.attn_scale,
+                            heads_per_pass,
+                        )?;
+                    }
+                }
+                // The next sub-batch reuses the score/selection/union scratch.
                 pass.level_barrier(&[&out])?;
             }
         }
@@ -3685,3 +3748,7 @@ impl LanguageModel for Qwen4ExpModel {
         )
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/qwen4exp/qsa_tiles.rs"]
+mod qsa_tile_tests;

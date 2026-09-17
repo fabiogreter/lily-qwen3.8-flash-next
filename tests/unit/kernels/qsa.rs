@@ -628,3 +628,316 @@ fn sparse_attention_tail_in_its_own_split_matches_cpu() {
     }
     cpu_ref::assert_close(&out.to_f32().expect("out"), &expected, 2e-2, 2e-2);
 }
+
+// --- Tiled sparse attention ------------------------------------------------------
+
+/// CPU model of `qsa_tile_union`: per tile, the ascending (block, query
+/// mask) pairs below the tile's window plus the tail-block masks.
+struct CpuTile {
+    blocks: Vec<(u32, u32)>,
+    tail: [u32; QSA_TILE_TAIL_BLOCKS],
+}
+
+fn cpu_tile_union(
+    sel: &[u32],
+    n_sel: &[u32],
+    qb: usize,
+    k_max: usize,
+    base_pos: usize,
+    ratio: usize,
+) -> Vec<CpuTile> {
+    (0..qb.div_ceil(QSA_TILE_BQ))
+        .map(|t| {
+            let q0 = t * QSA_TILE_BQ;
+            let qn = QSA_TILE_BQ.min(qb - q0);
+            let vb0 = visible_blocks(base_pos + q0, ratio) as u32;
+            let mut mask = std::collections::BTreeMap::<u32, u32>::new();
+            let mut tail = [0u32; QSA_TILE_TAIL_BLOCKS];
+            for i in 0..qn {
+                let qi = q0 + i;
+                for &b in &sel[qi * k_max..qi * k_max + n_sel[qi] as usize] {
+                    if b < vb0 {
+                        *mask.entry(b).or_default() |= 1 << i;
+                    } else {
+                        tail[(b - vb0) as usize] |= 1 << i;
+                    }
+                }
+            }
+            CpuTile { blocks: mask.into_iter().collect(), tail }
+        })
+        .collect()
+}
+
+/// Whether query `i` of tile `t` attends cache row `token`, read off the
+/// tile structures the way the kernel does.
+fn cpu_tile_attends(
+    tile: &CpuTile,
+    base_pos: usize,
+    t: usize,
+    i: usize,
+    ratio: usize,
+    token: usize,
+) -> bool {
+    let p0 = base_pos + t * QSA_TILE_BQ;
+    let p = p0 + i;
+    let vb0 = visible_blocks(p0, ratio);
+    let b = token / ratio;
+    if b < vb0 {
+        tile.blocks
+            .binary_search_by_key(&(b as u32), |x| x.0)
+            .map(|k| (tile.blocks[k].1 >> i) & 1 == 1)
+            .unwrap_or(false)
+    } else {
+        token <= p
+            && (token >= visible_blocks(p, ratio) * ratio
+                || (tile.tail[b - vb0] >> i) & 1 == 1)
+    }
+}
+
+/// The definition: a complete block's rows if selected, the tail causally.
+fn attends_direct(sel_row: &[u32], pos: usize, ratio: usize, token: usize) -> bool {
+    let b = token / ratio;
+    if b < visible_blocks(pos, ratio) {
+        sel_row.contains(&(b as u32))
+    } else {
+        token <= pos
+    }
+}
+
+/// Random ascending selections with the overlap of neighbouring queries
+/// controlled: `hot` blocks every query prefers, the rest drawn at random.
+fn random_selections(
+    rng: &mut StdRng,
+    qb: usize,
+    k_max: usize,
+    base_pos: usize,
+    ratio: usize,
+    hot: &[u32],
+) -> (Vec<u32>, Vec<u32>) {
+    let mut sel = vec![0u32; qb * k_max];
+    let mut n_sel = vec![0u32; qb];
+    for qi in 0..qb {
+        let nb = visible_blocks(base_pos + qi, ratio);
+        let n = k_max.min(nb);
+        let mut chosen: Vec<u32> = Vec::new();
+        for &h in hot {
+            if (h as usize) < nb && chosen.len() < n && rng.gen_bool(0.8) {
+                chosen.push(h);
+            }
+        }
+        while chosen.len() < n {
+            let b = rng.gen_range(0..nb) as u32;
+            if !chosen.contains(&b) {
+                chosen.push(b);
+            }
+        }
+        chosen.sort_unstable();
+        sel[qi * k_max..qi * k_max + n].copy_from_slice(&chosen);
+        n_sel[qi] = n as u32;
+    }
+    (sel, n_sel)
+}
+
+/// CPU only: the union structures reproduce the attended set of every query
+/// exactly, including the tail region where a block is complete for some
+/// queries of a tile and not for others, and tiles short of BQ queries.
+#[test]
+fn tile_union_reference_matches_direct_definition() {
+    let mut rng = StdRng::seed_from_u64(45);
+    for &(qb, k_max, base_pos, ratio) in &[
+        (37usize, 6usize, 61usize, 4usize),
+        (16, 3, 0, 4),
+        (50, 4, 7, 4),
+        (5, 2, 13, 2),
+    ] {
+        let hot: Vec<u32> = (0..4).map(|_| rng.gen_range(0..8)).collect();
+        let (sel, n_sel) =
+            random_selections(&mut rng, qb, k_max, base_pos, ratio, &hot);
+        let tiles = cpu_tile_union(&sel, &n_sel, qb, k_max, base_pos, ratio);
+        for (t, tile) in tiles.iter().enumerate() {
+            let q0 = t * QSA_TILE_BQ;
+            for i in 0..QSA_TILE_BQ.min(qb - q0) {
+                let qi = q0 + i;
+                let pos = base_pos + qi;
+                let row = &sel[qi * k_max..qi * k_max + n_sel[qi] as usize];
+                for token in 0..base_pos + qb + ratio {
+                    let direct = token <= pos && attends_direct(row, pos, ratio, token);
+                    let tiled = cpu_tile_attends(tile, base_pos, t, i, ratio, token);
+                    assert_eq!(
+                        tiled, direct,
+                        "qb {qb} k_max {k_max} base {base_pos}: tile {t} query {i} token {token}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn tile_union_matches_cpu() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(46);
+    let (qb, k_max, base_pos, ratio, max_blocks) =
+        (37usize, 6usize, 61usize, 4usize, 64usize);
+    let hot: Vec<u32> = vec![1, 4, 9];
+    let (sel, n_sel) = random_selections(&mut rng, qb, k_max, base_pos, ratio, &hot);
+    let expected = cpu_tile_union(&sel, &n_sel, qb, k_max, base_pos, ratio);
+
+    let t_sel =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[qb, k_max], DType::U32)
+            .expect("sel");
+    let t_n = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&n_sel), &[qb], DType::U32)
+        .expect("n");
+    let tiles = SparseTileScratch::new(&ctx, qb, max_blocks, k_max).expect("tiles");
+    let pass = ctx.begin().expect("pass");
+    qsa_tile_union(&ctx, &pass, &t_sel, &t_n, &tiles, qb, k_max, ratio, base_pos)
+        .expect("union");
+    pass.commit_wait().expect("commit");
+
+    let cap = tiles.cap();
+    let n_union = tiles.n_union.to_u32().expect("n_union");
+    let union_blk = tiles.union_blk.to_u32().expect("union_blk");
+    let union_mask = tiles.union_mask.to_u32().expect("union_mask");
+    let tail_mask = tiles.tail_mask.to_u32().expect("tail_mask");
+    for (t, tile) in expected.iter().enumerate() {
+        assert_eq!(n_union[t] as usize, tile.blocks.len(), "tile {t} union size");
+        for (r, &(b, m)) in tile.blocks.iter().enumerate() {
+            assert_eq!(union_blk[t * cap + r], b, "tile {t} entry {r} block");
+            assert_eq!(union_mask[t * cap + r], m, "tile {t} entry {r} mask");
+        }
+        assert_eq!(
+            &tail_mask[t * QSA_TILE_TAIL_BLOCKS..(t + 1) * QSA_TILE_TAIL_BLOCKS],
+            &tile.tail[..],
+            "tile {t} tail masks"
+        );
+    }
+    // The mask rows are clean for the next sub-batch, and the statistics
+    // count this dispatch.
+    assert!(tiles.mask.to_u32().expect("mask").iter().all(|&m| m == 0));
+    let total: u64 = expected.iter().map(|t| t.blocks.len() as u64).sum();
+    assert_eq!(tiles.union_stats().expect("stats"), (total, expected.len() as u64));
+}
+
+/// The tile kernel agrees with the split kernel and the CPU definition over
+/// the same selections, for every heads-per-pass variant, with a partial
+/// last tile (37 queries) and overlapping selections.
+#[test]
+fn tiled_attention_matches_split_kernel_and_cpu() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(47);
+    let (kvh, group, d, ratio, k_max) = (2usize, 12usize, 256usize, 4usize, 6usize);
+    let nq = kvh * group;
+    let (qb, base_pos, max_seq) = (37usize, 61usize, 128usize);
+    let scale = 1.0 / (d as f32).sqrt();
+    let q = cpu_ref::round_bf16(&random(&mut rng, qb * nq * d, -1.0, 1.0));
+    let k = cpu_ref::round_bf16(&random(&mut rng, kvh * max_seq * d, -1.0, 1.0));
+    let v = cpu_ref::round_bf16(&random(&mut rng, kvh * max_seq * d, -1.0, 1.0));
+    let hot: Vec<u32> = vec![2, 5, 11];
+    let (sel, n_sel) = random_selections(&mut rng, qb, k_max, base_pos, ratio, &hot);
+
+    let t_q = Tensor::from_f32_as_bf16(&ctx, &q, &[qb, nq, d]).expect("q");
+    let t_k = Tensor::from_f32_as_bf16(&ctx, &k, &[kvh, max_seq, d]).expect("k");
+    let t_v = Tensor::from_f32_as_bf16(&ctx, &v, &[kvh, max_seq, d]).expect("v");
+    let t_sel =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[qb, k_max], DType::U32)
+            .expect("sel");
+    let t_n = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&n_sel), &[qb], DType::U32)
+        .expect("n");
+
+    // Reference: the split kernel.
+    let out_split = Tensor::zeros(&ctx, &[qb, nq, d], DType::BF16).expect("out");
+    let splits = sparse_splits(k_max, ratio);
+    let partials =
+        Tensor::zeros(&ctx, &[qb * nq, splits, d], DType::F32).expect("partials");
+    let stats = Tensor::zeros(&ctx, &[qb * nq, splits, 2], DType::F32).expect("stats");
+    let pass = ctx.begin().expect("pass");
+    qsa_attention(
+        &ctx,
+        &pass,
+        &t_q,
+        &t_k,
+        &t_v,
+        &t_sel,
+        &t_n,
+        &out_split,
+        &SparseSplitScratch { partials: &partials, stats: &stats },
+        qb,
+        k_max,
+        ratio,
+        base_pos,
+        scale,
+    )
+    .expect("split attention");
+    pass.commit_wait().expect("commit");
+    let got_split = out_split.to_f32().expect("out");
+
+    // Reference: the definition on the CPU.
+    let mut expected = vec![0.0f32; qb * nq * d];
+    for qi in 0..qb {
+        let pos = base_pos + qi;
+        let row = &sel[qi * k_max..qi * k_max + n_sel[qi] as usize];
+        let tokens: Vec<usize> =
+            (0..=pos).filter(|&t| attends_direct(row, pos, ratio, t)).collect();
+        for hq in 0..nq {
+            let kh = hq / group;
+            let qrow = &q[(qi * nq + hq) * d..(qi * nq + hq + 1) * d];
+            let logits: Vec<f32> = tokens
+                .iter()
+                .map(|&t| {
+                    let krow = &k[(kh * max_seq + t) * d..(kh * max_seq + t + 1) * d];
+                    qrow.iter().zip(krow).map(|(a, b)| a * b).sum::<f32>() * scale
+                })
+                .collect();
+            let m = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let weights: Vec<f32> = logits.iter().map(|l| (l - m).exp()).collect();
+            let sum: f32 = weights.iter().sum();
+            let o = &mut expected[(qi * nq + hq) * d..(qi * nq + hq + 1) * d];
+            for (w, &t) in weights.iter().zip(&tokens) {
+                let vrow = &v[(kh * max_seq + t) * d..(kh * max_seq + t + 1) * d];
+                for i in 0..d {
+                    o[i] += w / sum * vrow[i];
+                }
+            }
+        }
+    }
+    cpu_ref::assert_close(&got_split, &expected, 2e-2, 2e-2);
+
+    let tiles =
+        SparseTileScratch::new(&ctx, qb, max_seq / ratio, k_max).expect("tiles");
+    for heads_per_pass in [1usize, 2, 4] {
+        let out = Tensor::zeros(&ctx, &[qb, nq, d], DType::BF16).expect("out");
+        let pass = ctx.begin().expect("pass");
+        qsa_tile_union(&ctx, &pass, &t_sel, &t_n, &tiles, qb, k_max, ratio, base_pos)
+            .expect("union");
+        pass.level_barrier(&[
+            &tiles.union_blk,
+            &tiles.union_mask,
+            &tiles.n_union,
+            &tiles.tail_mask,
+        ])
+        .expect("barrier");
+        qsa_attention_tiled(
+            &ctx,
+            &pass,
+            &t_q,
+            &t_k,
+            &t_v,
+            &tiles,
+            &out,
+            qb,
+            ratio,
+            base_pos,
+            scale,
+            heads_per_pass,
+        )
+        .expect("tiled attention");
+        pass.commit_wait().expect("commit");
+        let got = out.to_f32().expect("out");
+        assert!(
+            got.iter().all(|x| x.is_finite()),
+            "hpp {heads_per_pass}: non-finite output"
+        );
+        cpu_ref::assert_close(&got, &expected, 2e-2, 2e-2);
+        cpu_ref::assert_close(&got, &got_split, 2e-2, 2e-2);
+    }
+}

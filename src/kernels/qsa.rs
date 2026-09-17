@@ -441,6 +441,270 @@ pub fn qsa_attention<'t>(
     )
 }
 
+/// How the batched path attends past the dense limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SparseAttnRoute {
+    /// The per-query split kernel (`qsa_attn_split_bf16`).
+    Split,
+    /// The tensor-op tile kernel over per-tile unions of selected blocks,
+    /// `heads_per_pass` query heads (1, 2 or 4) per staged K/V slice.
+    Tiled { heads_per_pass: usize },
+}
+
+impl SparseAttnRoute {
+    /// `LILY_QSA_ROUTE`: `tile1` (the default: measured fastest at 8K and
+    /// 32K, see docs/architecture.md), `tile2`, `tile4` or `split` (the
+    /// per-query kernel).
+    pub fn from_env() -> Self {
+        match std::env::var("LILY_QSA_ROUTE").as_deref() {
+            Ok("tile1") | Err(_) => Self::Tiled { heads_per_pass: 1 },
+            Ok("tile2") => Self::Tiled { heads_per_pass: 2 },
+            Ok("tile4") => Self::Tiled { heads_per_pass: 4 },
+            Ok("split") => Self::Split,
+            Ok(other) => {
+                eprintln!("LILY_QSA_ROUTE={other}: unknown route, using tile1");
+                Self::Tiled { heads_per_pass: 1 }
+            }
+        }
+    }
+
+    /// The route for a sub-batch of `rows` queries: a tile needs a full
+    /// tile's worth of queries to pay for building the union, so smaller
+    /// batches (the verify pass) keep the split kernel.
+    pub fn for_rows(self, rows: usize) -> Self {
+        match self {
+            Self::Tiled { .. } if rows >= QSA_TILE_BQ => self,
+            _ => Self::Split,
+        }
+    }
+}
+
+/// Consecutive queries per tile of the tiled sparse attention kernel.
+pub const QSA_TILE_BQ: usize = 16;
+/// Blocks the tail region of a tile can span (`(QSA_TILE_BQ - 1 + ratio - 1) / ratio + 1`).
+pub const QSA_TILE_TAIL_BLOCKS: usize = 8;
+/// Threads of the tiled attention threadgroup (four simdgroups).
+const QSA_TILE_THREADS: usize = 128;
+
+/// Union entries a tile can hold: every block below the tile's window or
+/// every query's full selection, whichever is smaller.
+pub fn tile_union_capacity(max_blocks: usize, k_max: usize) -> usize {
+    max_blocks.min(QSA_TILE_BQ * k_max).max(1)
+}
+
+/// Scratch of [`qsa_tile_union`] and [`qsa_attention_tiled`] for up to
+/// `tiles` tiles: the per-tile mask rows (`U32 [tiles, max_blocks]`, zero
+/// between dispatches), the compacted unions (`U32 [tiles, cap]` block ids
+/// and query masks), their counts, the tail-region masks and the running
+/// union-size statistics.
+pub struct SparseTileScratch {
+    pub mask: Tensor,
+    pub union_blk: Tensor,
+    pub union_mask: Tensor,
+    pub n_union: Tensor,
+    pub tail_mask: Tensor,
+    /// `U32 [2]`: union blocks summed over every tile built, tiles built.
+    pub stats: Tensor,
+}
+
+impl SparseTileScratch {
+    pub fn new(
+        ctx: &MetalContext,
+        qb: usize,
+        max_blocks: usize,
+        k_max: usize,
+    ) -> Result<Self> {
+        let tiles = qb.div_ceil(QSA_TILE_BQ).max(1);
+        let cap = tile_union_capacity(max_blocks, k_max);
+        Ok(Self {
+            mask: Tensor::zeros(ctx, &[tiles, max_blocks.max(1)], DType::U32)?,
+            union_blk: Tensor::zeros(ctx, &[tiles, cap], DType::U32)?,
+            union_mask: Tensor::zeros(ctx, &[tiles, cap], DType::U32)?,
+            n_union: Tensor::zeros(ctx, &[tiles], DType::U32)?,
+            tail_mask: Tensor::zeros(ctx, &[tiles, QSA_TILE_TAIL_BLOCKS], DType::U32)?,
+            stats: Tensor::zeros(ctx, &[2], DType::U32)?,
+        })
+    }
+
+    /// The same buffers under fresh handles (for per-chunk scratch views).
+    pub fn share(&self) -> Result<Self> {
+        let v = |t: &Tensor| t.view(0, t.shape());
+        Ok(Self {
+            mask: v(&self.mask)?,
+            union_blk: v(&self.union_blk)?,
+            union_mask: v(&self.union_mask)?,
+            n_union: v(&self.n_union)?,
+            tail_mask: v(&self.tail_mask)?,
+            stats: v(&self.stats)?,
+        })
+    }
+
+    pub fn tiles(&self) -> usize {
+        self.n_union.numel()
+    }
+
+    pub fn max_blocks(&self) -> usize {
+        self.mask.shape()[1]
+    }
+
+    pub fn cap(&self) -> usize {
+        self.union_blk.shape()[1]
+    }
+
+    /// Union blocks summed over every tile built so far, and the tile count
+    /// (the mean union size per tile is their quotient). Reads the GPU
+    /// buffer, so the pass that built the unions must have completed.
+    pub fn union_stats(&self) -> Result<(u64, u64)> {
+        let v = self.stats.to_u32()?;
+        Ok((u64::from(v[0]), u64::from(v[1])))
+    }
+}
+
+/// Builds each tile's union of selected blocks from `sel`/`n_sel` (the
+/// [`qsa_select_blocks`] output for `qb` queries at `base_pos..`).
+#[allow(clippy::too_many_arguments)]
+pub fn qsa_tile_union<'t>(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    sel: &Tensor,
+    n_sel: &Tensor,
+    tiles: &SparseTileScratch,
+    qb: usize,
+    k_max: usize,
+    ratio: usize,
+    base_pos: impl Into<Pos<'t>>,
+) -> Result<()> {
+    let base_pos = base_pos.into();
+    ensure!(qb > 0, "no queries");
+    ensure!(
+        sel.numel() >= qb * k_max && sel.dtype() == DType::U32,
+        "sel must be U32 [QB, k_max]"
+    );
+    ensure!(
+        n_sel.numel() >= qb && n_sel.dtype() == DType::U32,
+        "n_sel must be U32 [QB]"
+    );
+    let n_tiles = qb.div_ceil(QSA_TILE_BQ);
+    ensure!(
+        n_tiles <= tiles.tiles(),
+        "tile scratch holds {} tiles, {qb} queries need {n_tiles}",
+        tiles.tiles()
+    );
+    ensure!(
+        visible_blocks(base_pos.max + qb - 1, ratio) <= tiles.max_blocks(),
+        "tile mask rows shorter than the visible blocks"
+    );
+    let pipeline = ctx.pipeline("qsa_tile_union", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_with(
+        &pipeline,
+        &[
+            sel.binding(),
+            n_sel.binding(),
+            tiles.mask.binding(),
+            tiles.union_blk.binding(),
+            tiles.union_mask.binding(),
+            tiles.n_union.binding(),
+            tiles.tail_mask.binding(),
+            tiles.stats.binding(),
+        ],
+        &[
+            Param::U32(qb as u32),
+            Param::U32(k_max as u32),
+            Param::U32(ratio as u32),
+            base_pos.param(),
+            Param::U32(tiles.max_blocks() as u32),
+            Param::U32(tiles.cap() as u32),
+        ],
+        Grid::Threadgroups { groups: (n_tiles, 1, 1), threadgroup: (SELECT_TG, 1, 1) },
+    )
+}
+
+/// Sparse GQA attention of `qb` queries (`q`: `[QB, NQ, D]`, query `qi` at
+/// position `base_pos + qi`) through the tensor-op tile kernel over the
+/// unions [`qsa_tile_union`] built, writing `out` (`[QB, NQ, D]`). Each
+/// threadgroup stages a K/V slice once for `heads_per_pass` query heads (1, 2
+/// or 4, dividing the GQA group).
+#[allow(clippy::too_many_arguments)]
+pub fn qsa_attention_tiled<'t>(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    q: &Tensor,
+    k_cache: &Tensor,
+    v_cache: &Tensor,
+    tiles: &SparseTileScratch,
+    out: &Tensor,
+    qb: usize,
+    ratio: usize,
+    base_pos: impl Into<Pos<'t>>,
+    scale: f32,
+    heads_per_pass: usize,
+) -> Result<()> {
+    let base_pos = base_pos.into();
+    let (kvh, max_seq, d) =
+        (k_cache.shape()[0], k_cache.shape()[1], k_cache.shape()[2]);
+    ensure!(
+        d == ATTN_D,
+        "tiled sparse attention is compiled for head dim {ATTN_D}, got {d}"
+    );
+    ensure!(v_cache.shape() == k_cache.shape(), "k/v cache shape mismatch");
+    ensure!(qb > 0, "no queries");
+    ensure!(
+        q.dtype() == DType::BF16 && q.numel().is_multiple_of(qb * d),
+        "q must be BF16 [QB, NQ, D]"
+    );
+    let nq = q.numel() / (qb * d);
+    ensure!(nq.is_multiple_of(kvh), "NQ {nq} not a multiple of KVH {kvh}");
+    let group = nq / kvh;
+    let name = match heads_per_pass {
+        1 => "qsa_attn_tile_nax_h1",
+        2 => "qsa_attn_tile_nax_h2",
+        4 => "qsa_attn_tile_nax_h4",
+        other => anyhow::bail!(
+            "{other} heads per pass: the tile kernel exists for 1, 2 and 4"
+        ),
+    };
+    ensure!(
+        group.is_multiple_of(heads_per_pass),
+        "{heads_per_pass} heads per pass do not divide the GQA group of {group}"
+    );
+    ensure!(out.numel() == q.numel() && out.dtype() == DType::BF16, "out must match q");
+    ensure!(base_pos.max + qb <= max_seq, "queries exceed the cache");
+    let n_tiles = qb.div_ceil(QSA_TILE_BQ);
+    ensure!(
+        n_tiles <= tiles.tiles(),
+        "tile scratch holds {} tiles, {qb} queries need {n_tiles}",
+        tiles.tiles()
+    );
+    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V4_0)?;
+    pass.dispatch_with(
+        &pipeline,
+        &[
+            q.binding(),
+            k_cache.binding(),
+            v_cache.binding(),
+            tiles.union_blk.binding(),
+            tiles.union_mask.binding(),
+            tiles.n_union.binding(),
+            tiles.tail_mask.binding(),
+            out.binding(),
+        ],
+        &[
+            Param::U32(max_seq as u32),
+            base_pos.param(),
+            Param::U32(qb as u32),
+            Param::U32(nq as u32),
+            Param::U32(group as u32),
+            Param::F32(scale),
+            Param::U32(tiles.cap() as u32),
+            Param::U32(ratio as u32),
+        ],
+        Grid::Threadgroups {
+            groups: (n_tiles, nq / heads_per_pass, 1),
+            threadgroup: (QSA_TILE_THREADS, 1, 1),
+        },
+    )
+}
+
 #[cfg(test)]
 #[path = "../../tests/unit/kernels/qsa.rs"]
 mod tests;
