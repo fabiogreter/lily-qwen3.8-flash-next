@@ -1,7 +1,7 @@
-# lily
+# lily-qwen3.8-flash-next
 
-lily is a Metal inference server for Apple Silicon that serves one model,
-Qwen3.8-Flash-Next. It is a fork of Perplexity's [lily](https://github.com/perplexityai/pplx-garden/tree/main/lily),
+lily-qwen3.8-flash-next is a Metal inference server for Apple Silicon that
+serves one model, Qwen3.8-Flash-Next. It is a fork of Perplexity's [lily](https://github.com/perplexityai/pplx-garden/tree/main/lily),
 a compact Metal engine for Qwen3.6-35B-A3B that decoded about 30 % faster
 than mlx-lm ([their write-up](https://www.perplexity.ai/hub/blog/optimizing-on-device-inference-for-apple-silicon)).
 The fork ports that engine to Qwen3.8-Flash-Next's architecture and tunes it
@@ -23,20 +23,20 @@ over HTTP.
 
 | tokens per second | 4K context | 16K | 32K | 64K |
 |---|---:|---:|---:|---:|
-| **prefill** lily | 1 300 | 1 546 | 1 499 | 1 382 |
+| **prefill** this fork | 1 300 | 1 546 | 1 499 | 1 382 |
 | prefill llama.cpp | 887 | 882 | 713 | 550 |
-| **decode** lily, 2 drafts | 102 | 102 | 102 | 98 |
+| **decode** this fork, 2 drafts | 102 | 102 | 102 | 98 |
 | decode llama.cpp, MTP 2 drafts | 52 | 44 | 37 | 27 |
-| decode lily, no drafts | 86 | 86 | 84 | 82 |
+| decode this fork, no drafts | 86 | 86 | 84 | 82 |
 | decode llama.cpp, no drafts | 39 | 31 | 25 | 17 |
 
-lily's decode is nearly flat from 1K to 64K because the architecture allows
+The fork's decode is nearly flat from 1K to 64K because the architecture allows
 it and the sparse-attention kernels keep the cost of context at a few percent
 of a step. Both engines were also run with three drafts per step; acceptance
 fell to about 50 % and decode was slower than with two, so those rows are
 left out.
 
-The quantizations differ slightly: lily's affine 4-bit with group 64 against
+The quantizations differ slightly: the fork's affine 4-bit with group 64 against
 llama.cpp's UD-IQ4_XS. The llama.cpp MTP rows come from a build with a
 one-line fix that the shipped one lacks. Method, noise band and the full
 record: [docs/performance.md](docs/performance.md).
@@ -61,7 +61,7 @@ attention with an indexer that picks 512 blocks per query, a 512-expert MoE
 with 10 active, a four-stream gated residual, a 32 GB hashed n-gram
 embedding, a multi-token-prediction head and a vision tower.
 
-lily runs a 4-bit conversion of it, 98 GiB on disk, produced by
+The server runs a 4-bit conversion of it, 98 GiB on disk, produced by
 `tools/convert/convert_qwen38_flash_next.py` from the Hugging Face BF16
 weights and published as
 [fabiogreter/Qwen3.8-Flash-Next-lily-q4](https://huggingface.co/fabiogreter/Qwen3.8-Flash-Next-lily-q4).
@@ -130,7 +130,7 @@ Prompt state is kept in three places. A client notices them only through
    only from the user's message on. The second run cannot resume from the
    first, because the first run's checkpoint sits at the end of its whole
    prompt, past the point where the two diverge. When the shared part is at
-   least 1 024 tokens long, lily writes it to disk as a durable entry, and
+   least 1 024 tokens long, the server writes it to disk as a durable entry, and
    every later run with the same preamble starts from there. Many tasks
    against the same repository pay for the preamble once.
 
@@ -195,7 +195,7 @@ uv pip install --python .venv/bin/python mlx safetensors numpy torch torchvision
 
 The full conversion takes about a minute on an M5 Max. `--layers 4` writes
 the small checkpoint the tests use. [tools/README.md](tools/README.md) has the
-other flags and the reference harness that checks lily against Hugging Face
+other flags and the reference harness that checks the engine against Hugging Face
 transformers on the same weights.
 
 ## Tests
