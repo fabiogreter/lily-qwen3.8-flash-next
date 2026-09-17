@@ -212,6 +212,18 @@ the step (plain decode at 8K measured 77 to 83 tok/s in one pair of runs).
 `LILY_QSA_SPLIT` sets the token count (32 to 256) and `LILY_QSA_HEAD_SPLIT=0`
 drops the head split. Prefill sub-batches keep the 256-token split.
 
+Block selection is one 256-thread threadgroup per query running a radix
+select over the block scores (four 8-bit digits, most significant first)
+and then a compaction in ascending block order. Every threadgroup-wide step
+is a scan or a simd reduction: the digit is picked by a scan over the 256
+bins (one per thread), the top digit, which the exponent crowds into a few
+bins, is counted with one atomic per distinct bin per simdgroup, and each
+thread owns a run of consecutive blocks (4 to 32, following the context) so
+the compaction is one scan per 32K tokens with each thread placing its own
+blocks in order. Per decode step the twelve selections take 0.21 ms at 8K
+(from 0.41) and 0.59 at 32K (from 0.70); per 64-query prefill chunk they
+take 18 us at 8K (from 108) and 73 at 32K (from 167).
+
 The hyper-connection read is fused into two dispatches instead of six. The
 down kernel uses one threadgroup per output row with one simdgroup per
 stream, dotting each stream's Q8 blocks against the normalized residual in

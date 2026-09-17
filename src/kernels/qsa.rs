@@ -27,7 +27,9 @@ pub const QSA_SMALL_ROWS: usize = 4;
 /// Query heads the split kernel folds per K/V pass (`QSA_HPP` in the shader).
 pub const QSA_HEADS_PER_PASS: usize = 4;
 /// Threads of the per-query selection threadgroup.
-const SELECT_TG: usize = 1024;
+const SELECT_TG: usize = 256;
+/// Threads per tile of the selection union; must match `QSA_UNION_TG`.
+const UNION_TG: usize = 1024;
 /// Indexer head dimension the kernels are written for.
 pub const INDEXER_D: usize = 128;
 /// Attention head dimension the sparse kernel is written for.
@@ -727,7 +729,7 @@ pub fn qsa_tile_union<'t>(
             Param::U32(tiles.max_blocks() as u32),
             Param::U32(tiles.cap() as u32),
         ],
-        Grid::Threadgroups { groups: (n_tiles, 1, 1), threadgroup: (SELECT_TG, 1, 1) },
+        Grid::Threadgroups { groups: (n_tiles, 1, 1), threadgroup: (UNION_TG, 1, 1) },
     )
 }
 

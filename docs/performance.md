@@ -197,7 +197,13 @@ estimate with its assumption named.
    to test. *Done since*: 64-token splits and one threadgroup per four query
    heads for batches of up to four rows take the kernel from 1.64 to 0.49 ms
    per decode step at 8K (the combine from 0.07 to 0.17), about 8% of the
-   step; the verify pass's from 1.98 to 1.32 ms.
+   step; the verify pass's from 1.98 to 1.32 ms. The block selection, a
+   single threadgroup per query, was then rewritten without serial steps
+   (scan-picked radix digits, simd-aggregated counting of the top digit,
+   thread-contiguous blocks compacted with one scan): 0.41 to 0.21 ms per
+   decode step at 8K, 0.70 to 0.59 at 32K, 0.46 to 0.30 per verify pass at
+   8K, and 15.6 to 2.6 ms per 8K prefill (30.1 to 13.1 per 32K prefill).
+   At 32K the 32 blocks each thread walks per pass are what remains.
 4. **Dispatch fusion in the decode graph.** Measured: about 966 dispatches
    per step, with a 1.4 us floor for a trivial dispatch plus barrier, and the
    fused hyper-connection kernels reading 0.68 GB at about 315 GB/s against

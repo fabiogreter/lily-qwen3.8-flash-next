@@ -10,7 +10,8 @@ using namespace metal;
 #define TG 256
 #define QSA_SPLIT 256      // largest split (tokens per threadgroup) of the split kernel
 #define QSA_HPP 4          // query heads folded per K/V pass
-#define QSA_SELECT_TG 1024 // threads of the per-query top-k selection
+#define QSA_SELECT_TG 256  // threads of the per-query top-k selection (one per radix bin)
+#define QSA_UNION_TG 1024  // threads of the per-tile selection union
 
 // --- Indexer projections --------------------------------------------------------
 
@@ -354,35 +355,170 @@ static inline uint qsa_key(float s) {
     return as_type<uint>(max(s, 0.0f));
 }
 
-// Exclusive prefix sum of one flag per thread over the whole threadgroup;
-// returns this thread's rank and writes the total to `total`.
-static inline uint qsa_scan(uint flag, threadgroup uint* sums, threadgroup uint* total,
-                            uint tid, uint sg, uint lane) {
-    const uint local = simd_prefix_exclusive_sum(flag);
-    const uint sg_total = simd_sum(flag);
+// Exclusive prefix sum of one value per thread over the whole threadgroup
+// (the sum must fit 32 bits); returns this thread's rank and writes the
+// total. Consecutive scans need a threadgroup barrier between them (`sums`
+// is rewritten by the next call).
+template <uint NT>
+static inline uint qsa_scan(uint value, threadgroup uint* sums, thread uint& total,
+                            uint sg, uint lane) {
+    const uint local = simd_prefix_exclusive_sum(value);
+    const uint sg_total = simd_sum(value);
     if (lane == 0) {
         sums[sg] = sg_total;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint before = 0;
-    for (uint s = 0; s < sg; ++s) {
-        before += sums[s];
-    }
-    if (tid == 0) {
-        uint t = 0;
-        for (uint s = 0; s < QSA_SELECT_TG / 32; ++s) {
-            t += sums[s];
-        }
-        *total = t;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Lane s holds simdgroup s's total; the scan over the lanes gives every
+    // simdgroup's offset and the total in one simd step.
+    const uint mine = lane < NT / 32 ? sums[lane] : 0u;
+    const uint before = simd_shuffle(simd_prefix_exclusive_sum(mine), sg);
+    total = simd_sum(mine);
     return before + local;
+}
+
+// Counts one per active lane into hist[bin] with one atomic per distinct
+// bin per simdgroup: the top radix digit of the scores (sign and exponent)
+// takes a handful of values, so per-lane atomics would serialize on them.
+static inline void qsa_hist_add(threadgroup atomic_uint* hist, uint bin, bool active,
+                                uint lane) {
+    while (true) {
+        const uint leader = simd_min(active ? bin : 0xFFFFFFFFu);
+        if (leader == 0xFFFFFFFFu) {
+            break;
+        }
+        const bool same = active && bin == leader;
+        const ulong votes = (simd_vote::vote_t)simd_ballot(same);
+        if (same) {
+            active = false;
+            if (lane == uint(ctz(votes))) {
+                atomic_fetch_add_explicit(&hist[leader], popcount(votes),
+                                          memory_order_relaxed);
+            }
+        }
+    }
+}
+
+// Largest per-thread block count of the selection (32K tokens at ratio 4
+// in one chunk).
+#define QSA_SELECT_CACHE_MAX 32
+
+// The selection of one query over `nb` blocks with `CACHE` consecutive
+// blocks per thread: a chunk is CACHE * QSA_SELECT_TG blocks, the first
+// chunk's keys stay in registers across the passes and later chunks are
+// re-read from the score row. See qsa_select_blocks.
+template <uint CACHE>
+static void qsa_select_body(device const float* row, device uint* out, uint nb,
+                            uint k_max, threadgroup atomic_uint (*hist)[256],
+                            threadgroup uint* sums, threadgroup uint* prefix_s,
+                            threadgroup uint* k_rem_s, uint tid, uint sg, uint lane) {
+    constexpr uint CHUNK = CACHE * QSA_SELECT_TG;
+    const uint t0 = tid * CACHE;
+    uint keys[CACHE];
+    for (uint i = 0; i < CACHE; ++i) {
+        const uint b = t0 + i;
+        keys[i] = b < nb ? qsa_key(row[b]) : 0u;
+    }
+    static_assert(QSA_SELECT_TG == 256, "one selection thread per radix bin");
+    atomic_store_explicit(&hist[0][tid], 0u, memory_order_relaxed);
+    atomic_store_explicit(&hist[1][tid], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Radix select (MSB first) for the k_max-th largest key. The top digit
+    // (sign and exponent) crowds a few bins: it is counted with one atomic
+    // per distinct bin per simdgroup. Later digits spread over the bins
+    // and only the keys under the prefix count.
+    uint prefix = 0;
+    uint mask = 0;
+    uint k_rem = k_max;
+    for (uint pass = 0; pass < 4; ++pass) {
+        const uint shift = 24 - 8 * pass;
+        threadgroup atomic_uint* h = hist[pass & 1];
+        for (uint b0 = 0; b0 < nb; b0 += CHUNK) {
+            for (uint i = 0; i < CACHE; ++i) {
+                const uint b = b0 + t0 + i;
+                const uint key = b0 == 0 ? keys[i] : (b < nb ? qsa_key(row[b]) : 0u);
+                const bool active = b < nb && (key & mask) == prefix;
+                const uint bin = (key >> shift) & 0xFFu;
+                if (pass == 0) {
+                    qsa_hist_add(h, bin, active, lane);
+                } else if (active) {
+                    atomic_fetch_add_explicit(&h[bin], 1u, memory_order_relaxed);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Thread t holds bin 255 - t: the scan gives the count above each
+        // bin, and exactly one bin straddles the k_rem-th key.
+        const uint c = atomic_load_explicit(&h[255 - tid], memory_order_relaxed);
+        uint total;
+        const uint above = qsa_scan<QSA_SELECT_TG>(c, sums, total, sg, lane);
+        if (above < k_rem && above + c >= k_rem) {
+            *prefix_s = prefix | ((255 - tid) << shift);
+            *k_rem_s = k_rem - above;
+        }
+        atomic_store_explicit(&h[tid], 0u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        prefix = *prefix_s;
+        k_rem = *k_rem_s;
+        mask |= 0xFFu << shift;
+    }
+    const uint threshold = prefix;
+    // Elements above the threshold are all taken; exactly k_rem ties fill up.
+    const uint ties_to_take = k_rem;
+
+    // Compaction in ascending block order, one scan per chunk: the low half
+    // of the scanned value counts a thread's keys above the threshold, the
+    // high half its ties (each at most CHUNK).
+    uint sel_base = 0;
+    uint tie_base = 0;
+    for (uint b0 = 0; b0 < nb; b0 += CHUNK) {
+        uint n_above = 0;
+        uint n_tie = 0;
+        for (uint i = 0; i < CACHE; ++i) {
+            const uint b = b0 + t0 + i;
+            const uint key = b0 == 0 ? keys[i] : (b < nb ? qsa_key(row[b]) : 0u);
+            n_above += (b < nb && key > threshold) ? 1u : 0u;
+            n_tie += (b < nb && key == threshold) ? 1u : 0u;
+        }
+        uint totals;
+        const uint ranks =
+            qsa_scan<QSA_SELECT_TG>((n_tie << 16) | n_above, sums, totals, sg, lane);
+        const uint quota = ties_to_take > tie_base ? ties_to_take - tie_base : 0u;
+        // Taken keys before this thread's: the scanned counts; within them,
+        // the thread walks its blocks in order.
+        uint a = sel_base + (ranks & 0xFFFFu);
+        uint t = ranks >> 16;
+        for (uint i = 0; i < CACHE; ++i) {
+            const uint b = b0 + t0 + i;
+            const uint key = b0 == 0 ? keys[i] : (b < nb ? qsa_key(row[b]) : 0u);
+            if (b < nb) {
+                if (key > threshold) {
+                    out[a + min(t, quota)] = b;
+                    ++a;
+                } else if (key == threshold) {
+                    if (t < quota) {
+                        out[a + t] = b;
+                    }
+                    ++t;
+                }
+            }
+        }
+        sel_base += (totals & 0xFFFFu) + min(totals >> 16, quota);
+        tie_base += totals >> 16;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 }
 
 // Selects the k_max highest-scoring visible blocks of each query (all of them
 // when fewer are visible), written in ascending block order to sel[qi, :] with
 // the count in n_sel[qi]. Ties at the k-th score resolve to the lowest block
-// ids. One threadgroup of QSA_SELECT_TG threads per query.
+// ids. One threadgroup of QSA_SELECT_TG threads per query: a radix select
+// (four 8-bit digits, most significant first) finds the k_max-th key, then
+// one scan per chunk compacts the keys above it and the lowest tied blocks
+// (each thread's blocks are consecutive, so it places its own in order
+// after the scan). The blocks per thread follow the context so every
+// thread holds some; every threadgroup-wide step is a scan or a simd
+// reduction and nothing runs serially on one thread.
 kernel void qsa_select_blocks(device const float* scores [[buffer(0)]],  // [QB, nb_max]
                               device uint*        sel    [[buffer(1)]],  // [QB, k_max]
                               device uint*        n_sel  [[buffer(2)]],  // [QB]
@@ -394,9 +530,10 @@ kernel void qsa_select_blocks(device const float* scores [[buffer(0)]],  // [QB,
                               uint tid  [[thread_index_in_threadgroup]],
                               uint sg   [[simdgroup_index_in_threadgroup]],
                               uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup atomic_uint hist[256];
+    // Two histograms: the one the next pass counts into is cleared while
+    // the current pass picks its digit.
+    threadgroup atomic_uint hist[2][256];
     threadgroup uint sums[QSA_SELECT_TG / 32];
-    threadgroup uint total;
     threadgroup uint prefix_s;
     threadgroup uint k_rem_s;
 
@@ -413,74 +550,18 @@ kernel void qsa_select_blocks(device const float* scores [[buffer(0)]],  // [QB,
         }
         return;
     }
-
-    // Radix select (MSB first) for the k_max-th largest key.
-    if (tid == 0) {
-        prefix_s = 0;
-        k_rem_s = k_max;
-    }
-    uint prefix = 0;
-    uint mask = 0;
-    for (uint pass = 0; pass < 4; ++pass) {
-        const uint shift = 24 - 8 * pass;
-        for (uint i = tid; i < 256; i += QSA_SELECT_TG) {
-            atomic_store_explicit(&hist[i], 0u, memory_order_relaxed);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint b = tid; b < nb; b += QSA_SELECT_TG) {
-            const uint key = qsa_key(row[b]);
-            if ((key & mask) == prefix) {
-                atomic_fetch_add_explicit(&hist[(key >> shift) & 0xFFu], 1u,
-                                          memory_order_relaxed);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid == 0) {
-            uint k_rem = k_rem_s;
-            uint cum = 0;
-            uint chosen = 0;
-            for (int bin = 255; bin >= 0; --bin) {
-                const uint c = atomic_load_explicit(&hist[bin], memory_order_relaxed);
-                if (cum + c >= k_rem) {
-                    chosen = uint(bin);
-                    k_rem -= cum;
-                    break;
-                }
-                cum += c;
-            }
-            prefix_s = prefix | (chosen << shift);
-            k_rem_s = k_rem;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        prefix = prefix_s;
-        mask |= 0xFFu << shift;
-    }
-    const uint threshold = prefix;
-    // Elements above the threshold are all taken; exactly k_rem ties fill up.
-    const uint ties_to_take = k_rem_s;
-
-    // Compaction in ascending block order.
-    uint sel_base = 0;
-    uint tie_base = 0;
-    for (uint b0 = 0; b0 < nb; b0 += QSA_SELECT_TG) {
-        const uint b = b0 + tid;
-        const bool in_range = b < nb;
-        const uint key = in_range ? qsa_key(row[b]) : 0u;
-        const uint is_tie = (in_range && key == threshold) ? 1u : 0u;
-        const uint tie_rank = qsa_scan(is_tie, sums, &total, tid, sg, lane);
-        const uint tie_total = total;
-        const uint take = (in_range && (key > threshold ||
-                                        (is_tie && tie_base + tie_rank < ties_to_take)))
-            ? 1u : 0u;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        const uint rank = qsa_scan(take, sums, &total, tid, sg, lane);
-        const uint take_total = total;
-        if (take) {
-            out[sel_base + rank] = b;
-        }
-        sel_base += take_total;
-        tie_base += tie_total;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (nb <= 4 * QSA_SELECT_TG) {
+        qsa_select_body<4>(row, out, nb, k_max, hist, sums, &prefix_s, &k_rem_s,
+                           tid, sg, lane);
+    } else if (nb <= 8 * QSA_SELECT_TG) {
+        qsa_select_body<8>(row, out, nb, k_max, hist, sums, &prefix_s, &k_rem_s,
+                           tid, sg, lane);
+    } else if (nb <= 16 * QSA_SELECT_TG) {
+        qsa_select_body<16>(row, out, nb, k_max, hist, sums, &prefix_s, &k_rem_s,
+                            tid, sg, lane);
+    } else {
+        qsa_select_body<QSA_SELECT_CACHE_MAX>(row, out, nb, k_max, hist, sums,
+                                              &prefix_s, &k_rem_s, tid, sg, lane);
     }
     if (tid == 0) {
         n_sel[qi] = k_max;
@@ -685,7 +766,7 @@ kernel void qsa_attn_split_bf16(device const bfloat* q        [[buffer(0)]],  //
 // the later queries of the tile see complete. `mask` ([tiles, nb_cap]) is one
 // scratch row per tile: zero on entry, zero again on exit. `stats` accumulates
 // the union sizes (blocks, tiles) for measurement. One threadgroup of
-// QSA_SELECT_TG threads per tile.
+// QSA_UNION_TG threads per tile.
 kernel void qsa_tile_union(device const uint*  sel        [[buffer(0)]],  // [QB, k_max]
                            device const uint*  n_sel      [[buffer(1)]],  // [QB]
                            device atomic_uint* mask       [[buffer(2)]],  // [tiles, nb_cap]
@@ -705,8 +786,7 @@ kernel void qsa_tile_union(device const uint*  sel        [[buffer(0)]],  // [QB
                            uint sg   [[simdgroup_index_in_threadgroup]],
                            uint lane [[thread_index_in_simdgroup]]) {
     threadgroup atomic_uint tail[QSA_TILE_TAIL_BLOCKS];
-    threadgroup uint sums[QSA_SELECT_TG / 32];
-    threadgroup uint total;
+    threadgroup uint sums[QSA_UNION_TG / 32];
 
     const uint q0 = tile * QSA_TILE_BQ;
     if (q0 >= QB) {
@@ -721,7 +801,7 @@ kernel void qsa_tile_union(device const uint*  sel        [[buffer(0)]],  // [QB
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Scatter every query's selection into the tile's mask row (bit = query).
-    for (uint i = tid; i < qn * k_max; i += QSA_SELECT_TG) {
+    for (uint i = tid; i < qn * k_max; i += QSA_UNION_TG) {
         const uint qi = i / k_max;
         const uint j = i - qi * k_max;
         if (j < n_sel[q0 + qi]) {
@@ -738,12 +818,12 @@ kernel void qsa_tile_union(device const uint*  sel        [[buffer(0)]],  // [QB
 
     // Compact the non-empty entries in ascending block order and clear them.
     uint base = 0;
-    for (uint b0 = 0; b0 < vb0; b0 += QSA_SELECT_TG) {
+    for (uint b0 = 0; b0 < vb0; b0 += QSA_UNION_TG) {
         const uint b = b0 + tid;
         const uint m = b < vb0 ? atomic_load_explicit(&row[b], memory_order_relaxed) : 0u;
         const uint take = m != 0u ? 1u : 0u;
-        const uint rank = qsa_scan(take, sums, &total, tid, sg, lane);
-        const uint take_total = total;
+        uint take_total;
+        const uint rank = qsa_scan<QSA_UNION_TG>(take, sums, take_total, sg, lane);
         if (take) {
             const uint r = base + rank;
             if (r < cap) {

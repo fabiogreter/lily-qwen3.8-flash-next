@@ -965,3 +965,92 @@ fn tiled_attention_matches_split_kernel_and_cpu() {
         cpu_ref::assert_close(&got, &got_split, 2e-2, 2e-2);
     }
 }
+
+/// The selection against a CPU sort on decode-sized rows: every
+/// blocks-per-thread variant of the kernel (8K, 16K and 32K contexts), a
+/// two-chunk row past 32K tokens, three queries with different visible
+/// counts, and coarse scores so the k-th key ties across many blocks.
+#[test]
+fn selection_matches_cpu_on_long_contexts() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(11);
+    let (ratio, k_max, qb) = (4usize, 512usize, 3usize);
+    for base_pos in [2100usize, 8192, 16384, 32768, 40000] {
+        let nb_max = visible_blocks(base_pos + qb - 1, ratio);
+        let scores: Vec<f32> =
+            (0..qb * nb_max).map(|_| rng.gen_range(0i32..64) as f32 * 0.125).collect();
+        let t_scores = Tensor::from_f32(&ctx, &scores, &[qb, nb_max]).expect("scores");
+        let sel = Tensor::zeros(&ctx, &[qb, k_max], DType::U32).expect("sel");
+        let n_sel = Tensor::zeros(&ctx, &[qb], DType::U32).expect("n_sel");
+        let pass = ctx.begin().expect("pass");
+        qsa_select_blocks(
+            &ctx, &pass, &t_scores, &sel, &n_sel, qb, nb_max, base_pos, ratio, k_max,
+        )
+        .expect("select");
+        pass.commit_wait().expect("commit");
+        let got_sel = sel.to_u32().expect("sel");
+        let got_n = n_sel.to_u32().expect("n_sel");
+        for qi in 0..qb {
+            let nb = visible_blocks(base_pos + qi, ratio);
+            let row = &scores[qi * nb_max..qi * nb_max + nb];
+            let mut order: Vec<usize> = (0..nb).collect();
+            order
+                .sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap().then(a.cmp(&b)));
+            let mut expected: Vec<u32> =
+                order[..k_max].iter().map(|&b| b as u32).collect();
+            expected.sort_unstable();
+            assert_eq!(got_n[qi] as usize, k_max, "base_pos {base_pos} query {qi}");
+            assert_eq!(
+                &got_sel[qi * k_max..(qi + 1) * k_max],
+                &expected[..],
+                "base_pos {base_pos} query {qi}"
+            );
+        }
+    }
+}
+
+/// Latency of the per-query block selection on the decode path (one
+/// serial dispatch after another, as between the layers of a step) at the
+/// decode and verify row counts on 8K and 32K contexts, and on a prefill
+/// chunk. Scores are non-negative like the indexer's ReLU'd dot products,
+/// so the keys crowd the top radix digits.
+/// `cargo test --release -- --ignored --nocapture select_blocks_timing`.
+#[test]
+#[ignore = "timing only"]
+fn select_blocks_timing() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(7);
+    let (ratio, k_max) = (4usize, 512usize);
+    for (qb, base_pos, what) in [
+        (1usize, 8192usize, "warm-up"),
+        (1, 64, "dispatch floor (16 blocks, no select)"),
+        (1, 8192, "decode 8K"),
+        (3, 8192, "verify 8K"),
+        (1, 32768, "decode 32K"),
+        (3, 32768, "verify 32K"),
+        (64, 8192, "chunk 8K"),
+    ] {
+        let nb_max = visible_blocks(base_pos + qb - 1, ratio);
+        let scores: Vec<f32> =
+            (0..qb * nb_max).map(|_| rng.gen_range(0.0f32..8.0)).collect();
+        let t_scores = Tensor::from_f32(&ctx, &scores, &[qb, nb_max]).expect("scores");
+        let sel = Tensor::zeros(&ctx, &[qb, k_max], DType::U32).expect("sel");
+        let n_sel = Tensor::zeros(&ctx, &[qb], DType::U32).expect("n_sel");
+        let iters = 64;
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let pass = ctx.begin().expect("pass");
+            for _ in 0..iters {
+                qsa_select_blocks(
+                    &ctx, &pass, &t_scores, &sel, &n_sel, qb, nb_max, base_pos, ratio,
+                    k_max,
+                )
+                .expect("select");
+            }
+            let start = std::time::Instant::now();
+            pass.commit_wait().expect("commit");
+            best = best.min(start.elapsed().as_secs_f64() * 1e6 / iters as f64);
+        }
+        eprintln!("{what} [qb {qb}, {nb_max} blocks]: {best:.1} us per dispatch");
+    }
+}
