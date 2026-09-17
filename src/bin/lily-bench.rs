@@ -23,6 +23,11 @@ struct Cli {
     model: PathBuf,
     #[arg(long)]
     prompt_len: usize,
+    /// A text file: its first `--prompt-len` tokens under the checkpoint's
+    /// tokenizer are the prompt, instead of the synthetic token sequence.
+    /// Real text is what draft acceptance and expert routing depend on.
+    #[arg(long)]
+    prompt_text: Option<PathBuf>,
     #[arg(long, default_value_t = 64)]
     decode_steps: usize,
     #[arg(long, default_value_t = false)]
@@ -50,6 +55,39 @@ struct Cli {
     seed: u64,
     #[arg(long)]
     json_out: PathBuf,
+}
+
+/// The prompt: the synthetic sequence (token `i` is `i * 2654435761 mod
+/// vocab`) or the first `prompt_len` tokens of `--prompt-text`.
+fn prompt_tokens(cli: &Cli, vocab: u32) -> Result<Vec<u32>> {
+    let Some(path) = &cli.prompt_text else {
+        let token = |index: usize| (index as u32).wrapping_mul(2_654_435_761) % vocab;
+        return Ok((0..cli.prompt_len).map(token).collect());
+    };
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
+    let tokenizer = lily::tokenizer::Tokenizer::from_model_dir(&cli.model)?;
+    // Tokenize a prefix long enough for the prompt (about four bytes per
+    // token in code and prose), growing it if the estimate falls short.
+    let mut bytes = (cli.prompt_len * 6).min(text.len());
+    loop {
+        while bytes < text.len() && !text.is_char_boundary(bytes) {
+            bytes += 1;
+        }
+        let mut ids = tokenizer.encode(&text[..bytes])?;
+        if ids.len() >= cli.prompt_len {
+            ids.truncate(cli.prompt_len);
+            return Ok(ids);
+        }
+        ensure!(
+            bytes < text.len(),
+            "{} holds {} tokens, fewer than --prompt-len {}",
+            path.display(),
+            ids.len(),
+            cli.prompt_len
+        );
+        bytes = (bytes * 2).min(text.len());
+    }
 }
 
 fn fnv1a(tokens: &[u32]) -> u64 {
@@ -301,8 +339,7 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
         );
     }
     let vocab = u32::try_from(model.vocab_size())?;
-    let token = |index: usize| (index as u32).wrapping_mul(2_654_435_761) % vocab;
-    let prompt: Vec<u32> = (0..cli.prompt_len).map(token).collect();
+    let prompt = prompt_tokens(cli, vocab)?;
     let mut scratch = model.new_scratch_with_capacity(&ctx, max_seq)?;
 
     // Warm the exact prompt shape and production cadence: one delivered decode
@@ -474,6 +511,7 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
         },
         "workload": {
             "prompt_len": cli.prompt_len,
+            "prompt": cli.prompt_text.as_ref().map_or("synthetic".to_string(), |p| p.display().to_string()),
             "prompt_kind": "u32_golden_ratio_hash_mod_vocab",
             "decode_steps": cli.decode_steps,
             "decode_mode": if parking { "production_depth2_parked" } else { "production_depth2_concurrent" }, "sampling": if cli.sample { "server_defaults" } else { "greedy" }, "seed": cli.seed,
@@ -545,8 +583,7 @@ fn bench_speculative<M: LanguageModel>(
     ensure!(model.max_drafts() > 0, "this checkpoint has no draft head");
     let max_seq = cli.prompt_len + cli.decode_steps + 2 * cli.drafts + 2;
     let vocab = u32::try_from(model.vocab_size())?;
-    let token = |index: usize| (index as u32).wrapping_mul(2_654_435_761) % vocab;
-    let prompt: Vec<u32> = (0..cli.prompt_len).map(token).collect();
+    let prompt = prompt_tokens(cli, vocab)?;
     let mut scratch = model.new_scratch_with_capacity(ctx, max_seq)?;
     let never_stop = |_: u32| false;
     let mut run = |steps: usize| -> Result<(f64, f64, usize, usize, Vec<u32>)> {
@@ -586,7 +623,7 @@ fn bench_speculative<M: LanguageModel>(
     let report = serde_json::json!({
         "schema_version": 1,
         "meta": {"engine": "lily", "model_id": M::MODEL_ID, "harness": "src/bin/lily-bench.rs", "crate_version": env!("CARGO_PKG_VERSION")},
-        "workload": {"prompt_len": cli.prompt_len, "decode_steps": cli.decode_steps, "decode_mode": format!("speculative_{}_drafts", cli.drafts), "sampling": if cli.sample { "server_defaults" } else { "greedy" }, "seed": cli.seed, "kernel_profile_diagnostic": ctx.profiling()},
+        "workload": {"prompt_len": cli.prompt_len, "prompt": cli.prompt_text.as_ref().map_or("synthetic".to_string(), |p| p.display().to_string()), "decode_steps": cli.decode_steps, "decode_mode": format!("speculative_{}_drafts", cli.drafts), "sampling": if cli.sample { "server_defaults" } else { "greedy" }, "seed": cli.seed, "kernel_profile_diagnostic": ctx.profiling()},
         "results": {
             "prefill": {"wall_secs": prefill_secs, "tok_s": cli.prompt_len as f64 / prefill_secs},
             "decode": {
