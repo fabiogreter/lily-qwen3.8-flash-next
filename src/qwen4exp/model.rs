@@ -916,6 +916,10 @@ pub struct Scratch {
     /// The vision tower's intermediates, allocated by the first image and
     /// grown to the largest patch count seen; `None` until then.
     pub(super) vision: Option<VisionScratch>,
+    /// Routing log for measurement (`Qwen4ExpModel::enable_expert_log`):
+    /// `U32 [layers, capacity, top_k]`, the experts each prefilled position
+    /// was routed to, per MoE layer.
+    pub(super) expert_log: Option<Tensor>,
 }
 
 impl Scratch {
@@ -1476,6 +1480,28 @@ impl Qwen4ExpModel {
 
     /// Scratch whose split-decode and sparse-attention buffers are sized for
     /// `capacity_tokens` of context rather than the engine's ceiling.
+    /// Records, during prefill, which experts every position of every MoE
+    /// layer was routed to, into `U32 [layers, capacity, top_k]` scratch
+    /// (measurement: expert usage skew for weight offloading). The log
+    /// covers positions below the scratch's capacity; the draft head's own
+    /// routing is not logged.
+    pub fn enable_expert_log(&self, ctx: &MetalContext, scratch: &mut Scratch, capacity: usize) -> Result<()> {
+        let layers = self.weights.layers.len();
+        let top_k = self.config.num_experts_per_tok;
+        scratch.expert_log = Some(Tensor::zeros(ctx, &[layers, capacity, top_k], DType::U32)?);
+        Ok(())
+    }
+
+    /// The routing log enabled by [`Self::enable_expert_log`].
+    pub fn expert_log<'s>(&self, scratch: &'s Scratch) -> Option<&'s Tensor> {
+        scratch.expert_log.as_ref()
+    }
+
+    /// Experts and top-k of the routed FFN (for reading the log).
+    pub fn moe_shape(&self) -> (usize, usize, usize) {
+        (self.weights.layers.len(), self.config.num_experts, self.config.num_experts_per_tok)
+    }
+
     pub fn new_scratch_with_capacity(
         &self,
         ctx: &MetalContext,
@@ -1564,6 +1590,7 @@ impl Qwen4ExpModel {
             moe: MoeScratch::new(ctx, &moe_dims(cfg))?,
             prefill: None,
             vision: None,
+            expert_log: None,
             spec: self
                 .weights
                 .mtp
@@ -1825,6 +1852,7 @@ impl Qwen4ExpModel {
         pass.level_barrier(&[&ps.hyper])?;
 
         let mut gdn_index = 0usize;
+        let mut layer_index = 0usize;
         for (layer, lstate) in self.weights.layers.iter().zip(state.layers.iter()) {
             let ple = match (&layer.ple, &ps.ple, &state.ple) {
                 (Some(w), Some(p), Some(pst)) => Some((w.as_ref(), p, pst)),
@@ -1890,6 +1918,21 @@ impl Qwen4ExpModel {
                 capture.as_ref(),
                 rope,
             )?;
+            if let Some(log) = &s.expert_log {
+                // Keep this layer's routing before the next layer's router
+                // overwrites the shared indices.
+                let top_k = cfg.num_experts_per_tok;
+                let capacity = log.shape()[1];
+                ensure!(pos + m <= capacity, "expert log holds {capacity} positions");
+                copy_words(
+                    ctx,
+                    &pass,
+                    &ps.moe.indices.view(0, &[m * top_k])?,
+                    &log.view((layer_index * capacity + pos) * top_k, &[m * top_k])?,
+                )?;
+                pass.level_barrier(&[log])?;
+            }
+            layer_index += 1;
         }
 
         match mode {
