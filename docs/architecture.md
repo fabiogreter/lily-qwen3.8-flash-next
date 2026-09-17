@@ -850,13 +850,21 @@ by a two-level bucket search on the distance below the maximum (4 096 bins
 over a range that widens when needed, refined once, boundary resolution
 2^-24 of the range), applies top-p and min-p over the sorted candidates, and
 draws by inverse CDF from a counter-based hash RNG seeded by `seed` and the
-step index. Greedy without penalties takes the exact argmax kernel. Measured
-per draw at the 248 320-token vocabulary: greedy 24 us, top-k 20 with
-top-p 0.95 350 us, the 1 024-candidate cap 170 us. The selection is shared
-by three kernels: the plain draw, the draft head's draw (which also exports
-the kept ids and probabilities for the verify pass) and the verify pass's
-speculative draw (accept the proposal or draw from the residual, see
-"Speculative decoding").
+step index. Greedy without penalties takes the exact argmax kernel. The
+selection is shared by three kernels: the plain draw, the draft head's draw
+(which also exports the kept ids and probabilities for the verify pass) and
+the verify pass's speculative draw (accept the proposal or draw from the
+residual, see "Speculative decoding"). For top-k up to 64 (the server's
+default is 20) the selection runs in two phases: 64 threadgroups each
+select their slice's top-k under the slice's own maximum (the prepare
+kernel's partial maxima cover exactly those slices), and the draw then
+selects over the 64 x k union through a candidate map, since the global
+top-k with the kernels' fixed tie order lies in that union. A single
+threadgroup sweeping the 248 320 logits four times took 170 us per draw
+regardless of k; per draw in the profiled model the two phases take about
+55 us and 22 us (25 and 19 in isolation), with the 5 us prepare kernel
+before them, and the drawn tokens are the same to the digest. Larger k
+keeps the single threadgroup (the 1 024-candidate cap 184 us).
 
 Stop signals are taken synchronously rather than in a signal handler: SIGTERM
 and SIGINT are blocked before the first thread is spawned, so every thread

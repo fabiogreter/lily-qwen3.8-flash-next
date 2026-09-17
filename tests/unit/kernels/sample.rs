@@ -460,3 +460,87 @@ fn speculative_draw_is_distributed_as_the_trunk() {
         "accepted {rate:.3} of proposals, overlap sum(min(p, q)) = {overlap:.3}"
     );
 }
+
+/// Per-dispatch GPU time of the sampler's two kernels at the model's
+/// vocabulary on the profile transport (minimum and median over 16 draws),
+/// for the server's defaults and the candidate cap.
+#[test]
+#[ignore = "timing only"]
+fn sampler_dispatch_timing() {
+    let ctx = MetalContext::new_with_profile(true).expect("metal context");
+    let mut rng = StdRng::seed_from_u64(29);
+    let v = 248_320usize;
+    let logits: Vec<f32> = (0..v).map(|_| rng.gen_range(-12.0..6.0)).collect();
+    let t_logits = Tensor::from_f32(&ctx, &logits, &[v]).expect("logits");
+    let scratch = SamplerScratch::new(&ctx, v).expect("scratch");
+    let out = Tensor::zeros(&ctx, &[1], DType::U32).expect("out");
+    for (label, params) in [
+        (
+            "top_k 2",
+            SamplingParams {
+                temperature: 1.0,
+                top_k: 2,
+                top_p: 1.0,
+                seed: 3,
+                ..SamplingParams::greedy()
+            },
+        ),
+        (
+            "top_k 64",
+            SamplingParams {
+                temperature: 1.0,
+                top_k: 64,
+                top_p: 1.0,
+                seed: 3,
+                ..SamplingParams::greedy()
+            },
+        ),
+        (
+            "top_k 20 / top_p 0.95",
+            SamplingParams {
+                temperature: 1.0,
+                top_k: 20,
+                top_p: 0.95,
+                seed: 3,
+                ..SamplingParams::greedy()
+            },
+        ),
+        (
+            "top_k 0 (cap 1024)",
+            SamplingParams {
+                temperature: 1.0,
+                top_k: 0,
+                top_p: 1.0,
+                seed: 3,
+                ..SamplingParams::greedy()
+            },
+        ),
+    ] {
+        crate::metal::profile::take();
+        for step in 0..16 {
+            let pass = ctx.begin().expect("pass");
+            sample_f32(&ctx, &pass, &t_logits, &scratch, &params, step, &out)
+                .expect("sample");
+            pass.commit_wait().expect("commit");
+        }
+        let passes = crate::metal::profile::take();
+        for name in ["sample_prepare_f32", "sample_local_topk_f32", "sample_f32"] {
+            let mut us: Vec<f64> = passes
+                .iter()
+                .flat_map(|p| p.kernels.iter())
+                .filter(|s| s.name == name)
+                .map(|s| s.gpu_secs * 1e6)
+                .collect();
+            us.sort_by(|a, b| a.total_cmp(b));
+            let n = us.len();
+            if n == 0 {
+                continue;
+            }
+            eprintln!(
+                "{label} {name}: min {:.1} us, median {:.1} us over {n}",
+                us[0],
+                us[n / 2]
+            );
+        }
+    }
+}

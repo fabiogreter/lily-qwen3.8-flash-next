@@ -105,7 +105,10 @@ its proposals under the request's sampler and the verify rows running exact
 speculative sampling against them (`docs/architecture.md`), the same three
 seeds accept 65%, 67% and 65% (2.31 to 2.35 tokens per step), about 5% more
 tokens per step on this prompt, on which the head and the trunk disagree
-more than on text; the output distribution is unchanged by construction.
+more than on text; the output distribution is unchanged by construction. Each sampled draw (two draft proposals and three verify rows per step
+under the defaults) then went from about 175 us on one threadgroup to about
+85 us in two phases (64 slices' top-k, then the draw over their union),
+about 0.45 ms per speculative step.
 
 ### Against mlx-lm
 

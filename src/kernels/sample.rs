@@ -94,6 +94,24 @@ impl SamplingParams {
     }
 }
 
+/// Threadgroups of the two-phase selection's first phase
+/// (`LILY_SAMPLE_LOCAL_GROUPS` overrides it, for measurement) and the
+/// largest candidate count it serves (the shader's SAMPLE_LOCAL_K_MAX).
+const LOCAL_GROUPS: usize = 64;
+const LOCAL_GROUPS_MAX: usize = 256;
+const LOCAL_K_MAX: usize = 64;
+
+fn local_groups() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("LILY_SAMPLE_LOCAL_GROUPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| (1..=LOCAL_GROUPS_MAX).contains(n))
+            .unwrap_or(LOCAL_GROUPS)
+    })
+}
+
 /// Per-engine sampler buffers, sized for one vocabulary.
 pub struct SamplerScratch {
     /// F32 `[V]`: penalised, temperature-scaled logits.
@@ -104,6 +122,9 @@ pub struct SamplerScratch {
     maxima: Tensor,
     /// Partials for the exact argmax the greedy path uses.
     argmax_partials: Tensor,
+    /// U32 `[LOCAL_GROUPS_MAX * LOCAL_K_MAX]`: the slices' top-k ids of the
+    /// two-phase selection.
+    local_ids: Tensor,
 }
 
 impl SamplerScratch {
@@ -113,6 +134,11 @@ impl SamplerScratch {
             counts: Tensor::zeros(ctx, &[vocab], DType::U32)?,
             maxima: Tensor::zeros(ctx, &[PREP_GROUPS], DType::F32)?,
             argmax_partials: Tensor::zeros(ctx, &[2 * ARGMAX_GROUPS], DType::U32)?,
+            local_ids: Tensor::zeros(
+                ctx,
+                &[LOCAL_GROUPS_MAX * LOCAL_K_MAX],
+                DType::U32,
+            )?,
         })
     }
 
@@ -251,6 +277,27 @@ fn encode_draw(
         },
     )?;
     pass.level_barrier(&[&scratch.adjusted, &scratch.maxima])?;
+    // Two phases for small k (the server's top-k 20): 64 threadgroups each
+    // select their slice's top-k, and the draw selects over the union.
+    let groups = local_groups();
+    let two_phase = top_k <= LOCAL_K_MAX && v > 4 * groups * top_k && two_phase_on();
+    let (select_v, mapped) = if two_phase {
+        let local = ctx.pipeline("sample_local_topk_f32", SOURCE, MslVersion::V3_1)?;
+        pass.dispatch_at(
+            &local,
+            &[
+                scratch.adjusted.binding(),
+                scratch.maxima.binding(),
+                scratch.local_ids.binding(),
+            ],
+            &[&u32_bytes(top_k), &u32_bytes(v), &u32_bytes(groups)],
+            Grid::Threadgroups { groups: (groups, 1, 1), threadgroup: (TG, 1, 1) },
+        )?;
+        pass.level_barrier(&[&scratch.local_ids])?;
+        (groups * top_k, 1usize)
+    } else {
+        (v, 0usize)
+    };
     let (name, mut buffers) = match &draw {
         Draw::Plain => ("sample_f32", Vec::new()),
         Draw::Draft(dist) => (
@@ -280,6 +327,9 @@ fn encode_draw(
         out.binding(),
     ];
     bindings.append(&mut buffers);
+    // The candidate map binds after the draw's own buffers and before the
+    // constants (unused unless `mapped`).
+    bindings.push(scratch.local_ids.binding());
     let select = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &select,
@@ -288,14 +338,22 @@ fn encode_draw(
             &f32_bytes(params.top_p),
             &f32_bytes(params.min_p),
             &u32_bytes(top_k),
-            &u32_bytes(v),
+            &u32_bytes(select_v),
             &u32_bytes((params.seed & 0xffff_ffff) as usize),
             &u32_bytes((params.seed >> 32) as usize),
             &u32_bytes(step),
             &penalties,
+            &u32_bytes(mapped),
         ],
         Grid::Threadgroups { groups: (1, 1, 1), threadgroup: (TG, 1, 1) },
     )
+}
+
+/// `LILY_SAMPLE_TWO_PHASE=0` keeps every draw on the single-threadgroup
+/// selection (for measurement).
+fn two_phase_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LILY_SAMPLE_TWO_PHASE").as_deref() != Ok("0"))
 }
 
 /// Encodes one draw from `logits` (F32 `[V]`) into `out` (U32 `[1]`);
