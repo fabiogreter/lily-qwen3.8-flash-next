@@ -30,6 +30,53 @@ static inline void qsa_rope_pair_bf16(bfloat lo, bfloat hi, float angle,
     *out_hi = bfloat(float(bfloat(h * c)) + float(bfloat(l * s)));
 }
 
+// The rotary position of a sequence index: the index plus `rope_delta` (0
+// for text; VISION.md `rope_deltas` for tokens generated after an image).
+// Cache slots and block indices stay sequence indices; only the angle takes
+// the delta.
+static inline float qsa_rope_position(uint seq_index, int rope_delta) {
+    return float(int(seq_index) + rope_delta);
+}
+
+// The axis rotary pair `j` reads under the interleaved M-RoPE with
+// mrope_section [11, 11, 10] (mirrors `kernels::mrope_axis` and
+// attention.metal's copy): temporal (0) when j % 3 == 0, height (1) when
+// j % 3 == 1 and j < sec_h_end, width (2) when j % 3 == 2 and j < sec_w_end.
+static inline uint qsa_mrope_axis(uint j, uint sec_h_end, uint sec_w_end) {
+    const uint axis = j % 3;
+    if (axis == 1) {
+        return j < sec_h_end ? 1u : 0u;
+    }
+    if (axis == 2) {
+        return j < sec_w_end ? 2u : 0u;
+    }
+    return 0u;
+}
+
+// RMSNorm(+1) of one D-wide row held in `value` per thread into `normed`
+// (threadgroup), the shared prologue of the indexer's query and block-key
+// kernels. D threads; every thread reaches the barriers.
+static inline void qsa_norm_row(float value, device const bfloat* w, uint D, float eps,
+                                uint tid, uint sg, uint lane,
+                                threadgroup float* partial, threadgroup float* inv_rms,
+                                threadgroup bfloat* normed) {
+    float acc = simd_sum(value * value);
+    if (lane == 0) {
+        partial[sg] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint i = 0; i < (D + 31) / 32; ++i) {
+            total += partial[i];
+        }
+        *inv_rms = rsqrt(total / float(D) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    normed[tid] = bfloat(value * *inv_rms * (1.0f + float(w[tid])));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
 // q[row, h, :] = rope(rmsnorm(qk[row, h*D..]) * (1 + w)) at position base_pos + row.
 // One threadgroup per (row, head); D threads.
 kernel void qsa_prep_q_bf16(device const bfloat* qk  [[buffer(0)]],  // [M, (NH+1)*D]
@@ -41,6 +88,7 @@ kernel void qsa_prep_q_bf16(device const bfloat* qk  [[buffer(0)]],  // [M, (NH+
                             constant uint&       base_pos [[buffer(6)]],
                             constant float&      theta [[buffer(7)]],
                             constant float&      eps [[buffer(8)]],
+                            constant int&        rope_delta [[buffer(9)]],
                             uint seg  [[threadgroup_position_in_grid]],
                             uint tid  [[thread_index_in_threadgroup]],
                             uint sg   [[simdgroup_index_in_threadgroup]],
@@ -71,7 +119,51 @@ kernel void qsa_prep_q_bf16(device const bfloat* qk  [[buffer(0)]],  // [M, (NH+
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint half_rot = rot / 2;
     if (tid < half_rot) {
-        const float angle = float(base_pos + row) * pow(theta, -2.0f * float(tid) / float(rot));
+        const float angle = qsa_rope_position(base_pos + row, rope_delta)
+                          * pow(theta, -2.0f * float(tid) / float(rot));
+        qsa_rope_pair_bf16(normed[tid], normed[half_rot + tid], angle,
+                           q + dst + tid, q + dst + half_rot + tid);
+    } else if (tid >= rot) {
+        q[dst + tid] = normed[tid];
+    }
+}
+
+// qsa_prep_q_bf16 for the prefill rows of a prompt with an image: row `row`
+// is sequence index base_pos + row, whose 3-axis position is
+// positions[base_pos + row - pos_base] (U32 [rows, 3]); pair `tid` takes the
+// axis qsa_mrope_axis gives it. Rows whose axes agree get exactly what
+// qsa_prep_q_bf16 computes.
+kernel void qsa_prep_q_mrope_bf16(device const bfloat* qk  [[buffer(0)]],  // [M, (NH+1)*D]
+                                  device const bfloat* w   [[buffer(1)]],  // [D]
+                                  device bfloat*       q   [[buffer(2)]],  // [M, NH, D]
+                                  device const uint*   positions [[buffer(3)]],  // [rows, 3]
+                                  constant uint&       D   [[buffer(4)]],
+                                  constant uint&       NH  [[buffer(5)]],
+                                  constant uint&       rot [[buffer(6)]],
+                                  constant uint&       base_pos [[buffer(7)]],
+                                  constant float&      theta [[buffer(8)]],
+                                  constant float&      eps [[buffer(9)]],
+                                  constant uint&       pos_base [[buffer(10)]],
+                                  constant uint&       sec_h_end [[buffer(11)]],
+                                  constant uint&       sec_w_end [[buffer(12)]],
+                                  uint seg  [[threadgroup_position_in_grid]],
+                                  uint tid  [[thread_index_in_threadgroup]],
+                                  uint sg   [[simdgroup_index_in_threadgroup]],
+                                  uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float partial[TG / 32];
+    threadgroup float inv_rms;
+    threadgroup bfloat normed[TG];
+
+    const uint row = seg / NH;
+    const uint h = seg % NH;
+    const ulong src = (ulong)row * (NH + 1) * D + (ulong)h * D;
+    const ulong dst = (ulong)seg * D;
+    qsa_norm_row(float(qk[src + tid]), w, D, eps, tid, sg, lane, partial, &inv_rms, normed);
+    const uint half_rot = rot / 2;
+    if (tid < half_rot) {
+        const uint axis = qsa_mrope_axis(tid, sec_h_end, sec_w_end);
+        const uint pos = positions[(base_pos + row - pos_base) * 3 + axis];
+        const float angle = float(pos) * pow(theta, -2.0f * float(tid) / float(rot));
         qsa_rope_pair_bf16(normed[tid], normed[half_rot + tid], angle,
                            q + dst + tid, q + dst + half_rot + tid);
     } else if (tid >= rot) {
@@ -103,6 +195,7 @@ kernel void qsa_block_keys_bf16(device const bfloat* cache [[buffer(0)]],  // [m
                                 constant float&      theta [[buffer(7)]],
                                 constant float&      eps   [[buffer(8)]],
                                 constant uint&       count [[buffer(9)]],  // blocks to build (grid may exceed it)
+                                constant int&        rope_delta [[buffer(10)]],
                                 uint tg   [[threadgroup_position_in_grid]],
                                 uint tid  [[thread_index_in_threadgroup]],
                                 uint sg   [[simdgroup_index_in_threadgroup]],
@@ -139,7 +232,58 @@ kernel void qsa_block_keys_bf16(device const bfloat* cache [[buffer(0)]],  // [m
     const ulong dst = (ulong)b * D;
     const uint half_rot = rot / 2;
     if (tid < half_rot) {
-        const float angle = float(b * ratio) * pow(theta, -2.0f * float(tid) / float(rot));
+        const float angle = qsa_rope_position(b * ratio, rope_delta)
+                          * pow(theta, -2.0f * float(tid) / float(rot));
+        qsa_rope_pair_bf16(normed[tid], normed[half_rot + tid], angle,
+                           blk + dst + tid, blk + dst + half_rot + tid);
+    } else if (tid >= rot) {
+        blk[dst + tid] = normed[tid];
+    }
+}
+
+// qsa_block_keys_bf16 for the blocks a prompt with an image completes: block
+// b is roped at the 3-axis position of its first token, sequence index
+// b * ratio, read from positions[b * ratio - pos_base] (VISION.md: the
+// indexer's block keys take the cos/sin of each block's first position).
+kernel void qsa_block_keys_mrope_bf16(device const bfloat* cache [[buffer(0)]],  // [max_seq, D]
+                                      device const bfloat* w     [[buffer(1)]],  // [D]
+                                      device bfloat*       blk   [[buffer(2)]],  // [max_blocks, D]
+                                      device const uint*   positions [[buffer(3)]],  // [rows, 3]
+                                      constant uint&       D     [[buffer(4)]],
+                                      constant uint&       ratio [[buffer(5)]],
+                                      constant uint&       first_block [[buffer(6)]],
+                                      constant uint&       rot   [[buffer(7)]],
+                                      constant float&      theta [[buffer(8)]],
+                                      constant float&      eps   [[buffer(9)]],
+                                      constant uint&       count [[buffer(10)]],
+                                      constant uint&       pos_base [[buffer(11)]],
+                                      constant uint&       sec_h_end [[buffer(12)]],
+                                      constant uint&       sec_w_end [[buffer(13)]],
+                                      uint tg   [[threadgroup_position_in_grid]],
+                                      uint tid  [[thread_index_in_threadgroup]],
+                                      uint sg   [[simdgroup_index_in_threadgroup]],
+                                      uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float partial[TG / 32];
+    threadgroup float inv_rms;
+    threadgroup bfloat normed[TG];
+
+    if (tg >= count) {
+        return;  // uniform per threadgroup: no barrier is skipped unevenly
+    }
+    const uint b = first_block + tg;
+    float pooled = 0.0f;
+    for (uint i = 0; i < ratio; ++i) {
+        pooled += float(cache[(ulong)(b * ratio + i) * D + tid]);
+    }
+    // The reference pools in f32 and rounds the mean to bf16 before the norm.
+    const float value = float(bfloat(pooled / float(ratio)));
+    qsa_norm_row(value, w, D, eps, tid, sg, lane, partial, &inv_rms, normed);
+    const ulong dst = (ulong)b * D;
+    const uint half_rot = rot / 2;
+    if (tid < half_rot) {
+        const uint axis = qsa_mrope_axis(tid, sec_h_end, sec_w_end);
+        const uint pos = positions[(b * ratio - pos_base) * 3 + axis];
+        const float angle = float(pos) * pow(theta, -2.0f * float(tid) / float(rot));
         qsa_rope_pair_bf16(normed[tid], normed[half_rot + tid], angle,
                            blk + dst + tid, blk + dst + half_rot + tid);
     } else if (tid >= rot) {

@@ -8,10 +8,15 @@ pub mod config;
 pub mod image;
 pub mod model;
 pub mod ngram;
+pub mod positions;
+pub mod probe;
 mod spec;
 pub mod vision;
 pub mod vision_weights;
 pub mod weights;
 
-pub use model::{DecodeState, Encoder, MAX_DRAFTS, Qwen4ExpModel, Scratch};
+pub use model::{
+    DecodeState, Encoder, ImageEmbeds, MAX_DRAFTS, Qwen4ExpModel, Scratch, VisionInput,
+};
 pub use ngram::NgramStorage;
+pub use positions::{ImageSpan, Positions, positions_for_prompt};

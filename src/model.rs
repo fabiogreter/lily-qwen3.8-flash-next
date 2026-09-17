@@ -21,7 +21,7 @@ use crate::kernels::gdn::{
 };
 use crate::kernels::norm::{add_rmsnorm_bf16, rmsnorm_bf16};
 use crate::kernels::sample::{SamplerScratch, sample_f32};
-use crate::kernels::{quant, skinny};
+use crate::kernels::{Rope, quant, skinny};
 use crate::metal::{BlitCopy, ComputePass, EncodedPass, MetalContext};
 use crate::moe_ffn::{
     DecodeMoeIo, MoeDims, MoeScratch, PrefillMoeIo, PrefillMoeScratch, decode_moe,
@@ -717,6 +717,7 @@ impl Qwen3_5Model {
                         rot,
                         pos,
                         theta,
+                        Rope::Delta(0),
                     )?;
                     rope_neox(
                         ctx,
@@ -726,6 +727,7 @@ impl Qwen3_5Model {
                         rot,
                         pos,
                         theta,
+                        Rope::Delta(0),
                     )?;
                     scatter_kv(ctx, &pass, k_cache, &ps.k_new, pos)?;
                     scatter_kv(ctx, &pass, v_cache, &ps.v_new, pos)?;
@@ -994,10 +996,10 @@ impl Qwen3_5Model {
         pass.level_barrier(&[&s.attn_qkv])?;
         {
             q_norm_rope_split_decode(
-                ctx, pass, &s.qg, &w.q_norm, &s.q, &s.gate, rot, pos, theta, eps,
+                ctx, pass, &s.qg, &w.q_norm, &s.q, &s.gate, rot, pos, theta, eps, 0,
             )?;
             k_norm_rope_scatter_decode(
-                ctx, pass, &s.k_new, &w.k_norm, k_cache, rot, pos, theta, eps,
+                ctx, pass, &s.k_new, &w.k_norm, k_cache, rot, pos, theta, eps, 0,
             )?;
             scatter_kv(ctx, pass, v_cache, &s.v_new, pos)?;
             pass.level_barrier(&[&s.q, &s.gate, k_cache, v_cache])?;

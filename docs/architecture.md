@@ -381,6 +381,70 @@ for this is `png` and `zune-jpeg` directly rather than the `image` facade,
 which with only those two formats still pulls colour management the server
 never applies.
 
+**Positions.** A prompt with an image numbers its tokens differently from
+text (`tools/reference/VISION.md`, "Prompt, tokens, positions"). A counter
+runs over the prompt: a text token takes the counter on all three rotary
+axes and advances it by one; an image's placeholders take the counter as
+their temporal position and the counter plus their row and column in the
+merged grid as height and width, in raster order, after which the counter
+advances by half the larger grid side. The text after the image therefore
+sits below its sequence index, and every token generated afterwards at
+sequence index `s` sits at `s + rope_delta` on all axes, with
+`rope_delta = max(position) + 1 - seq_len` (the reference's `rope_deltas`,
+-216 for the 282-token 333 x 777 prompt). `qwen4exp::positions` computes
+this from the tokens and the image spans alone and is pinned exactly to the
+four reference goldens (comparison 3). Because positions are a pure function
+of the prompt, nothing about them is stored with a session: the snapshot and
+the disk tier keep their byte layout and the persistence format tag is
+unchanged, the decode state carries only `rope_delta`, set when the prompt is
+prefilled and never persisted, and a resumed session's cached keys are valid
+whenever its tokens and image spans match the prompt's, which the cache
+identity work (`docs/vision-support-plan.md` item 7) makes the cache check.
+In the kernels the cache slot and the rotary position used to be one number;
+they are now two roles. Cache slots, indexer blocks and causal limits stay
+the sequence index. The rotary angle takes a `Rope` argument: for decode rows
+(the single-token step, verify and draft passes, including the GPU-supplied
+positions of the speculative chain) every axis is the sequence index plus the
+delta, so the five scalar rotary kernels (`rope_neox`, the fused decode Q and
+K prep, the indexer's query prep and block keys) take an `int rope_delta`
+added in the kernel, and with delta 0 their arithmetic is what it was, which
+keeps the text path byte-identical. For the prefill rows of a prompt with an
+image a separate kernel variant (`rope_neox_mrope`, `qsa_prep_q_mrope`,
+`qsa_block_keys_mrope`), selected only then, reads a per-token `[rows, 3]`
+position buffer and applies the interleaved M-RoPE: 32 pairs over the 64
+rotary dims, pair `i` taking the temporal axis when `i % 3 == 0`, height
+when `i % 3 == 1` and `i < 33`, width when `i % 3 == 2` and `i < 30`
+(`mrope_section` [11, 11, 10]), `rotate_half` pairing `(i, i + 32)`. A block
+key takes the position of its first token, which can lie before the chunk,
+so the uploaded buffer starts at that token. Frequencies are computed in f32
+exactly as the text kernels compute them, so the text and image rows of one
+prompt rotate consistently; the bf16 forward goldens carry the text
+`inv_freq` in bf16 (VISION.md notes this), which shows up as small logit
+gaps in comparison 4, not as argmax disagreement.
+
+**The override and the draft head.** After the embedding gather of a prefill
+chunk the images' merged rows replace the placeholder rows of the
+`[m, 2560]` bf16 embedding before it is broadcast into the four
+hyper-connection streams, which is what the reference's `masked_scatter` on
+`inputs_embeds` produces; a span that straddles a 4 096-token chunk boundary
+is split at it. The n-gram embedding keeps hashing the placeholder ids, as
+the reference does. The draft head builds its input from the embedding of the
+next token, so its catch-up during prefill gets the same override shifted by
+one row: when row `j`'s token is a placeholder the head is fed the image row,
+and its caches are built from the input the trunk saw. Acceptance is exact
+equality, so this decides draft quality after an image and nothing else.
+Comparison 4 on the four-layer conversion (`lily-vision-probe --forward`,
+`compare.py`, and the same check as a model-gated Rust test): the 282-token
+image prompt agrees with the reference's argmax at all 16 top-8 positions and
+the 3 greedy tokens that follow the prompt (top-8 overlap 7 to 8, worst
+shared-id logit gap 0.051),
+and the text-only control through the same path is byte-identical to
+`lily-probe`'s record; it agrees at 15 of its 16 prompt positions, the
+exception being an exact bf16 tie in the reference (two ids at 3.5312, which
+torch breaks by the lower id) that the unchanged text path resolves the other
+way. Prefill of the 282-token image prompt takes 34 ms on the four layers,
+the tower 37 ms.
+
 ## Speculative decoding
 
 With the draft head loaded, a decode step becomes two GPU passes.
@@ -623,7 +687,8 @@ bounds the loop; the fourth fault exits 1 for the supervisor.
 
 Constrained decoding (`response_format: json_schema`), batching across
 requests, the image path from the API to the tower and into the prompt (the
-tower itself runs; preprocessing, positions and the server work are the
+tower, preprocessing, positions and the placeholder override run at the
+engine level; the server work and the caches' image identity are the
 remaining items of `docs/vision-support-plan.md`), and session persistence
 for the Qwen3.6-35B path (the engine trait's defaults disable the disk tier
 for it).

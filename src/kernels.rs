@@ -118,3 +118,70 @@ impl<'t> Pos<'t> {
         self.arg.param()
     }
 }
+
+/// Rotary pairs per (temporal, height, width) axis of Qwen3.8-Flash-Next's
+/// interleaved M-RoPE over its 32 pairs, the one layout the kernels are
+/// written for (`tools/reference/VISION.md`, "Interleaved M-RoPE").
+pub const MROPE_SECTION: [usize; 3] = [11, 11, 10];
+
+/// The axis rotary pair `pair` takes under [`MROPE_SECTION`]: pair `i` takes
+/// the temporal axis (0) when `i % 3 == 0`, the height axis (1) when
+/// `i % 3 == 1` and `i < 3 * 11`, the width axis (2) when `i % 3 == 2` and
+/// `i < 3 * 10`, and the temporal axis for anything past a section's budget.
+/// The Metal kernels (`mrope_axis` in `attention.metal` and `qsa.metal`)
+/// apply the same rule; the kernel tests pin the two to each other.
+pub fn mrope_axis(pair: usize) -> usize {
+    let axis = pair % 3;
+    if axis == 0 || pair >= 3 * MROPE_SECTION[axis] { 0 } else { axis }
+}
+
+/// How a kernel turns a row's sequence index into its rotary position.
+/// Cache slots and indexer blocks always use the sequence index; only the
+/// rotary angle takes this.
+#[derive(Clone, Copy)]
+pub enum Rope<'t> {
+    /// `sequence index + delta` on every axis: text prompts (delta 0) and
+    /// every token generated after a prompt with an image (VISION.md:
+    /// `rope_deltas`). The delta is added in the kernel, so it applies to a
+    /// GPU-supplied index too.
+    Delta(i64),
+    /// Per-token 3-axis positions, for the prefill rows of a prompt with an
+    /// image: row `i` of `positions` (U32 `[rows, 3]`, temporal, height,
+    /// width) belongs to sequence index `base + i`, and each rotary pair
+    /// reads the axis [`mrope_axis`] gives it.
+    Rows { positions: &'t Tensor, base: usize },
+}
+
+impl Rope<'_> {
+    /// The delta as the kernels' `int` parameter.
+    pub fn delta_i32(delta: i64) -> anyhow::Result<i32> {
+        i32::try_from(delta)
+            .map_err(|_| anyhow::anyhow!("rope delta {delta} out of range"))
+    }
+
+    /// Checks that `positions` covers sequence indices `first..first + count`
+    /// (`first` may be a range for a GPU-supplied index) and returns the
+    /// kernel's `pos_base`.
+    pub fn check_rows(
+        positions: &Tensor,
+        base: usize,
+        first_min: usize,
+        first_max: usize,
+        count: usize,
+    ) -> anyhow::Result<usize> {
+        anyhow::ensure!(
+            positions.dtype() == crate::tensor::DType::U32
+                && positions.shape().len() == 2
+                && positions.shape()[1] == 3,
+            "rope positions must be U32 [rows, 3]"
+        );
+        let rows = positions.shape()[0];
+        anyhow::ensure!(
+            base <= first_min && first_max + count <= base + rows,
+            "rope positions cover {base}..{}, rows need {first_min}..{}",
+            base + rows,
+            first_max + count
+        );
+        Ok(base)
+    }
+}

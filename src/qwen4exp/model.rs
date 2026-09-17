@@ -40,7 +40,7 @@ use crate::kernels::ple;
 use crate::kernels::qsa::{self, INDEXER_D, SparseSplitScratch};
 use crate::kernels::sample::{SamplerScratch, SamplingParams, sample_f32};
 use crate::kernels::spec::ctrl_words;
-use crate::kernels::{Arg, Pos};
+use crate::kernels::{Arg, Pos, Rope};
 use crate::kernels::{quant, skinny};
 use crate::metal::{
     BlitCopy, ComputePass, DetachedPass, EncodedPass, MetalContext, Pacer, PendingPass,
@@ -54,6 +54,7 @@ use crate::tensor::{DType, Tensor};
 
 use super::config::{GateAct, Qwen4ExpConfig};
 use super::ngram::{NgramHasher, NgramStorage, NgramTable, StagedRows};
+use super::positions::{ImageSpan, Positions};
 use super::weights::{
     self, AttnWeights, GdnWeights, HcWeights, LayerWeights, Mixer, ModelWeights,
     MtpWeights, PleWeights,
@@ -109,8 +110,10 @@ fn encoder_for(rows: usize) -> Encoder {
 #[derive(Clone, Copy)]
 pub(super) enum BatchMode<'p> {
     /// Prompt prefill: logits (and a draw) for the last row only, plus the
-    /// draft head's catch-up over the chunk when the model has one.
-    Prefill { draw: Option<Draw<'p>> },
+    /// draft head's catch-up over the chunk when the model has one. `vision`
+    /// is set for a prompt with images: per-row rotary positions and the
+    /// vision rows that replace the placeholders' embeddings.
+    Prefill { draw: Option<Draw<'p>>, vision: Option<&'p PrefillVision<'p>> },
     /// Speculative verification: a draw per row (`step0 + row` indexes the
     /// request's draws), recurrent states after each row recorded for
     /// rollback, no draft-head work (that follows once acceptance is known).
@@ -118,6 +121,96 @@ pub(super) enum BatchMode<'p> {
     /// before its first host-staged input (the n-gram rows), so it can be
     /// committed before the host has them.
     Verify { params: &'p SamplingParams, step0: usize, park: Option<u64> },
+}
+
+/// One image of a prompt: its placeholder span and the tower's merged rows.
+pub struct ImageEmbeds<'t> {
+    pub span: ImageSpan,
+    /// bf16 `[span.len, hidden_size]`: the tower's merged output, one row per
+    /// placeholder in order (what the reference `masked_scatter`s into the
+    /// token embeddings).
+    pub rows: &'t Tensor,
+}
+
+/// What a prompt with images adds to its tokens for
+/// [`Qwen4ExpModel::prefill_with_vision`].
+pub struct VisionInput<'t> {
+    /// Positions of the whole prompt from sequence index 0, not only of the
+    /// tokens being fed: the kernels also rope the head's catch-up row one
+    /// before the chunk and the first token of every indexer block the chunk
+    /// completes, which can lie before it.
+    pub positions: &'t Positions,
+    pub images: &'t [ImageEmbeds<'t>],
+}
+
+/// A prefill chunk's share of a [`VisionInput`]: the position rows its
+/// kernels read (U32 `[rows, 3]`, row `i` for sequence index `base + i`) and
+/// the images whose rows may fall into the chunk.
+pub(super) struct PrefillVision<'p> {
+    positions: Tensor,
+    base: usize,
+    images: &'p [ImageEmbeds<'p>],
+}
+
+impl PrefillVision<'_> {
+    fn rope(&self) -> Rope<'_> {
+        Rope::Rows { positions: &self.positions, base: self.base }
+    }
+}
+
+/// Vision rows replacing the embedding rows of one batch: the batch row the
+/// run starts at and a `[rows, hidden]` bf16 view of the merged rows.
+pub(super) struct RowOverride {
+    row: usize,
+    rows: Tensor,
+}
+
+/// The overrides of a batch whose row `j` holds token `first + j`, `rows`
+/// rows long: every image span overlapping that range, clipped to it. Empty
+/// for a batch without placeholders.
+fn row_overrides(
+    images: &[ImageEmbeds<'_>],
+    first: usize,
+    rows: usize,
+    h: usize,
+) -> Result<Vec<RowOverride>> {
+    let mut out = Vec::new();
+    for image in images {
+        let a = image.span.start.max(first);
+        let b = image.span.end().min(first + rows);
+        if a >= b {
+            continue;
+        }
+        ensure!(
+            image.rows.shape() == [image.span.len, h]
+                && image.rows.dtype() == DType::BF16,
+            "image rows are {:?} {:?}, the span at {} needs bf16 [{}, {h}]",
+            image.rows.shape(),
+            image.rows.dtype(),
+            image.span.start,
+            image.span.len
+        );
+        out.push(RowOverride {
+            row: a - first,
+            rows: image.rows.view((a - image.span.start) * h, &[b - a, h])?,
+        });
+    }
+    Ok(out)
+}
+
+/// Writes `overrides` into `x` (`[rows, h]` bf16, the gathered embeddings).
+/// The caller orders this after the gather and before the next reader.
+fn override_rows(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    x: &Tensor,
+    overrides: &[RowOverride],
+    h: usize,
+) -> Result<()> {
+    for o in overrides {
+        copy_words(ctx, pass, &o.rows, &x.view(o.row * h, o.rows.shape())?)?;
+    }
+    Ok(())
 }
 
 /// Host/GPU handshake for parked passes: a pass committed before its
@@ -318,6 +411,14 @@ impl PleState {
 
 pub struct DecodeState {
     pub pos: usize,
+    /// What every token fed from now on adds to its sequence index to get
+    /// its rotary position on all three axes (VISION.md `rope_deltas`): 0
+    /// for a text prompt, negative after an image. Set from the prompt's
+    /// [`Positions`] by [`Qwen4ExpModel::prefill_with_vision`] (the engine
+    /// sets it when it acquires a session); a pure function of the prompt,
+    /// so it is not part of a snapshot or the disk tier and a restore leaves
+    /// it alone.
+    pub rope_delta: i64,
     /// Tokens the per-token caches hold; grows in `CAPACITY_STEP`s.
     capacity: usize,
     pub(super) layers: Vec<LayerState>,
@@ -493,6 +594,7 @@ impl DecodeState {
         }
         self.spec = None;
         self.pos = 0;
+        self.rope_delta = 0;
         self.conv_slot = 0;
         Ok(())
     }
@@ -941,6 +1043,10 @@ pub(super) struct PrefillScratch {
     /// bf16 `[m, G*H]` each (models with a draft head only).
     pub(super) mtp_hyper: Option<Tensor>,
     mtp_hidden_in: Option<Tensor>,
+    /// U32 `[m + ratio, 3]`: the 3-axis rotary positions a chunk of a prompt
+    /// with an image reads (its rows, the head's row before it and the first
+    /// token of every block it completes, up to `ratio` rows earlier).
+    positions: Tensor,
 }
 
 struct GdnStageScratch {
@@ -1018,6 +1124,11 @@ impl PrefillScratch {
             mtp_hidden_in: with_mtp
                 .then(|| Tensor::zeros(ctx, &[m, cfg.hc_width()], bf))
                 .transpose()?,
+            positions: Tensor::zeros(
+                ctx,
+                &[m + cfg.indexer.compress_ratio, 3],
+                DType::U32,
+            )?,
         })
     }
 
@@ -1087,6 +1198,8 @@ impl PrefillScratch {
                 .as_ref()
                 .map(|t| prefix_rows(t, m))
                 .transpose()?,
+            // Full extent: the chunk's slice is viewed at upload.
+            positions: self.positions.view(0, self.positions.shape())?,
         })
     }
 }
@@ -1290,6 +1403,7 @@ impl Qwen4ExpModel {
         };
         Ok(DecodeState {
             pos: 0,
+            rope_delta: 0,
             capacity,
             layers,
             conv_slot: 0,
@@ -1471,7 +1585,8 @@ impl Qwen4ExpModel {
 
     /// Runs the prompt in batches of `PREFILL_CHUNK` tokens, one command
     /// buffer per chunk. With `draw`, the final token's logits are sampled
-    /// into `next_token[0]`.
+    /// into `next_token[0]`. Text only: the rotary position of every row is
+    /// its sequence index plus the state's `rope_delta`.
     pub fn prefill(
         &self,
         ctx: &MetalContext,
@@ -1480,8 +1595,54 @@ impl Qwen4ExpModel {
         tokens: &[u32],
         draw: Option<Draw<'_>>,
     ) -> Result<()> {
+        self.prefill_with_vision(ctx, state, s, tokens, draw, None)
+    }
+
+    /// [`Self::prefill`] for a prompt that may carry images: `tokens` are fed
+    /// at `state.pos` as sequence indices into `vision.positions`, every
+    /// row takes its own 3-axis rotary position, the placeholders' embedding
+    /// rows are replaced by the images' merged rows (in the trunk and in the
+    /// draft head's catch-up), and the state's `rope_delta` becomes the
+    /// prompt's. Without `vision` this is the text path, untouched.
+    pub fn prefill_with_vision(
+        &self,
+        ctx: &MetalContext,
+        state: &mut DecodeState,
+        s: &mut Scratch,
+        tokens: &[u32],
+        draw: Option<Draw<'_>>,
+        vision: Option<&VisionInput<'_>>,
+    ) -> Result<()> {
         ensure!(!tokens.is_empty(), "empty prompt");
         ensure!(state.spec.is_none(), "prefill during a pending speculative step");
+        let h = self.config.hidden_size;
+        if let Some(v) = vision {
+            let n = v.positions.len();
+            ensure!(
+                state.pos + tokens.len() <= n,
+                "the prompt's positions cover {n} tokens, the prefill feeds {}..{}",
+                state.pos,
+                state.pos + tokens.len()
+            );
+            for image in v.images {
+                ensure!(
+                    image.span.end() <= n,
+                    "image span {}..{} exceeds the prompt of {n} tokens",
+                    image.span.start,
+                    image.span.end()
+                );
+                ensure!(
+                    image.rows.shape() == [image.span.len, h]
+                        && image.rows.dtype() == DType::BF16,
+                    "image rows are {:?} {:?}, the span at {} needs bf16 [{}, {h}]",
+                    image.rows.shape(),
+                    image.rows.dtype(),
+                    image.span.start,
+                    image.span.len
+                );
+            }
+            state.rope_delta = v.positions.rope_delta;
+        }
         state.ensure_capacity(ctx, state.pos + tokens.len())?;
         self.ensure_prefill_scratch(ctx, s, tokens.len())?;
         let s = &*s;
@@ -1490,6 +1651,7 @@ impl Qwen4ExpModel {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("prefill scratch missing after growth"))?;
         let ple_w = self.weights.layers.iter().find_map(|l| l.ple.as_deref());
+        let ratio = self.config.indexer.compress_ratio;
         let mut remaining = tokens.len();
         let profile = std::env::var_os("LILY_PROFILE").is_some();
         for chunk in tokens.chunks(PREFILL_CHUNK) {
@@ -1498,8 +1660,26 @@ impl Qwen4ExpModel {
                 self.stage_ngram(w, p, chunk, pst.hist)?;
             }
             remaining -= chunk.len();
-            let mode =
-                BatchMode::Prefill { draw: if remaining == 0 { draw } else { None } };
+            let chunk_vision = match vision {
+                Some(v) => {
+                    // The rows this chunk's kernels rope: its own, the head's
+                    // catch-up row one before it, and the first token of
+                    // every block the chunk or the head completes, which lies
+                    // at most `ratio - 1` before that row.
+                    let pos = state.pos;
+                    let lo = pos.saturating_sub(1) / ratio * ratio;
+                    let hi = pos + chunk.len();
+                    let positions = ps.positions.view(0, &[hi - lo, 3])?;
+                    positions
+                        .write_bytes(bytemuck::cast_slice(&v.positions.flat(lo..hi)))?;
+                    Some(PrefillVision { positions, base: lo, images: v.images })
+                }
+                None => None,
+            };
+            let mode = BatchMode::Prefill {
+                draw: if remaining == 0 { draw } else { None },
+                vision: chunk_vision.as_ref(),
+            };
             let started = std::time::Instant::now();
             let encoded = self.encode_batch(ctx, state, s, &ps, mode)?;
             let encoded_at = std::time::Instant::now();
@@ -1558,8 +1738,29 @@ impl Qwen4ExpModel {
             );
         }
         let spec = if verify { s.spec.as_ref() } else { None };
+        let vision = match mode {
+            BatchMode::Prefill { vision, .. } => vision,
+            BatchMode::Verify { .. } => None,
+        };
+        // Rotary positions: each row's own 3-axis position for a chunk of a
+        // prompt with an image, otherwise the sequence index plus the
+        // state's delta (0 for text).
+        let rope = match vision {
+            Some(v) => v.rope(),
+            None => Rope::Delta(state.rope_delta),
+        };
 
         quant::gather_rows_q4(ctx, &pass, &self.weights.embed_tokens, &ps.ids, &ps.x)?;
+        if let Some(v) = vision {
+            // The images' merged rows replace the placeholders' embeddings
+            // before the streams are initialised from them (the reference's
+            // `masked_scatter` on `inputs_embeds`).
+            let overrides = row_overrides(v.images, pos, m, h)?;
+            if !overrides.is_empty() {
+                pass.level_barrier(&[&ps.x])?;
+                override_rows(ctx, &pass, &ps.x, &overrides, h)?;
+            }
+        }
         pass.level_barrier(&[&ps.x])?;
         hc_broadcast_bf16(ctx, &pass, &ps.x, &ps.hyper, h, g)?;
         pass.level_barrier(&[&ps.hyper])?;
@@ -1628,11 +1829,12 @@ impl Qwen4ExpModel {
                 ps,
                 ple,
                 capture.as_ref(),
+                rope,
             )?;
         }
 
         match mode {
-            BatchMode::Prefill { draw } => {
+            BatchMode::Prefill { draw, vision } => {
                 if let Some(draw) = draw {
                     // Only the last prompt token feeds decoding: pull its stream
                     // row into the single-token scratch and reuse the decode
@@ -1663,7 +1865,8 @@ impl Qwen4ExpModel {
                     pass.level_barrier(&[&s.next_token])?;
                 }
                 if let (Some(mtp), Some(mst)) = (&self.weights.mtp, &state.mtp) {
-                    self.mtp_catch_up(ctx, &pass, mtp, mst, pos, s, ps)?;
+                    let images = vision.map_or(&[][..], |v| v.images);
+                    self.mtp_catch_up(ctx, &pass, mtp, mst, pos, s, ps, rope, images)?;
                 }
             }
             BatchMode::Verify { params, step0, .. } => {
@@ -1720,6 +1923,7 @@ impl Qwen4ExpModel {
         ps: &PrefillScratch,
         ple: Option<(&PleWeights, &PleScratch, &PleState)>,
         capture: Option<&Capture>,
+        rope: Rope<'_>,
     ) -> Result<()> {
         let cfg = &self.config;
         let (h, g) = (cfg.hidden_size, cfg.hc_count);
@@ -1759,6 +1963,7 @@ impl Qwen4ExpModel {
             ) => {
                 self.attn_batched(
                     ctx, pass, w, s, ps, k_cache, v_cache, idx_keys, blk_keys, pos,
+                    rope,
                 )?;
             }
             _ => anyhow::bail!("layer/state kind mismatch"),
@@ -2035,6 +2240,7 @@ impl Qwen4ExpModel {
         idx_keys: &Tensor,
         blk_keys: &Tensor,
         pos: usize,
+        rope: Rope<'_>,
     ) -> Result<()> {
         self.attn_batched_theta(
             ctx,
@@ -2048,12 +2254,15 @@ impl Qwen4ExpModel {
             blk_keys,
             AttnPos::host(pos),
             self.config.rope_parameters.rope_theta,
+            rope,
         )
     }
 
-    /// The attention branch over `ps.hc.mixed` at positions `pos..pos+m`
-    /// against the given caches, with an explicit RoPE base (the draft head
-    /// declares its own).
+    /// The attention branch over `ps.hc.mixed` at sequence indices
+    /// `pos..pos+m` against the given caches, with an explicit RoPE base (the
+    /// draft head declares its own) and the rule turning an index into a
+    /// rotary position (`rope`). Cache slots and indexer blocks always take
+    /// the sequence index.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn attn_batched_theta(
         &self,
@@ -2068,6 +2277,7 @@ impl Qwen4ExpModel {
         blk_keys: &Tensor,
         at: AttnPos<'_>,
         theta: f32,
+        rope: Rope<'_>,
     ) -> Result<()> {
         let cfg = &self.config;
         let eps = cfg.rms_norm_eps;
@@ -2117,11 +2327,21 @@ impl Qwen4ExpModel {
             pos,
             theta,
             eps,
+            rope,
         )?;
         qsa::qsa_scatter_keys(ctx, pass, &ps.idx_qk, idx_keys, idx.n_heads, pos)?;
         pass.level_barrier(&[&ps.q, &ps.gate, &ps.k_new, &ps.idx_q, idx_keys])?;
         rmsnorm_bf16(ctx, pass, &ps.q, &w.q_norm, &ps.q, eps, NORM_WEIGHT_BIAS)?;
-        rope_neox(ctx, pass, &ps.k_new, cfg.num_key_value_heads, rot, pos, theta)?;
+        rope_neox(
+            ctx,
+            pass,
+            &ps.k_new,
+            cfg.num_key_value_heads,
+            rot,
+            pos,
+            theta,
+            rope,
+        )?;
         // Block keys for every block this chunk completes.
         let ratio = idx.compress_ratio;
         match (pos.arg, at.block) {
@@ -2141,6 +2361,7 @@ impl Qwen4ExpModel {
                         rot,
                         theta,
                         eps,
+                        rope,
                     )?;
                 }
             }
@@ -2165,6 +2386,7 @@ impl Qwen4ExpModel {
                         rot,
                         theta,
                         eps,
+                        rope,
                     )?;
                 }
             }
@@ -2173,7 +2395,7 @@ impl Qwen4ExpModel {
             }
         }
         pass.level_barrier(&[&ps.q, &ps.k_new, blk_keys])?;
-        rope_neox(ctx, pass, &ps.q, nq, rot, pos, theta)?;
+        rope_neox(ctx, pass, &ps.q, nq, rot, pos, theta, rope)?;
         scatter_kv(ctx, pass, k_cache, &ps.k_new, pos)?;
         scatter_kv(ctx, pass, v_cache, &ps.v_new, pos)?;
         pass.level_barrier(&[&ps.q, k_cache, v_cache])?;
@@ -2262,7 +2484,10 @@ impl Qwen4ExpModel {
     /// with the trunk: row `j` pairs the trunk hidden of token `pos+j-1` with
     /// token `pos+j` (the previous chunk's last hidden comes from the state;
     /// at position 0 there is no earlier hidden, so that row is skipped).
-    /// Afterwards the state's hidden holds the chunk's last row.
+    /// Afterwards the state's hidden holds the chunk's last row. Row `j`'s
+    /// token is `pos+j`; when that is an image placeholder the head is fed
+    /// the image's row instead of the placeholder's embedding (`images`), as
+    /// the trunk was.
     #[allow(clippy::too_many_arguments)]
     fn mtp_catch_up(
         &self,
@@ -2273,6 +2498,8 @@ impl Qwen4ExpModel {
         pos: usize,
         s: &Scratch,
         ps: &PrefillScratch,
+        rope: Rope<'_>,
+        images: &[ImageEmbeds<'_>],
     ) -> Result<()> {
         let wide = self.config.hc_width();
         let m = ps.m;
@@ -2300,11 +2527,13 @@ impl Qwen4ExpModel {
                     &hidden_in.view(0, &[m - 1, wide])?,
                 )?;
             }
-            let ids = if pos > 0 {
-                ps.ids.view(0, &[m])?
+            let (ids, first_token) = if pos > 0 {
+                (ps.ids.view(0, &[m])?, pos)
             } else {
-                ps.ids.view(1, &[m - 1])?
+                (ps.ids.view(1, &[m - 1])?, 1)
             };
+            let overrides =
+                row_overrides(images, first_token, rows, self.config.hidden_size)?;
             pass.level_barrier(&[hidden_in])?;
             let ps_rows = ps.rows(rows)?;
             self.mtp_block(
@@ -2317,6 +2546,8 @@ impl Qwen4ExpModel {
                 AttnPos::host(pos0),
                 s,
                 &ps_rows,
+                rope,
+                &overrides,
             )?;
         }
         // The chunk's last trunk hidden pairs with the next token, whenever
@@ -2329,8 +2560,9 @@ impl Qwen4ExpModel {
     /// The draft head's block over `rows` inputs: `hidden` (`[rows, G*H]`
     /// trunk or head residuals) and `ids` (`[rows]`, the tokens following
     /// them) become the head's residual in `ps.mtp_hyper`, and the block runs
-    /// at head positions `pos0..pos0+rows` against the head's caches. Leaves
-    /// `ps.mtp_hyper` ordered.
+    /// at head positions `pos0..pos0+rows` against the head's caches, roped
+    /// by `rope`; `overrides` are the image rows standing in for placeholder
+    /// ids among `ids`. Leaves `ps.mtp_hyper` ordered.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn mtp_block(
         &self,
@@ -2343,6 +2575,8 @@ impl Qwen4ExpModel {
         pos0: AttnPos<'_>,
         s: &Scratch,
         ps: &PrefillScratch,
+        rope: Rope<'_>,
+        overrides: &[RowOverride],
     ) -> Result<()> {
         let cfg = &self.config;
         let (h, g, eps) = (cfg.hidden_size, cfg.hc_count, cfg.rms_norm_eps);
@@ -2370,6 +2604,10 @@ impl Qwen4ExpModel {
             NORM_WEIGHT_BIAS,
         )?;
         quant::gather_rows_q4(ctx, pass, &self.weights.embed_tokens, ids, &ps.x)?;
+        if !overrides.is_empty() {
+            pass.level_barrier(&[&ps.x])?;
+            override_rows(ctx, pass, &ps.x, overrides, h)?;
+        }
         pass.level_barrier(&[&ps.hc.hn, &ps.x])?;
         let hn_streams = ps.hc.hn.view(0, &[rows * g, h])?;
         let hyper_streams = hyper.view(0, &[rows * g, h])?;
@@ -2409,6 +2647,7 @@ impl Qwen4ExpModel {
         self.hc_read_batched(ctx, pass, &mtp.layer.attn_hc, hyper, s, ps)?;
         self.attn_batched_theta(
             ctx, pass, w, s, ps, k_cache, v_cache, idx_keys, blk_keys, pos0, theta,
+            rope,
         )?;
         pass.level_barrier(&[&ps.branch_out])?;
         hc_inject_bf16(ctx, pass, hyper, &ps.branch_out, &ps.hc.inj, h, g)?;
@@ -2493,8 +2732,16 @@ impl Qwen4ExpModel {
                     LayerState::Attn { k_cache, v_cache, idx_keys, blk_keys },
                 ) => {
                     self.attn_decode_branch(
-                        ctx, pass, w, s, k_cache, v_cache, idx_keys, blk_keys,
+                        ctx,
+                        pass,
+                        w,
+                        s,
+                        k_cache,
+                        v_cache,
+                        idx_keys,
+                        blk_keys,
                         state.pos,
+                        state.rope_delta,
                     )?;
                 }
                 _ => anyhow::bail!("layer/state kind mismatch"),
@@ -2697,6 +2944,7 @@ impl Qwen4ExpModel {
         idx_keys: &Tensor,
         blk_keys: &Tensor,
         pos: usize,
+        rope_delta: i64,
     ) -> Result<()> {
         let cfg = &self.config;
         let eps = cfg.rms_norm_eps;
@@ -2704,15 +2952,23 @@ impl Qwen4ExpModel {
         let theta = cfg.rope_parameters.rope_theta;
         let idx = &cfg.indexer;
         let len = pos + 1;
+        // The token sits at cache slot `pos` and rotates at `pos + delta`
+        // (equal for text; VISION.md `rope_deltas` after an image).
+        ensure!(
+            pos as i64 + rope_delta >= 0,
+            "rotary position {} + {rope_delta} is negative",
+            pos
+        );
 
         quant::gemv_quant(ctx, pass, &w.qkv_proj, &s.hc.mixed, &s.attn_qkv)?;
         quant::gemv_quant(ctx, pass, &w.indexer.qk_proj, &s.hc.mixed, &s.idx_qk)?;
         pass.level_barrier(&[&s.attn_qkv, &s.idx_qk])?;
         q_norm_rope_split_decode(
             ctx, pass, &s.qg, &w.q_norm, &s.q, &s.gate, rot, pos, theta, eps,
+            rope_delta,
         )?;
         k_norm_rope_scatter_decode(
-            ctx, pass, &s.k_new, &w.k_norm, k_cache, rot, pos, theta, eps,
+            ctx, pass, &s.k_new, &w.k_norm, k_cache, rot, pos, theta, eps, rope_delta,
         )?;
         scatter_kv(ctx, pass, v_cache, &s.v_new, pos)?;
         qsa::qsa_prep_q(
@@ -2726,6 +2982,7 @@ impl Qwen4ExpModel {
             pos,
             theta,
             eps,
+            Rope::Delta(rope_delta),
         )?;
         qsa::qsa_scatter_keys(ctx, pass, &s.idx_qk, idx_keys, idx.n_heads, pos)?;
         pass.level_barrier(&[&s.q, &s.gate, k_cache, v_cache, &s.idx_q, idx_keys])?;
@@ -2745,6 +3002,7 @@ impl Qwen4ExpModel {
                 rot,
                 theta,
                 eps,
+                Rope::Delta(rope_delta),
             )?;
             pass.level_barrier(&[blk_keys])?;
         }

@@ -37,7 +37,7 @@ use crate::kernels::spec::{
     SLOT_ACCEPTED, SLOT_KEEP, copy_row, ctrl_word, slot_block, slot_count, slot_pos,
     spec_accept,
 };
-use crate::kernels::{Arg, Pos};
+use crate::kernels::{Arg, Pos, Rope};
 use crate::metal::{EncodedPass, MetalContext, PendingPass};
 use crate::moe_ffn::{prefix_rows, project_mat};
 use crate::tensor::Tensor;
@@ -607,6 +607,9 @@ impl Qwen4ExpModel {
         // Catch-up over every verified row; the head's caches are position
         // indexed, so the rows past the accepted one are overwritten by the
         // chain (and by the next step) before anything valid reads them.
+        // Every row here is a generated token: its rotary position is the
+        // sequence index plus the prompt's delta, and no image row applies.
+        let rope = Rope::Delta(state.rope_delta);
         let ps = capacity.rows(m)?;
         self.mtp_block(
             ctx,
@@ -618,6 +621,8 @@ impl Qwen4ExpModel {
             AttnPos::host(pos0),
             s,
             &ps,
+            rope,
+            &[],
         )?;
         if chain > 0 {
             let hyper = ps
@@ -664,7 +669,19 @@ impl Qwen4ExpModel {
                     // pos0 + accepted + 1 + i (the GPU knows which).
                     let at =
                         AttnPos::gpu(pos, pos0 + 1 + i, pos0 + m + i, block, count);
-                    self.mtp_block(ctx, &pass, mtp, mst, &last, &out, at, s, &ps1)?;
+                    self.mtp_block(
+                        ctx,
+                        &pass,
+                        mtp,
+                        mst,
+                        &last,
+                        &out,
+                        at,
+                        s,
+                        &ps1,
+                        rope,
+                        &[],
+                    )?;
                     last = hyper.view(0, &[1, wide])?;
                 }
             }
@@ -774,6 +791,8 @@ impl Qwen4ExpModel {
             copy_words(ctx, &pass, keep, &mst.hidden)?;
         }
         if rows > 0 {
+            // Generated tokens only (see `encode_draft_selected`).
+            let rope = Rope::Delta(state.rope_delta);
             let ps = capacity.rows(rows)?;
             let ids = sp.mtp_ids.view(0, &[rows])?;
             self.mtp_block(
@@ -786,6 +805,8 @@ impl Qwen4ExpModel {
                 AttnPos::host(pos0),
                 s,
                 &ps,
+                rope,
+                &[],
             )?;
             if drafts > 0 {
                 let hyper = ps.mtp_hyper.as_ref().expect("draft head scratch");
@@ -828,6 +849,8 @@ impl Qwen4ExpModel {
                             AttnPos::host(pos0 + chain_row + 1 + i),
                             s,
                             &ps1,
+                            rope,
+                            &[],
                         )?;
                         last = hyper.view(0, &[1, wide])?;
                     }

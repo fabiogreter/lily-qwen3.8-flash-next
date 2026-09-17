@@ -5,7 +5,7 @@
 use anyhow::{Result, ensure};
 
 use crate::kernels::attention;
-use crate::kernels::{Pos, u32_bytes};
+use crate::kernels::{MROPE_SECTION, Pos, Rope, u32_bytes};
 use crate::metal::{ComputePass, Grid, MetalContext, MslVersion, Param};
 use crate::tensor::{DType, Tensor};
 
@@ -36,7 +36,9 @@ pub fn sparse_splits(k_max: usize, ratio: usize) -> usize {
     (k_max * ratio + ratio - 1).div_ceil(QSA_SPLIT)
 }
 
-/// `q[m, h, :] = rope(rmsnorm(qk[m, h*D..]) * (1 + w))` at position `base_pos + m`.
+/// `q[m, h, :] = rope(rmsnorm(qk[m, h*D..]) * (1 + w))` for sequence index
+/// `base_pos + m`, at the rotary position `rope` derives from it (see
+/// [`crate::kernels::attention::rope_neox`]).
 #[allow(clippy::too_many_arguments)]
 pub fn qsa_prep_q<'t>(
     ctx: &MetalContext,
@@ -49,6 +51,7 @@ pub fn qsa_prep_q<'t>(
     base_pos: impl Into<Pos<'t>>,
     theta: f32,
     eps: f32,
+    rope: Rope<'_>,
 ) -> Result<()> {
     let base_pos = base_pos.into();
     let d = INDEXER_D;
@@ -66,20 +69,50 @@ pub fn qsa_prep_q<'t>(
         "q must be BF16 [M, NH, D]"
     );
     ensure!(rot.is_multiple_of(2) && rot <= d, "bad rotary dim {rot}");
-    let pipeline = ctx.pipeline("qsa_prep_q_bf16", SOURCE, MslVersion::V3_1)?;
-    pass.dispatch_with(
-        &pipeline,
-        &[qk.binding(), w.binding(), q.binding()],
-        &[
-            Param::U32(d as u32),
-            Param::U32(n_heads as u32),
-            Param::U32(rot as u32),
-            base_pos.param(),
-            Param::F32(theta),
-            Param::F32(eps),
-        ],
-        Grid::Threadgroups { groups: (m * n_heads, 1, 1), threadgroup: (d, 1, 1) },
-    )
+    let grid =
+        Grid::Threadgroups { groups: (m * n_heads, 1, 1), threadgroup: (d, 1, 1) };
+    match rope {
+        Rope::Delta(delta) => {
+            let delta = Rope::delta_i32(delta)?.to_ne_bytes();
+            let pipeline = ctx.pipeline("qsa_prep_q_bf16", SOURCE, MslVersion::V3_1)?;
+            pass.dispatch_with(
+                &pipeline,
+                &[qk.binding(), w.binding(), q.binding()],
+                &[
+                    Param::U32(d as u32),
+                    Param::U32(n_heads as u32),
+                    Param::U32(rot as u32),
+                    base_pos.param(),
+                    Param::F32(theta),
+                    Param::F32(eps),
+                    Param::Bytes(&delta),
+                ],
+                grid,
+            )
+        }
+        Rope::Rows { positions, base } => {
+            let pos_base =
+                Rope::check_rows(positions, base, base_pos.min, base_pos.max, m)?;
+            let pipeline =
+                ctx.pipeline("qsa_prep_q_mrope_bf16", SOURCE, MslVersion::V3_1)?;
+            pass.dispatch_with(
+                &pipeline,
+                &[qk.binding(), w.binding(), q.binding(), positions.binding()],
+                &[
+                    Param::U32(d as u32),
+                    Param::U32(n_heads as u32),
+                    Param::U32(rot as u32),
+                    base_pos.param(),
+                    Param::F32(theta),
+                    Param::F32(eps),
+                    Param::U32(pos_base as u32),
+                    Param::U32((3 * MROPE_SECTION[1]) as u32),
+                    Param::U32((3 * MROPE_SECTION[2]) as u32),
+                ],
+                grid,
+            )
+        }
+    }
 }
 
 /// Appends the raw indexer keys of `qk` (`[M, (NH+1)*D]`) to `cache` (`[max_seq, D]`).
@@ -115,8 +148,10 @@ pub fn qsa_scatter_keys<'t>(
 }
 
 /// Builds block keys `first_block .. first_block + count` from the raw-key
-/// cache. Both may be GPU-supplied (bounded): the grid covers the largest
-/// count and threadgroups past the actual count exit.
+/// cache, each roped at the rotary position `rope` derives from its first
+/// token's sequence index `block * ratio`. Both bounds may be GPU-supplied
+/// (bounded): the grid covers the largest count and threadgroups past the
+/// actual count exit.
 #[allow(clippy::too_many_arguments)]
 pub fn qsa_block_keys<'t>(
     ctx: &MetalContext,
@@ -130,6 +165,7 @@ pub fn qsa_block_keys<'t>(
     rot: usize,
     theta: f32,
     eps: f32,
+    rope: Rope<'_>,
 ) -> Result<()> {
     let (first_block, count) = (first_block.into(), count.into());
     if count.max == 0 {
@@ -158,21 +194,60 @@ pub fn qsa_block_keys<'t>(
         w.numel() == d && w.dtype() == DType::BF16,
         "k norm weight must be BF16 [D]"
     );
-    let pipeline = ctx.pipeline("qsa_block_keys_bf16", SOURCE, MslVersion::V3_1)?;
-    pass.dispatch_with(
-        &pipeline,
-        &[cache.binding(), w.binding(), blocks.binding()],
-        &[
-            Param::U32(d as u32),
-            Param::U32(ratio as u32),
-            first_block.param(),
-            Param::U32(rot as u32),
-            Param::F32(theta),
-            Param::F32(eps),
-            count.param(),
-        ],
-        Grid::Threadgroups { groups: (count.max, 1, 1), threadgroup: (d, 1, 1) },
-    )
+    let grid = Grid::Threadgroups { groups: (count.max, 1, 1), threadgroup: (d, 1, 1) };
+    match rope {
+        Rope::Delta(delta) => {
+            let delta = Rope::delta_i32(delta)?.to_ne_bytes();
+            let pipeline =
+                ctx.pipeline("qsa_block_keys_bf16", SOURCE, MslVersion::V3_1)?;
+            pass.dispatch_with(
+                &pipeline,
+                &[cache.binding(), w.binding(), blocks.binding()],
+                &[
+                    Param::U32(d as u32),
+                    Param::U32(ratio as u32),
+                    first_block.param(),
+                    Param::U32(rot as u32),
+                    Param::F32(theta),
+                    Param::F32(eps),
+                    count.param(),
+                    Param::Bytes(&delta),
+                ],
+                grid,
+            )
+        }
+        Rope::Rows { positions, base } => {
+            // The last block's first token must have a position row; the
+            // first block's must not lie before the buffer.
+            let last_first_token = (first_block.max + count.max - 1) * ratio;
+            let pos_base = Rope::check_rows(
+                positions,
+                base,
+                first_block.min * ratio,
+                last_first_token,
+                1,
+            )?;
+            let pipeline =
+                ctx.pipeline("qsa_block_keys_mrope_bf16", SOURCE, MslVersion::V3_1)?;
+            pass.dispatch_with(
+                &pipeline,
+                &[cache.binding(), w.binding(), blocks.binding(), positions.binding()],
+                &[
+                    Param::U32(d as u32),
+                    Param::U32(ratio as u32),
+                    first_block.param(),
+                    Param::U32(rot as u32),
+                    Param::F32(theta),
+                    Param::F32(eps),
+                    count.param(),
+                    Param::U32(pos_base as u32),
+                    Param::U32((3 * MROPE_SECTION[1]) as u32),
+                    Param::U32((3 * MROPE_SECTION[2]) as u32),
+                ],
+                grid,
+            )
+        }
+    }
 }
 
 /// `scores[qi, b]` for every block visible to query `qi` at `base_pos + qi`;

@@ -2,7 +2,7 @@
 
 use anyhow::{Result, ensure};
 
-use crate::kernels::{Pos, u32_bytes};
+use crate::kernels::{MROPE_SECTION, Pos, Rope, u32_bytes};
 use crate::metal::{ComputePass, Grid, MetalContext, MslVersion, Param};
 use crate::tensor::{DType, Tensor};
 
@@ -71,8 +71,11 @@ pub fn sdpa_split_scratch_splits(capacity_tokens: usize) -> usize {
         .max(1)
 }
 
-/// In-place partial NeoX RoPE over `[M, heads, D]`; token `m` rotates at
-/// position `base_pos + m` (decode is the M=1 case).
+/// In-place partial NeoX RoPE over `[M, heads, D]`; token `m` is sequence
+/// index `base_pos + m` (decode is the M=1 case) and rotates at the position
+/// `rope` derives from it: the index plus a delta (the scalar kernel, text
+/// and generated tokens), or its own 3-axis position under the interleaved
+/// M-RoPE (the `_mrope` variant, prefill rows of a prompt with an image).
 #[allow(clippy::too_many_arguments)]
 pub fn rope_neox<'t>(
     ctx: &MetalContext,
@@ -82,26 +85,56 @@ pub fn rope_neox<'t>(
     rot: usize,
     base_pos: impl Into<Pos<'t>>,
     theta: f32,
+    rope: Rope<'_>,
 ) -> Result<()> {
     let base_pos = base_pos.into();
     let d = *x.shape().last().ok_or_else(|| anyhow::anyhow!("rope on 0-d tensor"))?;
     ensure!(x.numel().is_multiple_of(heads * d), "x not a multiple of heads*D");
     let m = x.numel() / (heads * d);
     ensure!(rot.is_multiple_of(2) && rot <= d, "rotary dim {rot} invalid for D {d}");
-    let pipeline = ctx.pipeline("rope_neox_bf16", SOURCE, MslVersion::V3_1)?;
     let pairs = heads * rot / 2;
-    pass.dispatch_with(
-        &pipeline,
-        &[x.binding()],
-        &[
-            Param::U32(d as u32),
-            Param::U32(rot as u32),
-            base_pos.param(),
-            Param::F32(theta),
-            Param::U32((heads * d) as u32),
-        ],
-        Grid::Threads { grid: (pairs, m, 1), threadgroup: (256.min(pairs), 1, 1) },
-    )
+    let grid =
+        Grid::Threads { grid: (pairs, m, 1), threadgroup: (256.min(pairs), 1, 1) };
+    match rope {
+        Rope::Delta(delta) => {
+            let delta = Rope::delta_i32(delta)?.to_ne_bytes();
+            let pipeline = ctx.pipeline("rope_neox_bf16", SOURCE, MslVersion::V3_1)?;
+            pass.dispatch_with(
+                &pipeline,
+                &[x.binding()],
+                &[
+                    Param::U32(d as u32),
+                    Param::U32(rot as u32),
+                    base_pos.param(),
+                    Param::F32(theta),
+                    Param::U32((heads * d) as u32),
+                    Param::Bytes(&delta),
+                ],
+                grid,
+            )
+        }
+        Rope::Rows { positions, base } => {
+            let pos_base =
+                Rope::check_rows(positions, base, base_pos.min, base_pos.max, m)?;
+            let pipeline =
+                ctx.pipeline("rope_neox_mrope_bf16", SOURCE, MslVersion::V3_1)?;
+            pass.dispatch_with(
+                &pipeline,
+                &[x.binding(), positions.binding()],
+                &[
+                    Param::U32(d as u32),
+                    Param::U32(rot as u32),
+                    base_pos.param(),
+                    Param::F32(theta),
+                    Param::U32((heads * d) as u32),
+                    Param::U32(pos_base as u32),
+                    Param::U32((3 * MROPE_SECTION[1]) as u32),
+                    Param::U32((3 * MROPE_SECTION[2]) as u32),
+                ],
+                grid,
+            )
+        }
+    }
 }
 
 /// Splits Qwen3.5's per-head-interleaved q_proj output (`[H, 2D]`, each head
@@ -161,6 +194,8 @@ pub fn scatter_kv<'t>(
     )
 }
 
+/// Decode-step Q prep: RMSNorm, the q/gate split and RoPE at rotary position
+/// `pos + rope_delta` (`pos` is the sequence index).
 #[allow(clippy::too_many_arguments)]
 pub fn q_norm_rope_split_decode(
     ctx: &MetalContext,
@@ -173,7 +208,9 @@ pub fn q_norm_rope_split_decode(
     pos: usize,
     theta: f32,
     eps: f32,
+    rope_delta: i64,
 ) -> Result<()> {
+    let delta = Rope::delta_i32(rope_delta)?.to_ne_bytes();
     let d = *q.shape().last().ok_or_else(|| anyhow::anyhow!("0-d q"))?;
     let heads = q.numel() / d;
     ensure!(d == 256, "decode fused Q prep requires D=256");
@@ -195,11 +232,14 @@ pub fn q_norm_rope_split_decode(
             &u32_bytes(pos),
             &theta.to_ne_bytes(),
             &eps.to_ne_bytes(),
+            &delta,
         ],
         Grid::Threadgroups { groups: (heads, 1, 1), threadgroup: (256, 1, 1) },
     )
 }
 
+/// Decode-step K prep: RMSNorm, RoPE at rotary position `pos + rope_delta`
+/// and the scatter into cache slot `pos` (the sequence index).
 #[allow(clippy::too_many_arguments)]
 pub fn k_norm_rope_scatter_decode(
     ctx: &MetalContext,
@@ -211,7 +251,9 @@ pub fn k_norm_rope_scatter_decode(
     pos: usize,
     theta: f32,
     eps: f32,
+    rope_delta: i64,
 ) -> Result<()> {
+    let delta = Rope::delta_i32(rope_delta)?.to_ne_bytes();
     let (heads, max_seq, d) = (cache.shape()[0], cache.shape()[1], cache.shape()[2]);
     ensure!(d == 256, "decode fused K prep requires D=256");
     ensure!(rot <= d && rot.is_multiple_of(2), "bad rotary dim {rot}");
@@ -233,6 +275,7 @@ pub fn k_norm_rope_scatter_decode(
             &theta.to_ne_bytes(),
             &eps.to_ne_bytes(),
             &u32_bytes(max_seq),
+            &delta,
         ],
         Grid::Threadgroups { groups: (heads, 1, 1), threadgroup: (256, 1, 1) },
     )

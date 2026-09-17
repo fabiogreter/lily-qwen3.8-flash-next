@@ -3,6 +3,7 @@ use rand::{Rng, SeedableRng};
 
 use super::*;
 use crate::cpu_ref;
+use crate::kernels::mrope_axis;
 use crate::tensor::DType;
 
 #[test]
@@ -176,7 +177,8 @@ fn rope_batched_matches_cpu_per_token() {
 
     let tx = Tensor::from_f32_as_bf16(&ctx, &x, &[m, heads, d]).expect("x");
     let pass = ctx.begin().expect("pass");
-    rope_neox(&ctx, &pass, &tx, heads, rot, base_pos, theta).expect("rope");
+    rope_neox(&ctx, &pass, &tx, heads, rot, base_pos, theta, Rope::Delta(0))
+        .expect("rope");
     pass.commit_wait().expect("commit");
 
     let mut expected = cpu_ref::round_bf16(&x);
@@ -190,6 +192,129 @@ fn rope_batched_matches_cpu_per_token() {
         );
     }
     cpu_ref::assert_close(&tx.to_f32().expect("read"), &expected, 2e-2, 2e-2);
+}
+
+/// A U32 `[rows, 3]` position tensor.
+fn position_rows(ctx: &MetalContext, rows: &[[u32; 3]]) -> Tensor {
+    let flat: Vec<u32> = rows.iter().flatten().copied().collect();
+    Tensor::from_bytes(ctx, bytemuck::cast_slice(&flat), &[rows.len(), 3], DType::U32)
+        .expect("positions")
+}
+
+/// Runs `rope_neox` over a fresh bf16 copy of `x` and returns the result.
+#[allow(clippy::too_many_arguments)]
+fn rope_of(
+    ctx: &MetalContext,
+    x: &[f32],
+    shape: &[usize],
+    heads: usize,
+    rot: usize,
+    base_pos: usize,
+    theta: f32,
+    rope: Rope<'_>,
+) -> Vec<f32> {
+    let tx = Tensor::from_f32_as_bf16(ctx, x, shape).expect("x");
+    let pass = ctx.begin().expect("pass");
+    rope_neox(ctx, &pass, &tx, heads, rot, base_pos, theta, rope).expect("rope");
+    pass.commit_wait().expect("commit");
+    tx.to_f32().expect("read")
+}
+
+/// The interleaved M-RoPE variant against a CPU reference on rows whose
+/// three axes differ (VISION.md "Interleaved M-RoPE"), its bit-exact
+/// equality with the scalar kernel on rows whose axes agree, and the scalar
+/// kernel's delta against a shifted base position, also bit-exact. The
+/// position buffer starts before the chunk (`base < base_pos`), as the
+/// prefill's does for the block keys.
+#[test]
+fn rope_mrope_matches_cpu_and_the_scalar_kernel_on_text_rows() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(23);
+    let (m, heads, d, rot, base_pos, base) =
+        (6usize, 3usize, 256usize, 64usize, 11usize, 8usize);
+    let theta = 1e7f32;
+    let shape = [m, heads, d];
+    let x: Vec<f32> = (0..m * heads * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+    let rows = base_pos + m - base;
+    let mixed: Vec<[u32; 3]> = (0..rows)
+        .map(|_| {
+            [
+                rng.gen_range(0..400u32),
+                rng.gen_range(0..400u32),
+                rng.gen_range(0..400u32),
+            ]
+        })
+        .collect();
+    let t_mixed = position_rows(&ctx, &mixed);
+    let got = rope_of(
+        &ctx,
+        &x,
+        &shape,
+        heads,
+        rot,
+        base_pos,
+        theta,
+        Rope::Rows { positions: &t_mixed, base },
+    );
+    let mut expected = cpu_ref::round_bf16(&x);
+    let half = rot / 2;
+    for t in 0..m {
+        let pos = mixed[base_pos + t - base];
+        for h in 0..heads {
+            let row = (t * heads + h) * d;
+            for j in 0..half {
+                let inv_freq = theta.powf(-2.0 * j as f32 / rot as f32);
+                let ang = pos[mrope_axis(j)] as f32 * inv_freq;
+                let (sin, cos) = ang.sin_cos();
+                let (lo, hi) = (expected[row + j], expected[row + half + j]);
+                expected[row + j] = lo * cos - hi * sin;
+                expected[row + half + j] = hi * cos + lo * sin;
+            }
+        }
+    }
+    cpu_ref::assert_close(&got, &expected, 2e-2, 2e-2);
+    // Distinct axes really were exercised: the result differs from the
+    // scalar kernel at the chunk's positions.
+    let scalar = rope_of(&ctx, &x, &shape, heads, rot, base_pos, theta, Rope::Delta(0));
+    assert_ne!(got, scalar);
+
+    // Text rows: every axis is the sequence index; the variant is bit-exact.
+    let text: Vec<[u32; 3]> = (0..rows).map(|i| [(base + i) as u32; 3]).collect();
+    let t_text = position_rows(&ctx, &text);
+    let via_rows = rope_of(
+        &ctx,
+        &x,
+        &shape,
+        heads,
+        rot,
+        base_pos,
+        theta,
+        Rope::Rows { positions: &t_text, base },
+    );
+    assert_eq!(via_rows, scalar);
+
+    // The delta moves the angle, not the row: index 20 with delta -9 is
+    // index 11 with delta 0, bit for bit.
+    let shifted =
+        rope_of(&ctx, &x, &shape, heads, rot, base_pos + 9, theta, Rope::Delta(-9));
+    assert_eq!(shifted, scalar);
+
+    // A buffer that does not cover the chunk is refused, not read past.
+    let short = position_rows(&ctx, &text[..rows - 1]);
+    let tx = Tensor::from_f32_as_bf16(&ctx, &x, &shape).expect("x");
+    let pass = ctx.begin().expect("pass");
+    let err = rope_neox(
+        &ctx,
+        &pass,
+        &tx,
+        heads,
+        rot,
+        base_pos,
+        theta,
+        Rope::Rows { positions: &short, base },
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("rope positions cover"), "{err:#}");
 }
 
 fn check_sdpa_prefill(

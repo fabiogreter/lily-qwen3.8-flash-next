@@ -29,6 +29,19 @@
 //! unless `--pixels` names another. Every record carries the golden's own
 //! sample indices with the candidate's values at them, so the comparison
 //! works with or without the `.npy` files.
+//!
+//! ```sh
+//! # Comparisons 3 and 4: the language model's logits with the image in the
+//! # prompt (positions, the tower's rows in place of the placeholders), in
+//! # the lily-probe record format for compare.py; --image is preprocessed
+//! # with the golden's cap. Without --image the golden must be the text-only
+//! # control.
+//! cargo run --release --bin lily-vision-probe -- --model <dir>-l4 \
+//!     --forward tools/reference/goldens/hf_l4_vision_333x777_dequant.json \
+//!     --image tools/reference/images/333x777.png --out /tmp/lily_l4_vision_333x777.json
+//! .venv/bin/python tools/reference/compare.py /tmp/lily_l4_vision_333x777.json \
+//!     tools/reference/goldens/hf_l4_vision_333x777_dequant.json
+//! ```
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -36,11 +49,18 @@ use std::time::Instant;
 
 use anyhow::{Context as _, Result, bail, ensure};
 use clap::Parser;
+use lily::engine::VisionMode;
+use lily::generate::Generator;
 use lily::metal::MetalContext;
 use lily::metal::profile;
 use lily::npy;
 use lily::qwen4exp::image::{self, ImageLimits, PixelValues};
+use lily::qwen4exp::probe::{ProbeStep, forward_probe};
 use lily::qwen4exp::vision::VisionTower;
+use lily::qwen4exp::{
+    ImageEmbeds, ImageSpan, NgramStorage, Qwen4ExpModel, VisionInput,
+    positions_for_prompt,
+};
 use serde::Serialize;
 
 #[derive(Parser)]
@@ -51,9 +71,16 @@ struct Cli {
     #[arg(long)]
     model: Option<PathBuf>,
     /// A `hf_vision_tower_<img>_cap<max>.json` golden: grid and sample
-    /// indices for the tower record. Required with `--model`.
+    /// indices for the tower record. Required with `--model` unless
+    /// `--forward` is given.
     #[arg(long)]
     golden: Option<PathBuf>,
+    /// A `hf_l4_vision_*_dequant.json` forward golden: run its prompt
+    /// through the language model (with `--image` preprocessed at the
+    /// golden's cap and fed through the tower when the golden has an image,
+    /// or text only) and write a `lily-probe` record for `compare.py`.
+    #[arg(long, conflicts_with = "golden")]
+    forward: Option<PathBuf>,
     /// An image file (PNG or JPEG) to preprocess with lily's own code; the
     /// tower then runs on those pixel rows.
     #[arg(long)]
@@ -93,6 +120,31 @@ struct Cli {
     /// meaningful). Default: all.
     #[arg(long)]
     blocks: Option<usize>,
+}
+
+/// The forward record (`lily-probe`'s layout plus the positions block
+/// `compare.py` checks exactly, comparison 3).
+#[derive(Serialize)]
+struct ForwardRecord {
+    model_id: &'static str,
+    prompt_token_ids: Vec<u32>,
+    steps: Vec<ProbeStep>,
+    text: String,
+    positions: Option<PositionsRecord>,
+    load_seconds: f64,
+    /// The full prompt's prefill.
+    prefill_seconds: f64,
+    decode_seconds: f64,
+    image: Option<serde_json::Value>,
+    golden: String,
+}
+
+#[derive(Serialize)]
+struct PositionsRecord {
+    image_span: ImageSpan,
+    /// `[3][n]`: the temporal, height and width axis of every prompt token.
+    position_ids: Vec<Vec<u32>>,
+    rope_deltas: i64,
 }
 
 /// One tensor in the golden format (`vision_golden.tensor_record`).
@@ -367,12 +419,218 @@ fn preprocess(cli: &Cli, image_path: &Path, out: &Path) -> Result<PixelValues> {
     Ok(pv)
 }
 
+/// Comparisons 3 and 4: the prompt of a forward golden through the language
+/// model, with its image (lily's preprocessing at the golden's cap, the
+/// tower, the positions, the placeholder override) or as the text-only
+/// control, recorded at the golden's top-8 positions and over its greedy
+/// continuation.
+fn forward(cli: &Cli, model_dir: &Path, golden_path: &Path) -> Result<()> {
+    let golden = read_json(golden_path)?;
+    ensure!(
+        golden["kind"] == "forward",
+        "{} is not a forward golden",
+        golden_path.display()
+    );
+    let tokens: Vec<u32> = golden["prompt_token_ids"]
+        .as_array()
+        .context("prompt_token_ids")?
+        .iter()
+        .map(|v| v.as_u64().map(|v| v as u32).context("token id"))
+        .collect::<Result<_>>()?;
+    let ints = |v: &serde_json::Value| -> Result<Vec<usize>> {
+        v.as_array()
+            .context("integer list")?
+            .iter()
+            .map(|x| x.as_u64().map(|x| x as usize).context("integer"))
+            .collect()
+    };
+    let dump_positions: Vec<usize> = golden["top8_last"]
+        .as_array()
+        .context("top8_last")?
+        .iter()
+        .map(|e| e["position"].as_u64().map(|p| p as usize).context("position"))
+        .collect::<Result<_>>()?;
+    let greedy_steps = golden["greedy"].as_array().map_or(0, Vec::len);
+
+    let ctx = MetalContext::new()?;
+    let started = Instant::now();
+    // The model without its tower copy; the tower is loaded on its own below
+    // so the probe drives it directly.
+    let model = Qwen4ExpModel::load_with(
+        &ctx,
+        model_dir,
+        NgramStorage::default(),
+        true,
+        VisionMode::Off,
+    )?;
+    let generator = Generator::from_model_dir(model_dir)?;
+
+    let (probe, positions_record, image_info, load_seconds) = if golden["positions"]
+        .is_null()
+    {
+        ensure!(
+            cli.image.is_none(),
+            "{} is the text-only control; drop --image",
+            golden_path.display()
+        );
+        let load_seconds = started.elapsed().as_secs_f64();
+        eprintln!(
+            "model loaded in {load_seconds:.2}s; text-only prompt of {} tokens",
+            tokens.len()
+        );
+        let probe = forward_probe(
+            &ctx,
+            &model,
+            &tokens,
+            None,
+            &dump_positions,
+            greedy_steps,
+            8,
+        )?;
+        (probe, None, None, load_seconds)
+    } else {
+        let image_path = cli.image.as_ref().with_context(|| {
+            format!("{} has an image; pass --image <file>", golden_path.display())
+        })?;
+        let pb = &golden["positions"];
+        let grid = ints(&pb["image_grid_thw"][0])?;
+        ensure!(
+            grid.len() == 3 && grid[0] == 1,
+            "image_grid_thw {grid:?} is not one still image"
+        );
+        let span = ImageSpan {
+            start: pb["image_span"]["start"].as_u64().context("image_span.start")?
+                as usize,
+            len: pb["image_span"]["length"].as_u64().context("image_span.length")?
+                as usize,
+            grid_h: grid[1],
+            grid_w: grid[2],
+        };
+        let cap = &golden["meta"]["cap"];
+        let limits = ImageLimits {
+            max_pixels: cap["max_pixels"].as_u64().context("meta.cap.max_pixels")?
+                as usize,
+            min_pixels: cap["min_pixels"].as_u64().context("meta.cap.min_pixels")?
+                as usize,
+            ..ImageLimits::default()
+        };
+        let bytes = std::fs::read(image_path)
+            .with_context(|| format!("reading {}", image_path.display()))?;
+        let header = image::read_header(&bytes)?;
+        let pv = image::preprocess(&bytes, &limits)?;
+        ensure!(
+            (pv.grid_h, pv.grid_w) == (span.grid_h, span.grid_w),
+            "lily's grid ({}, {}) does not match the golden's ({}, {})",
+            pv.grid_h,
+            pv.grid_w,
+            span.grid_h,
+            span.grid_w
+        );
+        let mut tower = VisionTower::load_from_dir(&ctx, model_dir)?;
+        let load_seconds = started.elapsed().as_secs_f64();
+        let out = tower.forward(&ctx, &pv.data, pv.grid_h, pv.grid_w)?;
+        eprintln!(
+            "model and tower loaded in {load_seconds:.2}s; {} {} x {} -> grid ({}, {}), {} image tokens, tower {:.1} ms; prompt of {} tokens",
+            header.format,
+            header.width,
+            header.height,
+            pv.grid_h,
+            pv.grid_w,
+            span.len,
+            out.gpu_secs * 1e3,
+            tokens.len()
+        );
+
+        // Comparison 3, exactly, before the forward: the positions the
+        // reference's language model saw.
+        let positions = positions_for_prompt(&tokens, &[span])?;
+        let axes: Vec<Vec<usize>> = pb["position_ids"]
+            .as_array()
+            .context("position_ids")?
+            .iter()
+            .map(ints)
+            .collect::<Result<_>>()?;
+        let position_ids: Vec<Vec<u32>> =
+            (0..3).map(|a| positions.rows.iter().map(|r| r[a]).collect()).collect();
+        let same_ids = axes.len() == 3
+            && (0..3).all(|a| {
+                axes[a].len() == position_ids[a].len()
+                    && axes[a]
+                        .iter()
+                        .zip(&position_ids[a])
+                        .all(|(x, y)| *x == *y as usize)
+            });
+        let same_delta = pb["rope_deltas"].as_i64() == Some(positions.rope_delta);
+        eprintln!(
+            "positions: {} against the golden, rope_delta {} ({})",
+            if same_ids { "exact" } else { "DIFFERENT" },
+            positions.rope_delta,
+            if same_delta { "same" } else { "DIFFERENT" }
+        );
+        ensure!(same_ids && same_delta, "lily's positions differ from the reference's");
+
+        let images = [ImageEmbeds { span, rows: &out.merged }];
+        let vision = VisionInput { positions: &positions, images: &images };
+        let probe = forward_probe(
+            &ctx,
+            &model,
+            &tokens,
+            Some(&vision),
+            &dump_positions,
+            greedy_steps,
+            8,
+        )?;
+        let record = PositionsRecord {
+            image_span: span,
+            position_ids,
+            rope_deltas: positions.rope_delta,
+        };
+        let info = serde_json::json!({
+            "file": image_path.file_name().map(|n| n.to_string_lossy().into_owned()),
+            "sha256": hex(&sha256(&bytes)),
+            "width": header.width,
+            "height": header.height,
+            "resized_wh": [pv.resized.0, pv.resized.1],
+            "image_grid_thw": [[1, pv.grid_h, pv.grid_w]],
+            "cap": {"min_pixels": limits.min_pixels, "max_pixels": limits.max_pixels},
+            "tower_gpu_ms": out.gpu_secs * 1e3,
+        });
+        (probe, Some(record), Some(info), load_seconds)
+    };
+    let chosen: Vec<u32> = probe.steps.iter().map(|s| s.chosen).collect();
+    let text = generator.decode_text(&chosen[chosen.len() - greedy_steps - 1..])?;
+    eprintln!(
+        "prefill of the full prompt {:.3}s, {greedy_steps} greedy steps {:.3}s; chosen {:?}; text {text:?}",
+        probe.prefill_seconds, probe.decode_seconds, chosen
+    );
+    let record = ForwardRecord {
+        model_id: "Qwen3.8-Flash-Next",
+        prompt_token_ids: tokens,
+        steps: probe.steps,
+        text,
+        positions: positions_record,
+        load_seconds,
+        prefill_seconds: probe.prefill_seconds,
+        decode_seconds: probe.decode_seconds,
+        image: image_info,
+        golden: golden_path.display().to_string(),
+    };
+    std::fs::write(&cli.out, serde_json::to_vec_pretty(&record)?)
+        .with_context(|| format!("writing {}", cli.out.display()))?;
+    eprintln!("wrote {}", cli.out.display());
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     ensure!(
         cli.image.is_some() || cli.model.is_some(),
         "nothing to do: pass --image to preprocess, --model to run the tower, or both"
     );
+    if let Some(golden) = &cli.forward {
+        let model = cli.model.as_ref().context("--forward needs --model")?;
+        return forward(&cli, model, golden);
+    }
     let out_dir = cli.out.parent().map(Path::to_path_buf).unwrap_or_default();
     let base = cli.out.file_stem().context("out name")?.to_string_lossy().into_owned();
 

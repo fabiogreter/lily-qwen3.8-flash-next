@@ -5,6 +5,29 @@ using namespace metal;
 #define TG 256
 #define MAX_T 4096
 
+// The rotary position of a row is its sequence index plus `rope_delta`
+// (0 for text; VISION.md `rope_deltas` for tokens generated after an image).
+// The cache slot stays the sequence index: only the angle takes the delta.
+static inline float rope_position(uint seq_index, int rope_delta) {
+    return float(int(seq_index) + rope_delta);
+}
+
+// The axis rotary pair `j` reads under the interleaved M-RoPE with
+// mrope_section [11, 11, 10]: temporal (0) when j % 3 == 0, height (1) when
+// j % 3 == 1 and j < sec_h_end (33), width (2) when j % 3 == 2 and
+// j < sec_w_end (30), temporal past a section's budget. Mirrors
+// `kernels::mrope_axis`.
+static inline uint mrope_axis(uint j, uint sec_h_end, uint sec_w_end) {
+    const uint axis = j % 3;
+    if (axis == 1) {
+        return j < sec_h_end ? 1u : 0u;
+    }
+    if (axis == 2) {
+        return j < sec_w_end ? 2u : 0u;
+    }
+    return 0u;
+}
+
 // In-place partial NeoX RoPE over [M, H, D]; grid is (H * rot/2, M).
 kernel void rope_neox_bf16(device bfloat*  x        [[buffer(0)]],
                            constant uint&  D        [[buffer(1)]],
@@ -12,12 +35,45 @@ kernel void rope_neox_bf16(device bfloat*  x        [[buffer(0)]],
                            constant uint&  base_pos [[buffer(3)]],
                            constant float& theta    [[buffer(4)]],
                            constant uint&  row_elems [[buffer(5)]],  // H * D
+                           constant int&   rope_delta [[buffer(6)]],
                            uint2 gid [[thread_position_in_grid]]) {
     uint half_rot = rot / 2;
     uint h = gid.x / half_rot;
     uint j = gid.x % half_rot;
     float inv_freq = pow(theta, -2.0f * float(j) / float(rot));
-    float ang = float(base_pos + gid.y) * inv_freq;
+    float ang = rope_position(base_pos + gid.y, rope_delta) * inv_freq;
+    float c = cos(ang);
+    float s = sin(ang);
+    ulong base = (ulong)gid.y * row_elems + (ulong)h * D;
+    float lo = float(x[base + j]);
+    float hi = float(x[base + half_rot + j]);
+    x[base + j] = bfloat(lo * c - hi * s);
+    x[base + half_rot + j] = bfloat(hi * c + lo * s);
+}
+
+// rope_neox_bf16 for the prefill rows of a prompt with an image: row m of
+// the chunk is sequence index base_pos + m, whose 3-axis position is
+// positions[base_pos + m - pos_base] (U32 [rows, 3]: temporal, height,
+// width); pair j rotates by the axis mrope_axis gives it. For rows whose
+// three axes agree this is exactly rope_neox_bf16 (same angle arithmetic).
+kernel void rope_neox_mrope_bf16(device bfloat*      x         [[buffer(0)]],
+                                 device const uint*  positions [[buffer(1)]],
+                                 constant uint&      D         [[buffer(2)]],
+                                 constant uint&      rot       [[buffer(3)]],
+                                 constant uint&      base_pos  [[buffer(4)]],
+                                 constant float&     theta     [[buffer(5)]],
+                                 constant uint&      row_elems [[buffer(6)]],  // H * D
+                                 constant uint&      pos_base  [[buffer(7)]],
+                                 constant uint&      sec_h_end [[buffer(8)]],
+                                 constant uint&      sec_w_end [[buffer(9)]],
+                                 uint2 gid [[thread_position_in_grid]]) {
+    uint half_rot = rot / 2;
+    uint h = gid.x / half_rot;
+    uint j = gid.x % half_rot;
+    float inv_freq = pow(theta, -2.0f * float(j) / float(rot));
+    const uint axis = mrope_axis(j, sec_h_end, sec_w_end);
+    const uint pos = positions[(base_pos + gid.y - pos_base) * 3 + axis];
+    float ang = float(pos) * inv_freq;
     float c = cos(ang);
     float s = sin(ang);
     ulong base = (ulong)gid.y * row_elems + (ulong)h * D;
@@ -63,6 +119,7 @@ kernel void q_norm_rope_split_decode_bf16(
     constant uint&       pos  [[buffer(6)]],
     constant float&      theta [[buffer(7)]],
     constant float&      eps   [[buffer(8)]],
+    constant int&        rope_delta [[buffer(9)]],
     uint head [[threadgroup_position_in_grid]],
     uint tid  [[thread_index_in_threadgroup]],
     uint sg   [[simdgroup_index_in_threadgroup]],
@@ -93,7 +150,7 @@ kernel void q_norm_rope_split_decode_bf16(
     const uint half_rot = rot / 2;
     if (tid < half_rot) {
         const float inv_freq = pow(theta, -2.0f * float(tid) / float(rot));
-        const float angle = float(pos) * inv_freq;
+        const float angle = rope_position(pos, rope_delta) * inv_freq;
         const float c = cos(angle);
         const float s = sin(angle);
         const float lo = float(normed[tid]);
@@ -115,6 +172,7 @@ kernel void k_norm_rope_scatter_decode_bf16(
     constant float&      theta [[buffer(6)]],
     constant float&      eps   [[buffer(7)]],
     constant uint&       max_seq [[buffer(8)]],
+    constant int&        rope_delta [[buffer(9)]],
     uint head [[threadgroup_position_in_grid]],
     uint tid  [[thread_index_in_threadgroup]],
     uint sg   [[simdgroup_index_in_threadgroup]],
@@ -144,7 +202,7 @@ kernel void k_norm_rope_scatter_decode_bf16(
     const uint half_rot = rot / 2;
     if (tid < half_rot) {
         const float inv_freq = pow(theta, -2.0f * float(tid) / float(rot));
-        const float angle = float(pos) * inv_freq;
+        const float angle = rope_position(pos, rope_delta) * inv_freq;
         const float c = cos(angle);
         const float s = sin(angle);
         const float lo = float(normed[tid]);
