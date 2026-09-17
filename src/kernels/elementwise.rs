@@ -57,6 +57,28 @@ pub fn add_bf16(
 
 /// Copies `src` into `dst` (same byte length, any dtype) as a compute
 /// dispatch, so a state restore can sit inside a pass between other kernels.
+/// XORs every word of `src` (any dtype, a multiple of 16 bytes) into
+/// `out[0]` (`U32 [1]`): a read-bandwidth probe over a whole buffer.
+pub fn checksum_words(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    src: &Tensor,
+    out: &Tensor,
+) -> Result<()> {
+    let bytes = src.byte_len();
+    ensure!(bytes.is_multiple_of(16) && bytes > 0, "checksum needs a 16-byte multiple");
+    ensure!(out.numel() == 1 && out.dtype() == DType::U32, "out must be U32 [1]");
+    let n4 = bytes / 16;
+    let pipeline = ctx.pipeline("checksum_u32", SOURCE, MslVersion::V3_1)?;
+    let threads = n4.min(40 * 1024 * 8);
+    pass.dispatch_at(
+        &pipeline,
+        &[src.binding(), out.binding()],
+        &[&u32_bytes(n4)],
+        Grid::Threads { grid: (threads, 1, 1), threadgroup: (256, 1, 1) },
+    )
+}
+
 pub fn copy_words(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,

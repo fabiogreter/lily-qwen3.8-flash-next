@@ -42,6 +42,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use block2::RcBlock;
+use core::ffi::c_void;
 use core::ptr::NonNull;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
@@ -322,6 +323,21 @@ impl MetalContext {
         self.residency.new_buffer(&self.device, len)
     }
 
+    /// A read-only buffer over `len` bytes of `path` at `offset`, mapped
+    /// from the file instead of copied: the pages are the file's page-cache
+    /// pages, which the OS can drop under memory pressure and read back on
+    /// demand (weights served from disk on machines the model does not fit).
+    /// Returns the buffer, which starts at the page boundary at or below
+    /// `offset`, and the byte offset of the requested range inside it.
+    pub fn new_buffer_mapped(
+        &self,
+        path: &std::path::Path,
+        offset: u64,
+        len: usize,
+    ) -> Result<(Buffer, usize)> {
+        self.residency.new_buffer_mapped(&self.device, path, offset, len)
+    }
+
     pub fn new_buffer_with_bytes(&self, bytes: &[u8]) -> Result<Buffer> {
         let buf = self.new_buffer(bytes.len())?;
         // SAFETY: the buffer was just allocated with exactly `bytes.len()` bytes.
@@ -536,6 +552,68 @@ impl Residency {
         self.set.addAllocation(ProtocolObject::<dyn MTLAllocation>::from_ref(&*raw));
         self.dirty.set(true);
         Ok(Rc::new(GpuBuffer { raw, address, residency: self.clone() }))
+    }
+
+    fn new_buffer_mapped(
+        self: &Rc<Self>,
+        device: &ProtocolObject<dyn MTLDevice>,
+        path: &std::path::Path,
+        offset: u64,
+        len: usize,
+    ) -> Result<(Buffer, usize)> {
+        use std::os::fd::AsRawFd;
+        ensure!(len > 0, "mapped buffer of zero bytes");
+        // SAFETY: sysconf has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        let base = offset - offset % page;
+        let inner = usize::try_from(offset - base)?;
+        let map_len = (inner + len).next_multiple_of(page as usize);
+        let file = std::fs::File::open(path)
+            .with_context(|| format!("opening {} for mapping", path.display()))?;
+        // SAFETY: a private read-only mapping of a file we opened; the
+        // kernel validates the range.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                map_len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                base as libc::off_t,
+            )
+        };
+        ensure!(
+            ptr != libc::MAP_FAILED,
+            "mapping {} bytes of {} at {base}: {}",
+            map_len,
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+        let ptr = NonNull::new(ptr).expect("mmap returned null");
+        // Metal unmaps the file when it releases the buffer.
+        let unmap = RcBlock::new(|p: NonNull<c_void>, len: usize| {
+            // SAFETY: the mapping handed to Metal, of this length.
+            unsafe { libc::munmap(p.as_ptr(), len) };
+        });
+        // SAFETY: page-aligned mapping of map_len bytes; the deallocator
+        // block outlives its use through Metal's copy of it.
+        let raw = unsafe {
+            device.newBufferWithBytesNoCopy_length_options_deallocator(
+                ptr,
+                map_len,
+                MTLResourceOptions::StorageModeShared,
+                Some(&unmap),
+            )
+        };
+        let Some(raw) = raw else {
+            // SAFETY: the mapping we just made, no buffer holds it.
+            unsafe { libc::munmap(ptr.as_ptr(), map_len) };
+            bail!("Metal refused a {map_len}-byte mapped buffer of {}", path.display());
+        };
+        let address = raw.gpuAddress();
+        self.set.addAllocation(ProtocolObject::<dyn MTLAllocation>::from_ref(&*raw));
+        self.dirty.set(true);
+        Ok((Rc::new(GpuBuffer { raw, address, residency: self.clone() }), inner))
     }
 
     fn remove(&self, raw: &ProtocolObject<dyn MTLBuffer>) {

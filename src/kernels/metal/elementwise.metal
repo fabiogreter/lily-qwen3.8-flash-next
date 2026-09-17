@@ -9,6 +9,25 @@ kernel void copy_u32(device const uint* src [[buffer(0)]],
     dst[gid] = src[gid];
 }
 
+// XOR of every word of `src` into out[0] (one atomic per simdgroup): a
+// read-bandwidth probe that touches every byte.
+kernel void checksum_u32(device const uint4* src   [[buffer(0)]],
+                         device atomic_uint* out   [[buffer(1)]],
+                         constant uint&      n4    [[buffer(2)]],
+                         uint gid  [[thread_position_in_grid]],
+                         uint grid [[threads_per_grid]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+    uint acc = 0u;
+    for (uint i = gid; i < n4; i += grid) {
+        const uint4 v = src[i];
+        acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    acc = simd_xor(acc);
+    if (lane == 0) {
+        atomic_fetch_xor_explicit(out, acc, memory_order_relaxed);
+    }
+}
+
 kernel void add_bf16(device const bfloat* a   [[buffer(0)]],
                      device const bfloat* b   [[buffer(1)]],
                      device bfloat*       out [[buffer(2)]],

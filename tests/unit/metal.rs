@@ -612,6 +612,86 @@ fn blocking_wait_latency() {
     );
 }
 
+/// Read bandwidth of the GPU over a file-mapped buffer, cold and warm:
+/// `LILY_MAP_PROBE_FILE` names a large file (evict its pages first, e.g.
+/// with a locked memory balloon), and the test maps it, reads every byte
+/// twice through the checksum kernel and prints GB/s for each pass.
+/// `cargo test --release -- --ignored --nocapture mapped_buffer_read_bandwidth`.
+#[test]
+#[ignore = "bandwidth probe; needs LILY_MAP_PROBE_FILE"]
+fn mapped_buffer_read_bandwidth() {
+    let path = std::env::var("LILY_MAP_PROBE_FILE").expect("LILY_MAP_PROBE_FILE");
+    let len = std::fs::metadata(&path).expect("file").len() as usize;
+    let ctx = MetalContext::new().expect("metal context");
+    let (buf, inner) = ctx.new_buffer_mapped(std::path::Path::new(&path), 0, len).expect("map");
+    assert_eq!(inner, 0);
+    let src = Tensor::from_buffer(buf, &[len / 4], DType::U32).expect("tensor");
+    let out = Tensor::zeros(&ctx, &[1], DType::U32).expect("out");
+    for pass_name in ["cold", "warm", "warm"] {
+        let t0 = Instant::now();
+        let pass = ctx.begin().expect("pass");
+        crate::kernels::elementwise::checksum_words(&ctx, &pass, &src, &out).expect("checksum");
+        pass.commit_wait().expect("commit");
+        let secs = t0.elapsed().as_secs_f64();
+        eprintln!(
+            "{pass_name}: {:.2} GB in {:.3} s = {:.1} GB/s (checksum {:08x})",
+            len as f64 / 1e9,
+            secs,
+            len as f64 / secs / 1e9,
+            out.to_u32().expect("out")[0]
+        );
+    }
+}
+
+/// Like `mapped_buffer_read_bandwidth`, but reading 64 slices of
+/// `LILY_MAP_PROBE_SLICE` bytes (default 2.8 MB, one expert's three
+/// projections) at pseudo-random offsets: the access pattern of expert
+/// weights served from disk. Prints GB/s cold and warm.
+#[test]
+#[ignore = "bandwidth probe; needs LILY_MAP_PROBE_FILE"]
+fn mapped_buffer_random_slice_bandwidth() {
+    let path = std::env::var("LILY_MAP_PROBE_FILE").expect("LILY_MAP_PROBE_FILE");
+    let slice: usize = std::env::var("LILY_MAP_PROBE_SLICE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2_800_000);
+    let slice = slice.next_multiple_of(16);
+    let len = std::fs::metadata(&path).expect("file").len() as usize;
+    let ctx = MetalContext::new().expect("metal context");
+    let (buf, _) = ctx.new_buffer_mapped(std::path::Path::new(&path), 0, len).expect("map");
+    let src = Tensor::from_buffer(buf, &[len / 4], DType::U32).expect("tensor");
+    let out = Tensor::zeros(&ctx, &[1], DType::U32).expect("out");
+    let n = 64usize;
+    let mut seed = 0x9e3779b97f4a7c15u64;
+    let offsets: Vec<usize> = (0..n)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            ((seed as usize) % ((len - slice) / 16)) * 16
+        })
+        .collect();
+    for pass_name in ["cold", "warm"] {
+        let t0 = Instant::now();
+        let pass = ctx.begin().expect("pass");
+        for &off in &offsets {
+            let view = src.view(off / 4, &[slice / 4]).expect("view");
+            crate::kernels::elementwise::checksum_words(&ctx, &pass, &view, &out)
+                .expect("checksum");
+        }
+        pass.commit_wait().expect("commit");
+        let secs = t0.elapsed().as_secs_f64();
+        let bytes = (n * slice) as f64;
+        eprintln!(
+            "{pass_name}: {n} slices of {:.2} MB in {:.3} s = {:.2} GB/s, {:.1} ms per slice",
+            slice as f64 / 1e6,
+            secs,
+            bytes / secs / 1e9,
+            secs * 1e3 / n as f64
+        );
+    }
+}
+
 #[test]
 fn injected_fault_fails_the_next_submission_and_is_reported() {
     let ctx = MetalContext::new().expect("metal context");
