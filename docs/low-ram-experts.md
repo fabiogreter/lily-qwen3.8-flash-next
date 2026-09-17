@@ -109,6 +109,28 @@ prompt, against 2 100 and 86 here: a 2x prefill and 1.6x decode cost,
 not a cliff. The initial fill of 45 GB takes about 20 s from the page
 cache and would take the SSD's 10 to 15 s cold.
 
+### Prefill chunks of 8 192 tokens
+
+`LILY_PREFILL_CHUNK=8192` (a per-model value now, `Qwen4ExpModel::
+set_prefill_chunk`) halves the cold-expert traffic per prefilled token:
+cold under the balloon, 1 161 tok/s prefill and 59.9 tok/s plain decode
+against 945 and 54.4 at 4 096, the initial fill 5 s on 16 threads. The
+4-layer differential test (`prefill_chunk_8192_matches_4096`) finds
+prefill and twelve decode steps bit-identical at both sizes, and on the
+full model the two sizes agree exactly under the per-query attention
+route; under the tile route they differ by the unions' grouping (the
+same rounding class as tile against split, top tokens unchanged, draft
+acceptance 67.7% against 71.1% over six prompts, two up and four down).
+It is not the default under the cache yet: with the balloon at 60 GB,
+the 45 GB slab, the scratch and a 32 GB n-gram preload the machine was
+far past its memory, and there the 8 192 runs produced a deterministic
+but timing-dependent digest that the warm runs and the 4 096 runs did
+not (all of those match the resident path exactly); the drift starts at
+token 26 and stays plausible text, so it reads as GPU buffers being
+paged under extreme pressure rather than a data race in the cache (a
+re-read check on the routed ids found no stale reads). A run on a real
+64 GB machine, without the preload, is what settles it.
+
 ### What would move it further
 
 - **Decode misses** cost a cold region read per resolution (about 0.35

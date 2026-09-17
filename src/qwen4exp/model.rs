@@ -335,6 +335,11 @@ pub struct Qwen4ExpModel {
     gdn_scale: f32,
     gdn_gate: GdnGate,
     pub(super) hasher: Option<NgramHasher>,
+    /// Prompt tokens per batched prefill pass: `PREFILL_CHUNK`, or what
+    /// `LILY_PREFILL_CHUNK` says (up to twice that; under an expert cache
+    /// the larger chunk streams the cold experts half as often per token,
+    /// see docs/low-ram-experts.md for why it is not the default).
+    prefill_chunk: usize,
 }
 
 pub(super) enum LayerState {
@@ -1294,7 +1299,12 @@ impl Qwen4ExpModel {
         };
         let attn_scale = 1.0 / (config.head_dim as f32).sqrt();
         let gdn_scale = 1.0 / (config.linear_key_head_dim as f32).sqrt();
-        Ok(Self { config, weights, attn_scale, gdn_scale, gdn_gate, hasher })
+        let prefill_chunk = std::env::var("LILY_PREFILL_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|c| c.is_power_of_two() && (256..=PREFILL_CHUNK * 2).contains(c))
+            .unwrap_or(PREFILL_CHUNK);
+        Ok(Self { config, weights, attn_scale, gdn_scale, gdn_gate, hasher, prefill_chunk })
     }
 
     /// Runs the vision tower over one preprocessed image and returns its
@@ -1501,6 +1511,23 @@ impl Qwen4ExpModel {
         scratch.expert_log.as_ref()
     }
 
+    /// Prompt tokens per batched prefill pass (see `prefill_chunk`).
+    pub fn prefill_chunk(&self) -> usize {
+        self.prefill_chunk
+    }
+
+    /// Sets the prompt tokens per batched prefill pass (a power of two up
+    /// to twice `PREFILL_CHUNK`; for measurement and tests).
+    pub fn set_prefill_chunk(&mut self, chunk: usize) -> Result<()> {
+        ensure!(
+            chunk.is_power_of_two() && (256..=PREFILL_CHUNK * 2).contains(&chunk),
+            "prefill chunk {chunk}: a power of two from 256 to {}",
+            PREFILL_CHUNK * 2
+        );
+        self.prefill_chunk = chunk;
+        Ok(())
+    }
+
     /// Distinct expert lookups and misses of the expert cache so far
     /// (`None` without a cache).
     pub fn expert_cache_stats(&self) -> Option<(u64, u64)> {
@@ -1617,10 +1644,10 @@ impl Qwen4ExpModel {
         s: &mut Scratch,
         needed: usize,
     ) -> Result<()> {
-        let needed = needed.min(PREFILL_CHUNK);
+        let needed = needed.min(self.prefill_chunk);
         let have = s.prefill.as_ref().map_or(0, |p| p.m);
         if have < needed {
-            let target = needed.next_power_of_two().min(PREFILL_CHUNK);
+            let target = needed.next_power_of_two().min(self.prefill_chunk);
             s.prefill = None;
             s.prefill = Some(PrefillScratch::new(
                 ctx,
@@ -1750,7 +1777,7 @@ impl Qwen4ExpModel {
         let ratio = self.config.indexer.compress_ratio;
         let mut remaining = tokens.len();
         let profile = std::env::var_os("LILY_PROFILE").is_some();
-        for chunk in tokens.chunks(PREFILL_CHUNK) {
+        for chunk in tokens.chunks(self.prefill_chunk) {
             let ps = capacity.chunk(chunk)?;
             if let (Some(w), Some(p), Some(pst)) = (ple_w, &ps.ple, &state.ple) {
                 self.stage_ngram(w, p, chunk, pst.hist)?;

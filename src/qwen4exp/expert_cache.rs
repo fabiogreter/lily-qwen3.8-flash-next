@@ -55,6 +55,7 @@ struct Service {
     stop: AtomicBool,
     lookups: AtomicU64,
     misses: AtomicU64,
+    stale: AtomicU64,
 }
 
 /// What a cached layer's `MoeWeights` holds: the events of the protocol
@@ -157,6 +158,7 @@ impl ExpertCache {
                 stop: AtomicBool::new(false),
                 lookups: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
+                stale: AtomicU64::new(0),
             }),
         });
         Ok(Self {
@@ -278,8 +280,9 @@ impl Drop for ExpertCache {
         let (lookups, misses) = self.link.stats();
         if lookups > 0 {
             eprintln!(
-                "expert cache: {lookups} distinct expert lookups, {misses} misses ({:.2}%)",
-                100.0 * misses as f64 / lookups as f64
+                "expert cache: {lookups} distinct expert lookups, {misses} misses ({:.2}%), {} stale reads",
+                100.0 * misses as f64 / lookups as f64,
+                self.link.service.stale.load(Ordering::Relaxed)
             );
         }
         self.link.service.stop.store(true, Ordering::Release);
@@ -375,6 +378,7 @@ fn serve(
 ) {
     let mut ids: Vec<u32> = Vec::new();
     let mut misses: Vec<(u32, usize, usize)> = Vec::new();
+    let debug = std::env::var_os("LILY_EXPERT_CACHE_DEBUG").is_some();
     loop {
         let request = {
             let mut queue = service.requests.lock().unwrap_or_else(|e| e.into_inner());
@@ -409,6 +413,27 @@ fn serve(
         };
         ids.clear();
         ids.extend_from_slice(routed_ids);
+        if debug {
+            // Visibility check: the ids must not change once the signal
+            // was seen.
+            let first: Vec<u32> = ids.clone();
+            let until = std::time::Instant::now() + std::time::Duration::from_micros(300);
+            while std::time::Instant::now() < until {
+                std::hint::spin_loop();
+            }
+            std::sync::atomic::fence(Ordering::SeqCst);
+            let again: Vec<u32> = routed_ids.iter().map(|p| unsafe { std::ptr::read_volatile(p) }).collect();
+            if first != again {
+                let changed = first.iter().zip(&again).filter(|(a, b)| a != b).count();
+                service.stale.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "expert cache: seq {} layer {}: {changed} of {} ids changed after the signal",
+                    request.seq, request.layer, again.len()
+                );
+                ids.clear();
+                ids.extend_from_slice(&again);
+            }
+        }
         ids.sort_unstable();
         ids.dedup();
         service.lookups.fetch_add(ids.len() as u64, Ordering::Relaxed);
