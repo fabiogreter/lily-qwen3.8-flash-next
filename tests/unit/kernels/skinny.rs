@@ -744,6 +744,45 @@ fn gemm_skinny_q8_matches_reference() {
 /// GEMV. Streams 64 weight sets per shape (past the SLC) and prints µs per
 /// dispatch and the weight bandwidth for m = 1..4, on the model's attention
 /// and GDN projection shapes. Run with
+/// Random affine weights at `bits` (4 or 8) for timing; no CPU dequant.
+fn random_quant_bits(
+    ctx: &MetalContext,
+    rng: &mut StdRng,
+    n: usize,
+    k: usize,
+    gs: usize,
+    bits: usize,
+) -> QuantWeights {
+    let words = k * bits / 32;
+    let groups = k / gs;
+    let codes: Vec<u32> = (0..n * words).map(|_| rng.r#gen()).collect();
+    let bf = |v: Vec<f32>| -> Vec<bf16> { v.into_iter().map(bf16::from_f32).collect() };
+    let scales = bf((0..n * groups).map(|_| rng.gen_range(0.001f32..0.05)).collect());
+    let biases = bf((0..n * groups).map(|_| rng.gen_range(-2.0f32..0.0)).collect());
+    let upload = |v: &[bf16]| {
+        Tensor::from_bytes(ctx, bytemuck::cast_slice(v), &[n, groups], DType::BF16)
+            .expect("bf16")
+    };
+    QuantWeights {
+        codes: Tensor::from_bytes(
+            ctx,
+            bytemuck::cast_slice(&codes),
+            &[n, words],
+            DType::U32,
+        )
+        .expect("codes"),
+        scales: upload(&scales),
+        biases: upload(&biases),
+        group_size: gs,
+        bits,
+    }
+}
+
+/// Times the decode GEMV against the one-row register-A kernel on every
+/// projection shape a Qwen3.8-Flash-Next decode step dispatches through
+/// `gemv_quant` (Q4 unless noted; the LM head writes f32), plus register-A
+/// at 2 to 4 rows. Weight sets rotate so the weights stream from memory
+/// rather than the last-level cache, as in a decode step.
 /// `cargo test --release -- --ignored --nocapture skinny_reg_vs_gemv_timing`.
 #[test]
 #[ignore = "timing only"]
@@ -751,20 +790,29 @@ fn skinny_reg_vs_gemv_timing() {
     use crate::kernels::quant::gemv_quant;
     let ctx = MetalContext::new().expect("metal context");
     let mut rng = StdRng::seed_from_u64(61);
-    let iters = 256;
-    for (n, k, what) in [
-        (2560usize, 2560usize, "square projection"),
-        (2560, 6144, "out_proj (wide K)"),
-        (7680, 2560, "stacked qkv-like (wide N)"),
+    let iters = 128;
+    for (bits, n, k, f32_out, what) in [
+        (4usize, 248320usize, 2560usize, true, "lm_head"),
+        (4, 16480, 2560, false, "gdn in_proj"),
+        (4, 2560, 6144, false, "gdn out_proj / attn o_proj"),
+        (4, 13312, 2560, false, "attn qkv_proj"),
+        (4, 1280, 2560, false, "shared gate_up"),
+        (4, 2560, 640, false, "shared down"),
+        (8, 512, 2560, false, "moe gate (q8)"),
+        (8, 640, 2560, false, "indexer qk_proj (q8)"),
+        (8, 10240, 2560, false, "ple key_proj (q8)"),
+        (8, 2560, 2560, false, "ple value_proj / mtp fc (q8)"),
+        (8, 1, 2560, false, "shared_expert_gate (q8)"),
     ] {
-        let bytes = n * k / 2 + 2 * n * (k / GROUP_SIZE) * 2;
-        let sets = (64usize * 3_300_000 / bytes).clamp(8, 64);
+        let bytes = n * k * bits / 8 + 2 * n * (k / GROUP_SIZE) * 2;
+        let sets = (256usize << 20).div_ceil(bytes).clamp(1, 64);
         let weights: Vec<QuantWeights> = (0..sets)
-            .map(|_| random_quant(&ctx, &mut rng, n, k, GROUP_SIZE).0)
+            .map(|_| random_quant_bits(&ctx, &mut rng, n, k, GROUP_SIZE, bits))
             .collect();
+        let out = if f32_out { DType::F32 } else { DType::BF16 };
         let x =
             Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, k), &[k]).expect("x");
-        let y = Tensor::zeros(&ctx, &[n], DType::BF16).expect("y");
+        let y = Tensor::zeros(&ctx, &[n], out).expect("y");
         let time = |name: &str, f: &dyn Fn(&ComputePass<'_>, &QuantWeights)| {
             let mut best = f64::MAX;
             for _ in 0..3 {
@@ -784,13 +832,18 @@ fn skinny_reg_vs_gemv_timing() {
         time("decode GEMV (m = 1)", &|pass, w| {
             gemv_quant(&ctx, pass, w, &x, &y).unwrap()
         });
-        for m in 1..=4usize {
+        let rows = if f32_out { 1 } else { 4 };
+        for m in 1..=rows {
             let a =
                 Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, m * k), &[m, k])
                     .expect("a");
-            let c = Tensor::zeros(&ctx, &[m, n], DType::BF16).expect("c");
+            let c = Tensor::zeros(&ctx, &[m, n], out).expect("c");
             time(&format!("register-A skinny (m = {m})"), &|pass, w| {
-                gemm_skinny_q4_nt(&ctx, pass, &a, w, &c).unwrap()
+                if bits == 4 {
+                    gemm_skinny_q4_nt(&ctx, pass, &a, w, &c).unwrap()
+                } else {
+                    gemm_skinny_q8_nt(&ctx, pass, &a, w, &c).unwrap()
+                }
             });
         }
     }

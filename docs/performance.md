@@ -96,8 +96,13 @@ figures are lower bounds.
 Speculative decoding changes no output: every emitted token is the trunk's
 own draw and the draft count changes only how many rows a pass confirms.
 Sampling with temperature accepts fewer drafts than greedy decoding, because
-the draft head proposes with argmax; that rate has not been measured as a
-number.
+the draft head proposes with argmax. Measured with `lily-bench --sample`
+(the checkpoint's defaults: temperature 1.0, top-k 20, top-p 0.95) on the
+8K synthetic prompt over 256 tokens with 2 drafts: 73% accepted greedily
+(2.46 tokens per step, reproducible to the digest) against 60%, 55% and 65%
+for three sampler seeds (2.10 to 2.31 tokens per step), so the server's
+default sampling gives up about 10% of the speculative rate to the greedy
+draft head.
 
 ### Against mlx-lm
 
@@ -174,7 +179,13 @@ estimate with its assumption named.
    ms (the Q8 one from 1.41 to 1.14), about 5% of the pass, so most of the
    gap is elsewhere in the pass. Splitting each stream of the
    hyper-connection down kernels over two simdgroups was measured slower
-   (9.2 to 9.8 us at one row, 12.8 to 14.2 at three) and not kept.
+   (9.2 to 9.8 us at one row, 12.8 to 14.2 at three) and not kept. Routing
+   the decode step's own matvecs through the one-row register-A kernel was
+   measured in the profiled 8K step and not kept either: the 192 dense Q4
+   projections took 4.08 to 4.12 ms against 3.90 to 4.07 with the packed
+   GEMV and the 96 Q8 router matvecs 0.64 against 0.50 to 0.52, although in
+   isolation the routers had streamed three times faster through it (the
+   `skinny_reg_vs_gemv_timing` test now covers every decode shape).
 3. **The sparse-attention occupancy parameter at decode.** Measured: with a
    512-block budget and a 256-token split the decode dispatch is 18
    threadgroups on a 40-core GPU, 134 us per call at 31 GB/s; with block
