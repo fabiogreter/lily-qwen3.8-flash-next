@@ -722,13 +722,17 @@ kernel void moe_scatter_slots(device const uint*  indices   [[buffer(0)]],  // [
 }
 
 // Builds grouped-GEMM blocks; T must match the offset scan.
+// `slot_of` (with REMAP) maps an expert to the slot of an expert cache
+// whose rows the grouped GEMM reads instead of the expert's own.
 kernel void moe_build_blocks(device const uint* offsets      [[buffer(0)]],  // [E+1]
                              device const uint* tile_offsets [[buffer(1)]],  // [E+1]
                              device uint4*      blocks       [[buffer(2)]],
-                             constant uint&     E            [[buffer(3)]],
-                             constant uint&     N_PER        [[buffer(4)]],
-                             constant uint&     T            [[buffer(5)]],
-                             constant uint&     ORDER        [[buffer(6)]],
+                             device const uint* slot_of      [[buffer(3)]],  // [E]
+                             constant uint&     E            [[buffer(4)]],
+                             constant uint&     N_PER        [[buffer(5)]],
+                             constant uint&     T            [[buffer(6)]],
+                             constant uint&     ORDER        [[buffer(7)]],
+                             constant uint&     REMAP        [[buffer(8)]],
                              uint2 gid [[thread_position_in_grid]]) {
     const uint t = gid.x;
     const uint n_tile = gid.y;
@@ -757,8 +761,20 @@ kernel void moe_build_blocks(device const uint* offsets      [[buffer(0)]],  // 
         out = (ulong)tile_offsets[e] * n_tiles
             + (ulong)n_tile * expert_tiles + tile_in_e;
     }
+    const uint rows_of = REMAP != 0 ? slot_of[e] : e;
     blocks[out] = uint4(offsets[e] + tile_in_e * T,
-                        e * N_PER + n_tile * 64,
+                        rows_of * N_PER + n_tile * 64,
                         n_tile * 64,
                         offsets[e + 1]);
+}
+
+// slots[i] = slot_of[indices[i]]: routed expert ids to expert-cache slots.
+kernel void moe_remap_slots(device const uint* indices [[buffer(0)]],
+                            device const uint* slot_of [[buffer(1)]],
+                            device uint*       slots   [[buffer(2)]],
+                            constant uint&     n       [[buffer(3)]],
+                            uint gid [[thread_position_in_grid]]) {
+    if (gid < n) {
+        slots[gid] = slot_of[indices[gid]];
+    }
 }

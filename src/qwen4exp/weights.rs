@@ -13,6 +13,7 @@ use anyhow::{Result, ensure};
 use crate::metal::MetalContext;
 use crate::safetensors::Checkpoint;
 use crate::tensor::Tensor;
+use super::expert_cache::ExpertCache;
 use crate::weights::{LinearWeights, Loader, MlpWeights, MoeWeights, expect_shape};
 
 use super::config::{LayerType, Qwen4ExpConfig, VISION_PREFIX};
@@ -134,6 +135,9 @@ pub struct ModelWeights {
     pub mtp: Option<Box<MtpWeights>>,
     /// The vision tower, when the checkpoint has it and the caller wanted it.
     pub vision: Option<Box<VisionWeights>>,
+    /// The expert cache when the experts are served from a slab of slots
+    /// (`LoadOptions::expert_slots`); the layers' `MoeWeights` view it.
+    pub expert_cache: Option<ExpertCache>,
 }
 
 /// The converter's storage policy: routers, gates and the small mixing
@@ -172,7 +176,7 @@ fn load_mtp(loader: &Loader<'_>, config: &Qwen4ExpConfig) -> Result<MtpWeights> 
     let attn_hc = load_hc(loader, &format!("{p}attn_hyper_connection."), config, true)?;
     let mixer_w = Mixer::Attn(Box::new(load_attn(loader, &p, config)?));
     let mlp_hc = load_hc(loader, &format!("{p}mlp_hyper_connection."), config, true)?;
-    let ffn = load_ffn(loader, &p, config)?;
+    let ffn = load_ffn(loader, &p, config, None)?;
     let mixer = load_hc(
         loader,
         &format!("{MTP_PREFIX}hyper_connection_mixer."),
@@ -232,17 +236,34 @@ fn load_ffn(
     loader: &Loader<'_>,
     p: &str,
     config: &Qwen4ExpConfig,
+    cache: Option<(&ExpertCache, usize)>,
 ) -> Result<Box<MoeWeights>> {
     let h = config.hidden_size;
     let (e, i) = (config.num_experts, config.moe_intermediate_size);
     let gate = loader.linear(&[&format!("{p}mlp.gate")], h)?;
     gate.expect_features(e, h, "router gate")?;
-    let expert_gate = loader.linear(&[&format!("{p}mlp.experts.gate_proj")], h)?;
-    expert_gate.expect_features(e * i, h, "expert gate_proj")?;
-    let expert_up = loader.linear(&[&format!("{p}mlp.experts.up_proj")], h)?;
-    expert_up.expect_features(e * i, h, "expert up_proj")?;
-    let expert_down = loader.linear(&[&format!("{p}mlp.experts.down_proj")], i)?;
-    expert_down.expect_features(e * h, i, "expert down_proj")?;
+    let (expert_gate, expert_up, expert_down, slot_of) = match cache {
+        Some((cache, layer)) => {
+            // The layer's experts live in the cache's slab (filled by the
+            // caller); its tensors are consumed by the cache, not the loader.
+            for name in ["gate_proj", "up_proj", "down_proj"] {
+                for suffix in ["weight", "scales", "biases"] {
+                    loader.mark_consumed(&format!("{p}mlp.experts.{name}.{suffix}"));
+                }
+            }
+            let (g, u, d, t) = cache.layer_weights(layer)?;
+            (g, u, d, Some(t))
+        }
+        None => {
+            let expert_gate = loader.linear(&[&format!("{p}mlp.experts.gate_proj")], h)?;
+            expert_gate.expect_features(e * i, h, "expert gate_proj")?;
+            let expert_up = loader.linear(&[&format!("{p}mlp.experts.up_proj")], h)?;
+            expert_up.expect_features(e * i, h, "expert up_proj")?;
+            let expert_down = loader.linear(&[&format!("{p}mlp.experts.down_proj")], i)?;
+            expert_down.expect_features(e * h, i, "expert down_proj")?;
+            (expert_gate, expert_up, expert_down, None)
+        }
+    };
     let shared = load_mlp(
         loader,
         &format!("{p}mlp.shared_expert."),
@@ -256,6 +277,7 @@ fn load_ffn(
         expert_gate,
         expert_up,
         expert_down,
+        slot_of,
         shared,
         shared_gate,
     }))
@@ -458,6 +480,7 @@ pub fn load(
     storage: NgramStorage,
     with_mtp: bool,
     with_vision: bool,
+    expert_slots: Option<usize>,
 ) -> Result<ModelWeights> {
     let ckpt = Checkpoint::open(&dir)?;
     ensure!(
@@ -488,6 +511,37 @@ pub fn load(
     let final_mixer =
         load_hc(&loader, &format!("{PREFIX}hyper_connection_mixer."), config, false)?;
 
+    // The expert cache: every layer's experts in one slab of slots. Until
+    // the cache is filled by usage, it holds whole layers from the first
+    // one on (validation on machines that fit the checkpoint).
+    let expert_cache = match expert_slots {
+        Some(n_slots) => {
+            let cache = ExpertCache::new(
+                ctx,
+                n_slots,
+                config.num_hidden_layers,
+                config.num_experts,
+                config.moe_intermediate_size,
+                h,
+                config.quantization,
+            )?;
+            let ckpt = loader.checkpoint();
+            let per_layer = config.num_experts;
+            for idx in 0..config.num_hidden_layers {
+                if (idx + 1) * per_layer > n_slots {
+                    break;
+                }
+                cache.fill_layer_from_checkpoint(
+                    ckpt,
+                    &format!("{PREFIX}layers.{idx}."),
+                    idx,
+                    idx * per_layer,
+                )?;
+            }
+            Some(cache)
+        }
+        None => None,
+    };
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     for (idx, layer_type) in config.layer_types.iter().enumerate() {
         let p = format!("{PREFIX}layers.{idx}.");
@@ -509,7 +563,7 @@ pub fn load(
         };
         let mlp_hc =
             load_hc(&loader, &format!("{p}mlp_hyper_connection."), config, true)?;
-        let ffn = load_ffn(&loader, &p, config)?;
+        let ffn = load_ffn(&loader, &p, config, expert_cache.as_ref().map(|c| (c, idx)))?;
         layers.push(LayerWeights { ple, attn_hc, mixer, mlp_hc, ffn });
     }
 
@@ -523,5 +577,5 @@ pub fn load(
     };
 
     loader.finish()?;
-    Ok(ModelWeights { embed_tokens, lm_head, final_mixer, layers, mtp, vision })
+    Ok(ModelWeights { embed_tokens, lm_head, final_mixer, layers, mtp, vision, expert_cache })
 }

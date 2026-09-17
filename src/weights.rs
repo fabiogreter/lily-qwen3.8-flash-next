@@ -99,6 +99,12 @@ pub struct MoeWeights {
     pub expert_up: LinearWeights,
     /// `[E * h, inter]`.
     pub expert_down: LinearWeights,
+    /// With an expert cache (machines the experts do not fit): the three
+    /// expert stacks above are the cache's slab, shared by every layer, and
+    /// this `U32 [E]` table maps the layer's expert ids to slab slots
+    /// (`ExpertCache::NONE` for experts not resident). `None`: the stacks
+    /// are the layer's own experts.
+    pub slot_of: Option<Tensor>,
     pub shared: MlpWeights,
     /// `[1, h]`, sigmoid-gating the shared expert's output.
     pub shared_gate: LinearWeights,

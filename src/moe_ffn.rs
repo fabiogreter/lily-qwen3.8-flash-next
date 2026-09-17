@@ -115,6 +115,9 @@ pub(crate) fn project_mat(
 pub(crate) struct MoeScratch {
     pub router_logits: Tensor,
     pub indices: Tensor,
+    /// The routed ids as expert-cache slots (`MoeWeights::slot_of`); aliases
+    /// `indices` when the experts are resident.
+    pub slots: Tensor,
     pub scores: Tensor,
     pub act: Tensor,
     pub shared_out: Tensor,
@@ -128,6 +131,7 @@ impl MoeScratch {
         Ok(Self {
             router_logits: Tensor::zeros(ctx, &[e], DType::F32)?,
             indices: Tensor::zeros(ctx, &[k], DType::U32)?,
+            slots: Tensor::zeros(ctx, &[k], DType::U32)?,
             scores: Tensor::zeros(ctx, &[k], DType::F32)?,
             act: Tensor::zeros(ctx, &[k, i], DType::BF16)?,
             shared_out: Tensor::zeros(ctx, &[h], DType::BF16)?,
@@ -144,6 +148,9 @@ pub(crate) struct PrefillMoeScratch {
     pub shared_out: Tensor,
     pub shared_gate: Tensor,
     pub indices: Tensor,
+    /// The routed ids as expert-cache slots for the small-m kernels
+    /// (`MoeWeights::slot_of`; the grouped route remaps in its block map).
+    pub slots: Tensor,
     pub scores: Tensor,
     pub counts: Tensor,
     pub cursors: Tensor,
@@ -206,6 +213,7 @@ impl PrefillMoeScratch {
             shared_out: Tensor::zeros(ctx, &[m, h], bf)?,
             shared_gate: Tensor::zeros(ctx, &[m], bf)?,
             indices: Tensor::zeros(ctx, &[m, k], u32t)?,
+            slots: Tensor::zeros(ctx, &[m, k], u32t)?,
             scores: Tensor::zeros(ctx, &[m, k], DType::F32)?,
             counts: Tensor::zeros(ctx, &[e], u32t)?,
             cursors: Tensor::zeros(ctx, &[e], u32t)?,
@@ -254,6 +262,7 @@ impl PrefillMoeScratch {
             shared_out: prefix_rows(&self.shared_out, m)?,
             shared_gate: prefix_rows(&self.shared_gate, m)?,
             indices: prefix_rows(&self.indices, m)?,
+            slots: prefix_rows(&self.slots, m)?,
             scores: prefix_rows(&self.scores, m)?,
             counts: self.counts.view(0, self.counts.shape())?,
             cursors: self.cursors.view(0, self.cursors.shape())?,
@@ -375,6 +384,14 @@ pub(crate) fn prefill_moe(
         None => silu_mul_bf16(ctx, pass, io.mlp_gate, io.mlp_up, io.mlp_act)?,
     }
     pass.level_barrier(&[&ms.indices, &ms.scores, io.mlp_act])?;
+    let slots = match &moe_w.slot_of {
+        Some(table) => {
+            moe::moe_remap_slots(ctx, pass, &ms.indices, table, &ms.slots, s_slots)?;
+            pass.level_barrier(&[&ms.slots])?;
+            &ms.slots
+        }
+        None => &ms.indices,
+    };
     project_mat(ctx, pass, io.mlp_act, &shared.down_proj, &ms.shared_out, io.dequant)?;
 
     let tile = match ms.route {
@@ -397,7 +414,7 @@ pub(crate) fn prefill_moe(
                 &moe_w.expert_up,
                 inter,
                 io.x,
-                &ms.indices,
+                slots,
                 &ms.ea,
                 top_k,
             )?;
@@ -408,7 +425,7 @@ pub(crate) fn prefill_moe(
                 &moe_w.expert_down,
                 h,
                 &ms.ea,
-                &ms.indices,
+                slots,
                 &ms.scores,
                 &ms.shared_out,
                 &ms.shared_gate,
@@ -445,6 +462,7 @@ pub(crate) fn prefill_moe(
         &ms.offsets,
         &ms.tile_offsets,
         &ms.blocks_gu,
+        moe_w.slot_of.as_ref(),
         e,
         inter,
         tile.rows(),
@@ -455,6 +473,7 @@ pub(crate) fn prefill_moe(
         &ms.offsets,
         &ms.tile_offsets,
         &ms.blocks_dn,
+        moe_w.slot_of.as_ref(),
         e,
         h,
         tile.rows(),
@@ -556,6 +575,14 @@ pub(crate) fn decode_moe(
     )?;
     silu_mul_bf16(ctx, pass, io.mlp_gate, io.mlp_up, io.mlp_act)?;
     pass.level_barrier(&[&ms.indices, &ms.scores, io.mlp_act])?;
+    let slots = match &moe_w.slot_of {
+        Some(table) => {
+            moe::moe_remap_slots(ctx, pass, &ms.indices, table, &ms.slots, dims.top_k)?;
+            pass.level_barrier(&[&ms.slots])?;
+            &ms.slots
+        }
+        None => &ms.indices,
+    };
 
     moe::moe_gather_gemv_gate_up(
         ctx,
@@ -564,7 +591,7 @@ pub(crate) fn decode_moe(
         &moe_w.expert_up,
         inter,
         io.x,
-        &ms.indices,
+        slots,
         &ms.act,
     )?;
     quant::gemv_quant(ctx, pass, &shared.down_proj, io.mlp_act, &ms.shared_out)?;
@@ -576,7 +603,7 @@ pub(crate) fn decode_moe(
         &moe_w.expert_down,
         dims.hidden,
         &ms.act,
-        &ms.indices,
+        slots,
         &ms.scores,
         Some((&ms.shared_out, &ms.shared_gate)),
         io.out,

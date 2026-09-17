@@ -547,6 +547,7 @@ impl<M: LanguageModel> Engine<M> {
                 ngram_storage: options.ngram_storage,
                 mtp_drafts: options.mtp_drafts,
                 vision: options.vision,
+                expert_slots: None,
             },
         )?;
         let drafts = options.mtp_drafts.min(model.max_drafts());

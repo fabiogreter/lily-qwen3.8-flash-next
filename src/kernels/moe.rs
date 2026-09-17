@@ -528,6 +528,7 @@ pub fn moe_build_blocks(
     offsets: &Tensor,
     tile_offsets: &Tensor,
     blocks: &Tensor,
+    slot_of: Option<&Tensor>,
     num_experts: usize,
     n_per: usize,
     tile_m: usize,
@@ -539,18 +540,59 @@ pub fn moe_build_blocks(
         blocks.dtype() == DType::U32 && blocks.numel().is_multiple_of(n_tiles * 4),
         "block map must be U32 sized as tiles x {n_tiles} x uint4"
     );
+    if let Some(t) = slot_of {
+        ensure!(
+            t.numel() >= num_experts && t.dtype() == DType::U32,
+            "slot table must be U32 [E]"
+        );
+    }
     let tile_capacity = blocks.numel() / (n_tiles * 4);
     let pipeline = ctx.pipeline("moe_build_blocks", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
-        &[offsets.binding(), tile_offsets.binding(), blocks.binding()],
+        &[
+            offsets.binding(),
+            tile_offsets.binding(),
+            blocks.binding(),
+            slot_of.unwrap_or(offsets).binding(),
+        ],
         &[
             &u32_bytes(num_experts),
             &u32_bytes(n_per),
             &u32_bytes(tile_m),
             &u32_bytes(0),
+            &u32_bytes(usize::from(slot_of.is_some())),
         ],
         Grid::Threads { grid: (tile_capacity, n_tiles, 1), threadgroup: (32, 1, 1) },
+    )
+}
+
+/// `slots[i] = slot_of[indices[i]]` over `n` routed ids: the expert-cache
+/// slots the gather kernels address instead of the expert ids.
+pub fn moe_remap_slots(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    indices: &Tensor,
+    slot_of: &Tensor,
+    slots: &Tensor,
+    n: usize,
+) -> Result<()> {
+    ensure!(
+        indices.numel() >= n && slots.numel() >= n,
+        "remap of {n} ids over {} indices and {} slots",
+        indices.numel(),
+        slots.numel()
+    );
+    ensure!(
+        indices.dtype() == DType::U32 && slots.dtype() == DType::U32 && slot_of.dtype() == DType::U32,
+        "remap tensors must be U32"
+    );
+    let pipeline = ctx.pipeline("moe_remap_slots", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[indices.binding(), slot_of.binding(), slots.binding()],
+        &[&u32_bytes(n)],
+        Grid::Threads { grid: (n, 1, 1), threadgroup: (n.min(256), 1, 1) },
     )
 }
 

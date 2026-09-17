@@ -600,6 +600,7 @@ fn router_pipeline_matches_host() {
             &t_offsets,
             &t_toffsets,
             &t_blocks,
+            None,
             e,
             n_per,
             tile_m,

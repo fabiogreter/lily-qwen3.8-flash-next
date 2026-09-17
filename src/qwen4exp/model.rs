@@ -1241,7 +1241,7 @@ pub(super) struct Capture {
 
 impl Qwen4ExpModel {
     pub fn load(ctx: &MetalContext, dir: impl AsRef<Path>) -> Result<Self> {
-        Self::load_with(ctx, dir, NgramStorage::default(), true, VisionMode::Auto)
+        Self::load_with(ctx, dir, NgramStorage::default(), true, VisionMode::Auto, None)
     }
 
     /// Loads with the n-gram table `storage` of choice, the draft head when
@@ -1253,6 +1253,7 @@ impl Qwen4ExpModel {
         storage: NgramStorage,
         with_mtp: bool,
         vision: VisionMode,
+        expert_slots: Option<usize>,
     ) -> Result<Self> {
         let config = Qwen4ExpConfig::from_model_dir(&dir)?;
         ensure!(
@@ -1273,6 +1274,7 @@ impl Qwen4ExpModel {
             storage,
             with_mtp,
             vision == VisionMode::Auto,
+            expert_slots,
         )?;
         let hasher = match &config.ple {
             Some(p) => Some(NgramHasher::new(
@@ -3530,12 +3532,19 @@ impl LanguageModel for Qwen4ExpModel {
     const MODEL_ID: &'static str = "Qwen3.8-Flash-Next";
 
     fn load(ctx: &MetalContext, dir: &Path, options: &LoadOptions) -> Result<Self> {
+        // `LILY_EXPERT_SLOTS` overrides the option (measurement on machines
+        // that fit the checkpoint).
+        let expert_slots = std::env::var("LILY_EXPERT_SLOTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(options.expert_slots);
         Qwen4ExpModel::load_with(
             ctx,
             dir,
             options.ngram_storage,
             options.mtp_drafts > 0,
             options.vision,
+            expert_slots,
         )
     }
 

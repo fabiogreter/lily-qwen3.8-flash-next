@@ -5,6 +5,8 @@
 //! Attention on top.
 
 pub mod config;
+pub mod expert_cache;
+pub mod expert_store;
 pub mod image;
 pub mod model;
 pub mod ngram;

@@ -178,6 +178,10 @@ pub struct LoadOptions {
     pub mtp_drafts: usize,
     /// Whether to load the vision tower when the checkpoint has one.
     pub vision: VisionMode,
+    /// Routed experts kept on the GPU at once, for machines that cannot hold
+    /// them all (`docs/low-ram-experts.md`); `None` loads every expert as
+    /// its layer's own stack. `LILY_EXPERT_SLOTS` overrides it.
+    pub expert_slots: Option<usize>,
 }
 
 /// Which draw a decode pass ends with.
