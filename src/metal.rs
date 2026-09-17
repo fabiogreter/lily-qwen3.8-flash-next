@@ -779,6 +779,12 @@ pub struct SharedEvent {
     event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
 }
 
+// SAFETY: MTLSharedEvent is documented as safe to signal and wait on from
+// any thread (that is what a shared event is for); the handle holds nothing
+// else.
+unsafe impl Send for SharedEvent {}
+unsafe impl Sync for SharedEvent {}
+
 impl SharedEvent {
     fn new(device: &ProtocolObject<dyn MTLDevice>) -> Result<Self> {
         let event = device
@@ -795,6 +801,12 @@ impl SharedEvent {
 
     pub fn signaled_value(&self) -> u64 {
         self.event.signaledValue()
+    }
+
+    /// Blocks until the counter reaches `value` or `timeout_ms` passes;
+    /// true when it did.
+    pub fn wait_until(&self, value: u64, timeout_ms: u64) -> bool {
+        self.event.waitUntilSignaledValue_timeoutMS(value, timeout_ms)
     }
 
     /// Releases every pending and future wait, for error paths that would

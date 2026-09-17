@@ -13,7 +13,12 @@ use anyhow::{Result, ensure};
 use crate::metal::MetalContext;
 use crate::safetensors::Checkpoint;
 use crate::tensor::Tensor;
+use std::path::PathBuf;
+
+use anyhow::Context as _;
+
 use super::expert_cache::ExpertCache;
+use super::expert_store::{ExpertStore, SlotPolicy, UsageRanking};
 use crate::weights::{LinearWeights, Loader, MlpWeights, MoeWeights, expect_shape};
 
 use super::config::{LayerType, Qwen4ExpConfig, VISION_PREFIX};
@@ -242,7 +247,7 @@ fn load_ffn(
     let (e, i) = (config.num_experts, config.moe_intermediate_size);
     let gate = loader.linear(&[&format!("{p}mlp.gate")], h)?;
     gate.expect_features(e, h, "router gate")?;
-    let (expert_gate, expert_up, expert_down, slot_of) = match cache {
+    let (expert_gate, expert_up, expert_down, slot_of, cache_link) = match cache {
         Some((cache, layer)) => {
             // The layer's experts live in the cache's slab (filled by the
             // caller); its tensors are consumed by the cache, not the loader.
@@ -252,7 +257,7 @@ fn load_ffn(
                 }
             }
             let (g, u, d, t) = cache.layer_weights(layer)?;
-            (g, u, d, Some(t))
+            (g, u, d, Some(t), Some((cache.link(), layer)))
         }
         None => {
             let expert_gate = loader.linear(&[&format!("{p}mlp.experts.gate_proj")], h)?;
@@ -261,7 +266,7 @@ fn load_ffn(
             expert_up.expect_features(e * i, h, "expert up_proj")?;
             let expert_down = loader.linear(&[&format!("{p}mlp.experts.down_proj")], i)?;
             expert_down.expect_features(e * h, i, "expert down_proj")?;
-            (expert_gate, expert_up, expert_down, None)
+            (expert_gate, expert_up, expert_down, None, None)
         }
     };
     let shared = load_mlp(
@@ -278,6 +283,7 @@ fn load_ffn(
         expert_up,
         expert_down,
         slot_of,
+        cache: cache_link,
         shared,
         shared_gate,
     }))
@@ -481,6 +487,7 @@ pub fn load(
     with_mtp: bool,
     with_vision: bool,
     expert_slots: Option<usize>,
+    expert_usage: Option<PathBuf>,
 ) -> Result<ModelWeights> {
     let ckpt = Checkpoint::open(&dir)?;
     ensure!(
@@ -511,33 +518,52 @@ pub fn load(
     let final_mixer =
         load_hc(&loader, &format!("{PREFIX}hyper_connection_mixer."), config, false)?;
 
-    // The expert cache: every layer's experts in one slab of slots. Until
-    // the cache is filled by usage, it holds whole layers from the first
-    // one on (validation on machines that fit the checkpoint).
+    // The expert cache: every layer's experts served from one slab of
+    // slots, placed by the usage ranking next to the checkpoint (or the
+    // one named), uniform without one.
     let expert_cache = match expert_slots {
         Some(n_slots) => {
-            let cache = ExpertCache::new(
+            let (layers, e) = (config.num_hidden_layers, config.num_experts);
+            let store = ExpertStore::open(loader.checkpoint(), config)?;
+            let usage = expert_usage.or_else(|| {
+                let next_to_it = dir.as_ref().join("expert-usage.json");
+                next_to_it.exists().then_some(next_to_it)
+            });
+            let ranking = match &usage {
+                Some(path) => UsageRanking::load(path)
+                    .with_context(|| format!("expert usage {}", path.display()))?,
+                None => UsageRanking::uniform(layers, e),
+            };
+            ensure!(
+                n_slots >= 2 * e,
+                "an expert cache needs at least {} slots (two layers' worth), got {n_slots}",
+                2 * e
+            );
+            // The LRU region must hold a whole layer's routing (prefill
+            // routes every expert of a layer) plus a decode step's.
+            // `LILY_EXPERT_LRU_SHARE` overrides the share for measurement.
+            let lru_share = std::env::var("LILY_EXPERT_LRU_SHARE")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.1)
+                .max((e + 64) as f64 / n_slots as f64)
+                .min(0.5);
+            let policy = SlotPolicy::new(n_slots, layers, e, &ranking, lru_share)?;
+            let mut cache = ExpertCache::new(
                 ctx,
                 n_slots,
-                config.num_hidden_layers,
-                config.num_experts,
+                layers,
+                e,
                 config.moe_intermediate_size,
                 h,
                 config.quantization,
             )?;
-            let ckpt = loader.checkpoint();
-            let per_layer = config.num_experts;
-            for idx in 0..config.num_hidden_layers {
-                if (idx + 1) * per_layer > n_slots {
-                    break;
-                }
-                cache.fill_layer_from_checkpoint(
-                    ckpt,
-                    &format!("{PREFIX}layers.{idx}."),
-                    idx,
-                    idx * per_layer,
-                )?;
-            }
+            eprintln!(
+                "expert cache: {n_slots} slots for {} experts, usage {}",
+                layers * e,
+                usage.as_ref().map_or("uniform".to_string(), |p| p.display().to_string())
+            );
+            cache.fill_and_serve(store, policy)?;
             Some(cache)
         }
         None => None,

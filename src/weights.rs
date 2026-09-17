@@ -105,6 +105,9 @@ pub struct MoeWeights {
     /// (`ExpertCache::NONE` for experts not resident). `None`: the stacks
     /// are the layer's own experts.
     pub slot_of: Option<Tensor>,
+    /// With a served cache: the protocol handle and this layer's index, so
+    /// a pass can have misses resolved before it reads the slab.
+    pub cache: Option<(std::rc::Rc<crate::qwen4exp::expert_cache::ExpertCacheLink>, usize)>,
     pub shared: MlpWeights,
     /// `[1, h]`, sigmoid-gating the shared expert's output.
     pub shared_gate: LinearWeights,

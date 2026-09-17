@@ -386,6 +386,7 @@ pub(crate) fn prefill_moe(
     pass.level_barrier(&[&ms.indices, &ms.scores, io.mlp_act])?;
     let slots = match &moe_w.slot_of {
         Some(table) => {
+            resolve_experts(pass, moe_w, &ms.indices, s_slots)?;
             moe::moe_remap_slots(ctx, pass, &ms.indices, table, &ms.slots, s_slots)?;
             pass.level_barrier(&[&ms.slots])?;
             &ms.slots
@@ -524,6 +525,25 @@ pub(crate) fn prefill_moe(
     moe::moe_row_gate_add(ctx, pass, &ms.shared_out, &ms.shared_gate, io.out)
 }
 
+/// With a served expert cache: has the routed ids in `indices` (`count`
+/// of them, written by the router) resolved into slots before the pass
+/// goes on. The pass signals the cache's `routed` event once the router
+/// is done and waits on `ready` for the same sequence number; the service
+/// thread loads the missing experts in between (`expert_cache`).
+fn resolve_experts(
+    pass: &ComputePass<'_>,
+    moe_w: &MoeWeights,
+    indices: &Tensor,
+    count: usize,
+) -> Result<()> {
+    if let Some((link, layer)) = &moe_w.cache {
+        let seq = link.enqueue(*layer, indices, count);
+        pass.signal_event(&link.routed, seq)?;
+        pass.wait_event(&link.ready, seq)?;
+    }
+    Ok(())
+}
+
 /// The single-token tensors the decode FFN reads and writes.
 pub(crate) struct DecodeMoeIo<'a> {
     /// `[h]` FFN input.
@@ -577,6 +597,7 @@ pub(crate) fn decode_moe(
     pass.level_barrier(&[&ms.indices, &ms.scores, io.mlp_act])?;
     let slots = match &moe_w.slot_of {
         Some(table) => {
+            resolve_experts(pass, moe_w, &ms.indices, dims.top_k)?;
             moe::moe_remap_slots(ctx, pass, &ms.indices, table, &ms.slots, dims.top_k)?;
             pass.level_barrier(&[&ms.slots])?;
             &ms.slots

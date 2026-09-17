@@ -588,10 +588,12 @@ fn bench_speculative<M: LanguageModel>(
     let never_stop = |_: u32| false;
     let mut run = |steps: usize| -> Result<(f64, f64, usize, usize, Vec<u32>)> {
         let mut state = model.new_state(ctx, max_seq)?;
+        let cache_before = model.expert_cache_stats();
         let prefill_start = Instant::now();
         model.prefill(ctx, &mut state, &mut scratch, &prompt, Some(draw(0)))?;
         let first = scratch.next_token().view(0, &[1])?.to_u32()?[0];
         let prefill_secs = prefill_start.elapsed().as_secs_f64();
+        let cache_after_prefill = model.expert_cache_stats();
         let mut tokens = vec![first];
         let decode_start = Instant::now();
         let outcome = speculate(
@@ -607,6 +609,19 @@ fn bench_speculative<M: LanguageModel>(
             &mut |_| Ok(true),
         )?;
         let decode_secs = decode_start.elapsed().as_secs_f64();
+        if let (Some((l0, m0)), Some((l1, m1)), Some((l2, m2))) =
+            (cache_before, cache_after_prefill, model.expert_cache_stats())
+        {
+            eprintln!(
+                "expert cache: prefill {} misses of {} lookups ({:.1}%), decode {} of {} ({:.1}%)",
+                m1 - m0,
+                l1 - l0,
+                100.0 * (m1 - m0) as f64 / (l1 - l0).max(1) as f64,
+                m2 - m1,
+                l2 - l1,
+                100.0 * (m2 - m1) as f64 / (l2 - l1).max(1) as f64
+            );
+        }
         Ok((prefill_secs, decode_secs, outcome.drafted, outcome.accepted, tokens))
     };
     // Warm-up compiles the pipelines for every shape the loop uses.

@@ -1241,7 +1241,7 @@ pub(super) struct Capture {
 
 impl Qwen4ExpModel {
     pub fn load(ctx: &MetalContext, dir: impl AsRef<Path>) -> Result<Self> {
-        Self::load_with(ctx, dir, NgramStorage::default(), true, VisionMode::Auto, None)
+        Self::load_with(ctx, dir, NgramStorage::default(), true, VisionMode::Auto, None, None)
     }
 
     /// Loads with the n-gram table `storage` of choice, the draft head when
@@ -1254,6 +1254,7 @@ impl Qwen4ExpModel {
         with_mtp: bool,
         vision: VisionMode,
         expert_slots: Option<usize>,
+        expert_usage: Option<std::path::PathBuf>,
     ) -> Result<Self> {
         let config = Qwen4ExpConfig::from_model_dir(&dir)?;
         ensure!(
@@ -1275,6 +1276,7 @@ impl Qwen4ExpModel {
             with_mtp,
             vision == VisionMode::Auto,
             expert_slots,
+            expert_usage,
         )?;
         let hasher = match &config.ple {
             Some(p) => Some(NgramHasher::new(
@@ -1497,6 +1499,12 @@ impl Qwen4ExpModel {
     /// The routing log enabled by [`Self::enable_expert_log`].
     pub fn expert_log<'s>(&self, scratch: &'s Scratch) -> Option<&'s Tensor> {
         scratch.expert_log.as_ref()
+    }
+
+    /// Distinct expert lookups and misses of the expert cache so far
+    /// (`None` without a cache).
+    pub fn expert_cache_stats(&self) -> Option<(u64, u64)> {
+        self.weights.expert_cache.as_ref().map(|c| c.link().stats())
     }
 
     /// Experts and top-k of the routed FFN (for reading the log).
@@ -3531,6 +3539,10 @@ impl LanguageModel for Qwen4ExpModel {
 
     const MODEL_ID: &'static str = "Qwen3.8-Flash-Next";
 
+    fn expert_cache_stats(&self) -> Option<(u64, u64)> {
+        Qwen4ExpModel::expert_cache_stats(self)
+    }
+
     fn load(ctx: &MetalContext, dir: &Path, options: &LoadOptions) -> Result<Self> {
         // `LILY_EXPERT_SLOTS` overrides the option (measurement on machines
         // that fit the checkpoint).
@@ -3538,6 +3550,9 @@ impl LanguageModel for Qwen4ExpModel {
             .ok()
             .and_then(|v| v.parse().ok())
             .or(options.expert_slots);
+        let expert_usage = std::env::var_os("LILY_EXPERT_USAGE")
+            .map(std::path::PathBuf::from)
+            .or_else(|| options.expert_usage.clone());
         Qwen4ExpModel::load_with(
             ctx,
             dir,
@@ -3545,6 +3560,7 @@ impl LanguageModel for Qwen4ExpModel {
             options.mtp_drafts > 0,
             options.vision,
             expert_slots,
+            expert_usage,
         )
     }
 

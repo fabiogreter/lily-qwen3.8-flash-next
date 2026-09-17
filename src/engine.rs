@@ -170,7 +170,7 @@ pub enum VisionTower {
 }
 
 /// Engine-wide load options; architectures ignore what does not apply.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct LoadOptions {
     /// Where the Qwen3.8-Flash-Next n-gram table lives.
     pub ngram_storage: crate::qwen4exp::NgramStorage,
@@ -182,6 +182,10 @@ pub struct LoadOptions {
     /// them all (`docs/low-ram-experts.md`); `None` loads every expert as
     /// its layer's own stack. `LILY_EXPERT_SLOTS` overrides it.
     pub expert_slots: Option<usize>,
+    /// The usage counts (`lily-experts` output) that place experts in the
+    /// cache; `None` looks for `expert-usage.json` next to the checkpoint
+    /// and falls back to uniform. `LILY_EXPERT_USAGE` overrides it.
+    pub expert_usage: Option<std::path::PathBuf>,
 }
 
 /// Which draw a decode pass ends with.
@@ -193,6 +197,12 @@ pub struct Draw<'p> {
 }
 
 pub trait LanguageModel: Sized {
+    /// Distinct expert lookups and misses of an expert cache, when the
+    /// model serves its experts from one (`LoadOptions::expert_slots`).
+    fn expert_cache_stats(&self) -> Option<(u64, u64)> {
+        None
+    }
+
     type State: DecodeStateApi;
     type Scratch: ScratchApi;
 

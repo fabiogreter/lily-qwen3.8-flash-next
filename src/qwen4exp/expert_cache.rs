@@ -1,7 +1,8 @@
 //! The expert cache for machines whose memory cannot hold every routed
 //! expert (`docs/low-ram-experts.md`): one slab of expert slots on the GPU
 //! that every MoE layer's kernels read through a per-layer slot table, and
-//! the host side that fills slots from the checkpoint files.
+//! the host side that fills slots from the checkpoint files and resolves
+//! misses while a pass waits.
 //!
 //! A slot holds one expert's three projections in the layout the gather
 //! kernels and the grouped GEMM read for a layer's own stacked experts, so
@@ -9,22 +10,95 @@
 //! by all layers: layer `l`'s `MoeWeights` views the slab and carries the
 //! table `slot_of[l]` (`U32 [E]`, [`NONE`] where the expert is not
 //! resident) that `moe_ffn` remaps the routed ids through.
+//!
+//! The protocol per cached MoE layer of a pass: after the router's top-k
+//! the pass signals `routed` to a sequence number and waits on `ready` for
+//! the same number before the remap. A service thread takes the requests
+//! in order, waits for the GPU's signal, reads the routed ids from the
+//! shared indices buffer, loads every missing expert into a slot chosen by
+//! [`SlotPolicy`] (writing the evicted expert's table entry to [`NONE`]
+//! and the loaded one's to its slot), and signals `ready`. The GPU is
+//! stalled at the wait meanwhile, so no kernel reads a slot being
+//! refilled.
+
+use std::cell::Cell;
+use std::collections::VecDeque;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 
 use anyhow::{Result, ensure};
 
-use crate::metal::MetalContext;
-use crate::safetensors::Checkpoint;
-use crate::tensor::{DType, Tensor};
+use super::expert_store::{ExpertStore, Lookup, REGIONS, SlotPolicy};
 use crate::config::QuantizationConfig;
+use crate::metal::{MetalContext, SharedEvent};
+use crate::tensor::{DType, Tensor};
 use crate::weights::QuantWeights;
 
 /// The slot-table entry of an expert that is not resident.
 pub const NONE: u32 = u32::MAX;
 
-/// Byte regions of one slot, in the order gate codes, gate scales, gate
-/// biases, up codes, up scales, up biases, down codes, down scales, down
-/// biases (the order `ExpertStore` reads them in).
-pub const REGIONS: usize = 9;
+/// One layer's request for a pass: the routed ids sit at `ids` (a shared
+/// buffer the GPU wrote before signalling `seq`).
+#[derive(Clone, Copy)]
+struct Request {
+    seq: u64,
+    layer: usize,
+    ids: usize,
+    count: usize,
+}
+
+struct Service {
+    requests: Mutex<VecDeque<Request>>,
+    wake: Condvar,
+    stop: AtomicBool,
+    lookups: AtomicU64,
+    misses: AtomicU64,
+}
+
+/// What a cached layer's `MoeWeights` holds: the events of the protocol
+/// and the request queue the service thread drains.
+pub struct ExpertCacheLink {
+    pub routed: SharedEvent,
+    pub ready: SharedEvent,
+    next_seq: Cell<u64>,
+    service: Arc<Service>,
+}
+
+impl ExpertCacheLink {
+    /// Registers the routing of `layer` held in `ids` (`count` `U32`s) and
+    /// returns the sequence number the pass must signal `routed` and wait
+    /// `ready` with. Sequence numbers rise in encode order, which is the
+    /// queue's execution order.
+    pub fn enqueue(&self, layer: usize, ids: &Tensor, count: usize) -> u64 {
+        let seq = self.next_seq.get() + 1;
+        self.next_seq.set(seq);
+        let request = Request { seq, layer, ids: ids.contents_ptr() as usize, count };
+        self.service
+            .requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(request);
+        self.service.wake.notify_one();
+        seq
+    }
+
+    /// Distinct expert lookups and misses served so far.
+    pub fn stats(&self) -> (u64, u64) {
+        (
+            self.service.lookups.load(Ordering::Relaxed),
+            self.service.misses.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// The slab's host addresses, for the service thread.
+#[derive(Clone, Copy)]
+struct SlabPointers {
+    regions: [usize; REGIONS],
+    lens: [usize; REGIONS],
+}
 
 pub struct ExpertCache {
     gate: QuantWeights,
@@ -37,12 +111,14 @@ pub struct ExpertCache {
     inter: usize,
     hidden: usize,
     quant: QuantizationConfig,
+    link: Rc<ExpertCacheLink>,
+    worker: Option<JoinHandle<()>>,
 }
 
 impl ExpertCache {
     /// A slab of `n_slots` empty slots for `layers` MoE layers of `experts`
     /// experts with intermediate size `inter` over hidden size `hidden`,
-    /// every slot table set to [`NONE`].
+    /// every slot table set to [`NONE`], with the protocol's events.
     pub fn new(
         ctx: &MetalContext,
         n_slots: usize,
@@ -71,6 +147,18 @@ impl ExpertCache {
                 Tensor::from_bytes(ctx, bytemuck::cast_slice(&none), &[experts], DType::U32)
             })
             .collect::<Result<Vec<_>>>()?;
+        let link = Rc::new(ExpertCacheLink {
+            routed: ctx.new_shared_event()?,
+            ready: ctx.new_shared_event()?,
+            next_seq: Cell::new(0),
+            service: Arc::new(Service {
+                requests: Mutex::new(VecDeque::new()),
+                wake: Condvar::new(),
+                stop: AtomicBool::new(false),
+                lookups: AtomicU64::new(0),
+                misses: AtomicU64::new(0),
+            }),
+        });
         Ok(Self {
             gate: stack(n_slots * inter, hidden)?,
             up: stack(n_slots * inter, hidden)?,
@@ -81,6 +169,8 @@ impl ExpertCache {
             inter,
             hidden,
             quant,
+            link,
+            worker: None,
         })
     }
 
@@ -96,7 +186,13 @@ impl ExpertCache {
         self.experts
     }
 
-    /// Bytes of each of a slot's nine regions.
+    /// The protocol handle the cached layers' `MoeWeights` share.
+    pub fn link(&self) -> Rc<ExpertCacheLink> {
+        self.link.clone()
+    }
+
+    /// Bytes of each of a slot's nine regions (the order of
+    /// `ExpertStore::read_into`).
     pub fn region_lens(&self) -> [usize; REGIONS] {
         let (i, h, gs, bits) = (self.inter, self.hidden, self.quant.group_size, self.quant.bits);
         let gu_codes = i * (h * bits / 32) * 4;
@@ -121,96 +217,253 @@ impl ExpertCache {
         ))
     }
 
-    /// Host-writable bytes of slot `slot`'s nine regions. The caller must
-    /// know the GPU is not reading the slot (a slot being refilled is one
-    /// the resolve protocol has just evicted while the pass waits).
-    ///
-    /// # Safety
-    ///
-    /// The slices alias the shared GPU buffers; no pass reading the slot may
-    /// be in flight while they are written.
-    pub unsafe fn slot_regions(&self, slot: usize) -> Result<[&mut [u8]; REGIONS]> {
-        ensure!(slot < self.n_slots, "slot {slot} of {}", self.n_slots);
-        let lens = self.region_lens();
-        let region = |t: &Tensor, len: usize| -> &mut [u8] {
-            // SAFETY: the slab buffers are shared-storage allocations of
-            // n_slots * len bytes; the caller upholds the no-concurrent-reader
-            // contract.
-            unsafe { core::slice::from_raw_parts_mut(t.contents_ptr().add(slot * len), len) }
-        };
-        Ok([
-            region(&self.gate.codes, lens[0]),
-            region(&self.gate.scales, lens[1]),
-            region(&self.gate.biases, lens[2]),
-            region(&self.up.codes, lens[3]),
-            region(&self.up.scales, lens[4]),
-            region(&self.up.biases, lens[5]),
-            region(&self.down.codes, lens[6]),
-            region(&self.down.scales, lens[7]),
-            region(&self.down.biases, lens[8]),
-        ])
+    fn pointers(&self) -> SlabPointers {
+        let tensors = [
+            &self.gate.codes,
+            &self.gate.scales,
+            &self.gate.biases,
+            &self.up.codes,
+            &self.up.scales,
+            &self.up.biases,
+            &self.down.codes,
+            &self.down.scales,
+            &self.down.biases,
+        ];
+        let mut regions = [0usize; REGIONS];
+        for (r, t) in regions.iter_mut().zip(tensors) {
+            *r = t.contents_ptr() as usize;
+        }
+        SlabPointers { regions, lens: self.region_lens() }
     }
 
-    /// Points layer `layer`'s expert `expert` at `slot` ([`NONE`] to unmap)
-    /// in the GPU table. Visible to the next pass the host commits or
-    /// releases after the write.
-    pub fn set_slot(&self, layer: usize, expert: usize, slot: u32) -> Result<()> {
-        ensure!(layer < self.slot_of.len() && expert < self.experts, "no such expert");
-        // SAFETY: the table is a shared-storage U32 [E] buffer.
-        unsafe {
-            self.slot_of[layer].contents_ptr().add(expert * 4).cast::<u32>().write_volatile(slot);
-        }
+    /// Fills the slab per `policy` from `store` (every pinned slice and
+    /// the LRU region's prefill), points the tables at the slots, and
+    /// starts the service thread that resolves misses. Must run before any
+    /// pass reads the slab.
+    pub fn fill_and_serve(&mut self, store: ExpertStore, mut policy: SlotPolicy) -> Result<()> {
+        ensure!(self.worker.is_none(), "the expert cache is already being served");
+        ensure!(
+            policy.n_slots() == self.n_slots
+                && store.layers() == self.slot_of.len()
+                && store.experts() == self.experts
+                && store.region_lens() == self.region_lens(),
+            "expert store, policy and slab disagree on the layout"
+        );
+        let slab = self.pointers();
+        let tables: Vec<usize> = self.slot_of.iter().map(|t| t.contents_ptr() as usize).collect();
+        let started = std::time::Instant::now();
+        let fill: Vec<(u32, usize, usize)> = policy.initial_fill().collect();
+        let filled = fill.len();
+        // SAFETY: nothing reads the slab before this function returns, and
+        // every entry names a distinct slot and expert.
+        unsafe { load_slots(&store, &slab, &tables, self.experts, &fill)? };
+        eprintln!(
+            "expert cache: {filled} of {} slots filled ({} pinned) in {:.1}s",
+            self.n_slots,
+            policy.pinned(),
+            started.elapsed().as_secs_f64()
+        );
+        let service = self.link.service.clone();
+        let (routed, ready) = (self.link.routed.clone(), self.link.ready.clone());
+        let experts = self.experts;
+        self.worker = Some(std::thread::Builder::new().name("expert-cache".into()).spawn(
+            move || serve(store, &mut policy, slab, tables, experts, routed, ready, service),
+        )?);
         Ok(())
     }
+}
 
-    /// Fills slots `slot0..slot0 + E` with every expert of the layer at
-    /// `prefix` (`...layers.{l}.`) straight from the checkpoint, one read per
-    /// tensor, and maps the layer's table to them: the whole-checkpoint
-    /// layout used to validate the cache path on machines that fit it.
-    pub fn fill_layer_from_checkpoint(
-        &self,
-        ckpt: &Checkpoint,
-        prefix: &str,
-        layer: usize,
-        slot0: usize,
-    ) -> Result<()> {
-        ensure!(slot0 + self.experts <= self.n_slots, "layer {layer} does not fit the slab");
-        let lens = self.region_lens();
-        let stacks = [
-            ("gate_proj", &self.gate),
-            ("up_proj", &self.up),
-            ("down_proj", &self.down),
-        ];
-        for (si, (name, stack)) in stacks.iter().enumerate() {
-            let tensors = [
-                (&stack.codes, "weight", lens[si * 3]),
-                (&stack.scales, "scales", lens[si * 3 + 1]),
-                (&stack.biases, "biases", lens[si * 3 + 2]),
-            ];
-            for (t, suffix, len) in tensors {
-                let full = format!("{prefix}mlp.experts.{name}.{suffix}");
-                ckpt.read_with(&full, |meta| {
-                    ensure!(
-                        meta.byte_len() == len * self.experts,
-                        "{full}: {} bytes, the slab expects {}",
-                        meta.byte_len(),
-                        len * self.experts
-                    );
-                    // SAFETY: shared-storage slab of n_slots * len bytes; the
-                    // range [slot0, slot0 + E) * len lies inside it (checked
-                    // above) and nothing reads it during loading.
-                    Ok(unsafe {
-                        core::slice::from_raw_parts_mut(
-                            t.contents_ptr().add(slot0 * len),
-                            len * self.experts,
-                        )
-                    })
-                })?;
+impl Drop for ExpertCache {
+    fn drop(&mut self) {
+        let (lookups, misses) = self.link.stats();
+        if lookups > 0 {
+            eprintln!(
+                "expert cache: {lookups} distinct expert lookups, {misses} misses ({:.2}%)",
+                100.0 * misses as f64 / lookups as f64
+            );
+        }
+        self.link.service.stop.store(true, Ordering::Release);
+        self.link.service.wake.notify_all();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Reads expert (`layer`, `expert`) into `slot` and points the table at it.
+///
+/// # Safety
+///
+/// No pass may be reading `slot` (the caller holds the GPU at a wait, or
+/// nothing has been committed yet).
+unsafe fn load_slot(
+    store: &ExpertStore,
+    slab: &SlabPointers,
+    tables: &[usize],
+    experts: usize,
+    slot: u32,
+    layer: usize,
+    expert: usize,
+) -> Result<()> {
+    let slot = slot as usize;
+    let dst: [&mut [u8]; REGIONS] = std::array::from_fn(|i| {
+        // SAFETY: shared-storage slab regions of n_slots * len bytes each;
+        // the nine regions are distinct buffers.
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                (slab.regions[i] as *mut u8).add(slot * slab.lens[i]),
+                slab.lens[i],
+            )
+        }
+    });
+    store.read_into(layer, expert, dst)?;
+    // SAFETY: the table is a shared-storage U32 [E] buffer.
+    unsafe { set_entry(tables, experts, layer, expert, slot as u32) };
+    Ok(())
+}
+
+/// Loads every `(slot, layer, expert)` of `entries`, spread over up to
+/// [`LOAD_THREADS`] threads (the reads are what a miss costs; a resolution
+/// with several misses pays one read time instead of their sum).
+///
+/// # Safety
+///
+/// As [`load_slot`], for every entry; the entries name distinct slots and
+/// distinct experts.
+unsafe fn load_slots(
+    store: &ExpertStore,
+    slab: &SlabPointers,
+    tables: &[usize],
+    experts: usize,
+    entries: &[(u32, usize, usize)],
+) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let threads = entries.len().min(LOAD_THREADS);
+    if threads == 1 {
+        for &(slot, layer, expert) in entries {
+            // SAFETY: as documented.
+            unsafe { load_slot(store, slab, tables, experts, slot, layer, expert)? };
+        }
+        return Ok(());
+    }
+    let per = entries.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = entries
+            .chunks(per)
+            .map(|chunk| {
+                scope.spawn(move || -> Result<()> {
+                    for &(slot, layer, expert) in chunk {
+                        // SAFETY: as documented; chunks are disjoint.
+                        unsafe { load_slot(store, slab, tables, experts, slot, layer, expert)? };
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().map_err(|_| anyhow::anyhow!("expert load thread panicked"))??;
+        }
+        Ok(())
+    })
+}
+
+/// Threads a batch of expert reads is spread over.
+const LOAD_THREADS: usize = 8;
+
+/// # Safety
+///
+/// `tables[layer]` is a live `U32 [experts]` shared buffer.
+unsafe fn set_entry(tables: &[usize], experts: usize, layer: usize, expert: usize, slot: u32) {
+    debug_assert!(expert < experts);
+    // SAFETY: as documented.
+    unsafe { (tables[layer] as *mut u32).add(expert).write_volatile(slot) };
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serve(
+    store: ExpertStore,
+    policy: &mut SlotPolicy,
+    slab: SlabPointers,
+    tables: Vec<usize>,
+    experts: usize,
+    routed: SharedEvent,
+    ready: SharedEvent,
+    service: Arc<Service>,
+) {
+    let mut ids: Vec<u32> = Vec::new();
+    let mut misses: Vec<(u32, usize, usize)> = Vec::new();
+    loop {
+        let request = {
+            let mut queue = service.requests.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if service.stop.load(Ordering::Acquire) {
+                    return;
+                }
+                if let Some(r) = queue.pop_front() {
+                    break r;
+                }
+                queue = service.wake.wait(queue).unwrap_or_else(|e| e.into_inner());
+            }
+        };
+        // The GPU is stalled behind this request from the moment it
+        // signals, so the wait spins: a blocking wait wakes tens of
+        // microseconds late and there are 48 of these per token.
+        let mut spins = 0u32;
+        while routed.signaled_value() < request.seq {
+            spins += 1;
+            if spins % 4096 == 0 {
+                if service.stop.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::yield_now();
+            } else {
+                std::hint::spin_loop();
             }
         }
-        for e in 0..self.experts {
-            self.set_slot(layer, e, (slot0 + e) as u32)?;
+        // SAFETY: the pass wrote `count` ids at `ids` before signalling.
+        let routed_ids = unsafe {
+            core::slice::from_raw_parts(request.ids as *const u32, request.count)
+        };
+        ids.clear();
+        ids.extend_from_slice(routed_ids);
+        ids.sort_unstable();
+        ids.dedup();
+        service.lookups.fetch_add(ids.len() as u64, Ordering::Relaxed);
+        misses.clear();
+        for &e in &ids {
+            let expert = e as usize;
+            if expert >= experts {
+                eprintln!("expert cache: routed id {e} out of range; the pass is corrupt");
+                std::process::abort();
+            }
+            match policy.lookup(request.layer, expert, request.seq) {
+                Lookup::Hit(_) => {}
+                Lookup::Miss { slot, evicted } => {
+                    if let Some((l2, e2)) = evicted {
+                        // SAFETY: the GPU waits at this layer; the evicted
+                        // expert's readers have completed.
+                        unsafe { set_entry(&tables, experts, l2, e2, NONE) };
+                    }
+                    misses.push((slot, request.layer, expert));
+                }
+                Lookup::Full => {
+                    eprintln!(
+                        "expert cache: no slot free for layer {} expert {expert} (LRU region too small)",
+                        request.layer
+                    );
+                    std::process::abort();
+                }
+            }
         }
-        Ok(())
+        // SAFETY: the GPU waits at this layer; the slots were just taken
+        // from experts whose readers have completed, and are distinct.
+        if let Err(e) = unsafe { load_slots(&store, &slab, &tables, experts, &misses) } {
+            eprintln!("expert cache: loading layer {}: {e:#}", request.layer);
+            std::process::abort();
+        }
+        service.misses.fetch_add(misses.len() as u64, Ordering::Relaxed);
+        ready.signal(request.seq);
     }
 }

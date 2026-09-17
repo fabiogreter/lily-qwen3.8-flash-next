@@ -548,6 +548,7 @@ impl<M: LanguageModel> Engine<M> {
                 mtp_drafts: options.mtp_drafts,
                 vision: options.vision,
                 expert_slots: None,
+                expert_usage: None,
             },
         )?;
         let drafts = options.mtp_drafts.min(model.max_drafts());
