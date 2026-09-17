@@ -283,7 +283,11 @@ estimate with its assumption named.
    The GDN prefill scan then went from one to four value columns per
    simdgroup (the per-token k, q and gate loads shared): 384 to 281 ms per
    8K chunk in paired profile runs, 27% of the kernel and about 3% of the
-   chunk. The MoE input gather (one bf16 element per thread) now moves eight
+   chunk. Its results differ from the single-column scan only by fast-math
+   contraction, which is enough to move the 8K greedy speculative
+   trajectory (the digest 9e5cd959e0842bc7 of the earlier rows became
+   74f9aab8ea2e7f87, 151/210 drafts accepted instead of 152/208); the
+   4-layer golden gaps shrank slightly. The MoE input gather (one bf16 element per thread) now moves eight
    per thread on its 16-byte-aligned rows: 1.07 to 0.52 ms per call at the
    chunk shape, about 26 ms per 8K chunk (1.3%). A 128-deep K step for the
    grouped expert GEMM (half the B-tile barriers per FLOP) measured within
@@ -345,7 +349,12 @@ estimate with its assumption named.
    the 575 GB/s probe. Estimated: 0.4 to 0.7 ms per step (4 to 6%) from
    halving the dispatch count, plus 0.6 to 1.0 ms from the down kernel's
    occupancy; the upper bound if every dispatch paid the floor would be
-   1.35 ms.
+   1.35 ms. *Measured since*: folding the write-gate inject into the
+   epilogues of the branch matvec and the MoE combine (96 dispatches fewer
+   per step, bit-identical) cost as much in those kernels' epilogues as the
+   inject kernel took (6.6 to 6.8 ms over the three kernels against 6.3 to
+   6.7 in paired profiles), so the 989 dispatches stay; the floor is not
+   what those dispatches pay.
 5. **Continuous batching across sessions.** Measured: an extra row in a
    verify pass costs about 3 ms on a 12 to 13 ms base, because it adds its
    own experts but shares the 2.8 GB of dense weights. Estimated: x1.5 to
