@@ -181,6 +181,19 @@ pub fn gather_rows_bf16(
     ensure!(m > 0 && out.numel().is_multiple_of(m), "out rows mismatch");
     let h = out.numel() / m;
     ensure!(table.numel().is_multiple_of(h), "table not a multiple of row size");
+    // Eight elements per thread when the rows and the buffers allow 16-byte
+    // accesses (the MoE input gather: 2 560-wide rows).
+    let aligned = |t: &Tensor| t.binding().1.is_multiple_of(16);
+    if h.is_multiple_of(8) && aligned(table) && aligned(out) {
+        let w = h / 8;
+        let pipeline = ctx.pipeline("gather_rows_bf16_x8", SOURCE, MslVersion::V3_1)?;
+        return pass.dispatch_at(
+            &pipeline,
+            &[table.binding(), ids.binding(), out.binding()],
+            &[&crate::kernels::u32_bytes(w)],
+            Grid::Threads { grid: (m * w, 1, 1), threadgroup: (256.min(m * w), 1, 1) },
+        );
+    }
     let pipeline = ctx.pipeline("gather_rows_bf16", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,

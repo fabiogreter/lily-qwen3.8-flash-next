@@ -251,7 +251,7 @@ Where a 4 096-token chunk goes at an 8K prompt:
 | dense bf16 GEMM (tensor ops)               | 18.8% | 54 TFLOP/s |
 | GDN prefill scan                           | 9.2%  | sequential recurrence (since: four value columns per simdgroup, 27% less) |
 | elementwise passes over the wide residual  | 3.7%  |            |
-| MoE input gather                           | 1.8%  |            |
+| MoE input gather                           | 1.8%  | since: eight elements per thread, 2x |
 
 At a 1K prompt, where attention is dense, the grouped expert GEMM (40.4%) and
 the dense GEMM (29.3%) dominate instead.

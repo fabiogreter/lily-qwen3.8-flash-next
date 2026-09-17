@@ -280,7 +280,12 @@ estimate with its assumption named.
    The GDN prefill scan then went from one to four value columns per
    simdgroup (the per-token k, q and gate loads shared): 384 to 281 ms per
    8K chunk in paired profile runs, 27% of the kernel and about 3% of the
-   chunk. The grouped expert GEMM's row tile was swept afterwards on the 4096-token
+   chunk. The MoE input gather (one bf16 element per thread) now moves eight
+   per thread on its 16-byte-aligned rows: 1.07 to 0.52 ms per call at the
+   chunk shape, about 26 ms per 8K chunk (1.3%). A 128-deep K step for the
+   grouped expert GEMM (half the B-tile barriers per FLOP) measured within
+   2% of the 64-deep one in paired profiles and was not kept.
+   The grouped expert GEMM's row tile was swept afterwards on the 4096-token
    chunk (about 80 routed rows per expert): 32 rows 645 ms, 64 rows 593 to
    622, 96 rows 659, 128 rows 759 (four simdgroups) and 698 (eight), so the
    shipped 64-row tile stays and the tensor work on padded rows, not the

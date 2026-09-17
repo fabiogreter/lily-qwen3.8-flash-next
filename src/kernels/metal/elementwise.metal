@@ -104,6 +104,18 @@ kernel void gather_rows_bf16(device const bfloat* table [[buffer(0)]],
     out[gid] = table[(ulong)ids[i] * H + d];
 }
 
+// gather_rows_bf16 by eight elements (one uint4) per thread, for rows whose
+// width is a multiple of 8 and 16-byte aligned buffers.
+kernel void gather_rows_bf16_x8(device const uint4* table [[buffer(0)]],
+                                device const uint*  ids   [[buffer(1)]],
+                                device uint4*       out   [[buffer(2)]],
+                                constant uint&      W     [[buffer(3)]],  // H / 8
+                                uint gid [[thread_position_in_grid]]) {
+    const uint i = gid / W;
+    const uint w = gid - i * W;
+    out[gid] = table[(ulong)ids[i] * W + w];
+}
+
 #define ARGMAX_TG 256
 
 struct ArgMaxPair {

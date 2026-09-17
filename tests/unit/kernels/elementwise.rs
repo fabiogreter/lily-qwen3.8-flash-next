@@ -295,3 +295,92 @@ fn gelu_forms_match_cpu() {
         assert!(tails > 10, "the input must reach into the tail");
     }
 }
+
+/// The row gather on both of its paths: eight elements per thread for
+/// 16-byte-aligned rows (the MoE input gather's 2 560-wide rows, and a view
+/// at an aligned offset) and one element per thread otherwise (a 6-wide
+/// table, an unaligned output view).
+#[test]
+fn gather_rows_bf16_both_paths_match_cpu() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(33);
+    for (rows, h, out_offset) in
+        [(64usize, 2560usize, 0usize), (37, 2560, 8), (20, 6, 0), (20, 16, 2)]
+    {
+        let table: Vec<f32> =
+            (0..rows * h).map(|_| rng.gen_range(-2.0f32..2.0)).collect();
+        let table = cpu_ref::round_bf16(&table);
+        let m = 50usize;
+        let ids: Vec<u32> = (0..m).map(|_| rng.gen_range(0..rows as u32)).collect();
+        let t_table =
+            Tensor::from_f32_as_bf16(&ctx, &table, &[rows, h]).expect("table");
+        let t_ids =
+            Tensor::from_bytes(&ctx, bytemuck::cast_slice(&ids), &[m], DType::U32)
+                .expect("ids");
+        let backing =
+            Tensor::zeros(&ctx, &[out_offset + m * h], DType::BF16).expect("out");
+        let out = backing.view(out_offset, &[m, h]).expect("view");
+        let pass = ctx.begin().expect("pass");
+        gather_rows_bf16(&ctx, &pass, &t_table, &t_ids, &out).expect("gather");
+        pass.commit_wait().expect("commit");
+        let got = out.to_f32().expect("read");
+        for (i, &id) in ids.iter().enumerate() {
+            assert_eq!(
+                &got[i * h..(i + 1) * h],
+                &table[id as usize * h..(id as usize + 1) * h],
+                "rows {rows} h {h} offset {out_offset}: row {i}"
+            );
+        }
+    }
+}
+
+/// Per-dispatch GPU time of the row gather at the MoE input gather's chunk
+/// shape (4 096 tokens x 10 experts rows of 2 560) on the profile
+/// transport, eight elements per thread against one.
+#[test]
+#[ignore = "timing only"]
+fn gather_rows_bf16_timing() {
+    let ctx = MetalContext::new_with_profile(true).expect("metal context");
+    let mut rng = StdRng::seed_from_u64(35);
+    let (rows, h, m) = (4096usize, 2560usize, 40960usize);
+    let table = Tensor::zeros(&ctx, &[rows, h], DType::BF16).expect("table");
+    let ids: Vec<u32> = (0..m).map(|_| rng.gen_range(0..rows as u32)).collect();
+    let t_ids = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&ids), &[m], DType::U32)
+        .expect("ids");
+    let out = Tensor::zeros(&ctx, &[m, h], DType::BF16).expect("out");
+    crate::metal::profile::take();
+    for _ in 0..8 {
+        for name in ["gather_rows_bf16_x8", "gather_rows_bf16"] {
+            let pipeline =
+                ctx.pipeline(name, SOURCE, MslVersion::V3_1).expect("pipeline");
+            let (n, w) =
+                if name.ends_with("_x8") { (m * h / 8, h / 8) } else { (m * h, h) };
+            let pass = ctx.begin().expect("pass");
+            pass.dispatch_at(
+                &pipeline,
+                &[table.binding(), t_ids.binding(), out.binding()],
+                &[&crate::kernels::u32_bytes(w)],
+                Grid::Threads { grid: (n, 1, 1), threadgroup: (256, 1, 1) },
+            )
+            .expect("dispatch");
+            pass.commit_wait().expect("commit");
+        }
+    }
+    let passes = crate::metal::profile::take();
+    for name in ["gather_rows_bf16_x8", "gather_rows_bf16"] {
+        let mut ms: Vec<f64> = passes
+            .iter()
+            .flat_map(|p| p.kernels.iter())
+            .filter(|s| s.name == name)
+            .map(|s| s.gpu_secs * 1e3)
+            .collect();
+        ms.sort_by(|a, b| a.total_cmp(b));
+        let n = ms.len();
+        eprintln!(
+            "{name}: min {:.2} ms, median {:.2} ms over {n} dispatches ({:.0} GB/s at the minimum)",
+            ms[0],
+            ms[n / 2],
+            2.0 * (m * h * 2) as f64 / ms[0] / 1e6
+        );
+    }
+}
