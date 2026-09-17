@@ -270,6 +270,11 @@ estimate with its assumption named.
    about 1 200 to 350 ms at 8K and 1 480 to 850 ms at 32K, prefill to about
    1 700 tok/s at 8K and 1 450 at 32K in single profile runs, the dense
    kernel taking the rows below the limit besides (`docs/architecture.md`).
+   The grouped expert GEMM's row tile was swept afterwards on the 4096-token
+   chunk (about 80 routed rows per expert): 32 rows 645 ms, 64 rows 593 to
+   622, 96 rows 659, 128 rows 759 (four simdgroups) and 698 (eight), so the
+   shipped 64-row tile stays and the tensor work on padded rows, not the
+   dequant staging, is what the kernel pays for.
 2. **The verify pass's kernel shapes.** Measured: for the same 1.64 GB of
    dense weights a 3-row verify pass spends 8.04 ms in the register-resident
    skinny Q4 GEMM where a decode step spends 3.85 ms in the 2-row GEMV, about
