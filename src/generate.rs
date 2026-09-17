@@ -326,7 +326,14 @@ impl Generator {
             // grow. An encoded-ahead pass would reference the old buffers
             // and is discarded.
             if state.pos() >= state.capacity() {
-                ensure!(parked.is_none(), "parked step beyond the state's capacity");
+                ensure!(
+                    parked.is_none(),
+                    "parked step beyond the state's capacity (position {}, capacity {}, {} of {} tokens drawn)",
+                    state.pos(),
+                    state.capacity(),
+                    tokens.len(),
+                    options.max_tokens
+                );
                 ahead = None;
                 state.ensure_capacity(ctx, state.pos() + 1)?;
             }
@@ -357,8 +364,15 @@ impl Generator {
                 }
             };
             // Encode the following step while this one runs, when there will
-            // be one and the caches already have room for it.
-            if tokens.len() + 1 < options.max_tokens && state.pos() < state.capacity() {
+            // be one and the caches have room for it and for the step after
+            // it: a parked step is committed against the current cache
+            // buffers, and the top of the loop must be able to grow the
+            // caches without one outstanding. Prompts that end within a few
+            // hundred tokens below a capacity step hit this every time;
+            // skipping the pipelining for one step there costs nothing.
+            if tokens.len() + 1 < options.max_tokens
+                && state.pos() + 1 < state.capacity()
+            {
                 let draw = Draw { params, step: step + 1 };
                 if parking {
                     let pass = model

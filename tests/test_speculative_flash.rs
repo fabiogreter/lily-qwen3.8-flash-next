@@ -1,14 +1,15 @@
 //! Optional Qwen3.8-Flash-Next checks that need a converted checkpoint with
 //! the draft head (`LILY_MODEL_DIR_FLASH`; the 4-layer `-l4` conversion is
 //! enough and fast): speculative decoding is invariant to the draft count,
-//! and a session survives the disk-tier round trip.
+//! a session survives the disk-tier round trip, and plain decoding grows the
+//! caches across a capacity step while a step is parked.
 
 use std::io::Cursor;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use lily::engine::{DecodeStateApi, LanguageModel, LoadOptions, SnapshotApi};
-use lily::generate::{GenerateOptions, Generator};
+use lily::generate::{FinishReason, GenerateOptions, Generator};
 use lily::kernels::sample::SamplingParams;
 use lily::metal::MetalContext;
 use lily::qwen4exp::Qwen4ExpModel;
@@ -177,5 +178,59 @@ fn persisted_session_continues_like_the_original() -> Result<()> {
         from_checkpoint.tokens, expected.tokens,
         "a prefix read out of a longer layout must match"
     );
+    Ok(())
+}
+
+/// Plain decoding (no drafts) keeps one step parked on the GPU while the
+/// current one runs, and the caches must still be able to grow when the
+/// prompt plus the output crosses a capacity step. A prompt ending a few
+/// tokens below the step once failed here with "parked step beyond the
+/// state's capacity": the parked step had been committed against the old
+/// buffers at the moment the loop needed to grow them.
+#[test]
+#[ignore = "requires LILY_MODEL_DIR_FLASH"]
+fn plain_decoding_grows_the_caches_across_a_capacity_step() -> Result<()> {
+    let dir = model_dir()?;
+    let ctx = MetalContext::new()?;
+    let model = <Qwen4ExpModel as LanguageModel>::load(
+        &ctx,
+        Path::new(&dir),
+        &LoadOptions { mtp_drafts: 0, ..LoadOptions::default() },
+    )?;
+    let generator = Generator::from_model_dir(Path::new(&dir))?;
+    // The first capacity step is what a tiny state rounds up to.
+    let step = model.new_state(&ctx, 8)?.capacity();
+    let head = prompt(&generator)?;
+    let pad = generator.tokenizer().encode(" and")?;
+    assert_eq!(pad.len(), 1, "the padding must be a single token");
+    let mut prompt = vec![pad[0]; step - 20 - head.len()];
+    prompt.extend(head);
+    let mut state = model.new_state(&ctx, prompt.len())?;
+    assert_eq!(state.capacity(), step, "the prompt must fit the first step exactly");
+    let mut scratch = model.new_scratch_with_capacity(&ctx, step + 64)?;
+    let params = SamplingParams::greedy();
+    let options = GenerateOptions {
+        max_tokens: 64,
+        sampling: &params,
+        stop_tokens: &[],
+        drafts: 0,
+    };
+    let g = generator.generate(
+        &ctx,
+        &model,
+        &mut state,
+        &mut scratch,
+        &prompt,
+        &options,
+        &mut |_| Ok(true),
+    )?;
+    assert_eq!(
+        g.finish,
+        FinishReason::Length,
+        "a stop token ended the generation before the capacity step; rerun"
+    );
+    assert_eq!(g.tokens.len(), 64);
+    assert!(state.capacity() > step, "the caches did not grow past {step}");
+    assert!(state.pos() > step, "position {} never crossed {step}", state.pos());
     Ok(())
 }
