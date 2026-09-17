@@ -1,7 +1,7 @@
 //! OpenAI-compatible request schemas and their validation into a
 //! [`Prepared`] generation.
 //!
-//! Images (`docs/vision-support-plan.md` item 6) arrive as `image_url`
+//! Images (`docs/architecture.md`, "The server") arrive as `image_url`
 //! content parts whose URL is a base64 data URI; they are decoded,
 //! preprocessed and digested here, on the connection thread, so the engine
 //! thread only ever sees pixel rows it can hand straight to the tower. The

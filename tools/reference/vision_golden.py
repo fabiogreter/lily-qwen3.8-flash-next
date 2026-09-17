@@ -20,7 +20,7 @@ from pathlib import Path
 
 import numpy as np
 
-# The server-side pixel cap (docs/vision-support-plan.md, item 1). One language token
+# The server-side pixel cap (docs/architecture.md, "The vision tower"). One language token
 # covers 32 x 32 pixels (patch 16, merge 2); 2 048 tokens is about 1.5 s of prefill and
 # 8 192 tower patches. A native 1920 x 1080 screenshot (2 073 600 px) passes untouched;
 # a Retina 3840 x 2160 capture is scaled to 1920 x 1056. The minimum is the checkpoint's

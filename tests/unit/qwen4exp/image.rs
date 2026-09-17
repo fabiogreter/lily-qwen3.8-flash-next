@@ -1,5 +1,5 @@
 //! Image preprocessing against the committed reference goldens
-//! (`docs/vision-support-plan.md`, comparison 1) and PIL's behaviour: the
+//! (`docs/architecture.md`, "How the tower was verified", comparison 1) and PIL's behaviour: the
 //! four test images and the five `hf_vision_preprocess_*.json` goldens run
 //! without Python or a GPU, the seeded 4 096-element sample judged with
 //! `PREPROCESS_TOLERANCE` and, stricter than the tolerance, counted by how

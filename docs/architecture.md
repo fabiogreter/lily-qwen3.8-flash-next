@@ -445,6 +445,50 @@ torch breaks by the lower id) that the unchanged text path resolves the other
 way. Prefill of the 282-token image prompt takes 34 ms on the four layers,
 the tower 37 ms.
 
+### How the tower was verified
+
+The reference implementation, transformers' `Qwen4ExpForConditionalGeneration`
+in the project venv, runs on the same inputs, so most of the checking is
+mechanical. Four comparisons, each living in the tree and each fed at the
+server's pixel cap of 2 097 152 pixels, which the goldens record:
+
+1. **Preprocessing.** lily's pixel rows against the reference processor's for
+   the same file: grid and resized size exact, values within 0.00984 on at
+   least 99.9 % of a seeded 4 096-element sample and 0.0255 at worst
+   (`tests/unit/qwen4exp/image.rs`, the `hf_vision_preprocess_*` goldens).
+2. **The tower.** lily's output against the reference tower's, fed with
+   lily's own preprocessing so that a tower bug cannot hide behind an image
+   difference: cosine at least 0.995, relative L2 at most 0.10, and the
+   fraction within 0.02 absolute or 5 % relative no more than 0.002 below the
+   bf16 reference's own floor for that image (`tests/unit/qwen4exp/vision.rs`,
+   `lily-vision-probe`, `compare_vision.py`).
+3. **Positions.** lily's token numbering for a prompt with an image against
+   the reference's, exactly (`tests/unit/qwen4exp/positions.rs`).
+4. **The forward pass** with an image on the four-layer conversion, argmax
+   agreement at every recorded position and over the greedy continuation
+   (`tests/unit/qwen4exp/probe.rs`, `lily-vision-probe --forward`).
+
+The reference side is `tools/reference/hf_vision_reference.py` (one
+subcommand per comparison and the measurements behind the tolerances),
+`compare_vision.py` and `vision_golden.py`; the checked facts about the
+reference, with line references, are in `tools/reference/VISION.md`.
+
+None of that says whether the answers are any good, so the full model was
+also asked about screenshots with known answers, over the API, on
+2026-09-17: a login form whose button covers the password field, a pricing
+table, a compiler error in a terminal, a bar chart, a settings page with
+toggles, a page with two spelling mistakes, two screenshots of one page that
+differ in a price, and a follow-up question about an image already in the
+cache. With thinking on, the server's default, all eight checks passed. With
+thinking off, six: the misses were a spelling mistake in small body text and
+the overlap described as a missing field. Latency with thinking off: a
+1440 x 900 screenshot is 1 260 image tokens, tower 0.32 s, prefill including
+the tower 1.1 s, 1.3 to 2.0 s per answer; a 1920 x 1080 screenshot is 2 040
+tokens, tower 0.76 s, prefill 2.6 s, 3.2 s in all; two 1440 x 900 screenshots
+are 2 520 tokens and 3.8 s; the follow-up about a cached image took 0.7 s
+with no tower pass. The first tower pass after a load is slower (0.68 s at
+1 260 tokens) while the GPU ramps.
+
 ## Speculative decoding
 
 With the draft head loaded, a decode step becomes two GPU passes.

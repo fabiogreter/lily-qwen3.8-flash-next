@@ -1,4 +1,4 @@
-//! Comparison 3 of `docs/vision-support-plan.md`: lily's token numbering for
+//! Comparison 3 of `docs/architecture.md`, "How the tower was verified": lily's token numbering for
 //! a prompt with an image against the reference's, exactly, on all four
 //! `hf_vision_positions_*` goldens (input ids, the three axes, `rope_deltas`),
 //! plus the text-only identity and the span validation.

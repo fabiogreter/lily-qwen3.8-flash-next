@@ -1,6 +1,6 @@
 //! The vision tower's kernels: the position-embedding blend, the 2-D rotary
 //! over fused qkv rows, and full bidirectional attention over one image
-//! (`docs/vision-support-plan.md` item 3; the chain is
+//! (`docs/architecture.md`, "The vision tower"; the chain is
 //! `tools/reference/VISION.md`, "The tower").
 
 use anyhow::{Result, ensure};

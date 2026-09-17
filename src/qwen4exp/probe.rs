@@ -1,6 +1,6 @@
 //! Step-by-step forward probes of the Qwen3.8-Flash-Next graph for the
 //! reference comparisons (`tools/reference/compare.py`, comparison 4 of
-//! `docs/vision-support-plan.md`): the top logits a prompt produces at chosen
+//! `docs/architecture.md`, "How the tower was verified"): the top logits a prompt produces at chosen
 //! positions and over a greedy continuation, with or without an image in the
 //! prompt. Shared by `lily-vision-probe --forward` and the model-gated test,
 //! so the check also runs from `cargo test` without Python.

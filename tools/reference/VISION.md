@@ -2,7 +2,7 @@
 
 Facts read off the Hugging Face implementation that the goldens in `goldens/` were made
 with (transformers 5.17.0.dev0, torch 2.14.0, torchvision 0.29.0, Pillow 12.3.0), for the
-Rust work in docs/vision-support-plan.md items 3 to 6. File paths are relative to
+Rust work in docs/architecture.md, "The vision tower" and "The server". File paths are relative to
 `.venv/lib/python3.13/site-packages/transformers/`; line numbers are of that install.
 Every measured number below is reproducible with `hf_vision_reference.py measure-*` and
 is stored in `goldens/vision_tolerance_floors.json`.

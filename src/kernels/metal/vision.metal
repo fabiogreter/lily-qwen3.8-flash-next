@@ -1,4 +1,4 @@
-// The vision tower's own kernels (docs/vision-support-plan.md item 3,
+// The vision tower's own kernels (docs/architecture.md "The vision tower",
 // tools/reference/VISION.md "The tower"): the position-embedding blend, the
 // 2-D rotary over the fused qkv rows, and full bidirectional attention over
 // every patch of one image. LayerNorm lives in norm.metal, the bias and GELU

@@ -1,6 +1,6 @@
 //! Runs lily's image preprocessing and the vision tower alone and writes
 //! their outputs in the golden format, for `tools/reference/compare_vision.py`
-//! (docs/vision-support-plan.md, comparisons 1 and 2) and for timing them.
+//! (docs/architecture.md, "How the tower was verified", comparisons 1 and 2) and for timing them.
 //!
 //! ```sh
 //! # Comparison 2 on the reference's own pixel_values:

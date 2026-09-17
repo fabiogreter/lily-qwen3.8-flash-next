@@ -2,7 +2,7 @@
 """Reference goldens for lily's vision path, from the Hugging Face implementation
 of Qwen3.8-Flash-Next (`Qwen4ExpForConditionalGeneration` and friends).
 
-One subcommand per comparison in docs/vision-support-plan.md, plus the two
+One subcommand per comparison in docs/architecture.md ("How the tower was verified"), plus the two
 measurements that set the tolerances:
 
   preprocess   pixel_values and image_grid_thw of one image at one pixel cap

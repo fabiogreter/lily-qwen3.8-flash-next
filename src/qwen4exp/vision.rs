@@ -1,4 +1,4 @@
-//! The vision tower on the GPU (`docs/vision-support-plan.md` item 3): from
+//! The vision tower on the GPU (`docs/architecture.md`, "The vision tower"): from
 //! preprocessed pixel rows to the merged embeddings the language model
 //! replaces its `<|image_pad|>` rows with. The chain is
 //! `tools/reference/VISION.md`, "The tower", followed step by step:

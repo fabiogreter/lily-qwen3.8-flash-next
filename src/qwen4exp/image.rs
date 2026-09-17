@@ -1,4 +1,4 @@
-//! Host-side image preprocessing (`docs/vision-support-plan.md` item 4): the
+//! Host-side image preprocessing (`docs/architecture.md`, "The vision tower"): the
 //! bytes of a PNG or JPEG become the `pixel_values` rows the vision tower
 //! consumes ([`super::vision::VisionTower::forward`]). The chain is
 //! `tools/reference/VISION.md`, "Preprocessing", step by step:

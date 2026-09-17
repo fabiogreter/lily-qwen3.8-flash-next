@@ -1,4 +1,4 @@
-//! Comparison 4 of `docs/vision-support-plan.md` without Python: the
+//! Comparison 4 of `docs/architecture.md`, "How the tower was verified", without Python: the
 //! four-layer conversion with the tower (`LILY_MODEL_DIR_FLASH`) runs the
 //! 333 x 777 prompt through the probe path (lily's own preprocessing, the
 //! tower, the positions, the prefill with the override) and its argmax must

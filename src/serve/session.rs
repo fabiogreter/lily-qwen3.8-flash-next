@@ -30,7 +30,7 @@
 //! the live conversation's cache and must not compete with it for the GPU
 //! budget. A hit never consumes them.
 //!
-//! **Images** (`docs/vision-support-plan.md` item 7). An image is a run of
+//! **Images** (`docs/architecture.md`, "The session cache"). An image is a run of
 //! identical `<|image_pad|>` tokens, so two prompts with different
 //! screenshots have identical tokens there. Tokens stay the identity, and
 //! every lineage (a session, a disk entry, a durable entry) also carries its

@@ -2,7 +2,7 @@
 //! exactly as the converter copied them (`docs/qwen38-flash-next-checkpoint-format.md`).
 //! Every shape is checked against `VisionConfig`, so a checkpoint whose
 //! `config.json` and tensors disagree fails at load. Loading only: the
-//! compute is `docs/vision-support-plan.md` item 3, and the layouts here are
+//! compute is `docs/architecture.md`, "The vision tower", and the layouts here are
 //! the ones it will consume (`tools/reference/VISION.md`, "The tower").
 
 use anyhow::{Result, ensure};

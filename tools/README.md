@@ -75,7 +75,7 @@ being quantization error.
 
 ## reference/hf_vision_reference.py, compare_vision.py, make_images.py
 
-The vision counterpart (docs/vision-support-plan.md, item 1). `make_images.py`
+The vision counterpart (docs/architecture.md, "How the tower was verified"). `make_images.py`
 writes the four synthetic test images in `reference/images/` (333 x 777,
 640 x 480, 1920 x 1080, 3840 x 2160; `images.json` has their sha256).
 `hf_vision_reference.py` produces one golden per comparison in the plan from

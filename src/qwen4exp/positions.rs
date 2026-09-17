@@ -1,5 +1,5 @@
-//! Token positions of a prompt that may contain images (`docs/vision-support-plan.md`
-//! item 5; the rule is `tools/reference/VISION.md`, "Prompt, tokens,
+//! Token positions of a prompt that may contain images (`docs/architecture.md`,
+//! "The vision tower"; the rule is `tools/reference/VISION.md`, "Prompt, tokens,
 //! positions", and the four `hf_vision_positions_*` goldens pin it).
 //!
 //! For text, every token's position is its sequence index on all three

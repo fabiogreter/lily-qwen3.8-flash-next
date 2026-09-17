@@ -5,7 +5,7 @@ format) against a vision golden from hf_vision_reference.py.
     .venv/bin/python tools/reference/compare_vision.py <candidate.json> <golden.json> \
         [--atol X] [--rtol Y] [--max-atol Z] [--min-frac F] [--min-cosine C] [--max-rel-l2 L]
 
-The golden's `kind` selects the comparison from docs/vision-support-plan.md:
+The golden's `kind` selects the comparison from docs/architecture.md, "How the tower was verified":
 
   preprocess  (1) image_grid_thw and resized size exact; pixel_values within
               tolerance: max abs error, max rel error, cosine, fraction within atol

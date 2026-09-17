@@ -2,7 +2,7 @@
 //! list carries it and the list is deliberately short.
 //!
 //! Two users: the vision probe's golden records (`tools/reference`) and the
-//! session cache's image identity (`docs/vision-support-plan.md` item 7),
+//! session cache's image identity (`docs/architecture.md`, "The session cache"),
 //! which digests an image's preprocessed pixel rows so two requests with
 //! different screenshots, whose prompts are the same run of placeholder
 //! tokens, are never matched to each other's cached state. The largest

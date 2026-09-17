@@ -1,5 +1,5 @@
-//! The tower against the reference golden (`docs/vision-support-plan.md`,
-//! comparison 2): the four-layer conversion with the tower
+//! The tower against the reference golden (`docs/architecture.md`,
+//! "How the tower was verified", comparison 2): the four-layer conversion with the tower
 //! (`LILY_MODEL_DIR_FLASH`) runs the 333 x 777 `pixel_values` from
 //! `tools/reference/goldens/large/` and the committed JSON golden's 4 096
 //! sampled merged values are checked within `TOWER_TOLERANCE`, so the check

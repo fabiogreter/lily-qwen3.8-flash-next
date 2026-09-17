@@ -34,8 +34,8 @@ pub struct RopeParameters {
     pub mrope_interleaved: Option<bool>,
 }
 
-/// The vision tower the converter keeps in bf16 (`docs/vision-support-plan.md`
-/// item 2; `tools/reference/VISION.md` for what each field means for the
+/// The vision tower the converter keeps in bf16 (`docs/architecture.md`,
+/// "The vision tower"; `tools/reference/VISION.md` for what each field means for the
 /// compute). Present only when the checkpoint carries the tensors.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VisionConfig {

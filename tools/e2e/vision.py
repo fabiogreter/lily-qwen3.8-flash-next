@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Image input and the caches' image identity, end to end (items 6 and 7 of
-`docs/vision-support-plan.md`). Like `durable.py` the script starts its own
+"""Image input and the caches' image identity, end to end (`docs/architecture.md`,
+"The server" and "The session cache"). Like `durable.py` the script starts its own
 lily server (never the one on port 8000) against a small checkpoint that
 carries the vision tower and an empty disk directory, e.g.
 
