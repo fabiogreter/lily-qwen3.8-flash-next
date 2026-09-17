@@ -85,7 +85,8 @@ pub fn speculate<M: LanguageModel>(
     let k = drafts.min(model.max_drafts()).max(1);
     ensure!(tokens.len() == 1, "speculation starts right after the first draw");
     let (mut drafted, mut accepted) = (0usize, 0usize);
-    let mut proposals = model.draft_initial(ctx, state, scratch, tokens[0], k)?;
+    let mut proposals =
+        model.draft_initial(ctx, state, scratch, tokens[0], k, params, tokens.len())?;
     // The next verify pass, committed by finish_speculation and parked on the
     // GPU until verify stages its n-gram rows.
     let mut parked: Option<PendingPass<'_>> = None;

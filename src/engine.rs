@@ -375,7 +375,9 @@ pub trait LanguageModel: Sized {
     }
 
     /// The first proposals of a request: up to `drafts` tokens following
-    /// `first`, the token the prefill drew. Waits for the GPU.
+    /// `first`, the token the prefill drew, proposed under the request's
+    /// sampler (`step0` is the draw index of the verify pass that will check
+    /// them). Waits for the GPU.
     fn draft_initial(
         &self,
         ctx: &MetalContext,
@@ -383,8 +385,10 @@ pub trait LanguageModel: Sized {
         scratch: &mut Self::Scratch,
         first: u32,
         drafts: usize,
+        params: &SamplingParams,
+        step0: usize,
     ) -> Result<Vec<u32>> {
-        let _ = (ctx, state, scratch, first, drafts);
+        let _ = (ctx, state, scratch, first, drafts, params, step0);
         anyhow::bail!("this model has no draft head")
     }
 

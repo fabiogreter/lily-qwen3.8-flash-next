@@ -149,34 +149,43 @@ kernel void sample_prepare_f32(device const float* logits    [[buffer(0)]],  // 
     }
 }
 
-// Selects the top-k of `adjusted`, truncates by top-p / min-p, draws one id
-// into `out[0]` and bumps its `counts` entry.
-kernel void sample_f32(device const float* adjusted  [[buffer(0)]],  // [V]
-                       device const float* maxima    [[buffer(1)]],  // [SAMPLE_PREP_GROUPS]
-                       device uint*        counts    [[buffer(2)]],  // [V]
-                       device uint*        out       [[buffer(3)]],  // [1]
-                       constant float&     top_p     [[buffer(4)]],
-                       constant float&     min_p     [[buffer(5)]],
-                       constant uint&      top_k     [[buffer(6)]],
-                       constant uint&      V         [[buffer(7)]],
-                       constant uint&      seed_lo   [[buffer(8)]],
-                       constant uint&      seed_hi   [[buffer(9)]],
-                       constant uint&      step      [[buffer(10)]],
-                       constant uint&      use_penalties [[buffer(11)]],
-                       uint tid  [[thread_index_in_threadgroup]],
-                       uint sg   [[simdgroup_index_in_threadgroup]],
-                       uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup atomic_uint hist[SAMPLE_BINS];
-    threadgroup uint sums[SAMPLE_TG / 32];
-    threadgroup uint total;
-    threadgroup uint bin_s;
-    threadgroup uint before_s;
-    threadgroup uint cand_key[SAMPLE_K_CAP];
-    threadgroup uint cand_id[SAMPLE_K_CAP];
-    threadgroup float cum[SAMPLE_K_CAP];
-    threadgroup float sg_sums[SAMPLE_TG / 32];
-    threadgroup uint n_keep_s;
+// Inclusive prefix sum of one float per thread over the threadgroup; the
+// total is written to `*total`. Callers separate consecutive scans by a
+// barrier (`sg_sums` is rewritten).
+static inline float sample_scan_f(float v, threadgroup float* sg_sums, thread float& total,
+                                  uint sg, uint lane) {
+    const float local = simd_prefix_inclusive_sum(v);
+    if (lane == 31) {
+        sg_sums[sg] = local;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float before = 0.0f;
+    for (uint s = 0; s < sg; ++s) {
+        before += sg_sums[s];
+    }
+    total = before;
+    for (uint s = sg; s < SAMPLE_TG / 32; ++s) {
+        total += sg_sums[s];
+    }
+    return before + local;
+}
 
+// The kept candidate set of `adjusted`: its top-k, sorted descending, then
+// truncated by top-p / min-p to a prefix of `n_keep` ids. On return
+// `cand_id[0..n_keep)` holds the ids, `cum[i]` the inclusive prefix of the
+// unnormalised probabilities exp(adjusted - top), and each thread `tid <
+// n_keep` its candidate's `p` and prefix `c`. `cum[n_keep - 1]` is the kept
+// mass. Shared by the plain draw, the draft draw and the speculative
+// verify draw.
+static void sample_select(device const float* adjusted, device const float* maxima,
+                          float top_p, float min_p, uint top_k, uint V,
+                          threadgroup atomic_uint* hist, threadgroup uint* sums,
+                          threadgroup uint* total, threadgroup uint* bin_s,
+                          threadgroup uint* before_s, threadgroup uint* cand_key,
+                          threadgroup uint* cand_id, threadgroup float* cum,
+                          threadgroup float* sg_sums, threadgroup uint* n_keep_s,
+                          thread float& p, thread float& c, thread uint& n_keep,
+                          uint tid, uint sg, uint lane) {
     uint k = min(min(top_k == 0u ? uint(SAMPLE_K_CAP) : top_k, uint(SAMPLE_K_CAP)), V);
 
     // 1. The maximum, from the prepare kernel's partials.
@@ -196,8 +205,8 @@ kernel void sample_f32(device const float* adjusted  [[buffer(0)]],  // [V]
             atomic_store_explicit(&hist[i], 0u, memory_order_relaxed);
         }
         if (tid == 0) {
-            bin_s = SAMPLE_BINS;
-            before_s = 0;
+            *bin_s = SAMPLE_BINS;
+            *before_s = 0;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint i = tid; i < V; i += SAMPLE_TG) {
@@ -207,21 +216,21 @@ kernel void sample_f32(device const float* adjusted  [[buffer(0)]],  // [V]
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        sample_locate(hist, k, sums, &total, &bin_s, &before_s, tid, sg, lane);
-        if (total >= k) {
+        sample_locate(hist, k, sums, total, bin_s, before_s, tid, sg, lane);
+        if (*total >= k) {
             break;
         }
         if (attempt == 3) {
             // Fewer than k finite candidates in a huge range: take them all.
-            k = total;
-            sample_locate(hist, k, sums, &total, &bin_s, &before_s, tid, sg, lane);
+            k = *total;
+            sample_locate(hist, k, sums, total, bin_s, before_s, tid, sg, lane);
             break;
         }
         range *= 8.0f;
         inv_w = float(SAMPLE_BINS) / range;
     }
-    const uint coarse_bin = bin_s;
-    const uint before_coarse = before_s;
+    const uint coarse_bin = *bin_s;
+    const uint before_coarse = *before_s;
     const float lo = float(coarse_bin) / inv_w;
     const float inv_w2 = inv_w * float(SAMPLE_BINS);
 
@@ -237,10 +246,9 @@ kernel void sample_f32(device const float* adjusted  [[buffer(0)]],  // [V]
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    sample_locate(hist, k - before_coarse, sums, &total, &bin_s, &before_s, tid, sg, lane);
-    const uint fine_bin = bin_s;
-    const uint n_definite = before_coarse + before_s;
-    const uint ties_to_take = k - n_definite;
+    sample_locate(hist, k - before_coarse, sums, total, bin_s, before_s, tid, sg, lane);
+    const uint fine_bin = *bin_s;
+    const uint n_definite = before_coarse + *before_s;
 
     // 4. Compaction. Each thread counts its definite takes and its boundary
     //    ties, a scan assigns disjoint slots, and a second sweep writes them.
@@ -260,8 +268,8 @@ kernel void sample_f32(device const float* adjusted  [[buffer(0)]],  // [V]
             }
         }
     }
-    const uint def_base = sample_scan(my_def, sums, &total, tid, sg, lane);
-    const uint tie_base = sample_scan(my_tie, sums, &total, tid, sg, lane);
+    const uint def_base = sample_scan(my_def, sums, total, tid, sg, lane);
+    const uint tie_base = sample_scan(my_tie, sums, total, tid, sg, lane);
     uint def_at = def_base;
     uint tie_at = n_definite + tie_base;
     for (uint i = tid; i < V; i += SAMPLE_TG) {
@@ -320,20 +328,12 @@ kernel void sample_f32(device const float* adjusted  [[buffer(0)]],  // [V]
 
     // 6. Softmax over the candidates and inclusive prefix sums of probability.
     const float top_val = adjusted[cand_id[0]];
-    float p = 0.0f;
+    p = 0.0f;
     if (tid < n) {
         p = exp(adjusted[cand_id[tid]] - top_val);
     }
-    const float local = simd_prefix_inclusive_sum(p);
-    if (lane == 31) {
-        sg_sums[sg] = local;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float before = 0.0f;
-    for (uint s = 0; s < sg; ++s) {
-        before += sg_sums[s];
-    }
-    const float c = before + local;
+    float mass;
+    c = sample_scan_f(p, sg_sums, mass, sg, lane);
     if (tid < SAMPLE_K_CAP) {
         cum[tid] = c;
     }
@@ -343,20 +343,215 @@ kernel void sample_f32(device const float* adjusted  [[buffer(0)]],  // [V]
     // 7. Nucleus / min-p truncation: both keep a prefix of the sorted list.
     const bool keep = tid < n
         && (tid == 0 || ((c - p) < top_p * total_mass && p >= min_p));
-    sample_scan(keep ? 1u : 0u, sums, &n_keep_s, tid, sg, lane);
-    const uint n_keep = n_keep_s;
+    sample_scan(keep ? 1u : 0u, sums, n_keep_s, tid, sg, lane);
+    n_keep = *n_keep_s;
+}
+
+// Inverse-CDF draw over the inclusive prefix sums `prefix[0..n_keep)`: the
+// thread whose interval [prefix[tid - 1], prefix[tid]) holds `target`
+// returns its slot (the last one also takes anything at or past its
+// start), the others SAMPLE_K_CAP. The intervals tile the mass exactly.
+static inline uint sample_pick(float target, threadgroup const float* prefix, uint n_keep,
+                               uint tid) {
+    if (tid < n_keep) {
+        const float lo_c = tid == 0 ? 0.0f : prefix[tid - 1];
+        const float c = prefix[tid];
+        const bool last = tid == n_keep - 1;
+        if ((lo_c <= target && target < c) || (last && target >= lo_c)) {
+            return tid;
+        }
+    }
+    return SAMPLE_K_CAP;
+}
+
+#define SAMPLE_TG_STATE                                                        \
+    threadgroup atomic_uint hist[SAMPLE_BINS];                                 \
+    threadgroup uint sums[SAMPLE_TG / 32];                                     \
+    threadgroup uint total;                                                    \
+    threadgroup uint bin_s;                                                    \
+    threadgroup uint before_s;                                                 \
+    threadgroup uint cand_key[SAMPLE_K_CAP];                                   \
+    threadgroup uint cand_id[SAMPLE_K_CAP];                                    \
+    threadgroup float cum[SAMPLE_K_CAP];                                       \
+    threadgroup float sg_sums[SAMPLE_TG / 32];                                 \
+    threadgroup uint n_keep_s;
+
+#define SAMPLE_SELECT_ARGS                                                     \
+    hist, sums, &total, &bin_s, &before_s, cand_key, cand_id, cum, sg_sums,    \
+    &n_keep_s
+
+// Selects the top-k of `adjusted`, truncates by top-p / min-p, draws one id
+// into `out[0]` and bumps its `counts` entry.
+kernel void sample_f32(device const float* adjusted  [[buffer(0)]],  // [V]
+                       device const float* maxima    [[buffer(1)]],  // [SAMPLE_PREP_GROUPS]
+                       device uint*        counts    [[buffer(2)]],  // [V]
+                       device uint*        out       [[buffer(3)]],  // [1]
+                       constant float&     top_p     [[buffer(4)]],
+                       constant float&     min_p     [[buffer(5)]],
+                       constant uint&      top_k     [[buffer(6)]],
+                       constant uint&      V         [[buffer(7)]],
+                       constant uint&      seed_lo   [[buffer(8)]],
+                       constant uint&      seed_hi   [[buffer(9)]],
+                       constant uint&      step      [[buffer(10)]],
+                       constant uint&      use_penalties [[buffer(11)]],
+                       uint tid  [[thread_index_in_threadgroup]],
+                       uint sg   [[simdgroup_index_in_threadgroup]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+    SAMPLE_TG_STATE
+    float p, c;
+    uint n_keep;
+    sample_select(adjusted, maxima, top_p, min_p, top_k, V, SAMPLE_SELECT_ARGS,
+                  p, c, n_keep, tid, sg, lane);
 
     // 8. Inverse-CDF draw within the kept mass.
     const float target = sample_uniform(seed_lo, seed_hi, step) * cum[n_keep - 1];
+    if (sample_pick(target, cum, n_keep, tid) == tid) {
+        const uint chosen = cand_id[tid];
+        out[0] = chosen;
+        if (use_penalties) {
+            counts[chosen] += 1u;
+        }
+    }
+}
+
+// The draft head's draw: as sample_f32, and the kept distribution it drew
+// from goes to q_ids / q_probs (normalised over the kept mass) with its size
+// in q_n[0], for the verify pass's speculative draw against this proposal.
+kernel void sample_draft_f32(device const float* adjusted  [[buffer(0)]],  // [V]
+                             device const float* maxima    [[buffer(1)]],  // [SAMPLE_PREP_GROUPS]
+                             device uint*        counts    [[buffer(2)]],  // [V]
+                             device uint*        out       [[buffer(3)]],  // [1]
+                             device uint*        q_ids     [[buffer(4)]],  // [SAMPLE_K_CAP]
+                             device float*       q_probs   [[buffer(5)]],  // [SAMPLE_K_CAP]
+                             device uint*        q_n       [[buffer(6)]],  // [1]
+                             constant float&     top_p     [[buffer(7)]],
+                             constant float&     min_p     [[buffer(8)]],
+                             constant uint&      top_k     [[buffer(9)]],
+                             constant uint&      V         [[buffer(10)]],
+                             constant uint&      seed_lo   [[buffer(11)]],
+                             constant uint&      seed_hi   [[buffer(12)]],
+                             constant uint&      step      [[buffer(13)]],
+                             constant uint&      use_penalties [[buffer(14)]],
+                             uint tid  [[thread_index_in_threadgroup]],
+                             uint sg   [[simdgroup_index_in_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+    SAMPLE_TG_STATE
+    float p, c;
+    uint n_keep;
+    sample_select(adjusted, maxima, top_p, min_p, top_k, V, SAMPLE_SELECT_ARGS,
+                  p, c, n_keep, tid, sg, lane);
+    const float mass = cum[n_keep - 1];
     if (tid < n_keep) {
-        const float lo_c = tid == 0 ? 0.0f : cum[tid - 1];
-        const bool last = tid == n_keep - 1;
-        if ((lo_c <= target && target < c) || (last && target >= lo_c)) {
-            const uint chosen = cand_id[tid];
-            out[0] = chosen;
+        q_ids[tid] = cand_id[tid];
+        q_probs[tid] = p / mass;
+    }
+    if (tid == 0) {
+        q_n[0] = n_keep;
+    }
+    const float target = sample_uniform(seed_lo, seed_hi, step) * mass;
+    if (sample_pick(target, cum, n_keep, tid) == tid) {
+        const uint chosen = cand_id[tid];
+        out[0] = chosen;
+        if (use_penalties) {
+            counts[chosen] += 1u;
+        }
+    }
+}
+
+// Speculative sampling (Leviathan et al.): the trunk's kept distribution p
+// against the draft's exported q and its proposal d = draft[0]. Accepts d
+// with probability min(1, p(d) / q(d)) on the (seed, step) uniform,
+// otherwise draws from the residual max(0, p - q) normalised, on a second
+// uniform of the same step (its high bit set). The output is distributed
+// exactly as a plain draw from p, and equals d exactly when accepted (the
+// residual has no mass on a rejected d). Falls back to a plain draw from p
+// when the residual has no mass, which only rounding can produce.
+kernel void sample_spec_f32(device const float* adjusted  [[buffer(0)]],  // [V]
+                            device const float* maxima    [[buffer(1)]],  // [SAMPLE_PREP_GROUPS]
+                            device uint*        counts    [[buffer(2)]],  // [V]
+                            device uint*        out       [[buffer(3)]],  // [1]
+                            device const uint*  q_ids     [[buffer(4)]],  // [SAMPLE_K_CAP]
+                            device const float* q_probs   [[buffer(5)]],  // [SAMPLE_K_CAP]
+                            device const uint*  q_n       [[buffer(6)]],  // [1]
+                            device const uint*  draft     [[buffer(7)]],  // [1]
+                            constant float&     top_p     [[buffer(8)]],
+                            constant float&     min_p     [[buffer(9)]],
+                            constant uint&      top_k     [[buffer(10)]],
+                            constant uint&      V         [[buffer(11)]],
+                            constant uint&      seed_lo   [[buffer(12)]],
+                            constant uint&      seed_hi   [[buffer(13)]],
+                            constant uint&      step      [[buffer(14)]],
+                            constant uint&      use_penalties [[buffer(15)]],
+                            uint tid  [[thread_index_in_threadgroup]],
+                            uint sg   [[simdgroup_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+    SAMPLE_TG_STATE
+    threadgroup float p_d_s;
+    threadgroup float q_d_s;
+    float p, c;
+    uint n_keep;
+    sample_select(adjusted, maxima, top_p, min_p, top_k, V, SAMPLE_SELECT_ARGS,
+                  p, c, n_keep, tid, sg, lane);
+    const float mass = cum[n_keep - 1];
+    const uint d = draft[0];
+    const uint qn = min(q_n[0], uint(SAMPLE_K_CAP));
+
+    // p(d) from the kept set (0 outside it) and q(d) from the draft's set.
+    if (tid == 0) {
+        p_d_s = 0.0f;
+        q_d_s = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < n_keep && cand_id[tid] == d) {
+        p_d_s = p / mass;
+    }
+    if (tid < qn && q_ids[tid] == d) {
+        q_d_s = q_probs[tid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float p_d = p_d_s;
+    const float q_d = q_d_s;
+    const float u1 = sample_uniform(seed_lo, seed_hi, step);
+    if (u1 * q_d < p_d) {
+        if (tid == 0) {
+            out[0] = d;
             if (use_penalties) {
-                counts[chosen] += 1u;
+                counts[d] += 1u;
             }
+        }
+        return;
+    }
+
+    // Rejected: the residual over the kept set (q's mass elsewhere only
+    // lowers the residual, which is zero outside p's support anyway).
+    float q_i = 0.0f;
+    if (tid < n_keep) {
+        const uint id = cand_id[tid];
+        for (uint j = 0; j < qn; ++j) {
+            if (q_ids[j] == id) {
+                q_i = q_probs[j];
+                break;
+            }
+        }
+    }
+    const float r = tid < n_keep ? max(0.0f, p / mass - q_i) : 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float r_total;
+    const float rc = sample_scan_f(r, sg_sums, r_total, sg, lane);
+    // The residual's prefix sums, in the sorted keys' storage (free now).
+    threadgroup float* rcum = (threadgroup float*)cand_key;
+    if (tid < SAMPLE_K_CAP) {
+        rcum[tid] = rc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float u2 = sample_uniform(seed_lo, seed_hi, step | 0x80000000u);
+    const uint slot = r_total > 0.0f ? sample_pick(u2 * r_total, rcum, n_keep, tid)
+                                     : sample_pick(u2 * mass, cum, n_keep, tid);
+    if (slot == tid) {
+        const uint chosen = cand_id[tid];
+        out[0] = chosen;
+        if (use_penalties) {
+            counts[chosen] += 1u;
         }
     }
 }

@@ -141,9 +141,77 @@ impl SamplerScratch {
     }
 }
 
-/// Encodes one draw from `logits` (F32 `[V]`) into `out` (U32 `[1]`);
-/// `step` indexes the request's draws for the RNG.
-pub fn sample_f32(
+/// The distributions the draft head drew its proposals from, one slot per
+/// draft: the kept candidate ids, their probabilities normalised over the
+/// kept mass, and the kept count. Written by [`sample_draft_f32`] on the
+/// GPU and read by [`sample_spec_f32`] in the verify pass that checks the
+/// proposal, so nothing about them crosses to the host.
+pub struct DraftDists {
+    ids: Tensor,
+    probs: Tensor,
+    counts: Tensor,
+}
+
+/// One slot of a [`DraftDists`].
+pub struct DraftDist {
+    ids: Tensor,
+    probs: Tensor,
+    count: Tensor,
+}
+
+impl DraftDists {
+    pub fn new(ctx: &MetalContext, slots: usize) -> Result<Self> {
+        Ok(Self {
+            ids: Tensor::zeros(ctx, &[slots * SAMPLE_K_CAP], DType::U32)?,
+            probs: Tensor::zeros(ctx, &[slots * SAMPLE_K_CAP], DType::F32)?,
+            counts: Tensor::zeros(ctx, &[slots], DType::U32)?,
+        })
+    }
+
+    pub fn slot(&self, i: usize) -> Result<DraftDist> {
+        Ok(DraftDist {
+            ids: self.ids.view(i * SAMPLE_K_CAP, &[SAMPLE_K_CAP])?,
+            probs: self.probs.view(i * SAMPLE_K_CAP, &[SAMPLE_K_CAP])?,
+            count: self.counts.view(i, &[1])?,
+        })
+    }
+}
+
+/// The RNG index of the draft head's draw for the proposal that the
+/// request's draw `step` will check: its own domain (high bit set), so it
+/// never shares a uniform with the trunk's draws or the residual draws.
+pub fn draft_step(step: usize) -> usize {
+    step | 0x4000_0000
+}
+
+/// The sampler the draft head draws with: the request's temperature and
+/// truncation, without the penalties (the proposals are not emissions and
+/// the draft pass never binds the histogram).
+pub fn draft_params(params: &SamplingParams) -> SamplingParams {
+    SamplingParams {
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        repetition_penalty: 1.0,
+        ..*params
+    }
+}
+
+/// The sampler runs when the draw is not an exact argmax: sampling, or
+/// greedy with penalties (a top-1 draw over the penalised logits).
+fn samples(params: &SamplingParams) -> bool {
+    !params.is_greedy() || params.uses_penalties()
+}
+
+/// What a draw needs beyond the plain kernel.
+enum Draw<'a> {
+    Plain,
+    /// Export the kept distribution to the slot.
+    Draft(&'a DraftDist),
+    /// Speculative draw against the slot's distribution and its proposal.
+    Spec(&'a DraftDist, &'a Tensor),
+}
+
+fn encode_draw(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
     logits: &Tensor,
@@ -151,16 +219,13 @@ pub fn sample_f32(
     params: &SamplingParams,
     step: usize,
     out: &Tensor,
+    draw: Draw<'_>,
 ) -> Result<()> {
     let v = logits.numel();
     ensure!(v > 0 && logits.dtype() == DType::F32, "logits must be F32 [V]");
     ensure!(scratch.vocab() == v, "sampler scratch sized for a different vocabulary");
     ensure!(out.numel() == 1 && out.dtype() == DType::U32, "out must be U32 [1]");
     params.validate()?;
-    if params.is_greedy() && !params.uses_penalties() {
-        // Exact and cheap: the multi-threadgroup argmax.
-        return argmax_f32(ctx, pass, logits, &scratch.argmax_partials, out);
-    }
     let (temperature, top_k) = params.effective();
     let penalties = u32_bytes(usize::from(params.uses_penalties()));
     let prepare = ctx.pipeline("sample_prepare_f32", SOURCE, MslVersion::V3_1)?;
@@ -186,15 +251,39 @@ pub fn sample_f32(
         },
     )?;
     pass.level_barrier(&[&scratch.adjusted, &scratch.maxima])?;
-    let select = ctx.pipeline("sample_f32", SOURCE, MslVersion::V3_1)?;
+    let (name, mut buffers) = match &draw {
+        Draw::Plain => ("sample_f32", Vec::new()),
+        Draw::Draft(dist) => (
+            "sample_draft_f32",
+            vec![dist.ids.binding(), dist.probs.binding(), dist.count.binding()],
+        ),
+        Draw::Spec(dist, draft) => {
+            ensure!(
+                draft.numel() == 1 && draft.dtype() == DType::U32,
+                "draft must be U32 [1]"
+            );
+            (
+                "sample_spec_f32",
+                vec![
+                    dist.ids.binding(),
+                    dist.probs.binding(),
+                    dist.count.binding(),
+                    draft.binding(),
+                ],
+            )
+        }
+    };
+    let mut bindings = vec![
+        scratch.adjusted.binding(),
+        scratch.maxima.binding(),
+        scratch.counts.binding(),
+        out.binding(),
+    ];
+    bindings.append(&mut buffers);
+    let select = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &select,
-        &[
-            scratch.adjusted.binding(),
-            scratch.maxima.binding(),
-            scratch.counts.binding(),
-            out.binding(),
-        ],
+        &bindings,
         &[
             &f32_bytes(params.top_p),
             &f32_bytes(params.min_p),
@@ -207,6 +296,69 @@ pub fn sample_f32(
         ],
         Grid::Threadgroups { groups: (1, 1, 1), threadgroup: (TG, 1, 1) },
     )
+}
+
+/// Encodes one draw from `logits` (F32 `[V]`) into `out` (U32 `[1]`);
+/// `step` indexes the request's draws for the RNG.
+pub fn sample_f32(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    logits: &Tensor,
+    scratch: &SamplerScratch,
+    params: &SamplingParams,
+    step: usize,
+    out: &Tensor,
+) -> Result<()> {
+    if !samples(params) {
+        // Exact and cheap: the multi-threadgroup argmax.
+        return argmax_f32(ctx, pass, logits, &scratch.argmax_partials, out);
+    }
+    encode_draw(ctx, pass, logits, scratch, params, step, out, Draw::Plain)
+}
+
+/// The draft head's draw of one proposal: as [`sample_f32`], and under a
+/// sampler that samples the kept distribution goes to `dist` for the
+/// verify pass. Greedy proposals (an argmax) export nothing: the verify
+/// pass compares them exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn sample_draft_f32(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    logits: &Tensor,
+    scratch: &SamplerScratch,
+    params: &SamplingParams,
+    step: usize,
+    out: &Tensor,
+    dist: &DraftDist,
+) -> Result<()> {
+    if !samples(params) {
+        return argmax_f32(ctx, pass, logits, &scratch.argmax_partials, out);
+    }
+    encode_draw(ctx, pass, logits, scratch, params, step, out, Draw::Draft(dist))
+}
+
+/// The verify pass's draw for a row whose proposal `draft` (U32 `[1]`) the
+/// draft head drew from `dist`: speculative sampling, which returns the
+/// proposal exactly when it accepts it and otherwise a token from the
+/// residual, distributed overall exactly as [`sample_f32`] would draw.
+/// Under a greedy sampler this is the plain argmax (the proposal was one
+/// too, and equality is the acceptance test).
+#[allow(clippy::too_many_arguments)]
+pub fn sample_spec_f32(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    logits: &Tensor,
+    scratch: &SamplerScratch,
+    params: &SamplingParams,
+    step: usize,
+    dist: &DraftDist,
+    draft: &Tensor,
+    out: &Tensor,
+) -> Result<()> {
+    if !samples(params) {
+        return argmax_f32(ctx, pass, logits, &scratch.argmax_partials, out);
+    }
+    encode_draw(ctx, pass, logits, scratch, params, step, out, Draw::Spec(dist, draft))
 }
 
 /// The kernel's uniform draw for `(seed, step)`, for tests and replay.

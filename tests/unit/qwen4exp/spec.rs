@@ -105,6 +105,8 @@ fn host_draft(
             rollback,
             chain,
             None,
+            &SamplingParams::greedy(),
+            0,
         )
         .expect("encode draft");
     s.spec

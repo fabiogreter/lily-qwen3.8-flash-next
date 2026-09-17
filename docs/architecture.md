@@ -576,11 +576,24 @@ all `m` rows with the trunk's draws (the rows past `a` compute values that
 later rows overwrite before anything valid reads them) and chains further
 drafts from its own residual.
 
-**Drafts are greedy.** The head proposes with argmax while the trunk may
-sample with temperature, so a sampled request accepts fewer drafts than a
-greedy one and gains less. Making acceptance exact under sampling would mean
-standard speculative sampling with rejection against the trunk's
-distribution, which changes the verify pass's sampler.
+**Drafts follow the request's sampler.** Under greedy decoding the head
+proposes with argmax and a verify row confirms its draft when the trunk's
+argmax equals it. Under sampling the head draws each proposal from its own
+distribution with the request's temperature, top-k, top-p and min-p (no
+penalties) and leaves that kept distribution `q` on the GPU next to the
+proposal; the verify row then runs speculative sampling (Leviathan et al.)
+against the trunk's kept distribution `p`: it accepts the proposal with
+probability min(1, p(d) / q(d)) on the row's uniform, and otherwise draws
+from the residual max(0, p - q) on a second uniform of the same step. The
+row's token is distributed exactly as a plain draw from `p` would be, so
+sampling-aware drafting changes no output distribution, and it equals the
+proposal exactly when accepted, so the engine's acceptance test is still
+equality. The draft draws use their own RNG domain (high bit of the step
+index) and never share a uniform with the trunk. Measured on the 8K
+synthetic prompt with the server's defaults (temperature 1.0, top-k 20,
+top-p 0.95, three seeds): 65 to 67% of proposals accepted against 55 to 65%
+with argmax proposals, 2.31 to 2.35 tokens per step against 2.10 to 2.31;
+greedy decoding is unchanged to the digest.
 
 Cost: a verify pass over `m` rows is the batched prefill graph, and the extra
 rows are mostly the extra experts they route to, up to 10 more per layer per
@@ -816,7 +829,11 @@ over a range that widens when needed, refined once, boundary resolution
 draws by inverse CDF from a counter-based hash RNG seeded by `seed` and the
 step index. Greedy without penalties takes the exact argmax kernel. Measured
 per draw at the 248 320-token vocabulary: greedy 24 us, top-k 20 with
-top-p 0.95 350 us, the 1 024-candidate cap 170 us.
+top-p 0.95 350 us, the 1 024-candidate cap 170 us. The selection is shared
+by three kernels: the plain draw, the draft head's draw (which also exports
+the kept ids and probabilities for the verify pass) and the verify pass's
+speculative draw (accept the proposal or draw from the residual, see
+"Speculative decoding").
 
 Stop signals are taken synchronously rather than in a signal handler: SIGTERM
 and SIGINT are blocked before the first thread is spawned, so every thread

@@ -40,7 +40,9 @@ use crate::kernels::ple;
 use crate::kernels::qsa::{
     self, INDEXER_D, SparseAttnRoute, SparseSplitScratch, SparseTileScratch,
 };
-use crate::kernels::sample::{SamplerScratch, SamplingParams, sample_f32};
+use crate::kernels::sample::{
+    DraftDists, SamplerScratch, SamplingParams, sample_f32, sample_spec_f32,
+};
 use crate::kernels::spec::ctrl_words;
 use crate::kernels::{Arg, Pos, Rope};
 use crate::kernels::{quant, skinny};
@@ -944,6 +946,9 @@ pub(super) struct SpecScratch {
     pub(super) verify_tokens: Tensor,
     /// U32 `[MAX_DRAFTS]`: the draft head's proposals.
     pub(super) draft_tokens: Tensor,
+    /// The distributions the proposals were drawn from under a sampling
+    /// request (one slot per draft), for the verify pass's speculative draws.
+    pub(super) dists: DraftDists,
     /// U32 `[MAX_DRAFTS + 1]`: host-written tokens for the head's catch-up rows.
     pub(super) mtp_ids: Tensor,
     /// U32 control block the GPU fills with the accepted count and what
@@ -984,6 +989,7 @@ impl SpecScratch {
             logits: Tensor::zeros(ctx, &[rows, cfg.vocab_size], DType::F32)?,
             verify_tokens: Tensor::zeros(ctx, &[rows], DType::U32)?,
             draft_tokens: Tensor::zeros(ctx, &[MAX_DRAFTS], DType::U32)?,
+            dists: DraftDists::new(ctx, MAX_DRAFTS)?,
             mtp_ids: Tensor::zeros(ctx, &[rows], DType::U32)?,
             ctrl: Tensor::zeros(ctx, &[ctrl_words(MAX_DRAFTS)], DType::U32)?,
             chain_in: Tensor::zeros(ctx, &[1, cfg.hc_width()], DType::BF16)?,
@@ -1946,10 +1952,35 @@ impl Qwen4ExpModel {
                 pass.level_barrier(&[&logits])?;
                 // One draw per row; the rows share the sampler scratch (and
                 // the penalty counts, which must see earlier rows' draws).
+                // Row j's draw checks proposal j (the row after it in the
+                // pass): a speculative draw against the distribution the
+                // draft head drew it from. The last row has no proposal.
                 for j in 0..m {
                     let row = sp.logits.view(j * cfg.vocab_size, &[cfg.vocab_size])?;
                     let out = sp.verify_tokens.view(j, &[1])?;
-                    sample_f32(ctx, &pass, &row, &s.sampler, params, step0 + j, &out)?;
+                    if j + 1 < m {
+                        sample_spec_f32(
+                            ctx,
+                            &pass,
+                            &row,
+                            &s.sampler,
+                            params,
+                            step0 + j,
+                            &sp.dists.slot(j)?,
+                            &ps.ids.view(j + 1, &[1])?,
+                            &out,
+                        )?;
+                    } else {
+                        sample_f32(
+                            ctx,
+                            &pass,
+                            &row,
+                            &s.sampler,
+                            params,
+                            step0 + j,
+                            &out,
+                        )?;
+                    }
                     pass.level_barrier(&[&sp.verify_tokens])?;
                 }
             }
@@ -3705,8 +3736,12 @@ impl LanguageModel for Qwen4ExpModel {
         scratch: &mut Scratch,
         first: u32,
         drafts: usize,
+        params: &SamplingParams,
+        step0: usize,
     ) -> Result<Vec<u32>> {
-        Qwen4ExpModel::draft_initial(self, ctx, state, scratch, first, drafts)
+        Qwen4ExpModel::draft_initial(
+            self, ctx, state, scratch, first, drafts, params, step0,
+        )
     }
 
     fn verify<'a>(

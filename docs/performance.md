@@ -95,14 +95,17 @@ figures are lower bounds.
 
 Speculative decoding changes no output: every emitted token is the trunk's
 own draw and the draft count changes only how many rows a pass confirms.
-Sampling with temperature accepts fewer drafts than greedy decoding, because
-the draft head proposes with argmax. Measured with `lily-bench --sample`
-(the checkpoint's defaults: temperature 1.0, top-k 20, top-p 0.95) on the
-8K synthetic prompt over 256 tokens with 2 drafts: 73% accepted greedily
-(2.46 tokens per step, reproducible to the digest) against 60%, 55% and 65%
-for three sampler seeds (2.10 to 2.31 tokens per step), so the server's
-default sampling gives up about 10% of the speculative rate to the greedy
-draft head.
+Sampling with temperature accepts fewer drafts than greedy decoding.
+Measured with `lily-bench --sample` (the checkpoint's defaults: temperature
+1.0, top-k 20, top-p 0.95) on the 8K synthetic prompt over 256 tokens with 2
+drafts: 73% accepted greedily (2.46 tokens per step, reproducible to the
+digest) against 60%, 55% and 65% for three sampler seeds (2.10 to 2.31
+tokens per step) while the head proposed with argmax. With the head drawing
+its proposals under the request's sampler and the verify rows running exact
+speculative sampling against them (`docs/architecture.md`), the same three
+seeds accept 65%, 67% and 65% (2.31 to 2.35 tokens per step), about 5% more
+tokens per step on this prompt, on which the head and the trunk disagree
+more than on text; the output distribution is unchanged by construction.
 
 ### Against mlx-lm
 

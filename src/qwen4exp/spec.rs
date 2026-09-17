@@ -32,7 +32,9 @@ use anyhow::{Result, ensure};
 use crate::engine::{DecodeStateApi, NextStep};
 use crate::kernels::elementwise::copy_words;
 use crate::kernels::gdn::{GDN_HEAD_DIM, conv_window_rollback};
-use crate::kernels::sample::{SamplingParams, sample_f32};
+use crate::kernels::sample::{
+    SamplingParams, draft_params, draft_step, sample_draft_f32,
+};
 use crate::kernels::spec::{
     SLOT_ACCEPTED, SLOT_KEEP, copy_row, ctrl_word, slot_block, slot_count, slot_pos,
     spec_accept,
@@ -47,8 +49,6 @@ use super::model::{
     Scratch, SpecPending,
 };
 use super::ngram::NgramHasher;
-
-const GREEDY: SamplingParams = SamplingParams::greedy();
 
 fn profiling() -> bool {
     std::env::var_os("LILY_PROFILE").is_some()
@@ -162,7 +162,16 @@ impl Qwen4ExpModel {
         // The draft pass follows on the queue; the GPU reads the accepted
         // count itself.
         let draft = self
-            .encode_draft_selected(ctx, state, s, pos_before, m, chain)?
+            .encode_draft_selected(
+                ctx,
+                state,
+                s,
+                pos_before,
+                m,
+                chain,
+                params,
+                step0 + m,
+            )?
             .commit()?;
         // While the GPU works, encode the next verify pass for every possible
         // outcome; finish_speculation then only commits the matching one.
@@ -320,6 +329,8 @@ impl Qwen4ExpModel {
                         Some((accepted, m)),
                         0,
                         None,
+                        &SamplingParams::greedy(),
+                        0,
                     )?
                     .commit()?
                     .wait()?;
@@ -414,6 +425,8 @@ impl Qwen4ExpModel {
         s: &mut Scratch,
         first: u32,
         drafts: usize,
+        params: &SamplingParams,
+        step0: usize,
     ) -> Result<Vec<u32>> {
         ensure!(
             state.spec.is_none(),
@@ -441,6 +454,8 @@ impl Qwen4ExpModel {
             None,
             drafts,
             None,
+            params,
+            step0,
         )?;
         let sp = s.spec.as_ref().ok_or_else(|| anyhow::anyhow!("no spec scratch"))?;
         sp.mtp_ids.view(0, &[1])?.write_bytes(bytemuck::cast_slice(&[first]))?;
@@ -511,6 +526,8 @@ impl Qwen4ExpModel {
         pos0: usize,
         m: usize,
         chain: usize,
+        params: &SamplingParams,
+        draw0: usize,
     ) -> Result<EncodedPass<'a>> {
         let cfg = &self.config;
         let wide = cfg.hc_width();
@@ -638,6 +655,7 @@ impl Qwen4ExpModel {
             )?;
             pass.level_barrier(&[&sp.chain_in])?;
             let ps1 = capacity.rows(1)?;
+            let head_params = draft_params(params);
             let mut last = sp.chain_in.view(0, &[1, wide])?;
             for (i, (pos, block, count)) in chain_words.iter().enumerate() {
                 // Head: mixer over the last residual row, shared LM head, argmax.
@@ -653,14 +671,15 @@ impl Qwen4ExpModel {
                 )?;
                 pass.level_barrier(&[&logits])?;
                 let out = sp.draft_tokens.view(i, &[1])?;
-                sample_f32(
+                sample_draft_f32(
                     ctx,
                     &pass,
                     &logits.view(0, &[cfg.vocab_size])?,
                     &s.sampler,
-                    &GREEDY,
-                    0,
+                    &head_params,
+                    draft_step(draw0 + i),
                     &out,
+                    &sp.dists.slot(i)?,
                 )?;
                 pass.level_barrier(&[&sp.draft_tokens])?;
                 if i + 1 < chain {
@@ -728,6 +747,8 @@ impl Qwen4ExpModel {
         rollback: Option<(usize, usize)>,
         drafts: usize,
         next_ids: Option<&Tensor>,
+        params: &SamplingParams,
+        draw0: usize,
     ) -> Result<EncodedPass<'a>> {
         let cfg = &self.config;
         let wide = cfg.hc_width();
@@ -743,6 +764,7 @@ impl Qwen4ExpModel {
             .prefill
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("prefill scratch missing"))?;
+        let head_params = draft_params(params);
         ensure!(rows <= MAX_DRAFTS + 1, "too many catch-up rows");
         ensure!(
             drafts == 0 || chain_row < rows,
@@ -826,14 +848,15 @@ impl Qwen4ExpModel {
                     )?;
                     pass.level_barrier(&[&logits])?;
                     let out = sp.draft_tokens.view(i, &[1])?;
-                    sample_f32(
+                    sample_draft_f32(
                         ctx,
                         &pass,
                         &logits.view(0, &[cfg.vocab_size])?,
                         &s.sampler,
-                        &GREEDY,
-                        0,
+                        &head_params,
+                        draft_step(draw0 + i),
                         &out,
+                        &sp.dists.slot(i)?,
                     )?;
                     pass.level_barrier(&[&sp.draft_tokens])?;
                     if i + 1 < drafts {
