@@ -146,6 +146,109 @@ Caveats, all of which matter:
   Each engine repeated its own 64-token digest exactly across rounds; a
   cross-engine digest comparison is informational only.
 
+### MLX engines for this model
+
+No released mlx-lm runs Qwen3.8-Flash-Next (0.31.3 has no `qwen4_exp`; the
+port is the open, unmerged mlx-lm pull request 1788). On 2026-09-11 a local
+build of that pull request, with two patches it needed (the n-gram hash seed,
+and a converter that keeps the n-gram tables at 4 bits, which the stock one
+leaves in bf16), was measured against lily's binary of that day, interleaved,
+one engine loaded at a time: at 1K, mlx-lm 1 526 tok/s prefill and 29.6
+decode against lily's 1 946 and 86.5; at 8K, 1 145 and 25.3 against 1 139 and
+72.5. The port has no draft head, so lily's 2-draft figures (116.5 and 82.1)
+had no counterpart, and it peaked at 105 GB of memory on the 128 GB machine.
+
+Several third-party MLX engines ship their own `qwen4_exp` and publish
+figures for an M5 Max: MTPLX (Apache-2.0) reports 79 tok/s at 9K and 61 at
+109K with its MTP path under the model's default sampling, 44 plain, and
+810 tok/s prefill at 131K; oMLX reports 58 to 70 tok/s with its speculative
+path in its 0.7.0 development builds. None of these were measured with this
+harness, so they are cited, not compared; lily's plain decode of 82 to 86 in
+the table below exceeds their speculative figures, and its 2-draft rate is
+measured greedily, which is worth about 10 % over sampled drafting.
+
+### Against llama.cpp
+
+Measured 2026-09-17 with `tools/bench/http_bench.py`, which drives both
+servers over HTTP with the same prompts and reads each engine's own timings.
+The other side is Unsloth's llama.cpp fork (build b11007, Unsloth Studio
+2026.9.5) serving `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ4_XS, 87 GB, KV
+cache f16, four slots over a unified 131 072-token context, flash attention
+off because the fork aborts at startup with it on for this model. lily ran
+commit 0c9ee63 with `--max-seq 131072`, the disk tier off for the matrix so
+that no run could hit a cache.
+
+- **Prompts.** Cut from this repository's documentation and source with the
+  model's tokenizer, a fresh region of the corpus for every run, at 1K, 4K,
+  16K, 32K and 64K tokens. The 1K column is not reported: it sits inside the
+  GPU's clock ramp (see above) and lily's runs there ranged from 631 to
+  1 679 tok/s.
+- **Generation.** 256 greedy tokens of new text, a task unrelated to the
+  prompt. The fork's default speculation is an n-gram drafter that copies
+  from the context; on a "continue the document" task it reached full
+  acceptance and four times plain decode by copying, which says nothing about
+  generating. On new text it gains nothing (11 % acceptance) and is left out.
+- **Repeats.** Three, interleaved per repeat, ten seconds between runs;
+  medians, ranges in the records under `docs/bench/2026-09-17-vs-unsloth/`.
+- **Both models at once do not fit** in 128 GB, so the two sides ran one
+  after the other with the other server stopped.
+
+Prefill, tok/s:
+
+| context | lily | llama.cpp | ratio |
+|--------:|-----:|----------:|------:|
+| 4 096   | 1 300 | 887 | 1.47x |
+| 16 384  | 1 546 | 882 | 1.75x |
+| 32 768  | 1 499 | 713 | 2.10x |
+| 65 536  | 1 382 | 550 | 2.51x |
+
+Decode, tok/s:
+
+| context | lily plain | lily 2 drafts | llama.cpp plain | llama.cpp MTP 2 | ratio, best against best |
+|--------:|-----------:|--------------:|----------------:|----------------:|-------------------------:|
+| 1 024   | 90.2 | 98.9  | 42.0 | 54.7 | 1.81x |
+| 4 096   | 86.0 | 101.7 | 39.1 | 51.8 | 1.96x |
+| 16 384  | 85.5 | 102.0 | 31.4 | 44.1 | 2.31x |
+| 32 768  | 83.9 | 101.5 | 25.2 | 37.0 | 2.74x |
+| 65 536  | 81.8 | 97.7  | 17.0 | 27.0 | 3.62x |
+
+Draft acceptance at two drafts per step was 63 % on lily and 66 % on the
+fork, so the head behaves alike in both engines. At three drafts both fell to
+50 to 53 % and decoded slower than at two (lily 83 to 94 tok/s, the fork
+25 to 51), so three is not worth it on either.
+
+**The fork's MTP needs a patched build.** Unsloth Studio's shipped build
+aborts while loading the MTP drafter (`GGML_ASSERT(ggml_can_repeat)` in the
+qwen4exp MTP graph; the draft head's `hc_head_norm` tensor is declared with
+a shape the trunk's norms moved away from) and then starts a third time
+without any drafter while its settings page still says MTP. The bug is
+reported on the fork's MTP pull request and in unslothai/unsloth issue
+11143 with a one-line fix; the MTP rows above come from a build of the same
+source with that fix. Everything else is the shipped build.
+
+**Prompt cache behaviour**, tokens recomputed out of the prompt, from the
+harness's `cache` test with lily's disk tier on:
+
+| request | lily | llama.cpp |
+|---|---|---|
+| the same 16K prefix, first new question | 16 404 (full), then a durable entry | 512 |
+| the same prefix, later questions | 1 to 16 | 512 to 516 |
+| a conversation growing 575 tokens per turn | about 535, in 0.49 s | about 535, in 0.87 s |
+| six 12K conversations interleaved, second round | 25 each, in 0.15 s | 25 each, in 0.31 s |
+
+The fork resumes from a checkpoint below the divergence and recomputes about
+512 tokens every time. lily's checkpoint sits at the end of the previous
+prompt, so the first divergence recomputes the prompt and writes a durable
+prefix entry; from then on the tail alone is recomputed. Both engines keep
+more conversations than the fork's four slots, the fork through a host-RAM
+cache of evicted slots.
+
+Caveats: the quantizations differ (affine 4-bit, group 64, against IQ4_XS at
+4.25 bits per weight); llama.cpp's `prompt_ms` and lily's `prefill_ms` both
+include their engine's own bookkeeping around the prefill, and lily's
+includes the recurrent-state checkpoint; and the fork ran with flash
+attention off, its only working configuration for this model that day.
+
 ## Known limits and remaining levers
 
 Ranked by expected gain per unit of effort for one interactive coding agent
