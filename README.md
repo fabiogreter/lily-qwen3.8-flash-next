@@ -1,19 +1,18 @@
 # lily
 
 lily is a Metal inference server for Apple Silicon that serves one model,
-Qwen3.8-Flash-Next, and is built around that one model and one machine. It
-started as a fork of Perplexity's [lily](https://github.com/perplexityai/pplx-garden/tree/main/lily),
-a compact Metal engine for Qwen3.6-35B-A3B that already decoded about 30 %
-faster than mlx-lm ([their write-up](https://www.perplexity.ai/hub/blog/optimizing-on-device-inference-for-apple-silicon)).
-This fork ported it to a new architecture and then kept going: every part of
-the model runs as hand-written Metal kernels, the GPU never waits for the
-host between tokens, the model's own draft head speculates, and the caches
-remember every conversation across requests, forks and restarts.
+Qwen3.8-Flash-Next. It is a fork of Perplexity's [lily](https://github.com/perplexityai/pplx-garden/tree/main/lily),
+a compact Metal engine for Qwen3.6-35B-A3B that decoded about 30 % faster
+than mlx-lm ([their write-up](https://www.perplexity.ai/hub/blog/optimizing-on-device-inference-for-apple-silicon)).
+The fork ports that engine to Qwen3.8-Flash-Next's architecture and tunes it
+for this one model on this class of machine: the model runs as hand-written
+Metal kernels, decode steps are pipelined so the GPU does not wait for the
+host, speculative decoding uses the model's own draft head, and conversations
+are cached across requests, forks and restarts.
 
-Against the other engine that runs this model on a Mac, Unsloth's llama.cpp
-fork, with the same model, prompts and machine, lily prefills 1.5 to 2.5
-times faster and decodes 2 to 3.6 times faster, and the gap widens with
-context.
+Measured against Unsloth's llama.cpp fork with the same model, prompts and
+machine, prefill is 1.5 to 2.5 times faster and decode 2 to 3.6 times
+faster; the difference grows with context.
 
 ## Performance
 
@@ -33,21 +32,30 @@ over HTTP.
 
 lily's decode is nearly flat from 1K to 64K because the architecture allows
 it and the sparse-attention kernels keep the cost of context at a few percent
-of a step. Two drafts per step is the right setting on both engines: at three
-the acceptance rate drops to about 50 % and the extra verify row costs more
-than it returns.
+of a step. Both engines were also run with three drafts per step; acceptance
+fell to about 50 % and decode was slower than with two, so those rows are
+left out.
 
-Three things to know when reading the table. The quantizations differ
-slightly, lily's affine 4-bit with group 64 against llama.cpp's UD-IQ4_XS.
-The llama.cpp MTP figures come from a build with a one-line fix, because the
-shipped Unsloth Studio build fails to load the draft head and silently runs
-without it. And the 1K column is left out: at that length a prefill finishes
-inside the GPU's clock ramp and measures the machine, not the engine. Method,
-noise band, history and the remaining levers: [docs/performance.md](docs/performance.md).
+The quantizations differ slightly: lily's affine 4-bit with group 64 against
+llama.cpp's UD-IQ4_XS. The llama.cpp MTP rows come from a build with a
+one-line fix that the shipped one lacks. Method, noise band and the full
+record: [docs/performance.md](docs/performance.md).
+
+### MLX engines
+
+No released mlx-lm runs this model. Several MLX-based engines ship their own
+implementation of the architecture and publish numbers for an M5 Max:
+[MTPLX](https://mtplx.com/benchmarks/) reports 79 tok/s at 9K and 61 tok/s
+at 109K of context with its speculative path, 44 without;
+[oMLX](https://github.com/jundot/omlx/releases) reports 58 to 70 tok/s with
+its speculative path in its 0.7.0 development builds. We have not re-verified
+either with our harness, and their quantizations and sampling settings differ
+from the table above.
 
 ## The model
 
-Qwen3.8-Flash-Next is Qwen's `qwen4_exp` preview architecture: 48 layers, 36
+[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) is
+Qwen's `qwen4_exp` preview architecture: 48 layers, 36
 of them Gated DeltaNet with a fixed-size recurrent state and 12 sparse
 attention with an indexer that picks 512 blocks per query, a 512-expert MoE
 with 10 active, a four-stream gated residual, a 32 GB hashed n-gram
@@ -80,11 +88,11 @@ model loads, and serves after about 30 seconds. `tools/service/lily-service.sh i
 turns it into a launchd agent that starts at login and unloads the model
 after 30 idle minutes. `--help` lists every flag.
 
-The API is OpenAI's: `POST /v1/chat/completions` (streaming or not) and
-`POST /v1/completions`, with sampling parameters, stop strings, tools and
-tool calls, `reasoning_content`, `prompt_cache_key`, usage blocks and
-`GET /v1/models`. Any OpenAI client and agent works unchanged; opencode does.
-The quirks:
+The API is OpenAI-compatible: `POST /v1/chat/completions` (streaming or
+not) and `POST /v1/completions`, with sampling parameters, stop strings,
+tools and tool calls, `reasoning_content`, `prompt_cache_key`, usage blocks
+and `GET /v1/models`. OpenAI clients and agents work unchanged; opencode is
+what the server is developed against. The quirks:
 
 - **Images are base64 data URIs**, PNG or JPEG, up to eight per request, in
   user messages. The server never fetches URLs. An image is scaled to at
@@ -93,9 +101,11 @@ The quirks:
   No video.
 - **One request runs at a time.** Others wait in a queue (503 when it is
   full). There is no batching across requests.
-- **Thinking is on by default**, as the model's template intends. Turn it off
-  per request with `reasoning_effort: "none"` or
-  `chat_template_kwargs: {"enable_thinking": false}`.
+- **Thinking is on by default**, as the model's template intends. Per
+  request, `reasoning_effort` takes `none` to turn it off and `low`,
+  `medium` or `high` to set the level (the template's default is high);
+  `chat_template_kwargs` with `enable_thinking` and `reasoning_effort` works
+  too. `--thinking` and `--reasoning-effort` set the server's defaults.
 - **Every response carries a `timings` object**: prompt tokens, cached
   tokens, prefill and decode rates, draft acceptance. `GET /v1/timings` keeps
   the last 32. `tools/opencode-plugin-timings/` shows them in opencode.
@@ -105,21 +115,24 @@ The quirks:
 
 ## Caching
 
-Three tiers, and a client sees them only as `cached_tokens`:
+Prompt state is kept in three places. A client notices them only through
+`cached_tokens` in the usage block.
 
 1. **Resident sessions.** Every conversation's state stays in GPU memory
    under a byte budget. Continuing it costs only the new tokens; editing,
-   regenerating or branching forks a copy, so parallel conversations never
+   regenerating or branching forks a copy, so parallel conversations do not
    destroy each other's context.
 2. **The disk tier.** Sessions evicted from GPU memory go to disk and come
    back in about a second per few gigabytes when their prefix returns. It
    survives restarts.
-3. **Durable prefixes.** Agent runs share a long preamble, the system
-   prompt, tool schemas and repository instructions, and differ only from the
-   user's message on. When a prompt agrees with a cached one for at least
-   1 024 tokens beyond where it could resume, that shared prefix is written
-   once as a durable entry, and every later run with the same preamble starts
-   from it. Running many tasks in the same repository pays the preamble once.
+3. **Durable prefixes.** Two runs of the same agent share their preamble,
+   the system prompt, tool schemas and repository instructions, and differ
+   only from the user's message on. The second run cannot resume from the
+   first, because the first run's checkpoint sits at the end of its whole
+   prompt, past the point where the two diverge. When the shared part is at
+   least 1 024 tokens long, lily writes it to disk as a durable entry, and
+   every later run with the same preamble starts from there. Many tasks
+   against the same repository pay for the preamble once.
 
 Images are identified by their content, not by their placeholder tokens, so
 two screenshots behind the same preamble never share cached state past the
@@ -128,39 +141,40 @@ session cache".
 
 ## How the speed was achieved
 
-The frame is simple: a decode step has to read about 4.4 GB of weights and
-state for one token, so it is bandwidth-bound, and everything is about not
-wasting that bandwidth and not waiting between steps. Prefill reads the
-weights once per 4 096-token chunk and is compute-bound instead.
+A decode step reads about 4.4 GB of weights and state for one token, so it
+is bandwidth-bound, and the work is about not wasting that bandwidth and not
+waiting between steps. Prefill reads the weights once per 4 096-token chunk
+and is compute-bound instead.
 
 **What came from Perplexity.** The Metal kernel foundations and the shape of
 the engine: 4-bit weight streaming kernels adapted from MLX, tensor-op GEMMs,
 the MoE, Gated DeltaNet and attention kernels, a runtime shader compiler, and
 a small greedy server with a token-prefix cache for one checkpoint. That
-engine was the 30 % over mlx-lm.
+engine measured about 30 % over mlx-lm on its model.
 
-**What this fork added**, in the two weeks since the import:
+**What this fork added:**
 
 - The Qwen3.8-Flash-Next graph and its converter: sparse attention with the
   indexer, hyper-connections, the paged n-gram table, the draft head, the
   vision tower.
 - A Metal 4 transport with one command buffer per step, level barriers
   instead of serial ones, decode steps parked on GPU events so the host is
-  never on the critical path, and control flow such as the accepted draft
+  not on the critical path, and control flow such as the accepted draft
   count decided on the GPU.
 - Speculative decoding through the model's own head, with the verify pass on
-  purpose-built small-row GEMMs.
-- Kernel fusion where the profile said so: the hyper-connection read from six
-  dispatches to two, the sparse-attention selection with no serial steps,
-  tiled sparse attention for prefill.
+  small-row GEMMs written for it.
+- Kernel fusion guided by a per-kernel profile: the hyper-connection read
+  from six dispatches to two, the sparse-attention selection with no serial
+  steps, tiled sparse attention for prefill.
 - The session cache with recurrent-state checkpoints, forks, the disk tier
   and durable prefixes, and the full OpenAI request surface around it.
 
-Most of this transfers. The transport, parking, GPU-side control flow,
-fusion, speculative decoding and the caching are engine properties and would
-serve any model, in any framework including MLX. The sparse-attention and
-recurrent-state work belongs to this architecture family, and the paged
-n-gram table to this model alone. The detailed account, with every
+Part of this is specific to the model and part is not. The transport,
+parking, GPU-side control flow, kernel fusion, speculative decoding and the
+caching are properties of the engine and apply to any model served from any
+framework, MLX included. The sparse-attention and recurrent-state work is
+specific to this architecture family, and the paged n-gram table to this
+model alone. The detailed account, with every
 measurement, is [docs/architecture.md](docs/architecture.md); what was
 tried and what remains is [docs/optimization-potential.md](docs/optimization-potential.md)
 and the dated reports in `docs/`.
