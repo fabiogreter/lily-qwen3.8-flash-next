@@ -237,6 +237,66 @@ fn load_mlp(
     Ok(MlpWeights { gate_up_proj, gate_proj, up_proj, down_proj })
 }
 
+/// Physical memory of this machine in bytes (`hw.memsize`).
+fn physical_memory() -> Option<u64> {
+    let mut size: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    let name = c"hw.memsize";
+    // SAFETY: sysctlbyname writes at most `len` bytes into `size`.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            (&mut size as *mut u64).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && len == std::mem::size_of::<u64>()).then_some(size)
+}
+
+/// How many expert slots this machine can afford: `None` when the whole
+/// checkpoint fits its memory with room to work (the current footprint),
+/// otherwise the slots left after the resident weights, the scratch and a
+/// reserve for the OS and the page cache, at least two layers' worth.
+fn auto_expert_slots(
+    ckpt: &Checkpoint,
+    config: &Qwen4ExpConfig,
+    storage: NgramStorage,
+) -> Option<usize> {
+    const GB: u64 = 1 << 30;
+    let ram = physical_memory()?;
+    let (mut experts, mut other) = (0u64, 0u64);
+    for name in ckpt.names() {
+        let bytes = ckpt.meta(name)?.byte_len() as u64;
+        if name.starts_with(PREFIX) && name.contains(".mlp.experts.") {
+            experts += bytes;
+        } else if storage == NgramStorage::Paged && name.contains("ngram_embedding.shard_") {
+            // Read from the files on demand; the page cache holds what it can.
+        } else {
+            other += bytes;
+        }
+    }
+    let scratch = 4 * GB;
+    let reserve = (8 * GB).max(ram / 8);
+    if experts + other + scratch + reserve <= ram {
+        return None;
+    }
+    let slices = (config.num_hidden_layers * config.num_experts) as u64;
+    let slice = experts / slices.max(1);
+    let budget = ram.saturating_sub(other + scratch + reserve);
+    let slots = ((budget / slice.max(1)) as usize).max(2 * config.num_experts).min(slices as usize);
+    eprintln!(
+        "expert cache: {:.1} GB of memory holds {:.1} GB of resident weights and {} of {slices} experts ({:.1} of {:.1} GB); the rest is served from the checkpoint",
+        ram as f64 / GB as f64,
+        other as f64 / GB as f64,
+        slots,
+        slots as f64 * slice as f64 / GB as f64,
+        experts as f64 / GB as f64
+    );
+    Some(slots)
+}
+
 fn load_ffn(
     loader: &Loader<'_>,
     p: &str,
@@ -520,7 +580,9 @@ pub fn load(
 
     // The expert cache: every layer's experts served from one slab of
     // slots, placed by the usage ranking next to the checkpoint (or the
-    // one named), uniform without one.
+    // one named), uniform without one. Asked for explicitly, or sized from
+    // the machine's memory when the checkpoint does not fit it.
+    let expert_slots = expert_slots.or_else(|| auto_expert_slots(loader.checkpoint(), config, storage));
     let expert_cache = match expert_slots {
         Some(n_slots) => {
             let (layers, e) = (config.num_hidden_layers, config.num_experts);
@@ -593,6 +655,16 @@ pub fn load(
         layers.push(LayerWeights { ple, attn_hc, mixer, mlp_hc, ffn });
     }
 
+    // Under an expert cache every trunk pass pays a handshake per MoE
+    // layer plus its misses, and a speculative step runs three trunk passes
+    // (two drafts, one verify) where plain decode runs one: measured 14 to
+    // 15 tok/s against 55 with the reads cold (docs/low-ram-experts.md).
+    // So the draft head stays unloaded there unless asked for.
+    let with_mtp = with_mtp
+        && (expert_cache.is_none() || std::env::var_os("LILY_EXPERT_CACHE_DRAFTS").is_some());
+    if expert_cache.is_some() && config.mtp.is_some() && !with_mtp {
+        eprintln!("expert cache: speculative decoding off (plain decode is faster here; LILY_EXPERT_CACHE_DRAFTS=1 keeps it)");
+    }
     let mtp = match (&config.mtp, with_mtp) {
         (Some(_), true) => Some(Box::new(load_mtp(&loader, config)?)),
         _ => None,

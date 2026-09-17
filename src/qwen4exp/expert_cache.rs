@@ -290,41 +290,10 @@ impl Drop for ExpertCache {
     }
 }
 
-/// Reads expert (`layer`, `expert`) into `slot` and points the table at it.
-///
-/// # Safety
-///
-/// No pass may be reading `slot` (the caller holds the GPU at a wait, or
-/// nothing has been committed yet).
-unsafe fn load_slot(
-    store: &ExpertStore,
-    slab: &SlabPointers,
-    tables: &[usize],
-    experts: usize,
-    slot: u32,
-    layer: usize,
-    expert: usize,
-) -> Result<()> {
-    let slot = slot as usize;
-    let dst: [&mut [u8]; REGIONS] = std::array::from_fn(|i| {
-        // SAFETY: shared-storage slab regions of n_slots * len bytes each;
-        // the nine regions are distinct buffers.
-        unsafe {
-            core::slice::from_raw_parts_mut(
-                (slab.regions[i] as *mut u8).add(slot * slab.lens[i]),
-                slab.lens[i],
-            )
-        }
-    });
-    store.read_into(layer, expert, dst)?;
-    // SAFETY: the table is a shared-storage U32 [E] buffer.
-    unsafe { set_entry(tables, experts, layer, expert, slot as u32) };
-    Ok(())
-}
-
-/// Loads every `(slot, layer, expert)` of `entries`, spread over up to
-/// [`LOAD_THREADS`] threads (the reads are what a miss costs; a resolution
-/// with several misses pays one read time instead of their sum).
+/// Loads every `(slot, layer, expert)` of `entries`: the reads (nine
+/// regions per expert) are spread over up to [`LOAD_THREADS`] threads, so
+/// a resolution with a few misses pays about one region's read latency,
+/// then the tables are pointed at the slots.
 ///
 /// # Safety
 ///
@@ -340,37 +309,49 @@ unsafe fn load_slots(
     if entries.is_empty() {
         return Ok(());
     }
-    let threads = entries.len().min(LOAD_THREADS);
+    let tasks: Vec<(usize, usize)> = (0..entries.len())
+        .flat_map(|i| (0..REGIONS).map(move |r| (i, r)))
+        .collect();
+    let threads = tasks.len().min(LOAD_THREADS);
+    let per = tasks.len().div_ceil(threads);
+    let read = |&(i, r): &(usize, usize)| -> Result<()> {
+        let (slot, layer, expert) = entries[i];
+        // SAFETY: shared-storage slab region of n_slots * len bytes; the
+        // caller guarantees no reader and distinct slots per entry, and
+        // each (entry, region) pair is read by one thread.
+        let dst = unsafe {
+            core::slice::from_raw_parts_mut(
+                (slab.regions[r] as *mut u8).add(slot as usize * slab.lens[r]),
+                slab.lens[r],
+            )
+        };
+        store.read_region(layer, expert, r, dst)
+    };
     if threads == 1 {
-        for &(slot, layer, expert) in entries {
-            // SAFETY: as documented.
-            unsafe { load_slot(store, slab, tables, experts, slot, layer, expert)? };
+        for task in &tasks {
+            read(task)?;
         }
-        return Ok(());
+    } else {
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = tasks
+                .chunks(per)
+                .map(|chunk| scope.spawn(move || chunk.iter().try_for_each(read)))
+                .collect();
+            for worker in workers {
+                worker.join().map_err(|_| anyhow::anyhow!("expert load thread panicked"))??;
+            }
+            Ok::<(), anyhow::Error>(())
+        })?;
     }
-    let per = entries.len().div_ceil(threads);
-    std::thread::scope(|scope| {
-        let workers: Vec<_> = entries
-            .chunks(per)
-            .map(|chunk| {
-                scope.spawn(move || -> Result<()> {
-                    for &(slot, layer, expert) in chunk {
-                        // SAFETY: as documented; chunks are disjoint.
-                        unsafe { load_slot(store, slab, tables, experts, slot, layer, expert)? };
-                    }
-                    Ok(())
-                })
-            })
-            .collect();
-        for worker in workers {
-            worker.join().map_err(|_| anyhow::anyhow!("expert load thread panicked"))??;
-        }
-        Ok(())
-    })
+    for &(slot, layer, expert) in entries {
+        // SAFETY: the table is a shared-storage U32 [E] buffer.
+        unsafe { set_entry(tables, experts, layer, expert, slot) };
+    }
+    Ok(())
 }
 
 /// Threads a batch of expert reads is spread over.
-const LOAD_THREADS: usize = 8;
+const LOAD_THREADS: usize = 16;
 
 /// # Safety
 ///

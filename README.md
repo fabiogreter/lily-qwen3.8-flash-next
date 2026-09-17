@@ -41,6 +41,20 @@ llama.cpp's UD-IQ4_XS. The llama.cpp MTP rows come from a build with a
 one-line fix that the shipped one lacks. Method, noise band and the full
 record: [docs/performance.md](docs/performance.md).
 
+### Smaller machines
+
+The checkpoint is 104.6 GB, most of it the 68 GB of routed experts. On a
+machine whose memory cannot hold it the engine keeps a usage-ranked
+two thirds (or whatever fits) of the experts on the GPU and reads the
+rest from the checkpoint files as they are routed to, sized automatically
+from physical memory; nothing changes on a machine that fits it.
+Measured with the reads cold, as on a 64 GB machine: about 950 tok/s
+prefill and 55 tok/s plain decode on an 8K real-text prompt, against
+2 100 and 86 with everything resident. Speculative decoding is off there
+because its extra trunk passes cost more than they return. Details,
+measurements and knobs: [docs/low-ram-experts.md](docs/low-ram-experts.md);
+`lily-experts` measures the expert usage that places them.
+
 ### MLX engines
 
 No released mlx-lm runs this model. Several MLX-based engines ship their own

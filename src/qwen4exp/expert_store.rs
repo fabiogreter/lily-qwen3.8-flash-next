@@ -214,26 +214,43 @@ impl ExpertStore {
             self.layers(),
             self.experts
         );
-        let slice = self.slice(layer, expert);
         for (r, buf) in dst.into_iter().enumerate() {
-            let region = slice.regions[r];
-            ensure!(
-                buf.len() == region.len,
-                "destination for layer {layer} expert {expert} {} is {} bytes, region is {}",
-                REGION_NAMES[r],
-                buf.len(),
-                region.len
-            );
-            let (path, file) = &self.shards[region.shard];
-            file.read_exact_at(buf, region.offset).with_context(|| {
-                format!(
-                    "reading layer {layer} expert {expert} {} from {}",
-                    REGION_NAMES[r],
-                    path.display()
-                )
-            })?;
+            self.read_region(layer, expert, r, buf)?;
         }
         Ok(())
+    }
+
+    /// Reads region `r` (see [`REGION_NAMES`]) of expert (`layer`,
+    /// `expert`) into `dst`, whose length must equal the region's.
+    pub fn read_region(
+        &self,
+        layer: usize,
+        expert: usize,
+        r: usize,
+        dst: &mut [u8],
+    ) -> Result<()> {
+        ensure!(
+            layer < self.layers() && expert < self.experts && r < REGIONS,
+            "expert ({layer}, {expert}) region {r} outside {} x {} x {REGIONS}",
+            self.layers(),
+            self.experts
+        );
+        let region = self.slice(layer, expert).regions[r];
+        ensure!(
+            dst.len() == region.len,
+            "destination for layer {layer} expert {expert} {} is {} bytes, region is {}",
+            REGION_NAMES[r],
+            dst.len(),
+            region.len
+        );
+        let (path, file) = &self.shards[region.shard];
+        file.read_exact_at(dst, region.offset).with_context(|| {
+            format!(
+                "reading layer {layer} expert {expert} {} from {}",
+                REGION_NAMES[r],
+                path.display()
+            )
+        })
     }
 }
 

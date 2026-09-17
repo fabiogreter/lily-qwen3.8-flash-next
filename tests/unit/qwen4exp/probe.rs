@@ -149,6 +149,7 @@ fn the_image_forward_and_the_text_control_agree_with_the_goldens() {
         true,
         VisionMode::Off,
         None,
+        None,
     )
     .expect("model");
     assert!(model.has_mtp(), "the check covers the draft head's catch-up too");

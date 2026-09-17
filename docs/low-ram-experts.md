@@ -46,6 +46,84 @@ pressure, 0.40 to 0.49 ms (worst 3.5) under the same balloon, 6 to 7 GB/s.
 mapping the shards as GPU buffers is out for them anyway; host reads into
 GPU memory have no such constraint.
 
+## What was built
+
+`ExpertCache` (`src/qwen4exp/expert_cache.rs`) with `ExpertStore` and
+`SlotPolicy` (`expert_store.rs`), engaged when the checkpoint does not
+fit physical memory (`hw.memsize` against the resident weights plus 4 GB
+of scratch and a reserve of 8 GB or an eighth of memory; the n-gram table
+is paged and not counted) or on request (`LoadOptions::expert_slots`,
+`LILY_EXPERT_SLOTS`). On this 128 GB machine nothing engages and the
+footprint is unchanged.
+
+1. **A slab of expert slots** in the layout of a layer's stacked experts;
+   every MoE layer's `MoeWeights` views the slab and carries a `U32 [E]`
+   slot table. The decode gathers and the small-m prefill kernels read
+   remapped ids (`moe_remap_slots`); the grouped GEMM's block map
+   indirects through the table in `moe_build_blocks`. Without a table the
+   kernels are unchanged, and with every expert in the slab the benches
+   reproduce the resident digests exactly.
+2. **A round trip per cached MoE layer.** After the router's top-k the
+   pass signals `routed` with a sequence number and waits on `ready` for
+   it before the remap; the cache's service thread spins on the signal,
+   reads the routed ids from the shared indices buffer, resolves them
+   through the policy and signals. With every expert resident this costs
+   7% of decode (96.9 against 104.6 tok/s); a blocking wait in the thread
+   had cost 30%.
+3. **Placement by usage.** The ranking from `lily-experts` (`expert-usage.
+   json` next to the checkpoint, or `LILY_EXPERT_USAGE`; uniform without
+   one) pins the top slices; an LRU region (10% by default, at least a
+   layer's worth, `LILY_EXPERT_LRU_SHARE`) takes the cold ones, never
+   evicting a slot used at the current sequence number. Misses are read
+   with positioned reads on up to 16 threads, each expert's nine regions
+   spread over them, straight into the slot.
+4. **No draft head under the cache** unless `LILY_EXPERT_CACHE_DRAFTS` is
+   set: a speculative step runs three trunk passes through the cached
+   layers (two drafts, one verify) where plain decode runs one, and the
+   handshakes and misses scale with passes.
+
+### Measured
+
+8K real-text prompt (`docs/bench/prompts/p0.txt`), 256 generated tokens,
+usage ranking from 40 corpus prompts, 16 384 of 24 576 slots (45 GB, two
+thirds), digests identical to the resident path in every row. "Cold"
+runs under a 60 GB locked balloon, which leaves the checkpoint's pages
+mostly out of the page cache, as a 64 GB machine would; "warm" with the
+files cached.
+
+| configuration                                   | prefill tok/s | decode tok/s |
+|-------------------------------------------------|---------------|--------------|
+| resident, no cache (2 drafts / plain)           | 1 898 / 2 117 | 104.6 / 86.3 |
+| all slots served through the protocol, 2 drafts | 1 954         | 96.9         |
+| two thirds, warm, 2 drafts, serial loads        | 1 370         | 23.3         |
+| two thirds, warm, 2 drafts, parallel loads      | 1 757         | 39.7 to 43.6 |
+| two thirds, cold, 2 drafts                      | 944           | 14.2         |
+| two thirds, cold, 1 draft                       | 919           | 15.1         |
+| **two thirds, cold, plain decode**              | **977**       | **54.6**     |
+
+Misses: 30% of prefill's distinct lookups (every layer touches nearly
+every expert per 4 096-token chunk, so the cold third is read once per
+chunk, 38 GB per 8K prompt, at the SSD's rate) and 8.8% of decode's. So
+a 64 GB machine lands near 950 tok/s prefill and 55 tok/s decode on this
+prompt, against 2 100 and 86 here: a 2x prefill and 1.6x decode cost,
+not a cliff. The initial fill of 45 GB takes about 20 s from the page
+cache and would take the SSD's 10 to 15 s cold.
+
+### What would move it further
+
+- **Decode misses** cost a cold region read per resolution (about 0.35
+  ms with the nine regions in flight). A ranking that includes decode-time
+  routing, or a larger LRU region (30% measured 6.9% against 8.8% of
+  decode lookups missing, at the price of prefill misses), lowers the
+  count; both are knobs to sweep on a real 64 GB machine.
+- **Prefill** is bound by reading the cold third per chunk; a chunk of
+  8 192 tokens would halve that per token at twice the activation
+  scratch.
+- **The handshake** (7% at zero misses) is 48 sequential host-GPU
+  exchanges per pass; only fewer cached layers or a GPU-side check that
+  skips the wait when nothing is missing would reduce it, and Metal has
+  no conditional wait.
+
 ## Design: a host-driven expert cache
 
 Only on machines whose physical memory cannot hold the checkpoint (or
