@@ -154,6 +154,12 @@ estimate with its assumption named.
    block-gathered tensor-op kernel reaches a quarter to a half of the dense
    rate and that neighbouring queries' selected blocks overlap enough to
    share, which is **not measured**. Highest effort in this list.
+   *Done since* (branch `sparse-prefill-tiles`): the overlap measured 1.9x
+   one query's selection per 16-query tile at 8K and 3.2x at 32K on real
+   text; the tiled tensor-op route cuts the chunk's sparse attention from
+   about 1 200 to 350 ms at 8K and 1 480 to 850 ms at 32K, prefill to about
+   1 700 tok/s at 8K and 1 450 at 32K in single profile runs, the dense
+   kernel taking the rows below the limit besides (`docs/architecture.md`).
 2. **The verify pass's kernel shapes.** Measured: for the same 1.64 GB of
    dense weights a 3-row verify pass spends 8.04 ms in the register-resident
    skinny Q4 GEMM where a decode step spends 3.85 ms in the 2-row GEMV, about
@@ -161,6 +167,14 @@ estimate with its assumption named.
    pattern. Estimated: +7 to +15% speculative tok/s at every context length
    from closing half that gap, assuming the loss is weight streaming in the
    skinny kernel rather than anything intrinsic to the row count.
+   *Partly done since*: the register-A skinny kernels compute two rows per
+   simdgroup, load each activation block once and dot the raw codes like
+   the decode GEMV; in isolation the 3-row kernel streams 360 to 540 GB/s on
+   the model's shapes, in the profiled verify pass it went from 5.80 to 5.46
+   ms (the Q8 one from 1.41 to 1.14), about 5% of the pass, so most of the
+   gap is elsewhere in the pass. Splitting each stream of the
+   hyper-connection down kernels over two simdgroups was measured slower
+   (9.2 to 9.8 us at one row, 12.8 to 14.2 at three) and not kept.
 3. **The sparse-attention occupancy parameter at decode.** Measured: with a
    512-block budget and a 256-token split the decode dispatch is 18
    threadgroups on a 40-core GPU, 134 us per call at 31 GB/s; with block
@@ -169,7 +183,10 @@ estimate with its assumption named.
    comparable for the verify pass, assuming 4 to 8 times the threadgroups
    brings the kernel near the dense split kernel's rate. The split count is
    already a parameter of the existing kernel, so this is the cheapest item
-   to test.
+   to test. *Done since*: 64-token splits and one threadgroup per four query
+   heads for batches of up to four rows take the kernel from 1.64 to 0.49 ms
+   per decode step at 8K (the combine from 0.07 to 0.17), about 8% of the
+   step; the verify pass's from 1.98 to 1.32 ms.
 4. **Dispatch fusion in the decode graph.** Measured: about 966 dispatches
    per step, with a 1.4 us floor for a trivial dispatch plus barrier, and the
    fused hyper-connection kernels reading 0.68 GB at about 315 GB/s against
