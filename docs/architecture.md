@@ -202,7 +202,15 @@ Where the 1K step goes, by profiled share:
 
 Past the dense limit the sparse-attention kernels enter: scoring, block
 selection and the split attention add 2.2 to 2.5 ms per step at 8K and 32K.
-That is the entire difference between a 1K and an 8K decode step.
+That is the entire difference between a 1K and an 8K decode step. Those
+numbers were taken with the split attention cut into 256-token splits, 18
+threadgroups for one query on a 40-core GPU. Batches of up to four rows
+(decode, verify) now take 64-token splits and one threadgroup per four query
+heads, 198 threadgroups per query: the kernel drops from 1.64 to 0.49 ms per
+decode step at 8K and the combine grows from 0.07 to 0.17 ms, about 8% of
+the step (plain decode at 8K measured 77 to 83 tok/s in one pair of runs).
+`LILY_QSA_SPLIT` sets the token count (32 to 256) and `LILY_QSA_HEAD_SPLIT=0`
+drops the head split. Prefill sub-batches keep the 256-token split.
 
 The hyper-connection read is fused into two dispatches instead of six. The
 down kernel uses one threadgroup per output row with one simdgroup per

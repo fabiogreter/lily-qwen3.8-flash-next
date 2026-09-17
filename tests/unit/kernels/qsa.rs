@@ -472,10 +472,9 @@ fn sparse_attention_matches_dense_over_selected_tokens() {
     let t_n = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&n_sel), &[qb], DType::U32)
         .expect("n");
     let out = Tensor::zeros(&ctx, &[qb, nq, d], DType::BF16).expect("out");
-    let splits = sparse_splits(k_max, ratio);
-    let partials =
-        Tensor::zeros(&ctx, &[qb * nq, splits, d], DType::F32).expect("partials");
-    let stats = Tensor::zeros(&ctx, &[qb * nq, splits, 2], DType::F32).expect("stats");
+    let slots = split_scratch_slots(qb, k_max, ratio);
+    let partials = Tensor::zeros(&ctx, &[slots * nq, d], DType::F32).expect("partials");
+    let stats = Tensor::zeros(&ctx, &[slots * nq, 2], DType::F32).expect("stats");
     let pass = ctx.begin().expect("pass");
     qsa_attention(
         &ctx,
@@ -569,30 +568,34 @@ fn sparse_attention_tail_in_its_own_split_matches_cpu() {
     let t_n = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&n_sel), &[qb], DType::U32)
         .expect("n");
     let out = Tensor::zeros(&ctx, &[qb, nq, d], DType::BF16).expect("out");
-    let splits = sparse_splits(k_max, ratio);
-    assert_eq!(splits, 2, "the tail must fall into a second split");
-    let partials =
-        Tensor::zeros(&ctx, &[qb * nq, splits, d], DType::F32).expect("partials");
-    let stats = Tensor::zeros(&ctx, &[qb * nq, splits, 2], DType::F32).expect("stats");
-    let pass = ctx.begin().expect("pass");
-    qsa_attention(
-        &ctx,
-        &pass,
-        &t_q,
-        &t_k,
-        &t_v,
-        &t_sel,
-        &t_n,
-        &out,
-        &SparseSplitScratch { partials: &partials, stats: &stats },
-        qb,
-        k_max,
-        ratio,
-        base_pos,
-        scale,
-    )
-    .expect("sparse attention");
-    pass.commit_wait().expect("commit");
+    let plan = SparseSplitPlan { split: QSA_SPLIT_BATCHED, head_groups: 1 };
+    assert_eq!(plan.splits(k_max, ratio), 2, "the tail must fall into a second split");
+    let slots = split_scratch_slots(qb, k_max, ratio);
+    let partials = Tensor::zeros(&ctx, &[slots * nq, d], DType::F32).expect("partials");
+    let stats = Tensor::zeros(&ctx, &[slots * nq, 2], DType::F32).expect("stats");
+    let run = |plan: SparseSplitPlan| {
+        let pass = ctx.begin().expect("pass");
+        qsa_attention_with(
+            &ctx,
+            &pass,
+            &t_q,
+            &t_k,
+            &t_v,
+            &t_sel,
+            &t_n,
+            &out,
+            &SparseSplitScratch { partials: &partials, stats: &stats },
+            qb,
+            k_max,
+            ratio,
+            base_pos,
+            scale,
+            plan,
+        )
+        .expect("sparse attention");
+        pass.commit_wait().expect("commit");
+    };
+    run(plan);
 
     let mut expected = vec![0.0f32; qb * nq * d];
     for qi in 0..qb {
@@ -627,6 +630,28 @@ fn sparse_attention_tail_in_its_own_split_matches_cpu() {
         }
     }
     cpu_ref::assert_close(&out.to_f32().expect("out"), &expected, 2e-2, 2e-2);
+
+    // The small-batch plans (finer splits, the head split) and the
+    // finest split allowed give the same result, and the scratch a scratch
+    // for `qb` queries allocates holds every one of them.
+    for plan in [
+        SparseSplitPlan { split: QSA_SPLIT_SMALL, head_groups: 1 },
+        SparseSplitPlan {
+            split: QSA_SPLIT_SMALL,
+            head_groups: group.div_ceil(QSA_HEADS_PER_PASS),
+        },
+        SparseSplitPlan {
+            split: QSA_SPLIT_MIN,
+            head_groups: group.div_ceil(QSA_HEADS_PER_PASS),
+        },
+        SparseSplitPlan::for_rows(qb, group),
+    ] {
+        out.zero_fill();
+        run(plan);
+        let got = out.to_f32().expect("out");
+        assert!(got.iter().all(|x| x.is_finite()), "{plan:?}: non-finite output");
+        cpu_ref::assert_close(&got, &expected, 2e-2, 2e-2);
+    }
 }
 
 // --- Tiled sparse attention ------------------------------------------------------
@@ -846,10 +871,9 @@ fn tiled_attention_matches_split_kernel_and_cpu() {
 
     // Reference: the split kernel.
     let out_split = Tensor::zeros(&ctx, &[qb, nq, d], DType::BF16).expect("out");
-    let splits = sparse_splits(k_max, ratio);
-    let partials =
-        Tensor::zeros(&ctx, &[qb * nq, splits, d], DType::F32).expect("partials");
-    let stats = Tensor::zeros(&ctx, &[qb * nq, splits, 2], DType::F32).expect("stats");
+    let slots = split_scratch_slots(qb, k_max, ratio);
+    let partials = Tensor::zeros(&ctx, &[slots * nq, d], DType::F32).expect("partials");
+    let stats = Tensor::zeros(&ctx, &[slots * nq, 2], DType::F32).expect("stats");
     let pass = ctx.begin().expect("pass");
     qsa_attention(
         &ctx,

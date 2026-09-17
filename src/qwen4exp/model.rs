@@ -700,9 +700,10 @@ struct QsaScratch {
     sel: Tensor,
     /// U32 `[QB]`.
     n_sel: Tensor,
-    /// F32 `[QB * NQ, splits, D]`.
+    /// F32 `[slots * NQ, D]`, indexed `[QB*NQ, splits, D]` per dispatch
+    /// (`qsa::split_scratch_slots`).
     partials: Tensor,
-    /// F32 `[QB * NQ, splits, 2]`.
+    /// F32 `[slots * NQ, 2]`.
     stats: Tensor,
     /// Per-tile unions for the tiled route.
     tiles: SparseTileScratch,
@@ -720,14 +721,14 @@ impl QsaScratch {
         let idx = &cfg.indexer;
         let max_blocks = (max_seq / idx.compress_ratio).max(1);
         let k_max = idx.block_topk();
-        let splits = qsa::sparse_splits(k_max, idx.compress_ratio);
+        let slots = qsa::split_scratch_slots(qb, k_max, idx.compress_ratio);
         let nq = cfg.num_attention_heads;
         Ok(Self {
             scores: Tensor::zeros(ctx, &[qb, max_blocks], DType::F32)?,
             sel: Tensor::zeros(ctx, &[qb, k_max], DType::U32)?,
             n_sel: Tensor::zeros(ctx, &[qb], DType::U32)?,
-            partials: Tensor::zeros(ctx, &[qb * nq, splits, cfg.head_dim], DType::F32)?,
-            stats: Tensor::zeros(ctx, &[qb * nq, splits, 2], DType::F32)?,
+            partials: Tensor::zeros(ctx, &[slots * nq, cfg.head_dim], DType::F32)?,
+            stats: Tensor::zeros(ctx, &[slots * nq, 2], DType::F32)?,
             tiles: SparseTileScratch::new(ctx, qb, max_blocks, k_max)?,
             route: SparseAttnRoute::from_env(),
         })

@@ -8,7 +8,7 @@
 using namespace metal;
 
 #define TG 256
-#define QSA_SPLIT 256
+#define QSA_SPLIT 256      // largest split (tokens per threadgroup) of the split kernel
 #define QSA_HPP 4          // query heads folded per K/V pass
 #define QSA_SELECT_TG 1024 // threads of the per-query top-k selection
 
@@ -499,9 +499,13 @@ static inline uint qsa_token_at(device const uint* sel_row, uint nblk, uint rati
 }
 
 // Split-K sparse GQA attention over each query's selected tokens. Grid:
-// threadgroups (KVH, splits, QB), TG threads. Emits per-split softmax stats
-// and weighted-V partials laid out like sdpa_decode_split (head index
-// qi*NQ + hq), for sdpa_decode_combine. D must be 256.
+// threadgroups (KVH * head_groups, splits, QB), TG threads; each threadgroup
+// covers `split` (<= QSA_SPLIT) consecutive attended tokens and, with
+// head_groups > 1, only its QSA_HPP query heads of the KV head (a decode
+// dispatch of one query otherwise has too few threadgroups to fill the
+// GPU). Emits per-split softmax stats and weighted-V partials laid out like
+// sdpa_decode_split (head index qi*NQ + hq), for sdpa_decode_combine. D
+// must be 256.
 kernel void qsa_attn_split_bf16(device const bfloat* q        [[buffer(0)]],  // [QB, NQ, D]
                                 device const bfloat* k_cache  [[buffer(1)]],  // [KVH, max_seq, D]
                                 device const bfloat* v_cache  [[buffer(2)]],
@@ -518,6 +522,8 @@ kernel void qsa_attn_split_bf16(device const bfloat* q        [[buffer(0)]],  //
                                 constant uint&       base_pos [[buffer(13)]],
                                 constant float&      scale    [[buffer(14)]],
                                 constant uint&       NQ       [[buffer(15)]],
+                                constant uint&       split    [[buffer(16)]],  // tokens per threadgroup
+                                constant uint&       head_groups [[buffer(17)]],  // threadgroups per KV head
                                 uint3 tg  [[threadgroup_position_in_grid]],
                                 uint tid  [[thread_index_in_threadgroup]],
                                 uint sg   [[simdgroup_index_in_threadgroup]],
@@ -527,32 +533,36 @@ kernel void qsa_attn_split_bf16(device const bfloat* q        [[buffer(0)]],  //
     threadgroup float red[QSA_HPP];
     threadgroup float v_stage[(TG / 32) * 256];
 
-    const uint kh = tg.x;
-    const uint split = tg.y;
+    const uint kh = tg.x / head_groups;
+    const uint hg = tg.x - kh * head_groups;
+    const uint split_idx = tg.y;
     const uint qi = tg.z;
     const uint pos = base_pos + qi;
     const uint nblk = n_sel[qi];
     const uint tail_start = qsa_visible_blocks(pos, ratio) * ratio;
     const uint total = nblk * ratio + (pos + 1 - tail_start);
-    const uint slot0 = split * QSA_SPLIT;
-    const uint count = slot0 < total ? min(uint(QSA_SPLIT), total - slot0) : 0;
+    const uint slot0 = split_idx * split;
+    const uint count = slot0 < total ? min(split, total - slot0) : 0;
+    // This threadgroup's query heads within the KV head.
+    const uint h_begin = hg * QSA_HPP;
+    const uint h_end = head_groups == 1 ? group : min(h_begin + QSA_HPP, group);
     device const uint* sel_row = sel + (ulong)qi * k_max;
     device const bfloat* k_head = k_cache + (ulong)kh * max_seq * D;
     device const bfloat* v_head = v_cache + (ulong)kh * max_seq * D;
 
     if (count == 0) {
         if (tid == 0) {
-            for (uint h = 0; h < group; ++h) {
+            for (uint h = h_begin; h < h_end; ++h) {
                 const ulong hq = (ulong)qi * NQ + (ulong)kh * group + h;
-                stats[(hq * splits + split) * 2] = -INFINITY;
-                stats[(hq * splits + split) * 2 + 1] = 0.0f;
+                stats[(hq * splits + split_idx) * 2] = -INFINITY;
+                stats[(hq * splits + split_idx) * 2 + 1] = 0.0f;
             }
         }
         return;
     }
 
-    for (uint h0 = 0; h0 < group; h0 += QSA_HPP) {
-        const uint gh = min(uint(QSA_HPP), group - h0);
+    for (uint h0 = h_begin; h0 < h_end; h0 += QSA_HPP) {
+        const uint gh = min(uint(QSA_HPP), h_end - h0);
         float4 qa[QSA_HPP];
         float4 qb[QSA_HPP];
         for (uint h = 0; h < gh; ++h) {
@@ -614,8 +624,8 @@ kernel void qsa_attn_split_bf16(device const bfloat* q        [[buffer(0)]],  //
                     s += part[h][i];
                 }
                 const ulong hq = (ulong)qi * NQ + (ulong)kh * group + h0 + h;
-                stats[(hq * splits + split) * 2] = chunk_max;
-                stats[(hq * splits + split) * 2 + 1] = s;
+                stats[(hq * splits + split_idx) * 2] = chunk_max;
+                stats[(hq * splits + split_idx) * 2 + 1] = s;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
@@ -649,7 +659,7 @@ kernel void qsa_attn_split_bf16(device const bfloat* q        [[buffer(0)]],  //
                 for (uint s = 0; s < TG / 32; ++s) {
                     acc += v_stage[s * D + d];
                 }
-                partials[(hq * splits + split) * D + d] = acc;
+                partials[(hq * splits + split_idx) * D + d] = acc;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }

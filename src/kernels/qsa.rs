@@ -11,8 +11,21 @@ use crate::tensor::{DType, Tensor};
 
 const SOURCE: &str = include_str!("metal/qsa.metal");
 const TG: usize = 256;
-/// Selected tokens per split of the sparse attention kernel.
-pub const QSA_SPLIT: usize = 256;
+/// Largest split (attended tokens per threadgroup) of the sparse attention
+/// kernel: its threadgroup arrays are sized for it.
+pub const QSA_SPLIT_MAX: usize = 256;
+/// Split for batched sub-batches (prefill), where the query count already
+/// supplies the threadgroups.
+pub const QSA_SPLIT_BATCHED: usize = 256;
+/// Split for small batches (decode, verify): a single query with the
+/// batched split is 18 threadgroups on a 40-core GPU.
+pub const QSA_SPLIT_SMALL: usize = 64;
+/// Smallest split allowed (`LILY_QSA_SPLIT`); the scratch is sized for it.
+pub const QSA_SPLIT_MIN: usize = 32;
+/// Batches up to this many rows take the small-batch split plan.
+pub const QSA_SMALL_ROWS: usize = 4;
+/// Query heads the split kernel folds per K/V pass (`QSA_HPP` in the shader).
+pub const QSA_HEADS_PER_PASS: usize = 4;
 /// Threads of the per-query selection threadgroup.
 const SELECT_TG: usize = 1024;
 /// Indexer head dimension the kernels are written for.
@@ -31,9 +44,56 @@ pub fn attended_tokens(pos: usize, ratio: usize, n_blocks: usize) -> usize {
     n_blocks * ratio + (pos + 1 - tail_start)
 }
 
-/// Splits the sparse kernel needs for the longest possible selection.
-pub fn sparse_splits(k_max: usize, ratio: usize) -> usize {
-    (k_max * ratio + ratio - 1).div_ceil(QSA_SPLIT)
+/// Splits of `split` tokens the sparse kernel needs for the longest
+/// possible selection.
+pub fn sparse_splits(k_max: usize, ratio: usize, split: usize) -> usize {
+    (k_max * ratio + ratio - 1).div_ceil(split)
+}
+
+/// How one [`qsa_attention`] dispatch is cut: `split` attended tokens per
+/// threadgroup and `head_groups` threadgroups per KV head (each covering
+/// [`QSA_HEADS_PER_PASS`] query heads).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SparseSplitPlan {
+    pub split: usize,
+    pub head_groups: usize,
+}
+
+impl SparseSplitPlan {
+    /// The plan for `qb` queries over a GQA group of `group` heads: small
+    /// batches take the fine split and the head split (`LILY_QSA_SPLIT`
+    /// overrides the token count, `LILY_QSA_HEAD_SPLIT=0` the head split),
+    /// batched sub-batches keep one split of [`QSA_SPLIT_BATCHED`].
+    pub fn for_rows(qb: usize, group: usize) -> Self {
+        if qb > QSA_SMALL_ROWS {
+            return Self { split: QSA_SPLIT_BATCHED, head_groups: 1 };
+        }
+        static SMALL: std::sync::OnceLock<(usize, bool)> = std::sync::OnceLock::new();
+        let (split, head_split) = *SMALL.get_or_init(|| {
+            let split = std::env::var("LILY_QSA_SPLIT")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .map_or(QSA_SPLIT_SMALL, |v| v.clamp(QSA_SPLIT_MIN, QSA_SPLIT_MAX));
+            let head_split =
+                std::env::var("LILY_QSA_HEAD_SPLIT").map_or(true, |v| v != "0");
+            (split, head_split)
+        });
+        let head_groups =
+            if head_split { group.div_ceil(QSA_HEADS_PER_PASS) } else { 1 };
+        Self { split, head_groups }
+    }
+
+    pub fn splits(self, k_max: usize, ratio: usize) -> usize {
+        sparse_splits(k_max, ratio, self.split)
+    }
+}
+
+/// `(query, split)` slots the split scratch of a scratch for up to `qb`
+/// queries must hold: the batched plan over all of them, or the finest
+/// small-batch plan over a small batch, whichever is larger.
+pub fn split_scratch_slots(qb: usize, k_max: usize, ratio: usize) -> usize {
+    (qb * sparse_splits(k_max, ratio, QSA_SPLIT_BATCHED))
+        .max(qb.min(QSA_SMALL_ROWS) * sparse_splits(k_max, ratio, QSA_SPLIT_MIN))
 }
 
 /// `q[m, h, :] = rope(rmsnorm(qk[m, h*D..]) * (1 + w))` for sequence index
@@ -342,8 +402,9 @@ pub fn qsa_select_blocks<'t>(
     )
 }
 
-/// Split scratch for [`qsa_attention`]: `partials` F32 `[QB*NQ, splits, D]`,
-/// `stats` F32 `[QB*NQ, splits, 2]`.
+/// Split scratch for [`qsa_attention`]: `partials` F32 with at least
+/// `QB * NQ * splits * D` elements (indexed `[QB*NQ, splits, D]`), `stats`
+/// F32 with at least `QB * NQ * splits * 2` (see [`split_scratch_slots`]).
 pub struct SparseSplitScratch<'a> {
     pub partials: &'a Tensor,
     pub stats: &'a Tensor,
@@ -351,7 +412,7 @@ pub struct SparseSplitScratch<'a> {
 
 /// Sparse GQA attention of `qb` queries (`q`: `[QB, NQ, D]`, query `qi` at
 /// position `base_pos + qi`) over their selected blocks plus tail, writing
-/// `out` (`[QB, NQ, D]`).
+/// `out` (`[QB, NQ, D]`), under the split plan for `qb` rows.
 #[allow(clippy::too_many_arguments)]
 pub fn qsa_attention<'t>(
     ctx: &MetalContext,
@@ -368,6 +429,39 @@ pub fn qsa_attention<'t>(
     ratio: usize,
     base_pos: impl Into<Pos<'t>>,
     scale: f32,
+) -> Result<()> {
+    let kvh = k_cache.shape()[0];
+    ensure!(
+        qb > 0 && q.numel().is_multiple_of(qb * ATTN_D),
+        "q must be BF16 [QB, NQ, D]"
+    );
+    let nq = q.numel() / (qb * ATTN_D);
+    ensure!(nq.is_multiple_of(kvh) && kvh > 0, "NQ {nq} not a multiple of KVH {kvh}");
+    let plan = SparseSplitPlan::for_rows(qb, nq / kvh);
+    qsa_attention_with(
+        ctx, pass, q, k_cache, v_cache, sel, n_sel, out, scratch, qb, k_max, ratio,
+        base_pos, scale, plan,
+    )
+}
+
+/// [`qsa_attention`] under an explicit split plan.
+#[allow(clippy::too_many_arguments)]
+pub fn qsa_attention_with<'t>(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    q: &Tensor,
+    k_cache: &Tensor,
+    v_cache: &Tensor,
+    sel: &Tensor,
+    n_sel: &Tensor,
+    out: &Tensor,
+    scratch: &SparseSplitScratch<'_>,
+    qb: usize,
+    k_max: usize,
+    ratio: usize,
+    base_pos: impl Into<Pos<'t>>,
+    scale: f32,
+    plan: SparseSplitPlan,
 ) -> Result<()> {
     let base_pos = base_pos.into();
     let (kvh, max_seq, d) =
@@ -394,7 +488,18 @@ pub fn qsa_attention<'t>(
         "n_sel must be U32 [QB]"
     );
     ensure!(base_pos.max + qb <= max_seq, "queries exceed the cache");
-    let splits = sparse_splits(k_max, ratio);
+    ensure!(
+        (QSA_SPLIT_MIN..=QSA_SPLIT_MAX).contains(&plan.split)
+            && plan.split.is_multiple_of(32),
+        "split of {} tokens: the kernel takes 32..={QSA_SPLIT_MAX} in steps of 32",
+        plan.split
+    );
+    ensure!(
+        plan.head_groups == 1 || plan.head_groups == group.div_ceil(QSA_HEADS_PER_PASS),
+        "{} head groups for a GQA group of {group}: 1 or ceil(group / {QSA_HEADS_PER_PASS})",
+        plan.head_groups
+    );
+    let splits = plan.splits(k_max, ratio);
     ensure!(
         scratch.partials.numel() >= qb * nq * splits * d
             && scratch.partials.dtype() == DType::F32,
@@ -427,8 +532,13 @@ pub fn qsa_attention<'t>(
             base_pos.param(),
             Param::F32(scale),
             Param::U32(nq as u32),
+            Param::U32(plan.split as u32),
+            Param::U32(plan.head_groups as u32),
         ],
-        Grid::Threadgroups { groups: (kvh, splits, qb), threadgroup: (TG, 1, 1) },
+        Grid::Threadgroups {
+            groups: (kvh * plan.head_groups, splits, qb),
+            threadgroup: (TG, 1, 1),
+        },
     )?;
     pass.level_barrier(&[scratch.partials, scratch.stats])?;
     let combine =
@@ -440,6 +550,8 @@ pub fn qsa_attention<'t>(
         Grid::Threadgroups { groups: (qb * nq, 1, 1), threadgroup: (TG, 1, 1) },
     )
 }
+
+// --- Tiled sparse attention (prefill past the dense limit) ----------------------
 
 /// How the batched path attends past the dense limit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
