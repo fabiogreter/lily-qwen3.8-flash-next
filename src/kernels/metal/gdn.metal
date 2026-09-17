@@ -258,6 +258,139 @@ static inline void gdn_prefill_regscan_body(device const bfloat* qkv,
     }
 }
 
+// One token's operands of the scan for a lane: its NK k and q values and the
+// decay and beta gates.
+static inline void gdn_scan_load(device const bfloat* qk, device const float* decay,
+                                 device const float* beta, uint t, uint H, uint HK, uint hk,
+                                 uint h, uint lane0, thread float* kh, thread float* qh,
+                                 thread float& g, thread float& b) {
+    device const bfloat* qrow = qk + (ulong)t * 2 * HK * DIM + hk * DIM + lane0;
+    device const bfloat* krow = qrow + HK * DIM;
+    for (uint i = 0; i < DIM / 32; ++i) {
+        kh[i] = float(krow[i]);
+        qh[i] = float(qrow[i]);
+    }
+    g = decay[t * H + h];
+    b = beta[t * H + h];
+}
+
+// The scan with CS value columns per simdgroup (dv .. dv + CS - 1), sharing
+// each token's k, q and gate loads across the columns (the single-column
+// scan reloads them per column: 128 simdgroups per head read the same
+// rows), and with PF the next token's operands loaded a token ahead. Per
+// column the arithmetic and its order are the single-column scan's; the
+// results differ from it only by the compiler's fast-math contraction of
+// the interleaved column updates (the 4-layer golden probes moved by less
+// than a bf16 ulp of their logit gap).
+template <typename StateT, int CS, bool PF>
+static inline void gdn_prefill_regscan_cols_body(device const bfloat* qkv,
+                                                 device const bfloat* qk,
+                                                 device const float* decay,
+                                                 device const float* beta,
+                                                 device StateT* state,
+                                                 device bfloat* out,
+                                                 device StateT* mid,
+                                                 uint M,
+                                                 uint H,
+                                                 uint vpk,
+                                                 uint mid_count,
+                                                 uint2 tg,
+                                                 uint sg,
+                                                 uint lane) {
+    const uint NK = DIM / 32;
+    const uint h = tg.x;
+    const uint dv = (tg.y * 4 + sg) * uint(CS);
+    const uint HK = H / vpk;
+    const uint hk = h / vpk;
+    const uint C = (2 * HK + H) * DIM;
+
+    device StateT* st = state + ((ulong)h * DIM + NK * lane) * DIM + dv;
+    float s[CS][DIM / 32];
+    for (uint c = 0; c < uint(CS); ++c) {
+        for (uint i = 0; i < NK; ++i) {
+            s[c][i] = st[i * DIM + c];
+        }
+    }
+    float kh[DIM / 32], qh[DIM / 32], g = 0.0f, b = 0.0f, v[CS];
+    if (PF && M > 0) {
+        gdn_scan_load(qk, decay, beta, 0u, H, HK, hk, h, NK * lane, kh, qh, g, b);
+        for (uint c = 0; c < uint(CS); ++c) {
+            v[c] = float(qkv[(2 * HK + h) * DIM + dv + c]);
+        }
+    }
+    for (uint t = 0; t < M; ++t) {
+        float kn[DIM / 32], qn[DIM / 32], gn = 0.0f, bn = 0.0f, vn[CS];
+        if (PF) {
+            if (t + 1 < M) {
+                gdn_scan_load(qk, decay, beta, t + 1, H, HK, hk, h, NK * lane, kn, qn, gn, bn);
+                for (uint c = 0; c < uint(CS); ++c) {
+                    vn[c] = float(qkv[(ulong)(t + 1) * C + (2 * HK + h) * DIM + dv + c]);
+                }
+            }
+        } else {
+            gdn_scan_load(qk, decay, beta, t, H, HK, hk, h, NK * lane, kh, qh, g, b);
+            for (uint c = 0; c < uint(CS); ++c) {
+                v[c] = float(qkv[(ulong)t * C + (2 * HK + h) * DIM + dv + c]);
+            }
+        }
+        float kv[CS];
+        for (uint c = 0; c < uint(CS); ++c) {
+            kv[c] = 0.0f;
+        }
+        for (uint i = 0; i < NK; ++i) {
+            for (uint c = 0; c < uint(CS); ++c) {
+                s[c][i] *= g;
+                kv[c] += kh[i] * s[c][i];
+            }
+        }
+        float vnew[CS];
+        for (uint c = 0; c < uint(CS); ++c) {
+            vnew[c] = (v[c] - simd_sum(kv[c])) * b;
+        }
+        float o[CS];
+        for (uint c = 0; c < uint(CS); ++c) {
+            o[c] = 0.0f;
+        }
+        for (uint i = 0; i < NK; ++i) {
+            for (uint c = 0; c < uint(CS); ++c) {
+                s[c][i] += kh[i] * vnew[c];
+                o[c] += qh[i] * s[c][i];
+            }
+        }
+        for (uint c = 0; c < uint(CS); ++c) {
+            const float oc = simd_sum(o[c]);
+            if (lane == 0) {
+                out[((ulong)t * H + h) * DIM + dv + c] = bfloat(oc);
+            }
+        }
+        if (t < mid_count) {
+            device StateT* md = mid + (ulong)t * H * DIM * DIM
+                + ((ulong)h * DIM + NK * lane) * DIM + dv;
+            for (uint c = 0; c < uint(CS); ++c) {
+                for (uint i = 0; i < NK; ++i) {
+                    md[i * DIM + c] = StateT(s[c][i]);
+                }
+            }
+        }
+        if (PF) {
+            for (uint i = 0; i < NK; ++i) {
+                kh[i] = kn[i];
+                qh[i] = qn[i];
+            }
+            g = gn;
+            b = bn;
+            for (uint c = 0; c < uint(CS); ++c) {
+                v[c] = vn[c];
+            }
+        }
+    }
+    for (uint c = 0; c < uint(CS); ++c) {
+        for (uint i = 0; i < NK; ++i) {
+            st[i * DIM + c] = StateT(s[c][i]);
+        }
+    }
+}
+
 #define GDN_REGSCAN_WRAPPER(NAME, STATE_T)                                    \
 kernel void NAME(device const bfloat* qkv   [[buffer(0)]],                    \
                  device const bfloat* qk    [[buffer(1)]],                    \
@@ -277,8 +410,38 @@ kernel void NAME(device const bfloat* qkv   [[buffer(0)]],                    \
                              mid_count, tg, sg, lane);                        \
 }
 
-GDN_REGSCAN_WRAPPER(gdn_prefill_regscan, float)
+// The single-column scan, kept for comparison by name (`LILY_GDN_SCAN_KERNEL`).
+GDN_REGSCAN_WRAPPER(gdn_prefill_regscan_c1, float)
 #undef GDN_REGSCAN_WRAPPER
+
+#define GDN_REGSCAN_VARIANT(NAME, CS, PF)                                      \
+kernel void NAME(device const bfloat* qkv   [[buffer(0)]],                    \
+                 device const bfloat* qk    [[buffer(1)]],                    \
+                 device const float*  decay [[buffer(2)]],                    \
+                 device const float*  beta  [[buffer(3)]],                    \
+                 device float*        state [[buffer(4)]],                    \
+                 device bfloat*       out   [[buffer(5)]],                    \
+                 device float*        mid   [[buffer(6)]],                    \
+                 constant uint&       M     [[buffer(7)]],                    \
+                 constant uint&       H     [[buffer(8)]],                    \
+                 constant uint&       vpk   [[buffer(9)]],                    \
+                 constant uint&       mid_count [[buffer(10)]],               \
+                 uint2 tg   [[threadgroup_position_in_grid]],                 \
+                 uint  sg   [[simdgroup_index_in_threadgroup]],               \
+                 uint  lane [[thread_index_in_simdgroup]]) {                  \
+    gdn_prefill_regscan_cols_body<float, CS, PF>(qkv, qk, decay, beta, state, \
+                                                 out, mid, M, H, vpk, mid_count,\
+                                                 tg, sg, lane);               \
+}
+// The shipped scan: four value columns per simdgroup. Measured per dispatch
+// on the profile transport at the chunk shape (4096 tokens, 48 heads), two
+// rotated runs: one column 7.8 to 8.4 ms, two 5.7 to 6.7, four 5.2 to 6.6,
+// eight 7.5 to 9.2, sixteen 23 to 25 (registers); loading the next token's
+// operands a token ahead was slower at every width (the recurrence's own
+// latency, not the loads', is the chain).
+GDN_REGSCAN_VARIANT(gdn_prefill_regscan, 4, false)
+GDN_REGSCAN_VARIANT(gdn_prefill_regscan_c2, 2, false)
+#undef GDN_REGSCAN_VARIANT
 
 // Causal depthwise conv1d + SiLU; window stores KD-1 inputs oldest first.
 kernel void conv1d_step_bf16(device bfloat*       window [[buffer(0)]],  // [C, KD-1]

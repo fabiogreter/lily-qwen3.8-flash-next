@@ -249,7 +249,7 @@ Where a 4 096-token chunk goes at an 8K prompt:
 | sparse attention (`qsa_attn_split`)        | 40.2% | 2.1 TFLOP/s |
 | grouped Q4 expert GEMM                     | 19.9% | 33 TFLOP/s |
 | dense bf16 GEMM (tensor ops)               | 18.8% | 54 TFLOP/s |
-| GDN prefill scan                           | 9.2%  | sequential recurrence |
+| GDN prefill scan                           | 9.2%  | sequential recurrence (since: four value columns per simdgroup, 27% less) |
 | elementwise passes over the wide residual  | 3.7%  |            |
 | MoE input gather                           | 1.8%  |            |
 
@@ -577,6 +577,19 @@ word, grids and strides come from the largest candidate and the kernels
 already mask per row. Such a position is restricted to single-row passes
 whose candidate range spans less than one indexer block, which keeps "at most
 one block completes" true.
+
+The GDN prefill scan runs one simdgroup per (head, value column) group
+sequentially over the chunk's tokens with the state column in registers.
+It takes four value columns per simdgroup: the single-column form had 128
+simdgroups per head each reloading the same k, q and gate rows per token,
+and sharing them over four columns took the scan from 384 to 281 ms per
+8K chunk in paired profile runs (27%, about 3% of the chunk); two columns
+and eight measured between, sixteen far slower (registers), and loading
+the next token's operands a token ahead slower at every width, so the
+recurrence's own latency is the chain. The per-column arithmetic order is
+unchanged; results differ from the single-column scan only by fast-math
+contraction (the 4-layer golden gaps moved from 0.045 / 0.031 to 0.043 /
+0.025).
 
 **Rollback needs no recomputation.** The GDN prefill scan records the state
 after every row, so the accepted one is copied back by index; the convolution

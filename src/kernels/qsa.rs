@@ -829,9 +829,9 @@ pub fn qsa_attention_tiled<'t>(
 
 /// [`qsa_attention_tiled`] through a tile kernel given by name (any
 /// instantiation of the tile body; the name is leaked into the pipeline
-/// cache).
+/// cache). For the timing and comparison tests.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn dispatch_tiled_named<'t>(
+pub fn dispatch_tiled_named<'t>(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
     q: &Tensor,

@@ -1279,3 +1279,72 @@ fn gdn_small_m_timing() {
         }
     }
 }
+
+/// Per-dispatch GPU time of the prefill scan at the model's chunk shape
+/// (4096 tokens, 48 value heads over 16 key heads) on the profile
+/// transport, for the kernels `LILY_GDN_SCAN_KERNELS` names (comma
+/// separated, rotated per round so they share the GPU's conditions; the
+/// shipped scan and the single-column one by default): minimum and median
+/// over the dispatches.
+#[test]
+#[ignore = "timing only"]
+fn gdn_prefill_scan_timing() {
+    let ctx = MetalContext::new_with_profile(true).expect("metal context");
+    let mut rng = StdRng::seed_from_u64(61);
+    let (dim, hk, h, m) = (GDN_HEAD_DIM, 16usize, 48usize, 4096usize);
+    let scale = 1.0 / (dim as f32).sqrt();
+    let c = (2 * hk + h) * dim;
+    let a_log = random_vec(&mut rng, h, -2.0, 0.5);
+    let dt_bias = random_vec(&mut rng, h, -0.5, 0.5);
+    let qkv = random_vec(&mut rng, m * c, -1.0, 1.0);
+    let a = random_vec(&mut rng, m * h, -1.0, 1.0);
+    let b = random_vec(&mut rng, m * h, -1.0, 1.0);
+    let t_a_log = Tensor::from_f32(&ctx, &a_log, &[h]).expect("a_log");
+    let t_dt_bias = Tensor::from_f32_as_bf16(&ctx, &dt_bias, &[h]).expect("dt_bias");
+    let t_qkv = Tensor::from_f32_as_bf16(&ctx, &qkv, &[m, c]).expect("qkv");
+    let ta = Tensor::from_f32_as_bf16(&ctx, &a, &[m, h]).expect("a");
+    let tb = Tensor::from_f32_as_bf16(&ctx, &b, &[m, h]).expect("b");
+    let (qk_norm, decay, beta) = staging_tensors(&ctx, m, hk, h);
+    let staging = GdnRegscanStaging { qk_norm: &qk_norm, decay: &decay, beta: &beta };
+    let state = Tensor::zeros(&ctx, &[h, dim, dim], DType::F32).expect("state");
+    let out = Tensor::zeros(&ctx, &[m, h, dim], DType::BF16).expect("out");
+    let names: Vec<String> = std::env::var("LILY_GDN_SCAN_KERNELS")
+        .map(|v| v.split(',').map(str::to_string).collect())
+        .unwrap_or_else(|_| {
+            vec![
+                "gdn_prefill_regscan".to_string(),
+                "gdn_prefill_regscan_c1".to_string(),
+            ]
+        });
+    crate::metal::profile::take();
+    let rounds = 8;
+    for round in 0..rounds {
+        for k in 0..names.len() {
+            let name = &names[(k + round) % names.len()];
+            let pass = ctx.begin().expect("pass");
+            gdn_prefill_scan_named(
+                &ctx, &pass, &t_qkv, &ta, &tb, &t_a_log, &t_dt_bias, &staging, &state,
+                &out, scale, hk, None, name,
+            )
+            .expect("gdn_prefill");
+            pass.commit_wait().expect("commit");
+        }
+    }
+    let passes = crate::metal::profile::take();
+    for name in &names {
+        let mut ms: Vec<f64> = passes
+            .iter()
+            .flat_map(|p| p.kernels.iter())
+            .filter(|s| s.name == name.as_str())
+            .map(|s| s.gpu_secs * 1e3)
+            .collect();
+        ms.sort_by(|x, y| x.total_cmp(y));
+        let n = ms.len();
+        assert!(n > 0, "no dispatches of {name} recorded");
+        eprintln!(
+            "{name}: min {:.1} ms, median {:.1} ms over {n} dispatches",
+            ms[0],
+            ms[n / 2]
+        );
+    }
+}

@@ -235,6 +235,51 @@ pub fn gdn_prefill_mid(
     num_k_heads: usize,
     mid: Option<&Tensor>,
 ) -> Result<()> {
+    // `LILY_GDN_SCAN_KERNEL` names an alternative scan (timing experiments).
+    static FORCED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let forced = FORCED.get_or_init(|| std::env::var("LILY_GDN_SCAN_KERNEL").ok());
+    let scan_name = forced.as_deref().unwrap_or(GDN_SCAN_KERNEL);
+    gdn_prefill_scan_named(
+        ctx,
+        pass,
+        qkv,
+        a,
+        b,
+        a_log,
+        dt_bias,
+        staging,
+        state,
+        out,
+        scale,
+        num_k_heads,
+        mid,
+        scan_name,
+    )
+}
+
+/// The shipped prefill scan kernel.
+const GDN_SCAN_KERNEL: &str = "gdn_prefill_regscan";
+
+/// [`gdn_prefill_mid`] through the scan kernel given by name (the shipped
+/// scan takes four value columns per simdgroup; `_c1` / `_c2` are the
+/// one- and two-column instantiations).
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_prefill_scan_named(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    qkv: &Tensor,
+    a: &Tensor,
+    b: &Tensor,
+    a_log: &Tensor,
+    dt_bias: &Tensor,
+    staging: &GdnRegscanStaging<'_>,
+    state: &Tensor,
+    out: &Tensor,
+    scale: f32,
+    num_k_heads: usize,
+    mid: Option<&Tensor>,
+    scan_name: &str,
+) -> Result<()> {
     let num_heads = a_log.numel();
     let dim = GDN_HEAD_DIM;
     ensure!(
@@ -289,7 +334,18 @@ pub fn gdn_prefill_mid(
     gdn_gates(ctx, pass, a, b, a_log, dt_bias, staging.decay, staging.beta)?;
     // The scan reads the staging the two dispatches above wrote.
     pass.level_barrier(&[staging.qk_norm, staging.decay, staging.beta])?;
-    let scan = ctx.pipeline("gdn_prefill_regscan", SOURCE, MslVersion::V3_1)?;
+    let scan_name: &'static str = if scan_name == GDN_SCAN_KERNEL {
+        GDN_SCAN_KERNEL
+    } else {
+        Box::leak(scan_name.to_string().into_boxed_str())
+    };
+    // Value columns per simdgroup: the shipped scan takes four, the
+    // comparison instantiations carry theirs in the name.
+    let cols_per_sg = ["_c16", "_c8", "_c4", "_c2", "_c1"]
+        .iter()
+        .find(|tag| scan_name.contains(*tag))
+        .map_or(4, |tag| tag[2..].parse::<usize>().expect("column tag"));
+    let scan = ctx.pipeline(scan_name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &scan,
         &[
@@ -303,7 +359,10 @@ pub fn gdn_prefill_mid(
             mid.unwrap_or(state).binding(),
         ],
         &[&u32_bytes(m), &u32_bytes(num_heads), &u32_bytes(vpk), &u32_bytes(mid_count)],
-        Grid::Threadgroups { groups: (num_heads, dim / 4, 1), threadgroup: (32, 4, 1) },
+        Grid::Threadgroups {
+            groups: (num_heads, dim / (4 * cols_per_sg), 1),
+            threadgroup: (32, 4, 1),
+        },
     )
 }
 

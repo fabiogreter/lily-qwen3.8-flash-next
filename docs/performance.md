@@ -277,7 +277,10 @@ estimate with its assumption named.
    (the slice's V rows and the next slice's K rows fetched into registers
    under the tensor ops): 18 to 25% off the kernel per 8K chunk and 12 to
    15% per 32K chunk in paired profile runs, about 4% and 5% of the chunk.
-   The grouped expert GEMM's row tile was swept afterwards on the 4096-token
+   The GDN prefill scan then went from one to four value columns per
+   simdgroup (the per-token k, q and gate loads shared): 384 to 281 ms per
+   8K chunk in paired profile runs, 27% of the kernel and about 3% of the
+   chunk. The grouped expert GEMM's row tile was swept afterwards on the 4096-token
    chunk (about 80 routed rows per expert): 32 rows 645 ms, 64 rows 593 to
    622, 96 rows 659, 128 rows 759 (four simdgroups) and 698 (eight), so the
    shipped 64-row tile stays and the tensor work on padded rows, not the
