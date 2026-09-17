@@ -964,6 +964,29 @@ fn tiled_attention_matches_split_kernel_and_cpu() {
         cpu_ref::assert_close(&got, &expected, 2e-2, 2e-2);
         cpu_ref::assert_close(&got, &got_split, 2e-2, 2e-2);
     }
+    // Every other instantiation of the tile body, by name.
+    for name in ["qsa_attn_tile_nax_h1_plain"] {
+        let out = Tensor::zeros(&ctx, &[qb, nq, d], DType::BF16).expect("out");
+        let pass = ctx.begin().expect("pass");
+        qsa_tile_union(&ctx, &pass, &t_sel, &t_n, &tiles, qb, k_max, ratio, base_pos)
+            .expect("union");
+        pass.level_barrier(&[
+            &tiles.union_blk,
+            &tiles.union_mask,
+            &tiles.n_union,
+            &tiles.tail_mask,
+        ])
+        .expect("barrier");
+        dispatch_tiled_named(
+            &ctx, &pass, &t_q, &t_k, &t_v, &tiles, &out, qb, ratio, base_pos, scale,
+            name,
+        )
+        .expect("tiled attention");
+        pass.commit_wait().expect("commit");
+        let got = out.to_f32().expect("out");
+        assert!(got.iter().all(|x| x.is_finite()), "{name}: non-finite output");
+        cpu_ref::assert_close(&got, &expected, 2e-2, 2e-2);
+    }
 }
 
 /// The selection against a CPU sort on decode-sized rows: every
@@ -1052,5 +1075,97 @@ fn select_blocks_timing() {
             best = best.min(start.elapsed().as_secs_f64() * 1e6 / iters as f64);
         }
         eprintln!("{what} [qb {qb}, {nb_max} blocks]: {best:.1} us per dispatch");
+    }
+}
+
+/// Per-dispatch GPU time of the tiled sparse attention on a prefill
+/// sub-batch shape (256 queries, 24 heads over 2 KV heads, 512-block
+/// budget, about 1.8x selection overlap per 16-query tile) at 8K and 32K,
+/// on the profile transport: the minimum and median over the dispatches
+/// of each kernel named in `LILY_QSA_TILE_KERNELS` (comma separated; the
+/// shipped one-head kernel and the plain one-head body by default).
+/// `cargo test --release -- --ignored --nocapture tiled_attention_timing`.
+#[test]
+#[ignore = "timing only"]
+fn tiled_attention_timing() {
+    let ctx = MetalContext::new_with_profile(true).expect("metal context");
+    let mut rng = StdRng::seed_from_u64(49);
+    let (kvh, group, d, ratio, k_max) = (2usize, 12usize, 256usize, 4usize, 512usize);
+    let nq = kvh * group;
+    let qb = 256usize;
+    let scale = 1.0 / (d as f32).sqrt();
+    let kernels: Vec<String> = std::env::var("LILY_QSA_TILE_KERNELS")
+        .map(|v| v.split(',').map(str::to_string).collect())
+        .unwrap_or_else(|_| {
+            vec![
+                "qsa_attn_tile_nax_h1".to_string(),
+                "qsa_attn_tile_nax_h1_plain".to_string(),
+            ]
+        });
+    for base_pos in [8192usize, 32768] {
+        let max_seq = base_pos + qb;
+        let q = random(&mut rng, qb * nq * d, -1.0, 1.0);
+        let k = random(&mut rng, kvh * max_seq * d, -1.0, 1.0);
+        let v = random(&mut rng, kvh * max_seq * d, -1.0, 1.0);
+        let nb = visible_blocks(base_pos, ratio);
+        let hot: Vec<u32> = (0..300).map(|_| rng.gen_range(0..nb as u32)).collect();
+        let (sel, n_sel) =
+            random_selections(&mut rng, qb, k_max, base_pos, ratio, &hot);
+        let t_q = Tensor::from_f32_as_bf16(&ctx, &q, &[qb, nq, d]).expect("q");
+        let t_k = Tensor::from_f32_as_bf16(&ctx, &k, &[kvh, max_seq, d]).expect("k");
+        let t_v = Tensor::from_f32_as_bf16(&ctx, &v, &[kvh, max_seq, d]).expect("v");
+        let t_sel = Tensor::from_bytes(
+            &ctx,
+            bytemuck::cast_slice(&sel),
+            &[qb, k_max],
+            DType::U32,
+        )
+        .expect("sel");
+        let t_n =
+            Tensor::from_bytes(&ctx, bytemuck::cast_slice(&n_sel), &[qb], DType::U32)
+                .expect("n");
+        let tiles =
+            SparseTileScratch::new(&ctx, qb, max_seq / ratio, k_max).expect("tiles");
+        let out = Tensor::zeros(&ctx, &[qb, nq, d], DType::BF16).expect("out");
+        let pass = ctx.begin().expect("pass");
+        qsa_tile_union(&ctx, &pass, &t_sel, &t_n, &tiles, qb, k_max, ratio, base_pos)
+            .expect("union");
+        pass.commit_wait().expect("union");
+        let (blocks, built) = tiles.union_stats().expect("stats");
+        eprintln!(
+            "base {base_pos}: union {:.0} blocks per tile ({:.2}x one selection)",
+            blocks as f64 / built.max(1) as f64,
+            (QSA_TILE_BQ * k_max) as f64 / (blocks as f64 / built.max(1) as f64)
+        );
+        crate::metal::profile::take();
+        let rounds = 12;
+        for round in 0..rounds {
+            for k in 0..kernels.len() {
+                let name = &kernels[(k + round) % kernels.len()];
+                let pass = ctx.begin().expect("pass");
+                dispatch_tiled_named(
+                    &ctx, &pass, &t_q, &t_k, &t_v, &tiles, &out, qb, ratio, base_pos,
+                    scale, name,
+                )
+                .expect("tiled attention");
+                pass.commit_wait().expect("commit");
+            }
+        }
+        let passes = crate::metal::profile::take();
+        for name in &kernels {
+            let mut ms: Vec<f64> = passes
+                .iter()
+                .flat_map(|p| p.kernels.iter())
+                .filter(|s| s.name == name.as_str())
+                .map(|s| s.gpu_secs * 1e3)
+                .collect();
+            ms.sort_by(|a, b| a.total_cmp(b));
+            let n = ms.len();
+            eprintln!(
+                "base {base_pos} {name}: min {:.2} ms, median {:.2} ms over {n} dispatches",
+                ms[0],
+                ms[n / 2]
+            );
+        }
     }
 }

@@ -769,7 +769,11 @@ pub fn qsa_attention_tiled<'t>(
     let nq = q.numel() / (qb * d);
     ensure!(nq.is_multiple_of(kvh), "NQ {nq} not a multiple of KVH {kvh}");
     let group = nq / kvh;
-    let name = match heads_per_pass {
+    // `LILY_QSA_TILE_KERNEL` names an alternative instantiation of the tile
+    // kernel (timing experiments).
+    static FORCED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let forced = FORCED.get_or_init(|| std::env::var("LILY_QSA_TILE_KERNEL").ok());
+    let name: &'static str = match heads_per_pass {
         1 => "qsa_attn_tile_nax_h1",
         2 => "qsa_attn_tile_nax_h2",
         4 => "qsa_attn_tile_nax_h4",
@@ -777,10 +781,99 @@ pub fn qsa_attention_tiled<'t>(
             "{other} heads per pass: the tile kernel exists for 1, 2 and 4"
         ),
     };
+    let name: &'static str = match forced {
+        Some(f) => Box::leak(f.clone().into_boxed_str()),
+        None => name,
+    };
     ensure!(
         group.is_multiple_of(heads_per_pass),
         "{heads_per_pass} heads per pass do not divide the GQA group of {group}"
     );
+    ensure!(out.numel() == q.numel() && out.dtype() == DType::BF16, "out must match q");
+    ensure!(base_pos.max + qb <= max_seq, "queries exceed the cache");
+    let n_tiles = qb.div_ceil(QSA_TILE_BQ);
+    ensure!(
+        n_tiles <= tiles.tiles(),
+        "tile scratch holds {} tiles, {qb} queries need {n_tiles}",
+        tiles.tiles()
+    );
+    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V4_0)?;
+    pass.dispatch_with(
+        &pipeline,
+        &[
+            q.binding(),
+            k_cache.binding(),
+            v_cache.binding(),
+            tiles.union_blk.binding(),
+            tiles.union_mask.binding(),
+            tiles.n_union.binding(),
+            tiles.tail_mask.binding(),
+            out.binding(),
+        ],
+        &[
+            Param::U32(max_seq as u32),
+            base_pos.param(),
+            Param::U32(qb as u32),
+            Param::U32(nq as u32),
+            Param::U32(group as u32),
+            Param::F32(scale),
+            Param::U32(tiles.cap() as u32),
+            Param::U32(ratio as u32),
+        ],
+        Grid::Threadgroups {
+            groups: (n_tiles, nq / heads_per_pass, 1),
+            threadgroup: (QSA_TILE_THREADS, 1, 1),
+        },
+    )
+}
+
+/// [`qsa_attention_tiled`] through a tile kernel given by name (any
+/// instantiation of the tile body; the name is leaked into the pipeline
+/// cache).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_tiled_named<'t>(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    q: &Tensor,
+    k_cache: &Tensor,
+    v_cache: &Tensor,
+    tiles: &SparseTileScratch,
+    out: &Tensor,
+    qb: usize,
+    ratio: usize,
+    base_pos: impl Into<Pos<'t>>,
+    scale: f32,
+    name: &str,
+) -> Result<()> {
+    let base_pos = base_pos.into();
+    let (kvh, max_seq, d) =
+        (k_cache.shape()[0], k_cache.shape()[1], k_cache.shape()[2]);
+    ensure!(
+        d == ATTN_D,
+        "tiled sparse attention is compiled for head dim {ATTN_D}, got {d}"
+    );
+    ensure!(v_cache.shape() == k_cache.shape(), "k/v cache shape mismatch");
+    ensure!(qb > 0, "no queries");
+    ensure!(
+        q.dtype() == DType::BF16 && q.numel().is_multiple_of(qb * d),
+        "q must be BF16 [QB, NQ, D]"
+    );
+    let nq = q.numel() / (qb * d);
+    ensure!(nq.is_multiple_of(kvh), "NQ {nq} not a multiple of KVH {kvh}");
+    let group = nq / kvh;
+    // The instantiation's heads per pass, from its name (`_h1`, `_h2`, `_h4`).
+    let heads_per_pass = if name.contains("_h4") {
+        4
+    } else if name.contains("_h2") {
+        2
+    } else if name.contains("_h1") {
+        1
+    } else {
+        anyhow::bail!(
+            "tile kernel name {name} carries no _h1/_h2/_h4 heads-per-pass tag"
+        )
+    };
+    let name: &'static str = Box::leak(name.to_string().into_boxed_str());
     ensure!(out.numel() == q.numel() && out.dtype() == DType::BF16, "out must match q");
     ensure!(base_pos.max + qb <= max_seq, "queries exceed the cache");
     let n_tiles = qb.div_ceil(QSA_TILE_BQ);

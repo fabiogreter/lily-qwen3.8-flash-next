@@ -281,7 +281,17 @@ about 1 250 to 1 700 tok/s at 8K and from 1 150 to 1 450 at 32K, with the
 same tokens drawn. The variants that share a staged K/V slice across two or
 four query heads (`tile2`, `tile4`) are slower than one head per slice at
 both lengths, so the accumulators' register pressure outweighs the saved
-gathers. `LILY_QSA_ROUTE=split` restores the per-query kernel; `tile2` and
+gathers. The one-head kernel pipelines its gathers: while a slice's scores
+and softmax run on the staged K rows, each thread already holds the slice's
+V rows in registers, and while P.V runs it holds the next slice's K rows,
+so the gather latency overlaps the tensor ops instead of being exposed
+twice per slice. In the per-kernel profile that took the kernel from 697
+to 572 ms and 896 to 676 ms per 8K chunk in two paired runs (18 to 25%)
+and from 1 802 to 1 534 and 1 703 to 1 492 ms per 32K chunk (12 to 15%),
+all four pairs measured while the machine ran at about half its usual
+speed; staging 16 rows per slice instead of 32 (for occupancy) and
+prefetching the next slice's K rows a whole slice earlier both measured
+slower or equal in isolation. `LILY_QSA_ROUTE=split` restores the per-query kernel; `tile2` and
 `tile4` select the other variants. Sub-batches under 16 rows (the verify
 pass) keep the split kernel.
 

@@ -273,6 +273,10 @@ estimate with its assumption named.
    about 1 200 to 350 ms at 8K and 1 480 to 850 ms at 32K, prefill to about
    1 700 tok/s at 8K and 1 450 at 32K in single profile runs, the dense
    kernel taking the rows below the limit besides (`docs/architecture.md`).
+   The one-head tile kernel then had its K/V gathers software-pipelined
+   (the slice's V rows and the next slice's K rows fetched into registers
+   under the tensor ops): 18 to 25% off the kernel per 8K chunk and 12 to
+   15% per 32K chunk in paired profile runs, about 4% and 5% of the chunk.
    The grouped expert GEMM's row tile was swept afterwards on the 4096-token
    chunk (about 80 routed rows per expert): 32 rows 645 ms, 64 rows 593 to
    622, 96 rows 659, 128 rows 759 (four simdgroups) and 698 (eight), so the
