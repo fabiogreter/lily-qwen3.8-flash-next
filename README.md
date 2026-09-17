@@ -176,8 +176,8 @@ framework, MLX included. The sparse-attention and recurrent-state work is
 specific to this architecture family, and the paged n-gram table to this
 model alone. The detailed account, with every
 measurement, is [docs/architecture.md](docs/architecture.md); what was
-tried and what remains is [docs/optimization-potential.md](docs/optimization-potential.md)
-and the dated reports in `docs/`.
+tried, what it measured and what remains is the last part of
+[docs/performance.md](docs/performance.md).
 
 ## Converting a checkpoint
 
