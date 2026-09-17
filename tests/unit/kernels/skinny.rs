@@ -38,7 +38,8 @@ fn gemm_skinny_q4_nt_staged(
     )
 }
 
-/// Test-only register-A variant with an explicit rows-per-threadgroup width.
+/// Test-only register-A variant with an explicit simdgroups-per-threadgroup
+/// width (each simdgroup computes `REG_ROWS_PER_SG` rows).
 fn gemm_skinny_q4_nt_reg(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
@@ -83,9 +84,46 @@ const GROUP_SIZE: usize = 64;
 /// M values covering register-A and both sides of the staged-A boundary.
 const M_SWEEP: [usize; 6] = [1, 2, 5, 8, 9, 16];
 
-/// Tolerance against an f32 reference over BF16-rounded operands.
+/// Tolerance against an f32 reference over BF16-rounded operands (the
+/// staged kernels).
 const ATOL: f32 = 2e-2;
 const RTOL: f32 = 2e-2;
+/// Tolerance of the register-A kernels against an f32 reference over the
+/// unrounded dequantized weights: the bf16 output rounding (2^-9) and the
+/// f32 accumulation order.
+const ATOL_REG: f32 = 4e-3;
+const RTOL_REG: f32 = 4e-3;
+
+/// The f32 reference of `gemm_skinny_q4_nt` at this shape and its
+/// tolerance: the register-A route (m <= 8) dots the unrounded dequantized
+/// weights like the decode GEMV, the staged route rounds them to bf16
+/// first.
+fn q4_reference(
+    a: &[f32],
+    dequant: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> (Vec<f32>, f32, f32) {
+    let a_r = cpu_ref::round_bf16(a);
+    if reg_routes(m, n, q4_block_walk_ok(k, GROUP_SIZE)) {
+        (cpu_ref::gemm_nt(&a_r, dequant, m, k, n), ATOL_REG, RTOL_REG)
+    } else {
+        (cpu_ref::gemm_nt(&a_r, &cpu_ref::round_bf16(dequant), m, k, n), ATOL, RTOL)
+    }
+}
+
+fn assert_q4_close(
+    got: &[f32],
+    a: &[f32],
+    dequant: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) {
+    let (expected, atol, rtol) = q4_reference(a, dequant, m, k, n);
+    cpu_ref::assert_close(got, &expected, atol, rtol);
+}
 
 fn random_vec(rng: &mut StdRng, len: usize) -> Vec<f32> {
     (0..len).map(|_| rng.gen_range(-1.0f32..1.0)).collect()
@@ -212,15 +250,7 @@ fn gemm_skinny_q4_matches_reference() {
             let pass = ctx.begin().expect("pass");
             gemm_skinny_q4_nt(&ctx, &pass, &ta, &w, &tc).expect("skinny q4");
             pass.commit_wait().expect("commit");
-            // The reference uses the kernel's BF16-rounded dequantized weights.
-            let expected = cpu_ref::gemm_nt(
-                &cpu_ref::round_bf16(&a),
-                &cpu_ref::round_bf16(&dequant),
-                m,
-                k,
-                n,
-            );
-            cpu_ref::assert_close(&tc.to_f32().expect("read"), &expected, ATOL, RTOL);
+            assert_q4_close(&tc.to_f32().expect("read"), &a, &dequant, m, k, n);
         }
     }
 }
@@ -244,14 +274,7 @@ fn gemm_skinny_q4_unaligned_a_matches_reference() {
     let pass = ctx.begin().expect("pass");
     gemm_skinny_q4_nt(&ctx, &pass, &ta, &w, &tc).expect("skinny q4");
     pass.commit_wait().expect("commit");
-    let expected = cpu_ref::gemm_nt(
-        &cpu_ref::round_bf16(&a),
-        &cpu_ref::round_bf16(&dequant),
-        m,
-        k,
-        n,
-    );
-    cpu_ref::assert_close(&tc.to_f32().expect("read"), &expected, ATOL, RTOL);
+    assert_q4_close(&tc.to_f32().expect("read"), &a, &dequant, m, k, n);
 }
 
 /// Samples boundary rows and a prime-stride walk across wide outputs.
@@ -294,7 +317,8 @@ fn gemm_skinny_q4_vocab_shape_matches_reference() {
                     k,
                     gs,
                 );
-                let w_r = cpu_ref::round_bf16(&deq);
+                let reg = reg_routes(m, n, q4_block_walk_ok(k, gs));
+                let w_r = if reg { deq } else { cpu_ref::round_bf16(&deq) };
                 for i in 0..m {
                     let mut sum = 0.0f32;
                     for kk in 0..k {
@@ -304,7 +328,9 @@ fn gemm_skinny_q4_vocab_shape_matches_reference() {
                     got.push(got_full[i * n + r]);
                 }
             }
-            cpu_ref::assert_close(&got, &want, ATOL, RTOL);
+            let reg = reg_routes(m, n, q4_block_walk_ok(k, gs));
+            let (atol, rtol) = if reg { (ATOL_REG, RTOL_REG) } else { (ATOL, RTOL) };
+            cpu_ref::assert_close(&got, &want, atol, rtol);
         }
     }
 }
@@ -357,14 +383,7 @@ fn gemm_skinny_q4_wide_route_boundary_matches_reference() {
         let pass = ctx.begin().expect("pass");
         gemm_skinny_q4_nt(&ctx, &pass, &ta, w, &tc).expect("skinny q4");
         pass.commit_wait().expect("commit");
-        let expected = cpu_ref::gemm_nt(
-            &cpu_ref::round_bf16(&a),
-            &cpu_ref::round_bf16(dequant),
-            m,
-            k,
-            n,
-        );
-        cpu_ref::assert_close(&tc.to_f32().expect("read"), &expected, ATOL, RTOL);
+        assert_q4_close(&tc.to_f32().expect("read"), &a, dequant, m, k, n);
     };
     for (n, ms) in [(WIDE_N - 4, &[8usize][..]), (WIDE_N, &[1usize, 8, 9][..])] {
         let (w, dequant) = random_quant(&ctx, &mut rng, n, k, GROUP_SIZE);
@@ -393,14 +412,7 @@ fn gemm_skinny_q4_wide_unaligned_a_matches_reference() {
     let pass = ctx.begin().expect("pass");
     gemm_skinny_q4_nt(&ctx, &pass, &ta, &w, &tc).expect("skinny q4");
     pass.commit_wait().expect("commit");
-    let expected = cpu_ref::gemm_nt(
-        &cpu_ref::round_bf16(&a),
-        &cpu_ref::round_bf16(&dequant),
-        m,
-        k,
-        n,
-    );
-    cpu_ref::assert_close(&tc.to_f32().expect("read"), &expected, ATOL, RTOL);
+    assert_q4_close(&tc.to_f32().expect("read"), &a, &dequant, m, k, n);
 }
 
 /// Checks explicit staged K-chunk and register threadgroup-width variants.
@@ -413,6 +425,7 @@ fn gemm_skinny_q4_variants_match_reference() {
         for m in [1usize, 5, 8] {
             let a = random_vec(&mut rng, m * k);
             let ta = Tensor::from_f32_as_bf16(&ctx, &a, &[m, k]).expect("a");
+            // The explicit staged variants round the weights to bf16.
             let expected = cpu_ref::gemm_nt(
                 &cpu_ref::round_bf16(&a),
                 &cpu_ref::round_bf16(&dequant),
@@ -439,19 +452,19 @@ fn gemm_skinny_q4_variants_match_reference() {
     let (w, dequant) = random_quant(&ctx, &mut rng, n, k, GROUP_SIZE);
     let a = random_vec(&mut rng, m * k);
     let ta = Tensor::from_f32_as_bf16(&ctx, &a, &[m, k]).expect("a");
-    let expected = cpu_ref::gemm_nt(
-        &cpu_ref::round_bf16(&a),
-        &cpu_ref::round_bf16(&dequant),
-        m,
-        k,
-        n,
-    );
+    // The register-A variants dot the unrounded weights.
+    let expected = cpu_ref::gemm_nt(&cpu_ref::round_bf16(&a), &dequant, m, k, n);
     for rows in [2usize, 4, 8] {
         let tc = Tensor::zeros(&ctx, &[m, n], DType::BF16).expect("c");
         let pass = ctx.begin().expect("pass");
         gemm_skinny_q4_nt_reg(&ctx, &pass, &ta, &w, &tc, rows).expect("skinny q4 reg");
         pass.commit_wait().expect("commit");
-        cpu_ref::assert_close(&tc.to_f32().expect("read"), &expected, ATOL, RTOL);
+        cpu_ref::assert_close(
+            &tc.to_f32().expect("read"),
+            &expected,
+            ATOL_REG,
+            RTOL_REG,
+        );
     }
 }
 
@@ -584,18 +597,18 @@ fn gemm_skinny_reg_layer_shapes_match_reference() {
         for m in 1..=REG_MAX_M {
             let a = random_vec(&mut rng, m * k);
             let ta = Tensor::from_f32_as_bf16(&ctx, &a, &[m, k]).expect("a");
-            let expected = cpu_ref::gemm_nt(
-                &cpu_ref::round_bf16(&a),
-                &cpu_ref::round_bf16(&dequant),
-                m,
-                k,
-                n,
-            );
+            let expected =
+                cpu_ref::gemm_nt(&cpu_ref::round_bf16(&a), &dequant, m, k, n);
             let tc = Tensor::zeros(&ctx, &[m, n], DType::BF16).expect("c");
             let pass = ctx.begin().expect("pass");
             gemm_skinny_q4_nt_reg(&ctx, &pass, &ta, &w, &tc, 2).expect("q4 reg");
             pass.commit_wait().expect("commit");
-            cpu_ref::assert_close(&tc.to_f32().expect("read"), &expected, ATOL, RTOL);
+            cpu_ref::assert_close(
+                &tc.to_f32().expect("read"),
+                &expected,
+                ATOL_REG,
+                RTOL_REG,
+            );
         }
     }
 }
@@ -646,14 +659,7 @@ fn gemm_skinny_q4_f32_out_is_the_unrounded_bf16_result() {
                 &got_bf,
                 &format!("m={m} n={n} rounded f32 vs bf16"),
             );
-            let expected = cpu_ref::gemm_nt(
-                &cpu_ref::round_bf16(&a),
-                &cpu_ref::round_bf16(&dequant),
-                m,
-                k,
-                n,
-            );
-            cpu_ref::assert_close(&got_f32, &expected, ATOL, RTOL);
+            assert_q4_close(&got_f32, &a, &dequant, m, k, n);
         }
     }
 }
@@ -714,24 +720,106 @@ fn gemm_skinny_q8_matches_reference() {
             gemm_skinny_q8_nt(&ctx, &pass, &ta, &w, &c_bf).expect("q8 bf16");
             gemm_skinny_q8_nt(&ctx, &pass, &ta, &w, &c_f32).expect("q8 f32");
             pass.commit_wait().expect("commit");
-            let expected = cpu_ref::gemm_nt(
-                &cpu_ref::round_bf16(&a),
-                &cpu_ref::round_bf16(&dequant),
-                m,
-                k,
-                n,
-            );
+            // The f32 output takes the staged kernel (bf16-rounded weights).
+            let a_r = cpu_ref::round_bf16(&a);
+            let expected =
+                cpu_ref::gemm_nt(&a_r, &cpu_ref::round_bf16(&dequant), m, k, n);
             let got_f32 = c_f32.to_f32().expect("read");
             cpu_ref::assert_close(&got_f32, &expected, ATOL, RTOL);
-            // bf16 output takes the register-A kernel for m <= 8 (a different
-            // reduction order than the staged f32 kernel), so compare it to
-            // the reference rather than bit-for-bit to the f32 result.
-            cpu_ref::assert_close(
-                &c_bf.to_f32().expect("read"),
-                &expected,
-                ATOL * 4.0,
-                RTOL * 4.0,
-            );
+            // bf16 output takes the register-A kernel for m <= 8, which dots
+            // the unrounded weights.
+            let got_bf = c_bf.to_f32().expect("read");
+            if m <= REG_MAX_M {
+                let expected_reg = cpu_ref::gemm_nt(&a_r, &dequant, m, k, n);
+                cpu_ref::assert_close(&got_bf, &expected_reg, ATOL_REG, RTOL_REG);
+            } else {
+                cpu_ref::assert_close(&got_bf, &expected, ATOL, RTOL);
+            }
         }
+    }
+}
+
+/// The verify-pass question of the optimization notes (§ 2.2): the same
+/// dense bytes through the m-row register-A kernel against the decode
+/// GEMV. Streams 64 weight sets per shape (past the SLC) and prints µs per
+/// dispatch and the weight bandwidth for m = 1..4, on the model's attention
+/// and GDN projection shapes. Run with
+/// `cargo test --release -- --ignored --nocapture skinny_reg_vs_gemv_timing`.
+#[test]
+#[ignore = "timing only"]
+fn skinny_reg_vs_gemv_timing() {
+    use crate::kernels::quant::gemv_quant;
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(61);
+    let iters = 256;
+    for (n, k, what) in [
+        (2560usize, 2560usize, "square projection"),
+        (2560, 6144, "out_proj (wide K)"),
+        (7680, 2560, "stacked qkv-like (wide N)"),
+    ] {
+        let bytes = n * k / 2 + 2 * n * (k / GROUP_SIZE) * 2;
+        let sets = (64usize * 3_300_000 / bytes).clamp(8, 64);
+        let weights: Vec<QuantWeights> = (0..sets)
+            .map(|_| random_quant(&ctx, &mut rng, n, k, GROUP_SIZE).0)
+            .collect();
+        let x =
+            Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, k), &[k]).expect("x");
+        let y = Tensor::zeros(&ctx, &[n], DType::BF16).expect("y");
+        let time = |name: &str, f: &dyn Fn(&ComputePass<'_>, &QuantWeights)| {
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let pass = ctx.begin_concurrent().expect("pass");
+                for i in 0..iters {
+                    f(&pass, &weights[i % sets]);
+                }
+                let start = std::time::Instant::now();
+                pass.commit_wait().expect("commit");
+                best = best.min(start.elapsed().as_secs_f64() * 1e6 / iters as f64);
+            }
+            eprintln!(
+                "{what} [{n} x {k}] {name}: {best:.1} us per dispatch, {:.0} GB/s of weights",
+                bytes as f64 / best / 1e3
+            );
+        };
+        time("decode GEMV (m = 1)", &|pass, w| {
+            gemv_quant(&ctx, pass, w, &x, &y).unwrap()
+        });
+        for m in 1..=4usize {
+            let a =
+                Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, m * k), &[m, k])
+                    .expect("a");
+            let c = Tensor::zeros(&ctx, &[m, n], DType::BF16).expect("c");
+            time(&format!("register-A skinny (m = {m})"), &|pass, w| {
+                gemm_skinny_q4_nt(&ctx, pass, &a, w, &c).unwrap()
+            });
+        }
+    }
+}
+
+/// The one-row register-A kernel and the decode GEMV are the same
+/// construction (raw-code dot, scale and bias per block or word), so they
+/// agree to the f32 accumulation order on the model's projection shapes.
+#[test]
+fn gemm_skinny_reg_m1_matches_decode_gemv() {
+    use crate::kernels::quant::gemv_quant;
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(63);
+    for (n, k) in [(2560usize, 2560usize), (320, 6144), (48, 2560), (7680, 2560)] {
+        let (w, _) = random_quant(&ctx, &mut rng, n, k, GROUP_SIZE);
+        let x = random_vec(&mut rng, k);
+        let tx = Tensor::from_f32_as_bf16(&ctx, &x, &[k]).expect("x");
+        let ta = Tensor::from_f32_as_bf16(&ctx, &x, &[1, k]).expect("a");
+        let y = Tensor::zeros(&ctx, &[n], DType::BF16).expect("y");
+        let c = Tensor::zeros(&ctx, &[1, n], DType::BF16).expect("c");
+        let pass = ctx.begin().expect("pass");
+        gemv_quant(&ctx, &pass, &w, &tx, &y).expect("gemv");
+        gemm_skinny_q4_nt(&ctx, &pass, &ta, &w, &c).expect("skinny");
+        pass.commit_wait().expect("commit");
+        cpu_ref::assert_close(
+            &c.to_f32().expect("c"),
+            &y.to_f32().expect("y"),
+            ATOL_REG,
+            RTOL_REG,
+        );
     }
 }

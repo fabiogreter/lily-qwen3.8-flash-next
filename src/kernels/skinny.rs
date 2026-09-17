@@ -22,8 +22,11 @@ const REG_MAX_M: usize = 8;
 const WIDE_N_MIN: usize = 65536;
 const REG_SMALL_M: usize = 8;
 
-/// Rows, one simdgroup each, per register-A threadgroup.
-const WIDE_ROWS_PER_TG: usize = 2;
+/// Simdgroups per register-A threadgroup.
+const REG_SIMDGROUPS_PER_TG: usize = 2;
+/// Weight rows each register-A simdgroup computes; must match
+/// `SKINNY_REG_ROWS` in skinny.metal.
+const REG_ROWS_PER_SG: usize = 2;
 
 /// Selects register-A when shape and packing constraints hold.
 fn reg_routes(m: usize, n: usize, block_walk_ok: bool) -> bool {
@@ -89,10 +92,10 @@ const Q4_REG_FNS_F32: [&str; REG_MAX_M] = [
     "gemm_skinny_q4_f32_reg_m8",
 ];
 
-fn reg_grid(n: usize, rows_per_tg: usize) -> Grid {
+fn reg_grid(n: usize, simdgroups: usize) -> Grid {
     Grid::Threadgroups {
-        groups: (n.div_ceil(rows_per_tg), 1, 1),
-        threadgroup: (32 * rows_per_tg, 1, 1),
+        groups: (n.div_ceil(simdgroups * REG_ROWS_PER_SG), 1, 1),
+        threadgroup: (32 * simdgroups, 1, 1),
     }
 }
 
@@ -186,13 +189,14 @@ fn dispatch_q4_reg(
             c.binding(),
         ],
         &[&u32_bytes(k), &u32_bytes(n), &u32_bytes(w.group_size)],
-        reg_grid(n, WIDE_ROWS_PER_TG),
+        reg_grid(n, REG_SIMDGROUPS_PER_TG),
     )
 }
 
-/// Small-M affine-Q8 GEMM (staged-A only; the 8-bit tensors are the narrow
-/// routers, gates and stream mixers). Same numerics as the bf16 dequant +
-/// GEMM fallback it replaces, at a fraction of the memory traffic.
+/// Small-M affine-Q8 GEMM (the 8-bit tensors are the narrow routers, gates
+/// and stream mixers). The staged kernels have the numerics of the bf16
+/// dequant + GEMM fallback they replace; register-A (`m <= 8`, bf16 out)
+/// dots the raw codes like the decode GEMV.
 pub fn gemm_skinny_q8_nt(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
@@ -233,7 +237,7 @@ pub fn gemm_skinny_q8_nt(
                 c.binding(),
             ],
             &[&u32_bytes(k), &u32_bytes(n), &u32_bytes(w.group_size)],
-            reg_grid(n, WIDE_ROWS_PER_TG),
+            reg_grid(n, REG_SIMDGROUPS_PER_TG),
         );
     }
     let fn_name = match (m <= REG_MAX_M, c.dtype()) {
@@ -258,10 +262,11 @@ pub fn gemm_skinny_q8_nt(
     )
 }
 
-/// Small-M affine-Q4 GEMM with BF16-rounded dequantization. Register-A requires
-/// `m <= 8`, `group_size == 64`, `K % 64 == 0`, and a wide output. `c` may be
-/// BF16 or F32 (the latter for logits); the f32 result is what the bf16
-/// variant rounds.
+/// Small-M affine-Q4 GEMM. Register-A (`m <= 8`, `group_size == 64`,
+/// `K % 64 == 0`) dots the raw codes with scale and bias applied per block,
+/// like the decode GEMV; the staged fallback rounds dequantized weights to
+/// bf16 first. `c` may be BF16 or F32 (the latter for logits); the f32
+/// result is what the bf16 variant rounds.
 pub fn gemm_skinny_q4_nt(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,

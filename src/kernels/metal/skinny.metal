@@ -1,5 +1,7 @@
-// Small-M Q4 GEMM with FP32 accumulation and BF16-rounded weights.
-// Staged-A and register-A variants cover different M/N regimes.
+// Small-M Q4/Q8 GEMMs with FP32 accumulation. The staged-A variants round
+// dequantized weights to bf16 like the dequant + GEMM fallback they replace;
+// the register-A variants (m <= 8) dot the raw codes like the decode GEMV.
+// The two cover different M/N regimes.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -165,8 +167,43 @@ static void gemm_skinny_q8_body(device const uint* codes,
     }
 }
 
-// Register-A body requires M == MB and K/GS divisible by 32.
-// Each uint4 weight block stays within one quantization group.
+// Register-A bodies: one simdgroup per SKINNY_REG_ROWS consecutive weight
+// rows, lanes striding over the uint4 weight blocks of both rows. The
+// activation block is loaded and converted once per lane and dotted against
+// both rows' raw codes; scale and bias are applied once per block as
+// s * dot(q, x) + b * sum(x) (quant.metal's dot_word_q4), so the weights are
+// never dequantized element by element and never rounded to bf16. The rows
+// of a pair are computed independently in the same operation order, so a
+// row's result does not depend on which row it is paired with (fused stacks
+// and their slices stay bit-identical). Requires M == MB, K % 32 == 0 and
+// GS % 32 == 0 (a block never straddles a quant group).
+constant constexpr uint SKINNY_REG_ROWS = 2;
+
+// Eight bf16 activations at `p` as two float4 (16-byte load when aligned).
+static inline void skinny_load_x8(device const bfloat* p, bool vec,
+                                  thread float4& lo, thread float4& hi) {
+    if (vec) {
+        const uint4 v = *(device const uint4*)p;
+        lo = float4(as_type<bfloat4>(v.xy));
+        hi = float4(as_type<bfloat4>(v.zw));
+    } else {
+        lo = float4(p[0], p[1], p[2], p[3]);
+        hi = float4(p[4], p[5], p[6], p[7]);
+    }
+}
+
+static inline void skinny_unpack_q4(uint word, thread float4& lo, thread float4& hi) {
+    lo = float4(float((word >> 0) & 0xF), float((word >> 4) & 0xF),
+                float((word >> 8) & 0xF), float((word >> 12) & 0xF));
+    hi = float4(float((word >> 16) & 0xF), float((word >> 20) & 0xF),
+                float((word >> 24) & 0xF), float((word >> 28) & 0xF));
+}
+
+static inline float4 skinny_unpack_q8(uint word) {
+    return float4(float(word & 0xFF), float((word >> 8) & 0xFF),
+                  float((word >> 16) & 0xFF), float((word >> 24) & 0xFF));
+}
+
 template <uint MB, typename CT>
 static void gemm_skinny_q4_reg_body(device const uint* codes,
                                     device const bfloat* scales,
@@ -174,72 +211,75 @@ static void gemm_skinny_q4_reg_body(device const uint* codes,
                                     device const bfloat* a, device CT* c,
                                     uint K, uint N, uint GS, uint tg,
                                     uint tg_size, uint simd_id, uint lane) {
-    const uint row = tg * (tg_size / 32) + simd_id;
-    if (row >= N) {
-        return;
+    const uint row0 = (tg * (tg_size / 32) + simd_id) * SKINNY_REG_ROWS;
+    if (row0 >= N) {
+        return;  // whole simdgroup
     }
+    const bool has1 = row0 + 1 < N;
+    const uint row1 = has1 ? row0 + 1 : row0;
     const uint words = K / 8;
     const uint blocks = words / 4;
     const uint bpg = GS / 32;
     const uint groups = K / GS;
     const bool a_vec = ((ulong)a & 15) == 0;
-    device const uint4* wrow = (device const uint4*)(codes + (ulong)row * words);
+    device const uint4* w0 = (device const uint4*)(codes + (ulong)row0 * words);
+    device const uint4* w1 = (device const uint4*)(codes + (ulong)row1 * words);
 
-    float acc[MB];
+    float acc0[MB];
+    float acc1[MB];
     for (uint i = 0; i < MB; ++i) {
-        acc[i] = 0.0f;
+        acc0[i] = 0.0f;
+        acc1[i] = 0.0f;
     }
 
     for (uint blk = lane; blk < blocks; blk += 32) {
         const uint g = blk / bpg;
-        const float s = float(scales[row * groups + g]);
-        const float b = float(biases[row * groups + g]);
-        const uint4 w4 = wrow[blk];
-        float4 wq[8];
+        const float s0 = float(scales[row0 * groups + g]);
+        const float b0 = float(biases[row0 * groups + g]);
+        const float s1 = float(scales[row1 * groups + g]);
+        const float b1 = float(biases[row1 * groups + g]);
+        const uint4 v0 = w0[blk];
+        const uint4 v1 = w1[blk];
+        float qx0[MB];
+        float qx1[MB];
+        float xs[MB];
+        for (uint i = 0; i < MB; ++i) {
+            qx0[i] = 0.0f;
+            qx1[i] = 0.0f;
+            xs[i] = 0.0f;
+        }
         for (uint wi = 0; wi < 4; ++wi) {
-            const uint word = w4[wi];
-            float4 qlo =
-                float4(float((word >> 0) & 0xF), float((word >> 4) & 0xF),
-                       float((word >> 8) & 0xF), float((word >> 12) & 0xF));
-            float4 qhi =
-                float4(float((word >> 16) & 0xF), float((word >> 20) & 0xF),
-                       float((word >> 24) & 0xF), float((word >> 28) & 0xF));
-            wq[2 * wi] = float4(bfloat4(qlo * s + b));
-            wq[2 * wi + 1] = float4(bfloat4(qhi * s + b));
+            float4 q0lo, q0hi, q1lo, q1hi;
+            skinny_unpack_q4(v0[wi], q0lo, q0hi);
+            skinny_unpack_q4(v1[wi], q1lo, q1hi);
+            for (uint i = 0; i < MB; ++i) {
+                float4 xlo, xhi;
+                skinny_load_x8(a + (ulong)i * K + blk * 32 + wi * 8, a_vec, xlo, xhi);
+                xs[i] += dot(xlo, float4(1.0f)) + dot(xhi, float4(1.0f));
+                qx0[i] += dot(q0lo, xlo) + dot(q0hi, xhi);
+                qx1[i] += dot(q1lo, xlo) + dot(q1hi, xhi);
+            }
         }
         for (uint i = 0; i < MB; ++i) {
-            device const bfloat* arow = a + (ulong)i * K + blk * 32;
-            if (a_vec) {
-                device const uint4* av = (device const uint4*)arow;
-                for (uint wi = 0; wi < 4; ++wi) {
-                    const uint4 x = av[wi];
-                    acc[i] += dot(wq[2 * wi], float4(as_type<bfloat4>(x.xy))) +
-                              dot(wq[2 * wi + 1], float4(as_type<bfloat4>(x.zw)));
-                }
-            } else {
-                for (uint wi = 0; wi < 4; ++wi) {
-                    const float4 xlo =
-                        float4(arow[wi * 8], arow[wi * 8 + 1],
-                               arow[wi * 8 + 2], arow[wi * 8 + 3]);
-                    const float4 xhi =
-                        float4(arow[wi * 8 + 4], arow[wi * 8 + 5],
-                               arow[wi * 8 + 6], arow[wi * 8 + 7]);
-                    acc[i] += dot(wq[2 * wi], xlo) + dot(wq[2 * wi + 1], xhi);
-                }
-            }
+            acc0[i] += s0 * qx0[i] + b0 * xs[i];
+            acc1[i] += s1 * qx1[i] + b1 * xs[i];
         }
     }
 
     for (uint i = 0; i < MB; ++i) {
-        const float sum = simd_sum(acc[i]);
+        const float sum0 = simd_sum(acc0[i]);
+        const float sum1 = simd_sum(acc1[i]);
         if (lane == 0) {
-            c[(ulong)i * N + row] = CT(sum);
+            c[(ulong)i * N + row0] = CT(sum0);
+            if (has1) {
+                c[(ulong)i * N + row1] = CT(sum1);
+            }
         }
     }
 }
 
-// 8-bit register-A body: a uint4 block holds 16 elements; requires M == MB,
-// K % 16 == 0 and GS % 16 == 0 (blocks never straddle a quant group).
+// 8-bit register-A body: a uint4 block holds 16 elements (four words of
+// four); requires M == MB, K % 16 == 0 and GS % 16 == 0.
 template <uint MB, typename CT>
 static void gemm_skinny_q8_reg_body(device const uint* codes,
                                     device const bfloat* scales,
@@ -247,58 +287,71 @@ static void gemm_skinny_q8_reg_body(device const uint* codes,
                                     device const bfloat* a, device CT* c,
                                     uint K, uint N, uint GS, uint tg,
                                     uint tg_size, uint simd_id, uint lane) {
-    const uint row = tg * (tg_size / 32) + simd_id;
-    if (row >= N) {
-        return;
+    const uint row0 = (tg * (tg_size / 32) + simd_id) * SKINNY_REG_ROWS;
+    if (row0 >= N) {
+        return;  // whole simdgroup
     }
+    const bool has1 = row0 + 1 < N;
+    const uint row1 = has1 ? row0 + 1 : row0;
     const uint words = K / 4;
     const uint blocks = words / 4;
     const uint bpg = GS / 16;
     const uint groups = K / GS;
     const bool a_vec = ((ulong)a & 15) == 0;
-    device const uint4* wrow = (device const uint4*)(codes + (ulong)row * words);
+    device const uint4* w0 = (device const uint4*)(codes + (ulong)row0 * words);
+    device const uint4* w1 = (device const uint4*)(codes + (ulong)row1 * words);
 
-    float acc[MB];
+    float acc0[MB];
+    float acc1[MB];
     for (uint i = 0; i < MB; ++i) {
-        acc[i] = 0.0f;
+        acc0[i] = 0.0f;
+        acc1[i] = 0.0f;
     }
 
     for (uint blk = lane; blk < blocks; blk += 32) {
         const uint g = blk / bpg;
-        const float s = float(scales[row * groups + g]);
-        const float b = float(biases[row * groups + g]);
-        const uint4 w4 = wrow[blk];
-        float4 wq[4];
-        for (uint wi = 0; wi < 4; ++wi) {
-            const uint word = w4[wi];
-            float4 q = float4(float(word & 0xFF), float((word >> 8) & 0xFF),
-                              float((word >> 16) & 0xFF), float((word >> 24) & 0xFF));
-            wq[wi] = float4(bfloat4(q * s + b));
+        const float s0 = float(scales[row0 * groups + g]);
+        const float b0 = float(biases[row0 * groups + g]);
+        const float s1 = float(scales[row1 * groups + g]);
+        const float b1 = float(biases[row1 * groups + g]);
+        const uint4 v0 = w0[blk];
+        const uint4 v1 = w1[blk];
+        float qx0[MB];
+        float qx1[MB];
+        float xs[MB];
+        for (uint i = 0; i < MB; ++i) {
+            qx0[i] = 0.0f;
+            qx1[i] = 0.0f;
+            xs[i] = 0.0f;
+        }
+        // Two words (eight elements) per step: one 16-byte activation load.
+        for (uint wp = 0; wp < 2; ++wp) {
+            const float4 q0lo = skinny_unpack_q8(v0[2 * wp]);
+            const float4 q0hi = skinny_unpack_q8(v0[2 * wp + 1]);
+            const float4 q1lo = skinny_unpack_q8(v1[2 * wp]);
+            const float4 q1hi = skinny_unpack_q8(v1[2 * wp + 1]);
+            for (uint i = 0; i < MB; ++i) {
+                float4 xlo, xhi;
+                skinny_load_x8(a + (ulong)i * K + blk * 16 + wp * 8, a_vec, xlo, xhi);
+                xs[i] += dot(xlo, float4(1.0f)) + dot(xhi, float4(1.0f));
+                qx0[i] += dot(q0lo, xlo) + dot(q0hi, xhi);
+                qx1[i] += dot(q1lo, xlo) + dot(q1hi, xhi);
+            }
         }
         for (uint i = 0; i < MB; ++i) {
-            device const bfloat* arow = a + (ulong)i * K + blk * 16;
-            if (a_vec) {
-                device const uint4* av = (device const uint4*)arow;
-                const uint4 x0 = av[0];
-                const uint4 x1 = av[1];
-                acc[i] += dot(wq[0], float4(as_type<bfloat4>(x0.xy))) +
-                          dot(wq[1], float4(as_type<bfloat4>(x0.zw))) +
-                          dot(wq[2], float4(as_type<bfloat4>(x1.xy))) +
-                          dot(wq[3], float4(as_type<bfloat4>(x1.zw)));
-            } else {
-                for (uint wi = 0; wi < 4; ++wi) {
-                    const float4 x = float4(arow[wi * 4], arow[wi * 4 + 1],
-                                            arow[wi * 4 + 2], arow[wi * 4 + 3]);
-                    acc[i] += dot(wq[wi], x);
-                }
-            }
+            acc0[i] += s0 * qx0[i] + b0 * xs[i];
+            acc1[i] += s1 * qx1[i] + b1 * xs[i];
         }
     }
 
     for (uint i = 0; i < MB; ++i) {
-        const float sum = simd_sum(acc[i]);
+        const float sum0 = simd_sum(acc0[i]);
+        const float sum1 = simd_sum(acc1[i]);
         if (lane == 0) {
-            c[(ulong)i * N + row] = CT(sum);
+            c[(ulong)i * N + row0] = CT(sum0);
+            if (has1) {
+                c[(ulong)i * N + row1] = CT(sum1);
+            }
         }
     }
 }
