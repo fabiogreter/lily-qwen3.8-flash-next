@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use anyhow::{Result, ensure};
@@ -41,6 +41,14 @@ struct Cli {
     /// to a normal run; the per-kernel times are the point.
     #[arg(long, default_value_t = false)]
     kernel_profile: bool,
+    /// Sample every draw with the server's defaults for this checkpoint
+    /// (temperature 1.0, top-k 20, top-p 0.95) instead of drawing greedily;
+    /// with `--drafts`, this measures draft acceptance under sampling.
+    #[arg(long, default_value_t = false)]
+    sample: bool,
+    /// Sampler seed under `--sample`.
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
     #[arg(long)]
     json_out: PathBuf,
 }
@@ -53,6 +61,9 @@ fn fnv1a(tokens: &[u32]) -> u64 {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let params =
+        if cli.sample { server_sampling(cli.seed) } else { SamplingParams::greedy() };
+    SAMPLER.set(params).expect("sampler set once");
     match checkpoint_model_type(&cli.model)?.as_str() {
         "qwen3_5_moe" => bench::<Qwen3_5Model>(&cli),
         "qwen4_exp" => bench::<Qwen4ExpModel>(&cli),
@@ -60,7 +71,23 @@ fn main() -> Result<()> {
     }
 }
 
-const GREEDY: SamplingParams = SamplingParams::greedy();
+/// The sampler every draw in this process uses, set once from the CLI.
+static SAMPLER: OnceLock<SamplingParams> = OnceLock::new();
+
+fn sampler() -> &'static SamplingParams {
+    SAMPLER.get().expect("sampler set before the model loads")
+}
+
+/// The server's defaults for the Qwen checkpoints (`generation_config.json`).
+const fn server_sampling(seed: u64) -> SamplingParams {
+    SamplingParams {
+        temperature: 1.0,
+        top_k: 20,
+        top_p: 0.95,
+        seed,
+        ..SamplingParams::greedy()
+    }
+}
 
 /// Host time in seconds on the clock Metal's `GPUStartTime`/`GPUEndTime`
 /// use (mach_absolute_time), so host and GPU marks can be subtracted.
@@ -84,7 +111,7 @@ fn host_secs() -> f64 {
 }
 
 fn draw(step: usize) -> Draw<'static> {
-    Draw { params: &GREEDY, step }
+    Draw { params: sampler(), step }
 }
 
 /// Aggregates the recorded pass profiles by label and kernel: calls and GPU
@@ -451,7 +478,7 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
             "prompt_len": cli.prompt_len,
             "prompt_kind": "u32_golden_ratio_hash_mod_vocab",
             "decode_steps": cli.decode_steps,
-            "decode_mode": if parking { "production_depth2_parked" } else { "production_depth2_concurrent" },
+            "decode_mode": if parking { "production_depth2_parked" } else { "production_depth2_concurrent" }, "sampling": if cli.sample { "server_defaults" } else { "greedy" }, "seed": cli.seed,
             "gpu_timing_diagnostic": cli.gpu_timing,
             "kernel_profile_diagnostic": ctx.profiling(),
         },
@@ -537,7 +564,7 @@ fn bench_speculative<M: LanguageModel>(
             model,
             &mut state,
             &mut scratch,
-            &GREEDY,
+            sampler(),
             cli.drafts,
             steps + 1,
             &mut tokens,
@@ -561,7 +588,7 @@ fn bench_speculative<M: LanguageModel>(
     let report = serde_json::json!({
         "schema_version": 1,
         "meta": {"engine": "lily", "model_id": M::MODEL_ID, "harness": "src/bin/lily-bench.rs", "crate_version": env!("CARGO_PKG_VERSION")},
-        "workload": {"prompt_len": cli.prompt_len, "decode_steps": cli.decode_steps, "decode_mode": format!("speculative_{}_drafts", cli.drafts), "kernel_profile_diagnostic": ctx.profiling()},
+        "workload": {"prompt_len": cli.prompt_len, "decode_steps": cli.decode_steps, "decode_mode": format!("speculative_{}_drafts", cli.drafts), "sampling": if cli.sample { "server_defaults" } else { "greedy" }, "seed": cli.seed, "kernel_profile_diagnostic": ctx.profiling()},
         "results": {
             "prefill": {"wall_secs": prefill_secs, "tok_s": cli.prompt_len as f64 / prefill_secs},
             "decode": {
