@@ -1241,7 +1241,13 @@ fn sparse_decode_chain_timing() {
         })
         .unwrap_or_else(|_| vec![("qsa_attn_split_bf16", "sdpa_decode_combine")]);
     let mut best = vec![f64::INFINITY; pairs.len()];
-    for round in 0..6 {
+    // The GPU clock ramps over the first few hundred milliseconds of work:
+    // untimed rounds until `LILY_CHAIN_WARMUP_MS` (300) have passed, then
+    // six timed rounds, the first discarded.
+    let warm = chain_warmup();
+    let mut round = 0usize;
+    loop {
+        let timed = warm.elapsed() >= chain_warmup_ms();
         for k in 0..pairs.len() {
             let which = (round + k) % pairs.len();
             let pass = ctx.begin_concurrent().expect("pass");
@@ -1251,8 +1257,14 @@ fn sparse_decode_chain_timing() {
             }
             let done = pass.commit().expect("commit").wait_retain().expect("wait");
             let t = done.timing().expect("timing");
-            if round > 0 {
+            if timed && round > 0 {
                 best[which] = best[which].min((t.gpu_end_secs - t.gpu_start_secs) / layers as f64);
+            }
+        }
+        if timed {
+            round += 1;
+            if round == 6 {
+                break;
             }
         }
     }
@@ -1260,3 +1272,17 @@ fn sparse_decode_chain_timing() {
         eprintln!("{a} + {b}: {:.2} us per layer (split + combine, two levels)", secs * 1e6);
     }
 }
+
+/// Start of a chain harness's warm-up window (see [`chain_warmup_ms`]).
+pub(crate) fn chain_warmup() -> std::time::Instant {
+    std::time::Instant::now()
+}
+
+/// How long a chain harness runs untimed before measuring: the GPU clock
+/// ramps over the first few hundred milliseconds of work, and a harness
+/// that measures cold reads up to twice the warm figure.
+pub(crate) fn chain_warmup_ms() -> std::time::Duration {
+    let ms = std::env::var("LILY_CHAIN_WARMUP_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(300u64);
+    std::time::Duration::from_millis(ms)
+}
+

@@ -1006,4 +1006,4 @@ pub fn dispatch_tiled_named<'t>(
 
 #[cfg(test)]
 #[path = "../../tests/unit/kernels/qsa.rs"]
-mod tests;
+pub(crate) mod tests;
