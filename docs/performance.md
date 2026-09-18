@@ -603,7 +603,11 @@ dispatch per layer over distinct weights, a barrier between, best of
 several passes) put each family against the level ceiling of its size:
 the expert gate/up gather at 35.4 us for 18.4 MB (521 GB/s, at the 16 MB
 ceiling), the down gather 23.7 us for 9.2 MB (390; two routed slots per
-simdgroup iteration instead of one measured 22.9 and was not kept), the
+simdgroup iteration instead of one measured 22.9 and was not kept; it
+now runs four simdgroups per row pair taking alternate slots, 22.3 us at
+413 GB/s, bit-identical, with five, eight and ten simdgroups at 22.3 to
+22.8 and one row per simdgroup over all 32 lanes no better at any count;
+in the model the 1.5 us per layer sit under the step's noise), the
 hyper-connection pair 16.9 us for 7 MB as two 3.5 MB levels (413 and 428
 GB/s each, within 10% of the 4 MB ceiling; variants with the activation
 loads or the weight loads removed showed neither is the limiter, and the
@@ -612,9 +616,21 @@ kernels were already tuned three ways in an earlier pass), the GDN step
 the head over thread groups or column groups measured the same 15 to 16),
 the router top-k 4.3 us per level against a 1.35 us floor. The dense
 GEMVs read 24 MB levels at the peak. What remains at 1K after the kept
-changes is about 0.15 ms in the down gather, 0.15 in the top-k level and
-0.1 in the hyper-connection reads: each one to two percent, each needing
-its own kernel design.
+changes is about 0.1 ms in the hyper-connection reads, one percent.
+
+**The top-k level is free.** The 0.35 ms the ablation charged to it is an
+artifact: with the selection skipped the stale indices route every slot to
+one expert, and the gathers read one expert's rows ten times over from
+cache. Skipping the selection kernel alone measured 0.97 ms for the same
+reason. The real measure was a fused router (the Q8 router GEMV with the
+selection run by the last threadgroup to finish, the logits handed over
+through relaxed atomics; 48 levels fewer per step, 661 against 709): 10.55
+and 10.61 ms per step against 10.54 and 10.54 over three interleaved pairs
+at 1K, nothing. A tiny level between two streaming levels costs what the
+inject levels cost, nothing, and the fused kernel was not kept; its
+cross-threadgroup handoff also produced one wrong selection in 2 400
+chained layer dispatches of the bit-identity test, so the pattern is not
+trustworthy on this GPU either.
 
 **Attention past 2K.** The branch costs 0.90 ms at 1K, 1.58 at 8K and
 2.76 at 32K. Per layer at 32K in the chain: block scores 12 us, the
@@ -631,7 +647,22 @@ reorders the reductions), a barrier-free one-simdgroup-per-split design
 with lanes owning tokens for the scores and dims for the values (82 us),
 32-token splits (58 us), and a combine kernel with its statistics
 prologue parallelized (within noise, and not bit-identical because
-fast-math reassociates the serial sum it replaced).
+fast-math reassociates the serial sum it replaced). Two more, measured
+in the warmed chain (`sparse_decode_chain_timing` now runs untimed rounds
+for 300 ms first; cold it read 90 us per layer against 44 to 45 warm):
+all eight K rows of a simdgroup requested at once with its V rows
+requested before the softmax barriers (49.5 against 44.4 us, register
+pressure), and a redesign with one threadgroup per K/V head and split
+holding one simdgroup per query head, each walking the whole split with
+no cross-simdgroup staging and one barrier for the token ids, bit-identical
+through eight accumulators per lane (42.8 against 44.4 at 8K, 43.3
+against 44.4 at 32K). The 1.6 us per layer were not kept: the barriers
+and staging were not the cost, so what remains in the split kernel is its
+per-token score and reduction chain, which only a reordering of the
+arithmetic (rounding moves) could shorten. The kernel measures the same
+at 8K and 32K in the chain; in the model the 32K step's extra attention
+cost is in the block selection (0.14 to 0.44 ms per step in the profile)
+and the block scores, not the split kernel.
 
 **Kept, with the paired in-model result** (interleaved base/final runs on
 p0.txt, 96 steps): plain
@@ -651,6 +682,13 @@ a fast and a slow GPU state during this work (the 8 MB level probe at 487
 against 372 GB/s, a 1K step at 10.7 against 13.9 ms) while the other
 worktree ran prefill kernels; every comparison above is paired within one
 state, and the probe line is the canary to run before trusting a batch.
+The second round's closing pairs (base 5f815b6 against the four-simdgroup
+gather, p0.txt, median GPU span per step) drifted the same way: at 1K
+11.34/11.15/10.72 ms against 12.75/10.66/10.49, at 8K 11.28/11.19 against
+11.20/11.20, at 32K 11.70 against 11.48 (one pair, 64 steps); with two
+drafts 86.5 against 87.8 tok/s at 8K and 79.6 against 79.8 at 1K, the
+same drafts accepted; every digest unchanged (3046f489a837c310,
+35a5cf1f2b25d0ce, 3ee310fa14c80068, fe9c573893eeb992, d588021698d20eeb).
 
 ## Reproducing this
 
