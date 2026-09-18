@@ -50,11 +50,14 @@ GPU memory have no such constraint.
 
 `ExpertCache` (`src/qwen4exp/expert_cache.rs`) with `ExpertStore` and
 `SlotPolicy` (`expert_store.rs`), engaged when the checkpoint does not
-fit physical memory (`hw.memsize` against the resident weights plus 4 GB
-of scratch and a reserve of 8 GB or an eighth of memory; the n-gram table
+fit physical memory (`hw.memsize` against the resident weights plus 4.5 GB
+of scratch and a reserve of 12 GB or a sixth of memory; the n-gram table
 is paged and not counted) or on request (`LoadOptions::expert_slots`,
 `LILY_EXPERT_SLOTS`). On this 128 GB machine nothing engages and the
-footprint is unchanged.
+footprint is unchanged. Measured footprint with 16 384 slots: 52.9 GB of
+process RSS (45.3 GB slab, 3.1 GB resident weights, about 4.5 GB of
+scratch, caches and pipelines); a 64 GB machine therefore gets about
+43 GB of experts (15 500 slots, 63%) and keeps about 13 GB free.
 
 1. **A slab of expert slots** in the layout of a layer's stacked experts;
    every MoE layer's `MoeWeights` views the slab and carries a `U32 [E]`

@@ -257,8 +257,10 @@ fn physical_memory() -> Option<u64> {
 
 /// How many expert slots this machine can afford: `None` when the whole
 /// checkpoint fits its memory with room to work (the current footprint),
-/// otherwise the slots left after the resident weights, the scratch and a
-/// reserve for the OS and the page cache, at least two layers' worth.
+/// otherwise the slots left after the resident weights, about 4.5 GB of
+/// scratch and a 12 GB reserve for the OS, other apps and the page cache
+/// (a 64 GB machine gets about 43 GB of experts and keeps about 13 GB
+/// free), at least two layers' worth.
 fn auto_expert_slots(
     ckpt: &Checkpoint,
     config: &Qwen4ExpConfig,
@@ -277,8 +279,12 @@ fn auto_expert_slots(
             other += bytes;
         }
     }
-    let scratch = 4 * GB;
-    let reserve = (8 * GB).max(ram / 8);
+    // Measured with 16 384 slots: 52.9 GB of process footprint for a
+    // 45.3 GB slab and 3.1 GB of resident weights, so scratch, caches and
+    // pipelines take about 4.5 GB. The reserve keeps 12 GB (or a sixth of
+    // memory) for the OS, other apps and the page cache.
+    let scratch = 9 * GB / 2;
+    let reserve = (12 * GB).max(ram / 6);
     if experts + other + scratch + reserve <= ram {
         return None;
     }
