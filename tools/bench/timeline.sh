@@ -28,6 +28,9 @@ usage: tools/bench/timeline.sh [options]
   --note TEXT       one line on what changed (stored in run.json; with several commits it
                     applies to all of them, the commit subject is recorded anyway)
   --prompts LIST    prompt lengths, space separated (default "1024 8192 32768")
+  --prompt-text F   a text file whose first N tokens are each prompt (real text instead of
+                    the synthetic token sequence); a commit whose lily-bench has no
+                    --prompt-text flag is refused, so the cells stay comparable
   --drafts LIST     drafts per step, space separated (default "0 2"; non-zero values are
                     skipped when a commit's lily-bench has no --drafts flag)
   --steps N         decode steps / generated tokens per run (default 96)
@@ -44,6 +47,7 @@ model="$root/../models/Qwen3.8-Flash-Next-lily-q4"
 revs=()
 note=""
 prompts="1024 8192 32768"
+prompt_text=""
 drafts="0 2"
 steps=96
 repeats=3
@@ -58,6 +62,7 @@ while [ $# -gt 0 ]; do
         --commit) revs+=("$2"); shift 2 ;;
         --note) note="$2"; shift 2 ;;
         --prompts) prompts="$2"; shift 2 ;;
+        --prompt-text) prompt_text="$2"; shift 2 ;;
         --drafts) drafts="$2"; shift 2 ;;
         --steps) steps="$2"; shift 2 ;;
         --repeats) repeats="$2"; shift 2 ;;
@@ -138,11 +143,16 @@ for rev in "${revs[@]}"; do
     echo "== building lily-bench at $label in $tree"
     run cargo build --release --locked --bin lily-bench --manifest-path "$tree/Cargo.toml"
     bin="$tree/target/release/lily-bench"
-    has_drafts=0; has_preload=0
+    has_drafts=0; has_preload=0; has_prompt_text=0
     if [ -x "$bin" ]; then
         help=$("$bin" --help 2>&1 || true)
         case "$help" in *"--drafts"*) has_drafts=1 ;; esac
         case "$help" in *"--ngram-preload"*) has_preload=1 ;; esac
+        case "$help" in *"--prompt-text"*) has_prompt_text=1 ;; esac
+    fi
+    if [ -n "$prompt_text" ] && [ "$dry_run" != 1 ] && [ "$has_prompt_text" != 1 ]; then
+        echo "$label: its lily-bench has no --prompt-text flag; real-text cells would not be comparable" >&2
+        exit 1
     fi
     c_sha[$n]=$sha; c_short[$n]=$short; c_label[$n]=$label; c_tree[$n]=$tree; c_bin[$n]=$bin
     c_out[$n]=$out; c_dirty[$n]=$dirty; c_has_drafts[$n]=$has_drafts; c_has_preload[$n]=$has_preload
@@ -154,10 +164,10 @@ interleaved=""
 # write_meta INDEX FINISHED-TIMESTAMP (empty while running)
 write_meta() {
     local i=$1
-    python3 - "${c_out[$i]}/run.json" <<'PY' "${c_sha[$i]}" "${c_short[$i]}" "${c_dirty[$i]}" "$note" "$model" "$prompts" "$drafts" "$steps" "$repeats" "${c_has_drafts[$i]}" "${c_has_preload[$i]}" "$power_source" "$started" "$2" "$cooldown" "$swap_start" "$(swap_used)" "$interleaved"
+    python3 - "${c_out[$i]}/run.json" <<'PY' "${c_sha[$i]}" "${c_short[$i]}" "${c_dirty[$i]}" "$note" "$model" "$prompts" "$drafts" "$steps" "$repeats" "${c_has_drafts[$i]}" "${c_has_preload[$i]}" "$power_source" "$started" "$2" "$cooldown" "$swap_start" "$(swap_used)" "$interleaved" "$prompt_text"
 import json, subprocess, sys
 (path, sha, short, dirty, note, model, prompts, drafts, steps, repeats, has_drafts, has_preload,
- power, started, finished, cooldown, swap_start, swap_now, interleaved) = sys.argv[1:]
+ power, started, finished, cooldown, swap_start, swap_now, interleaved, prompt_text) = sys.argv[1:]
 def sh(*cmd):
     try:
         return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip()
@@ -184,6 +194,7 @@ meta = {
         "interleaved_with": interleaved.split() if interleaved else [],
     },
     "bench_flags": {"drafts": has_drafts == "1", "ngram_preload": has_preload == "1"},
+    "prompt_text": prompt_text or None,
     "host": {
         "macos": sh("sw_vers", "-productVersion"),
         "hw_model": sh("sysctl", "-n", "hw.model"),
@@ -225,6 +236,7 @@ for r in $(seq 1 "$repeats"); do
                 stem="$out/p$p-d$d-r$r"
                 args=(--model "$model" --prompt-len "$p" --decode-steps "$steps" --json-out "$stem.json")
                 [ "${c_has_preload[$i]}" = 1 ] && args+=(--ngram-preload)
+                [ -n "$prompt_text" ] && args+=(--prompt-text "$prompt_text")
                 [ "$d" != 0 ] && args+=(--drafts "$d")
                 echo "== ${c_label[$i]} p=$p drafts=$d repeat=$r"
                 if [ "$dry_run" = 1 ]; then
