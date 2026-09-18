@@ -55,24 +55,35 @@ one-line fix that the shipped one lacks. Method, noise band, the fixed
 
 ### Smaller machines
 
-The checkpoint is 104.6 GB, most of it the 68 GB of routed experts, and
-the fork runs it on machines that cannot hold all of that. On a 64 GB
-machine the engine keeps a usage-ranked two thirds of the experts on the
-GPU and reads the rest from the checkpoint files as they are routed to,
-sized automatically from physical memory; nothing changes on a machine
+The checkpoint is 104.6 GB: 68 GB of routed experts, the 32 GB hashed
+n-gram table, and about 5 GB of everything else. The table never lives on
+the GPU, on any machine: it stays on disk and is read through the page
+cache, 16 rows per token. What has to be resident is the other 72 GB, and
+the fork runs that on machines that cannot hold it. On a 64 GB machine the
+engine keeps a usage-ranked share of the experts on the GPU (about 43 GB,
+two thirds of them) and reads the others from the checkpoint files as they
+are routed to, sized automatically from physical memory, with the table's
+page cache taking whatever memory is left; nothing changes on a machine
 that fits it. Measured with the reads cold, as on a 64 GB machine, on an
 8K real-text prompt: about 930 tok/s prefill and 55 to 65 tok/s plain
 decode, against 2 250 and 87 with everything resident, with the same
 tokens produced. Speculative decoding is off there because its extra trunk
-passes cost more than they return. Nothing to configure: the server sizes
-it from the machine's memory and keeps 12 GB or a sixth of it free for
+passes cost more than they return.
+
+Which experts stay resident is decided once, from a usage ranking
+measured over real text (`lily-experts`; the one measured for this model,
+40 prompts of documentation and code, is
+`tools/bench/expert-usage-qwen38-flash-next.json`, and a copy named
+`expert-usage.json` next to the checkpoint is picked up automatically;
+without one the placement is uniform). The ranked hot set stays pinned
+for the life of the process; a small LRU region, 10 % of the slots by
+default, takes whatever else gets routed to and is the only part that
+adapts to the running workload. The engine does not measure usage live or
+re-rank the hot set. Nothing else to configure: the server sizes the
+cache from the machine's memory and keeps 12 GB or a sixth of it free for
 everything else; `--memory-gb 64` plans for that much instead (also the
-way to try the mode on a bigger machine), and an `expert-usage.json` next
-to the checkpoint (the one measured for this model is
-`tools/bench/expert-usage-qwen38-flash-next.json`) tells it which experts
-to keep. Details, measurements and knobs:
-[docs/low-ram-experts.md](docs/low-ram-experts.md); `lily-experts`
-measures the expert usage that places them.
+way to try the mode on a bigger machine). Details, measurements and
+knobs: [docs/low-ram-experts.md](docs/low-ram-experts.md).
 
 ### MLX engines
 
