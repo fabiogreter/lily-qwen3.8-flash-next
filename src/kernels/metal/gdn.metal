@@ -15,6 +15,9 @@ static inline float gate_activation(float gate, uint gate_act) {
     return gate_act == GDN_GATE_SIGMOID ? sig : gate * sig;
 }
 
+// Rows of the state a decode-step thread loads per register block.
+#define GDN_STEP_RB 8
+
 // One GDN decode step per value head; each thread owns one state column.
 // Value head h uses key head h / vpk; state is FP32 [H, DIM, DIM].
 template <typename StateT>
@@ -74,16 +77,40 @@ static inline float gdn_step_body(device const bfloat* q,
     device StateT* st = state + (ulong)h * DIM * DIM;
 
     // Predict from the fully decayed state before applying the delta update.
+    // Both walks take the column in register blocks of GDN_STEP_RB rows
+    // (the loads of a block issued before its math) in the same
+    // accumulation order as a plain loop: the plain loop left the compiler
+    // pipelining one or two loads and ran the 48 heads' step at 19 us
+    // per layer in the decode chain against 16 for the blocked one
+    // (docs/performance.md); 16- and 32-row blocks measured within a
+    // microsecond of 8 but moved the fast-math contraction, 8 is
+    // bit-identical to the plain loop.
     float kv_pred = 0.0f;
-    for (uint ki = 0; ki < DIM; ++ki) {
-        kv_pred += k_norm[ki] * st[ki * DIM + tid] * decay;
+    for (uint k0 = 0; k0 < DIM; k0 += GDN_STEP_RB) {
+        float sv[GDN_STEP_RB];
+        _Pragma("clang loop unroll(full)")
+        for (uint j = 0; j < GDN_STEP_RB; ++j) {
+            sv[j] = float(st[(k0 + j) * DIM + tid]);
+        }
+        _Pragma("clang loop unroll(full)")
+        for (uint j = 0; j < GDN_STEP_RB; ++j) {
+            kv_pred += k_norm[k0 + j] * sv[j] * decay;
+        }
     }
-    float v_new = (float(v[h * DIM + tid]) - kv_pred) * beta;
+    const float v_new = (float(v[h * DIM + tid]) - kv_pred) * beta;
     float o = 0.0f;
-    for (uint ki = 0; ki < DIM; ++ki) {
-        float updated = st[ki * DIM + tid] * decay + k_norm[ki] * v_new;
-        st[ki * DIM + tid] = StateT(updated);
-        o += q_norm[ki] * updated;
+    for (uint k0 = 0; k0 < DIM; k0 += GDN_STEP_RB) {
+        float sv[GDN_STEP_RB];
+        _Pragma("clang loop unroll(full)")
+        for (uint j = 0; j < GDN_STEP_RB; ++j) {
+            sv[j] = float(st[(k0 + j) * DIM + tid]);
+        }
+        _Pragma("clang loop unroll(full)")
+        for (uint j = 0; j < GDN_STEP_RB; ++j) {
+            const float updated = sv[j] * decay + k_norm[k0 + j] * v_new;
+            st[(k0 + j) * DIM + tid] = StateT(updated);
+            o += q_norm[k0 + j] * updated;
+        }
     }
     return o;
 }
