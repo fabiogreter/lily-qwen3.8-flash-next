@@ -10,7 +10,7 @@ using namespace metal;
 #define TG 256
 #define QSA_SPLIT 256      // largest split (tokens per threadgroup) of the split kernel
 #define QSA_HPP 4          // query heads folded per K/V pass
-#define QSA_SELECT_TG 256  // threads of the per-query top-k selection (one per radix bin)
+#define QSA_SELECT_TG 512  // threads of the per-query top-k selection (two per radix bin)
 #define QSA_UNION_TG 1024  // threads of the per-tile selection union
 
 // --- Indexer projections --------------------------------------------------------
@@ -406,21 +406,23 @@ static inline void qsa_hist_add(threadgroup atomic_uint* hist, uint bin, bool ac
 // blocks per thread: a chunk is CACHE * QSA_SELECT_TG blocks, the first
 // chunk's keys stay in registers across the passes and later chunks are
 // re-read from the score row. See qsa_select_blocks.
-template <uint CACHE>
+template <uint CACHE, uint NT = QSA_SELECT_TG>
 static void qsa_select_body(device const float* row, device uint* out, uint nb,
                             uint k_max, threadgroup atomic_uint (*hist)[256],
                             threadgroup uint* sums, threadgroup uint* prefix_s,
                             threadgroup uint* k_rem_s, uint tid, uint sg, uint lane) {
-    constexpr uint CHUNK = CACHE * QSA_SELECT_TG;
+    constexpr uint CHUNK = CACHE * NT;
     const uint t0 = tid * CACHE;
     uint keys[CACHE];
     for (uint i = 0; i < CACHE; ++i) {
         const uint b = t0 + i;
         keys[i] = b < nb ? qsa_key(row[b]) : 0u;
     }
-    static_assert(QSA_SELECT_TG == 256, "one selection thread per radix bin");
-    atomic_store_explicit(&hist[0][tid], 0u, memory_order_relaxed);
-    atomic_store_explicit(&hist[1][tid], 0u, memory_order_relaxed);
+    static_assert(NT >= 256 && NT % 32 == 0, "at least one selection thread per radix bin");
+    if (tid < 256) {
+        atomic_store_explicit(&hist[0][tid], 0u, memory_order_relaxed);
+        atomic_store_explicit(&hist[1][tid], 0u, memory_order_relaxed);
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Radix select (MSB first) for the k_max-th largest key. The top digit
@@ -449,14 +451,18 @@ static void qsa_select_body(device const float* row, device uint* out, uint nb,
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // Thread t holds bin 255 - t: the scan gives the count above each
         // bin, and exactly one bin straddles the k_rem-th key.
-        const uint c = atomic_load_explicit(&h[255 - tid], memory_order_relaxed);
+        // Threads past the 256 bins hold nothing (their `c` is 0, so they
+        // never straddle the k_rem-th key).
+        const uint c = tid < 256 ? atomic_load_explicit(&h[255 - tid], memory_order_relaxed) : 0u;
         uint total;
-        const uint above = qsa_scan<QSA_SELECT_TG>(c, sums, total, sg, lane);
-        if (above < k_rem && above + c >= k_rem) {
+        const uint above = qsa_scan<NT>(c, sums, total, sg, lane);
+        if (tid < 256 && above < k_rem && above + c >= k_rem) {
             *prefix_s = prefix | ((255 - tid) << shift);
             *k_rem_s = k_rem - above;
         }
-        atomic_store_explicit(&h[tid], 0u, memory_order_relaxed);
+        if (tid < 256) {
+            atomic_store_explicit(&h[tid], 0u, memory_order_relaxed);
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         prefix = *prefix_s;
         k_rem = *k_rem_s;
@@ -482,7 +488,7 @@ static void qsa_select_body(device const float* row, device uint* out, uint nb,
         }
         uint totals;
         const uint ranks =
-            qsa_scan<QSA_SELECT_TG>((n_tie << 16) | n_above, sums, totals, sg, lane);
+            qsa_scan<NT>((n_tie << 16) | n_above, sums, totals, sg, lane);
         const uint quota = ties_to_take > tie_base ? ties_to_take - tie_base : 0u;
         // Taken keys before this thread's: the scanned counts; within them,
         // the thread walks its blocks in order.
@@ -518,7 +524,10 @@ static void qsa_select_body(device const float* row, device uint* out, uint nb,
 // (each thread's blocks are consecutive, so it places its own in order
 // after the scan). The blocks per thread follow the context so every
 // thread holds some; every threadgroup-wide step is a scan or a simd
-// reduction and nothing runs serially on one thread.
+// reduction and nothing runs serially on one thread. The threads beyond
+// the 256 radix bins only shorten each thread's walk: 512 threads halved
+// the kernel against 256 (8K decode 16.7 to 7.8 us, 32K 31.3 to 15.7) and
+// 1 024 gave it back to the wider scans (15.8 and 16.2).
 kernel void qsa_select_blocks(device const float* scores [[buffer(0)]],  // [QB, nb_max]
                               device uint*        sel    [[buffer(1)]],  // [QB, k_max]
                               device uint*        n_sel  [[buffer(2)]],  // [QB]

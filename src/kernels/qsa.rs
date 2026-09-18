@@ -27,7 +27,7 @@ pub const QSA_SMALL_ROWS: usize = 4;
 /// Query heads the split kernel folds per K/V pass (`QSA_HPP` in the shader).
 pub const QSA_HEADS_PER_PASS: usize = 4;
 /// Threads of the per-query selection threadgroup.
-const SELECT_TG: usize = 256;
+const SELECT_TG: usize = 512;
 /// Threads per tile of the selection union; must match `QSA_UNION_TG`.
 const UNION_TG: usize = 1024;
 /// Indexer head dimension the kernels are written for.
