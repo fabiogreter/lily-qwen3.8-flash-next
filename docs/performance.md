@@ -365,7 +365,17 @@ estimate with its assumption named.
    acceptance averaged 65.0% against 68.7% with the serial scan (46.0 /
    76.3 / 50.0 / 79.7 / 76.3 / 61.6 against 59.1 / 76.3 / 59.1 / 67.1 /
    83.3 / 67.1), the same kind of per-prompt swing as between the one- and
-   four-column serial scans. The MoE input gather (one bf16 element per thread) now moves eight
+   four-column serial scans. Over 256 steps the totals are 893 of 1 286
+   drafts accepted (69.4%) against 897 of 1 278 (70.2%) at 8K and 873 of
+   1 326 (65.8%) against 901 of 1 270 (70.9%) at 1K, the 1K gap being one
+   prompt (40.8 against 73.1%, the two trajectories parting at the second
+   token). On the full model the last prefill row's top-64 logits
+   (`lily-probe`, six prompts at about 1K and 8K tokens) differ from the
+   four-column serial scan's by a mean of 0.12 to 0.39 and at most 1.2 where the
+   top logit is about 17, the top token unchanged on all twelve; the
+   one-column serial scan differs from it by 0.09 to 0.46 and at most 1.2
+   and flips one top token. The chunked scan sits inside the rounding band
+   the serial variants already span. The MoE input gather (one bf16 element per thread) now moves eight
    per thread on its 16-byte-aligned rows: 1.07 to 0.52 ms per call at the
    chunk shape, about 26 ms per 8K chunk (1.3%). A 128-deep K step for the
    grouped expert GEMM (half the B-tile barriers per FLOP) measured within
