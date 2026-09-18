@@ -5,6 +5,7 @@
 //! this crate needs no offline `.metal` -> `.metallib` step (which would
 //! require a non-hermetic Xcode Metal toolchain that Bazel does not model).
 
+pub mod activity;
 pub mod chat;
 pub mod config;
 #[cfg(target_os = "macos")]

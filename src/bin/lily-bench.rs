@@ -102,6 +102,7 @@ fn fnv1a(tokens: &[u32]) -> u64 {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let _activity = lily::activity::Activity::begin("lily-bench");
     let params =
         if cli.sample { server_sampling(cli.seed) } else { SamplingParams::greedy() };
     SAMPLER.set(params).expect("sampler set once");

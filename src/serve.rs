@@ -812,6 +812,8 @@ impl<M: LanguageModel> Engine<M> {
     }
 
     fn run(&mut self, p: Prepared, sink: &mut Sink) -> Result<()> {
+        // Work on the user's behalf for as long as the request runs.
+        let _activity = crate::activity::Activity::begin("lily: serving a request");
         if sink.cancelled() {
             return Ok(());
         }
