@@ -273,29 +273,22 @@ static inline void store_word_q4_tg(uint word, float s, float b,
 constant constexpr uint QNAX_BN = 64;
 constant constexpr uint QNAX_BK = 64;
 
-// BM must match the block-map row tile.
-template <uint BM, int SG>
-static void gemm_q4_nt_nax_grouped_body(device const uint* codes,
+// One block of the grouped GEMM at row-tile height BM: the B tile is
+// dequantized per K step and the product accumulated over the block's rows.
+template <uint BM, int SG, typename AT, typename BT>
+static void gemm_q4_nt_nax_grouped_rows(device const uint* codes,
                                         device const bfloat* scales,
                                         device const bfloat* biases,
-                                        device bfloat* a,
+                                        thread AT& ta,
+                                        thread BT& tb,
                                         device bfloat* c,
-                                        device const uint4* blocks,
                                         uint K, uint N, uint GS,
+                                        uint m0, uint b_row0, uint n0, uint m_end,
                                         threadgroup bfloat* b_tile,
-                                        uint bid, uint tid) {
+                                        uint tid) {
     using namespace mpp::tensor_ops;
-
-    const uint4 blk = blocks[bid];
-    if (blk.x >= blk.w) {
-        return;  // sentinel entry from the GPU-built block map
-    }
-    const uint m0 = blk.x, b_row0 = blk.y, n0 = blk.z, m_end = blk.w;
     const uint words = K / 8;
     const uint groups = K / GS;
-
-    auto ta = metal::tensor(a, metal::dextents<int32_t, 2>(K, int(m_end)));
-    auto tb = metal::tensor(b_tile, metal::dextents<int32_t, 2>(QNAX_BK, QNAX_BN));
     constexpr auto desc = matmul2d_descriptor(
         BM, QNAX_BN, QNAX_BK, /*transpose_left=*/false,
         /*transpose_right=*/true, /*relaxed_precision=*/false,
@@ -303,8 +296,7 @@ static void gemm_q4_nt_nax_grouped_body(device const uint* codes,
     matmul2d<desc, metal::execution_simdgroups<SG>> op;
 
     using ASlice = decltype(ta.slice(0, 0));
-    auto acc = op.template get_destination_cooperative_tensor<ASlice,
-                                                              decltype(tb), float>();
+    auto acc = op.template get_destination_cooperative_tensor<ASlice, BT, float>();
     for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
         if (acc.is_valid_element(i)) {
             acc[i] = 0.0f;
@@ -340,6 +332,42 @@ static void gemm_q4_nt_nax_grouped_body(device const uint* codes,
                 c[(ulong)row * N + col] = bfloat(acc[i]);
             }
         }
+    }
+}
+
+// BM must match the block-map row tile. An expert's last tile usually
+// holds fewer rows than BM (about 80 routed rows per expert per 4 096-token
+// chunk against 64-row tiles); such a block runs the product at the
+// smallest height of BM, BM/2 and BM/4 that covers its rows instead of
+// paying tensor work on padding.
+template <uint BM, int SG>
+static void gemm_q4_nt_nax_grouped_body(device const uint* codes,
+                                        device const bfloat* scales,
+                                        device const bfloat* biases,
+                                        device bfloat* a,
+                                        device bfloat* c,
+                                        device const uint4* blocks,
+                                        uint K, uint N, uint GS,
+                                        threadgroup bfloat* b_tile,
+                                        uint bid, uint tid) {
+    const uint4 blk = blocks[bid];
+    if (blk.x >= blk.w) {
+        return;  // sentinel entry from the GPU-built block map
+    }
+    const uint m0 = blk.x, b_row0 = blk.y, n0 = blk.z, m_end = blk.w;
+    const uint rows = m_end - m0;
+
+    auto ta = metal::tensor(a, metal::dextents<int32_t, 2>(K, int(m_end)));
+    auto tb = metal::tensor(b_tile, metal::dextents<int32_t, 2>(QNAX_BK, QNAX_BN));
+    if (rows <= BM / 4) {
+        gemm_q4_nt_nax_grouped_rows<BM / 4, SG>(codes, scales, biases, ta, tb, c, K, N, GS,
+                                                m0, b_row0, n0, m_end, b_tile, tid);
+    } else if (rows <= BM / 2) {
+        gemm_q4_nt_nax_grouped_rows<BM / 2, SG>(codes, scales, biases, ta, tb, c, K, N, GS,
+                                                m0, b_row0, n0, m_end, b_tile, tid);
+    } else {
+        gemm_q4_nt_nax_grouped_rows<BM, SG>(codes, scales, biases, ta, tb, c, K, N, GS,
+                                            m0, b_row0, n0, m_end, b_tile, tid);
     }
 }
 

@@ -374,7 +374,17 @@ estimate with its assumption named.
    chunk (about 80 routed rows per expert): 32 rows 645 ms, 64 rows 593 to
    622, 96 rows 659, 128 rows 759 (four simdgroups) and 698 (eight), so the
    shipped 64-row tile stays and the tensor work on padded rows, not the
-   dequant staging, is what the kernel pays for. A 32-query tile for the
+   dequant staging, is what the kernel pays for. The padding then went
+   instead: an expert's last tile, which usually holds fewer rows than the
+   tile height, runs its product at the smallest of the full, half and
+   quarter heights that covers its rows (the block map, the dequant
+   staging and the results are unchanged, bit for bit). On the measured
+   routing histogram 64-row tiles pad the rows by 47% and the mixed
+   heights by 10%; in paired kernel profiles the three grouped GEMMs per
+   8K prefill took 573 to 583 ms against 666 to 677 (14% off the kernel,
+   about 4.5% of the prefill), per 32K prefill 628 against 710, and with
+   the 32-row tile of the 1K prefill 229 to 232 against 246 over four
+   interleaved pairs (7%). A 32-query tile for the
    one-head kernel (twice the queries per staged slice; the union grows
    from 1 935 to 2 065 blocks per tile at 8K and 3 676 to 5 610 at 32K in
    the harness, so each query fetches about half the rows) measured slower
