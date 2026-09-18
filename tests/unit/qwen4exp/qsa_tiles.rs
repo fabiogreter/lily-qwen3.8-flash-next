@@ -77,7 +77,7 @@ fn argmax(v: &[f32]) -> usize {
     v.iter().enumerate().fold(0, |best, (i, &x)| if x > v[best] { i } else { best })
 }
 
-/// Every tile variant reproduces the split route's prefill: same top token
+/// The tile route reproduces the split route's prefill: same top token
 /// and logits within the attention path's bf16 rounding, on a prompt that
 /// crosses the dense limit inside its first chunk and on one with whole
 /// chunks past it.
@@ -97,13 +97,8 @@ fn tiled_prefill_matches_split_route() {
             (0..prompt_len).map(|i| 1000 + (i * 37 % 5000) as u32).collect();
         let reference = prefill_logits(&ctx, &model, &prompt, SparseAttnRoute::Split);
         let top = argmax(&reference);
-        for heads_per_pass in [1usize, 2, 4] {
-            let got = prefill_logits(
-                &ctx,
-                &model,
-                &prompt,
-                SparseAttnRoute::Tiled { heads_per_pass },
-            );
+        {
+            let got = prefill_logits(&ctx, &model, &prompt, SparseAttnRoute::Tiled);
             let max_abs = got
                 .iter()
                 .zip(&reference)
@@ -111,21 +106,21 @@ fn tiled_prefill_matches_split_route() {
                 .fold(0.0f32, f32::max);
             let scale = reference.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
             eprintln!(
-                "{prompt_len} tokens, {heads_per_pass} heads per pass: top {} vs {top}, max |dlogit| {max_abs:.4} (logit scale {scale:.2})",
+                "{prompt_len} tokens: top {} vs {top}, max |dlogit| {max_abs:.4} (logit scale {scale:.2})",
                 argmax(&got)
             );
             assert!(
                 got.iter().all(|x| x.is_finite()),
-                "{prompt_len} tokens, hpp {heads_per_pass}: non-finite logits"
+                "{prompt_len} tokens: non-finite logits"
             );
             assert!(
                 max_abs <= 0.05 * scale,
-                "{prompt_len} tokens, hpp {heads_per_pass}: logits differ by {max_abs} (scale {scale})"
+                "{prompt_len} tokens: logits differ by {max_abs} (scale {scale})"
             );
             assert_eq!(
                 argmax(&got),
                 top,
-                "{prompt_len} tokens, hpp {heads_per_pass}: top token differs"
+                "{prompt_len} tokens: top token differs"
             );
         }
     }
@@ -152,7 +147,7 @@ fn prefill_chunk_8192_matches_4096() {
     for (prompt_len, exact) in [(3000usize, true), (9000, false)] {
         let prompt: Vec<u32> =
             (0..prompt_len).map(|i| 1000 + (i * 37 % 5000) as u32).collect();
-        let route = SparseAttnRoute::Tiled { heads_per_pass: 1 };
+        let route = SparseAttnRoute::Tiled;
         model.set_prefill_chunk(4096).expect("chunk");
         let (reference, tokens_a) = prefill_then_decode(&ctx, &model, &prompt, route, 12);
         model.set_prefill_chunk(8192).expect("chunk");
@@ -240,7 +235,7 @@ fn measure_tile_union_overlap() {
         let mut s = model.new_scratch_with_capacity(&ctx, capacity).expect("scratch");
         let mut state = model.new_state(&ctx, capacity).expect("state");
         model.ensure_prefill_scratch(&ctx, &mut s, n).expect("prefill scratch");
-        set_route(&mut s, SparseAttnRoute::Tiled { heads_per_pass: 1 });
+        set_route(&mut s, SparseAttnRoute::Tiled);
         s.prefill.as_ref().expect("prefill scratch").qsa.tiles.stats.zero_fill();
         LanguageModel::prefill(&model, &ctx, &mut state, &mut s, prompt, None)
             .expect("prefill");

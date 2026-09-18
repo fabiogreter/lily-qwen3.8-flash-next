@@ -341,6 +341,8 @@ pub struct Qwen4ExpModel {
     /// the larger chunk streams the cold experts half as often per token,
     /// see docs/low-ram-experts.md for why it is not the default).
     prefill_chunk: usize,
+    /// Bytes the gathered-row scratch of the tiled sparse attention may take.
+    tile_row_budget: usize,
 }
 
 pub(super) enum LayerState {
@@ -725,6 +727,7 @@ impl QsaScratch {
         cfg: &Qwen4ExpConfig,
         max_seq: usize,
         qb: usize,
+        row_budget: usize,
     ) -> Result<Self> {
         let idx = &cfg.indexer;
         let max_blocks = (max_seq / idx.compress_ratio).max(1);
@@ -737,7 +740,15 @@ impl QsaScratch {
             n_sel: Tensor::zeros(ctx, &[qb], DType::U32)?,
             partials: Tensor::zeros(ctx, &[slots * nq, cfg.head_dim], DType::F32)?,
             stats: Tensor::zeros(ctx, &[slots * nq, 2], DType::F32)?,
-            tiles: SparseTileScratch::new(ctx, qb, max_blocks, k_max)?,
+            tiles: SparseTileScratch::new(
+                ctx,
+                qb,
+                max_blocks,
+                k_max,
+                cfg.num_key_value_heads,
+                idx.compress_ratio,
+                row_budget,
+            )?,
             route: SparseAttnRoute::from_env(),
         })
     }
@@ -1134,6 +1145,7 @@ impl PrefillScratch {
         max_seq: usize,
         table: Option<&NgramTable>,
         with_mtp: bool,
+        row_budget: usize,
     ) -> Result<Self> {
         ensure!(capacity > 0, "prefill scratch capacity must be nonzero");
         let m = capacity;
@@ -1183,7 +1195,7 @@ impl PrefillScratch {
                 Tensor::zeros(ctx, &[rows, width], bf)?
             },
             moe: PrefillMoeScratch::new(ctx, &moe_dims(cfg), m)?,
-            qsa: QsaScratch::new(ctx, cfg, max_seq, QSA_QUERY_BATCH.min(m))?,
+            qsa: QsaScratch::new(ctx, cfg, max_seq, QSA_QUERY_BATCH.min(m), row_budget)?,
             ple: table.map(|t| PleScratch::new(ctx, cfg, m, t)).transpose()?,
             mtp_hyper: with_mtp
                 .then(|| Tensor::zeros(ctx, &[m, cfg.hc_width()], bf))
@@ -1340,7 +1352,17 @@ impl Qwen4ExpModel {
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|c| c.is_power_of_two() && (256..=PREFILL_CHUNK * 2).contains(c))
             .unwrap_or(PREFILL_CHUNK);
-        Ok(Self { config, weights, attn_scale, gdn_scale, gdn_gate, hasher, prefill_chunk })
+        let tile_row_budget = qsa::tile_row_budget();
+        Ok(Self {
+            config,
+            weights,
+            attn_scale,
+            gdn_scale,
+            gdn_gate,
+            hasher,
+            prefill_chunk,
+            tile_row_budget,
+        })
     }
 
     /// Runs the vision tower over one preprocessed image and returns its
@@ -1646,7 +1668,7 @@ impl Qwen4ExpModel {
             attn_gated: Tensor::zeros(ctx, &[nq * hd], bf)?,
             idx_qk: Tensor::zeros(ctx, &[(nh + 1) * INDEXER_D], bf)?,
             idx_q: Tensor::zeros(ctx, &[nh, INDEXER_D], bf)?,
-            qsa: QsaScratch::new(ctx, cfg, capacity_tokens, 1)?,
+            qsa: QsaScratch::new(ctx, cfg, capacity_tokens, 1, 0)?,
             ple: self
                 .ple_table()
                 .map(|t| PleScratch::new(ctx, cfg, 1, t))
@@ -1692,6 +1714,7 @@ impl Qwen4ExpModel {
                 MAX_SEQ,
                 self.ple_table(),
                 self.weights.mtp.is_some(),
+                self.tile_row_budget,
             )?);
         }
         Ok(())
@@ -2682,7 +2705,7 @@ impl Qwen4ExpModel {
                         base,
                         self.attn_scale,
                     )?,
-                    SparseAttnRoute::Tiled { heads_per_pass } => {
+                    SparseAttnRoute::Tiled => {
                         let tiles = &ps.qsa.tiles;
                         qsa::qsa_tile_union(
                             ctx,
@@ -2713,7 +2736,6 @@ impl Qwen4ExpModel {
                             idx.compress_ratio,
                             base,
                             self.attn_scale,
-                            heads_per_pass,
                         )?;
                     }
                 }

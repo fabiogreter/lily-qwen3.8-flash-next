@@ -282,9 +282,11 @@ fn auto_expert_slots(
     }
     // Measured with 16 384 slots: 52.9 GB of process footprint for a
     // 45.3 GB slab and 3.1 GB of resident weights, so scratch, caches and
-    // pipelines take about 4.5 GB. The reserve keeps 12 GB (or a sixth of
-    // memory) for the OS, other apps and the page cache.
-    let scratch = 9 * GB / 2;
+    // pipelines take about 4.5 GB; the tiled attention's gathered rows
+    // (`qsa::tile_row_budget`) add 0.5 GB. The
+    // reserve keeps 12 GB (or a sixth of memory) for the OS, other apps
+    // and the page cache.
+    let scratch = 5 * GB;
     let reserve = (12 * GB).max(ram / 6);
     if experts + other + scratch + reserve <= ram {
         return None;

@@ -410,7 +410,50 @@ estimate with its assumption named.
    core and a diet below 16 KB would buy one more; with 32 staged rows the
    K/V staging alone is 16 KB (16 rows per slice measured slower earlier,
    and the tensor ops take the slice height in multiples of 16), so that
-   diet is not available to this design.
+   diet is not available to this design. Taking the kernel apart in the
+   harness at 8K (min ms per 256-query dispatch of 24 heads) showed why:
+   3.88 whole, 3.31 with the softmax arithmetic skipped, 2.15 with no QK
+   product, 3.41 with no P.V product, 0.34 with neither, 2.05 with the K/V
+   fetches skipped; the removals do not add, because each 32-row slice is
+   a serial chain of gathered fetches, two dependent tensor ops and five
+   barriers that only the three threadgroups a core holds overlap. The
+   dense kernel has none of that: 128-key slices read by the tensor ops
+   straight from device memory, 12 KB of threadgroup memory. So the
+   staged design was replaced: `qsa_tile_gather` copies each tile's union
+   rows (K, V and the per-row query mask) once per KV head into a
+   contiguous device scratch, and `qsa_attn_rows_nax_h1` runs the dense
+   kernel's loop over them, one query head per threadgroup with a tile's
+   heads adjacent so they share the rows in cache. Harness: 1.98 + 0.61
+   (gather) against 3.87 ms at 8K and 3.64 + 1.21 against 7.61 at 32K;
+   by the clock on production-shape passes 2.76 against 4.09 and 5.06
+   against 7.78. In paired kernel profiles on the full model the sparse
+   attention of a pass went from 290 to 153 + 35 ms at 8K (5.4% of the
+   pass) and from 565 to 573 down to 295 to 303 + 78 at 32K (8.6%), 32K
+   prefill 1 937 and 1 871 against 1 789 and 1 811 tok/s; by the clock,
+   three interleaved pairs at 32K gave 1 700, 1 734 and 1 723 against
+   1 600, 1 639 and 1 596 tok/s (6%) and at 8K 1 876, 1 934 and 2 117
+   against 1 846, 1 894 and 2 087 (2%; the GEMMs in the same passes read
+   2 to 9% slower next to the new kernels in four profile pairs, in
+   either order, which is inside the machine's drift band but consistent
+   enough to note). The gather is
+   bandwidth-bound at 400 to 460 GB/s (splitting it over eight
+   threadgroups per tile changed nothing); 64-key slices measured 2.49
+   against 1.98; gathering and attending in two groups of eight tiles
+   with each group's gather on the previous group's level (a double
+   buffer) measured 3.14 against 2.76 and 5.78 against 5.06 by the clock,
+   so in the harness the scratch would hold every tile of a batch. In the
+   model's profile, where a real prompt's unions are about half the
+   harness's, the opposite holds: with a 512 MB scratch (six of the
+   sixteen tiles per group at 32K contexts and beyond) the attention
+   kernel took 136 to 141 ms per 8K pass against 146 to 149 with 1.1 GB
+   (every tile at once) and the gather 29 against 34, equal within noise
+   at 32K, and with 256 MB (three tiles) 232 to 328 and 617 to 623; a
+   group's rows fitting the cache matters more than dispatch width, so
+   the scratch is 512 MB (`LILY_QSA_ROWS_MB`). The staged kernels
+   (`_h1`, `_h2`, `_h4`, `_plain`) were dropped. The
+   tile route's digests move (a different slice height changes the online
+   softmax's order); the 4-layer tile-against-split comparison stays
+   within 0.011 on a logit scale of 2.93.
 2. **The verify pass's kernel shapes.** Measured: for the same 1.64 GB of
    dense weights a 3-row verify pass spends 8.04 ms in the register-resident
    skinny Q4 GEMM where a decode step spends 3.85 ms in the 2-row GEMV, about

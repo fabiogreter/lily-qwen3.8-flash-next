@@ -64,7 +64,7 @@ cache's lookups and misses per phase.
 
 `ExpertCache` (`src/qwen4exp/expert_cache.rs`) with `ExpertStore` and
 `SlotPolicy` (`expert_store.rs`), engaged when the checkpoint does not
-fit physical memory (`hw.memsize` against the resident weights plus 4.5 GB
+fit physical memory (`hw.memsize` against the resident weights plus 5 GB
 of scratch and a reserve of 12 GB or a sixth of memory; the n-gram table
 is paged and not counted) or on request (`LoadOptions::expert_slots`,
 `LILY_EXPERT_SLOTS`). On this 128 GB machine nothing engages and the

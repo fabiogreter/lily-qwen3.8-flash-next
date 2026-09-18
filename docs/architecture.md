@@ -268,31 +268,26 @@ the budget (the prefix up to the dense limit) take the dense kernel, which
 is exact for them, and only the rest goes through the indexer. And the
 default route past the limit is now **tiled**: `qsa_tile_union` merges the
 selections of 16 consecutive queries into one ascending block list with a
-query mask per block, and `qsa_attn_tile_nax_h1` runs the dense kernel's
-tensor-op flash loop over that union, gathering its K/V rows into
-threadgroup memory 32 at a time and masking each query to its own selection.
-The gain rests on how much neighbouring queries' selections overlap, which
-the union kernel measures: on real text (this repository's documentation) a
-tile's union is 1.9 times one query's 512 blocks at 8K and 3.2 times at 32K,
-against 16 for disjoint selections. Measured on the full model in the
-per-kernel profile: the sparse attention of a 4096-token chunk drops from
-about 1 200 to 350 ms at 8K and from 1 480 to 850 ms at 32K, prefill from
-about 1 250 to 1 700 tok/s at 8K and from 1 150 to 1 450 at 32K, with the
-same tokens drawn. The variants that share a staged K/V slice across two or
-four query heads (`tile2`, `tile4`) are slower than one head per slice at
-both lengths, so the accumulators' register pressure outweighs the saved
-gathers. The one-head kernel pipelines its gathers: while a slice's scores
-and softmax run on the staged K rows, each thread already holds the slice's
-V rows in registers, and while P.V runs it holds the next slice's K rows,
-so the gather latency overlaps the tensor ops instead of being exposed
-twice per slice. In the per-kernel profile that took the kernel from 697
-to 572 ms and 896 to 676 ms per 8K chunk in two paired runs (18 to 25%)
-and from 1 802 to 1 534 and 1 703 to 1 492 ms per 32K chunk (12 to 15%),
-all four pairs measured while the machine ran at about half its usual
-speed; staging 16 rows per slice instead of 32 (for occupancy) and
-prefetching the next slice's K rows a whole slice earlier both measured
-slower or equal in isolation. `LILY_QSA_ROUTE=split` restores the per-query kernel; `tile2` and
-`tile4` select the other variants. Sub-batches under 16 rows (the verify
+query mask per block, `qsa_tile_gather` copies the union's K and V rows
+(and each row's query mask) once per KV head into a contiguous device
+scratch, and `qsa_attn_rows_nax_h1` runs the dense kernel's tensor-op
+flash loop over that scratch, one query head per threadgroup, 128 keys per
+slice read straight from device memory, each query masked to its own
+selection. The gain rests on how much neighbouring queries' selections
+overlap, which the union kernel measures: on real text (this repository's
+documentation) a tile's union is 1.9 times one query's 512 blocks at 8K
+and 3.2 times at 32K, against 16 for disjoint selections. The first tiled
+kernel staged the union's rows into threadgroup memory 32 at a time
+instead; taken apart in the harness it was a serial chain of gathered
+fetches, dependent tensor ops and barriers per slice, and the gathered-row
+kernel halves its time (`docs/performance.md`, item 1). The scratch is
+512 MB (`LILY_QSA_ROWS_MB`): at 32K contexts and beyond a 256-query batch
+is gathered and attended in groups of six tiles, which measured no
+slower than every tile at once and faster at 8K. Measured on
+the full model in the per-kernel profile: the sparse attention of a pass
+past the dense limit takes 153 + 35 ms (attention + gather) at 8K and
+about 300 + 78 at 32K, against 1 200 and 1 480 for the per-query kernel.
+`LILY_QSA_ROUTE=split` restores the per-query kernel. Sub-batches under 16 rows (the verify
 pass) keep the split kernel.
 
 ## The vision tower

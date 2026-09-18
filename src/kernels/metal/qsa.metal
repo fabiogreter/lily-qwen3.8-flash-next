@@ -808,9 +808,10 @@ kernel void qsa_attn_split_bf16(device const bfloat* q        [[buffer(0)]],  //
 // Prefill past the dense limit. Adjacent queries select largely the same
 // blocks, so a tile of QSA_TILE_BQ consecutive queries attends the union of
 // its selections through the tensor-op path, each query masked to its own
-// selection. `qsa_tile_union` builds the union per tile; the attention kernel
-// stages the union's K/V rows into threadgroup memory a tile at a time and
-// runs the same flash loop as the dense prefill kernel over them.
+// selection. `qsa_tile_union` builds the union per tile; `qsa_tile_gather`
+// copies its K/V rows into a contiguous device scratch once per KV head, and
+// `qsa_attn_rows_nax_h1` runs the same flash loop as the dense prefill
+// kernel over them.
 
 #define QSA_TILE_BQ 16
 #define QSA_TILE_TAIL_BLOCKS 8  // blocks the tail region of a tile can span (at most 5)
@@ -910,36 +911,154 @@ kernel void qsa_tile_union(device const uint*  sel        [[buffer(0)]],  // [QB
 #define QSA_TILE_D 256   // attention head dim the tile kernel is written for
 #define QSA_TILE_SG 4    // simdgroups per threadgroup
 
-// Flash attention of one tile of BQ consecutive queries and HPP query heads
-// (all within one KV head) over the tile's union of selected blocks plus its
-// tail region, every query masked to the tokens it attends. The union's K
-// rows are gathered into threadgroup memory BK at a time (block by block,
-// `ratio` consecutive cache rows per block), scored against every head with
-// the tensor-op matmul, softmaxed under the mask, then the same rows of V are
-// staged over K for the P·V accumulation. Grid: threadgroups
-// (ceil(M / BQ), NQ / HPP), 32 * QSA_TILE_SG threads.
-template <int BQ, int BK, int HPP>
-static void qsa_attn_tile_body(device bfloat* q,
-                               device bfloat* k_cache,
-                               device bfloat* v_cache,
-                               device const uint* union_blk,
-                               device const uint* union_mask,
-                               device const uint* n_union,
-                               device const uint* tail_mask,
+// --- Gathered-row tiled attention -----------------------------------------------
+//
+// The earlier tile kernel staged the union's K/V rows into threadgroup
+// memory 32 at a time and paid a chain of gathered fetches and two dependent
+// tensor ops per slice, hidden only by the threadgroups a core holds at 20 KB
+// each (by parts at 8K: 3.9 ms per 256-query dispatch, 2.1 with no QK op,
+// 2.1 with no fetch, 0.34 with no ops). Here a tile's union rows are gathered
+// once per KV head into a contiguous device scratch (`qsa_tile_gather`), and
+// the attention kernel runs the dense kernel's loop over them: 128-row
+// slices read by the tensor ops straight from device memory, 12 KB of
+// threadgroup memory, one query head per threadgroup with a tile's heads
+// adjacent in the grid so they share the gathered rows in cache. In the
+// harness (256 queries, 24 heads): 2.0 + 0.6 ms against 3.9 at 8K and
+// 3.6 + 1.2 against 7.6 at 32K; the staged kernel was dropped.
+
+#define QSA_ROWS_BK 128    // keys per slice of the gathered-row kernel
+#define QSA_ROWS_TG 256    // threads of the gather kernel
+#define QSA_ROWS_SPLIT 8   // threadgroups per (tile, KV head) of the gather kernel
+
+// Gathers tile `tile0 + tg.y`'s union rows for KV head `tg.x` into
+// `rows_k`/`rows_v` (`[tiles, KVH, slot, D]`), the query mask of every row
+// into `row_mask` (`[tiles, slot]`, KV head 0 only) and the row count into
+// `n_rows`; rows past the count up to a slice multiple are zeroed so the
+// tensor ops' over-reads stay finite. The rows are strided over
+// QSA_ROWS_SPLIT threadgroups (`tg.z`) and their simdgroups, each moving a
+// row per iteration with the next one's loads already in flight: the copy
+// is latency-bound per simdgroup, not bandwidth-bound.
+kernel void qsa_tile_gather(device const uint4*  k_cache    [[buffer(0)]],
+                            device const uint4*  v_cache    [[buffer(1)]],
+                            device const uint*   union_blk  [[buffer(2)]],
+                            device const uint*   union_mask [[buffer(3)]],
+                            device const uint*   n_union    [[buffer(4)]],
+                            device const uint*   tail_mask  [[buffer(5)]],
+                            device uint4*        rows_k     [[buffer(6)]],
+                            device uint4*        rows_v     [[buffer(7)]],
+                            device uint*         row_mask   [[buffer(8)]],
+                            device uint*         n_rows     [[buffer(9)]],
+                            constant uint&       max_seq    [[buffer(10)]],
+                            constant uint&       base_pos   [[buffer(11)]],
+                            constant uint&       M          [[buffer(12)]],
+                            constant uint&       cap        [[buffer(13)]],
+                            constant uint&       ratio      [[buffer(14)]],
+                            constant uint&       slot       [[buffer(15)]],
+                            constant uint&       tile0      [[buffer(16)]],
+                            constant uint&       kvh        [[buffer(17)]],
+                            uint3 tg   [[threadgroup_position_in_grid]],
+                            uint  tid  [[thread_index_in_threadgroup]],
+                            uint  sg   [[simdgroup_index_in_threadgroup]],
+                            uint  lane [[thread_index_in_simdgroup]]) {
+    constexpr uint ROW4 = uint(QSA_TILE_D) * 2u / 16u;  // uint4 words per row (32)
+    constexpr uint SGS = QSA_ROWS_TG / 32u;
+    constexpr uint STRIDE = SGS * uint(QSA_ROWS_SPLIT);
+    const uint kh = tg.x;
+    const uint local = tg.y;
+    const uint tile = tile0 + local;
+    const uint q0 = tile * uint(QSA_TILE_BQ);
+    if (q0 >= M) {
+        return;
+    }
+    const uint qn = min(uint(QSA_TILE_BQ), M - q0);
+    const uint p0 = base_pos + q0;
+    const uint vb0 = qsa_visible_blocks(p0, ratio);
+    const uint n_u = min(n_union[tile], cap);
+    const uint in_blocks = n_u * ratio;
+    const uint tail_start = vb0 * ratio;
+    const uint total = in_blocks + (p0 + qn - tail_start);
+    const uint padded = min((total + uint(QSA_ROWS_BK) - 1u) / uint(QSA_ROWS_BK) * uint(QSA_ROWS_BK), slot);
+    device const uint* ublk = union_blk + (ulong)tile * cap;
+    device const uint* umask = union_mask + (ulong)tile * cap;
+    device const uint* tmask = tail_mask + (ulong)tile * QSA_TILE_TAIL_BLOCKS;
+    device const uint4* k_head = k_cache + (ulong)kh * max_seq * ROW4;
+    device const uint4* v_head = v_cache + (ulong)kh * max_seq * ROW4;
+    const ulong dst0 = ((ulong)local * kvh + kh) * slot;
+    device uint4* dk = rows_k + dst0 * ROW4;
+    device uint4* dv = rows_v + dst0 * ROW4;
+    device uint* dm = row_mask + (ulong)local * slot;
+    if (tg.z == 0u && tid == 0u) {
+        n_rows[local] = total;
+    }
+    // The cache row and query mask of gathered row j.
+    auto describe = [&](uint j, thread uint& token, thread uint& m) {
+        token = 0u;
+        m = 0u;
+        if (j < in_blocks) {
+            const uint u = j / ratio;
+            token = ublk[u] * ratio + (j - u * ratio);
+            m = umask[u];
+        } else if (j < total) {
+            token = tail_start + (j - in_blocks);
+            const uint tb = token / ratio - vb0;
+            const uint tbits = tb < QSA_TILE_TAIL_BLOCKS ? tmask[tb] : 0u;
+            for (uint i = 0; i < qn; ++i) {
+                const uint p = p0 + i;
+                const bool causal = token <= p;
+                const bool own_tail = token >= qsa_visible_blocks(p, ratio) * ratio;
+                if (causal && (own_tail || ((tbits >> i) & 1u))) {
+                    m |= 1u << i;
+                }
+            }
+        }
+    };
+    uint j = tg.z * SGS + sg;
+    uint token, m;
+    describe(j, token, m);
+    uint4 kw = j < total ? k_head[(ulong)token * ROW4 + lane] : uint4(0u);
+    uint4 vw = j < total ? v_head[(ulong)token * ROW4 + lane] : uint4(0u);
+    while (j < padded) {
+        const uint jn = j + STRIDE;
+        uint token_n = 0u, m_n = 0u;
+        uint4 kn = uint4(0u), vn = uint4(0u);
+        if (jn < padded) {
+            describe(jn, token_n, m_n);
+            if (jn < total) {
+                kn = k_head[(ulong)token_n * ROW4 + lane];
+                vn = v_head[(ulong)token_n * ROW4 + lane];
+            }
+        }
+        dk[(ulong)j * ROW4 + lane] = kw;
+        dv[(ulong)j * ROW4 + lane] = vw;
+        if (kh == 0u && lane == 0u) {
+            dm[j] = m;
+        }
+        j = jn;
+        m = m_n;
+        kw = kn;
+        vw = vn;
+    }
+}
+
+// Flash attention of one tile of BQ queries and one query head over the
+// tile's gathered rows. Grid: threadgroups (NQ, tiles in the group),
+// 32 * QSA_TILE_SG threads.
+template <int BQ, int BK>
+static void qsa_attn_rows_body(device bfloat* q,
+                               device bfloat* rows_k,
+                               device bfloat* rows_v,
+                               device const uint* row_mask,
+                               device const uint* n_rows,
                                device bfloat* out,
-                               uint max_seq,
-                               uint base_pos,
                                uint M,
                                uint NQ,
                                uint group,
                                float scale,
-                               uint cap,
-                               uint ratio,
-                               threadgroup uint4* kv4,
+                               uint slot,
+                               uint kvh,
+                               uint tile0,
                                threadgroup float* s_tile,
                                threadgroup bfloat* p_tile,
-                               threadgroup uint* tok_idx,
-                               threadgroup uint* tok_mask,
                                threadgroup float* row_max,
                                threadgroup float* row_sum,
                                threadgroup float* row_alpha,
@@ -949,262 +1068,6 @@ static void qsa_attn_tile_body(device bfloat* q,
     constexpr uint THREADS = 32u * uint(QSA_TILE_SG);
     constexpr uint LANES = THREADS / uint(BQ);
     constexpr uint COLS = uint(BK) / LANES;
-    constexpr uint ROW4 = uint(QSA_TILE_D) * 2u / 16u;  // uint4 words per K/V row
-    static_assert(uint(BQ) * LANES == THREADS,
-                  "the threadgroup must divide into BQ equal row groups");
-    static_assert(uint(BK) % LANES == 0u, "each lane must own a whole number of key columns");
-    static_assert(LANES <= 32u, "a row's lanes must sit inside one simdgroup");
-    static_assert(HPP >= 1 && HPP <= 4, "one to four heads per staged tile");
-    static_assert(BQ <= 32, "the query mask is one uint");
-
-    using namespace mpp::tensor_ops;
-
-    if (tg_size.x != THREADS) {
-        return;
-    }
-    const uint tile = tg.x;
-    const uint q0 = tile * uint(BQ);
-    if (q0 >= M) {
-        return;
-    }
-    const uint qn = min(uint(BQ), M - q0);
-    const uint h0 = tg.y * uint(HPP);
-    const uint kh = h0 / group;
-    const uint p0 = base_pos + q0;
-    const uint vb0 = qsa_visible_blocks(p0, ratio);
-    const uint n_u = min(n_union[tile], cap);
-    const uint in_blocks = n_u * ratio;
-    const uint tail_start = vb0 * ratio;
-    const uint total = in_blocks + (p0 + qn - tail_start);
-    device const uint* ublk = union_blk + (ulong)tile * cap;
-    device const uint* umask = union_mask + (ulong)tile * cap;
-    device const uint* tmask = tail_mask + (ulong)tile * QSA_TILE_TAIL_BLOCKS;
-    device const uint4* k_head =
-        (device const uint4*)(k_cache + (ulong)kh * max_seq * QSA_TILE_D);
-    device const uint4* v_head =
-        (device const uint4*)(v_cache + (ulong)kh * max_seq * QSA_TILE_D);
-    threadgroup bfloat* kv_tile = (threadgroup bfloat*)kv4;
-
-    if (tid < uint(HPP * BQ)) {
-        row_max[tid] = -INFINITY;
-        row_sum[tid] = 0.0f;
-        row_alpha[tid] = 1.0f;
-    }
-
-    auto tKV = tensor(kv_tile, dextents<int32_t, 2>(QSA_TILE_D, BK));
-    auto tS = tensor(s_tile, dextents<int32_t, 2>(BK, BQ));
-    constexpr auto qk_desc = matmul2d_descriptor(
-        BQ, BK, QSA_TILE_D, false, /*transpose_right=*/true, false,
-        matmul2d_descriptor::mode::multiply);
-    constexpr auto pv_desc = matmul2d_descriptor(
-        BQ, QSA_TILE_D, BK, false, false, false,
-        matmul2d_descriptor::mode::multiply_accumulate);
-    matmul2d<qk_desc, metal::execution_simdgroups<QSA_TILE_SG>> qk_op;
-    matmul2d<pv_desc, metal::execution_simdgroups<QSA_TILE_SG>> pv_op;
-
-    const array<int, 2> q_strides{1, int(NQ * uint(QSA_TILE_D))};
-    auto q_tensor = [&](uint h) {
-        return tensor(q + ((ulong)q0 * NQ + h0 + h) * QSA_TILE_D,
-                      dextents<int32_t, 2>(QSA_TILE_D, int(qn)), q_strides);
-    };
-    auto p_tensor = [&](uint h) {
-        return tensor(p_tile + h * uint(BQ * BK), dextents<int32_t, 2>(BK, BQ));
-    };
-    using QT = decltype(q_tensor(0u));
-    using PT = decltype(p_tensor(0u));
-    using KVT = decltype(tKV);
-    auto make_acc = [&]() {
-        return pv_op.template get_destination_cooperative_tensor<PT, KVT, float>();
-    };
-    using AccT = decltype(make_acc());
-    // One accumulator per head of the pass, selected at compile time so each
-    // stays in registers (the unused ones fold away).
-    AccT acc0 = make_acc();
-    AccT acc1 = make_acc();
-    AccT acc2 = make_acc();
-    AccT acc3 = make_acc();
-#define QSA_EACH_HEAD(FN)   \
-    FN(0u, acc0);           \
-    if (HPP > 1) FN(1u, acc1); \
-    if (HPP > 2) FN(2u, acc2); \
-    if (HPP > 3) FN(3u, acc3);
-    auto zero_acc = [&](uint, thread AccT& acc) {
-        for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
-            if (acc.is_valid_element(i)) {
-                acc[i] = 0.0f;
-            }
-        }
-    };
-    QSA_EACH_HEAD(zero_acc)
-    // Rescales the head's accumulator by its rows' softmax correction and
-    // adds this slice's P·V.
-    auto pv_step = [&](uint h, thread AccT& acc) {
-        for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
-            if (acc.is_valid_element(i)) {
-                auto ix = acc.get_multidimensional_index(i);
-                acc[i] *= row_alpha[h * uint(BQ) + uint(ix[1])];
-            }
-        }
-        auto tP = p_tensor(h);
-        pv_op.run(tP, tKV, acc);
-    };
-    auto store_acc = [&](uint h, thread AccT& acc) {
-        for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
-            if (acc.is_valid_element(i)) {
-                auto ix = acc.get_multidimensional_index(i);
-                const uint row = uint(ix[1]);
-                const uint col = uint(ix[0]);
-                if (row < qn) {
-                    out[((ulong)(q0 + row) * NQ + h0 + h) * QSA_TILE_D + col] =
-                        bfloat(acc[i] / row_sum[h * uint(BQ) + row]);
-                }
-            }
-        }
-    };
-
-    for (uint k0 = 0; k0 < total; k0 += uint(BK)) {
-        const uint count = min(uint(BK), total - k0);
-        // Which cache rows this slice of the union holds, and who attends them.
-        if (tid < uint(BK)) {
-            const uint j = k0 + tid;
-            uint token = 0u;
-            uint m = 0u;
-            if (j < in_blocks) {
-                const uint u = j / ratio;
-                token = ublk[u] * ratio + (j - u * ratio);
-                m = umask[u];
-            } else if (j < total) {
-                // Tail region: a row every query at or past it attends
-                // causally, and earlier queries attend only if they selected
-                // its (for them complete) block.
-                token = tail_start + (j - in_blocks);
-                const uint tb = token / ratio - vb0;
-                const uint tbits = tb < QSA_TILE_TAIL_BLOCKS ? tmask[tb] : 0u;
-                for (uint i = 0; i < qn; ++i) {
-                    const uint p = p0 + i;
-                    const bool causal = token <= p;
-                    const bool own_tail = token >= qsa_visible_blocks(p, ratio) * ratio;
-                    if (causal && (own_tail || ((tbits >> i) & 1u))) {
-                        m |= 1u << i;
-                    }
-                }
-            }
-            tok_idx[tid] = token;
-            tok_mask[tid] = m;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Stage K rows.
-        for (uint i = tid; i < uint(BK) * ROW4; i += THREADS) {
-            const uint r = i / ROW4;
-            const uint c = i - r * ROW4;
-            kv4[i] = r < count ? k_head[(ulong)tok_idx[r] * ROW4 + c] : uint4(0u);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint h = 0; h < uint(HPP); ++h) {
-            auto tQ = q_tensor(h);
-            auto sT = qk_op.template get_destination_cooperative_tensor<QT, KVT, float>();
-            qk_op.run(tQ, tKV, sT);
-            sT.store(tS);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            // Masked online softmax: LANES lanes per query row.
-            const uint row = tid / LANES;
-            const uint l = tid - row * LANES;
-            const uint j0 = l * COLS;
-            const uint stat = h * uint(BQ) + row;
-            const float prev = row_max[stat];
-            float local = prev;
-            for (uint j = j0; j < j0 + COLS; ++j) {
-                if (j < count && ((tok_mask[j] >> row) & 1u)) {
-                    local = max(local, s_tile[row * uint(BK) + j] * scale);
-                }
-            }
-            for (uint off = 1u; off < LANES; off <<= 1) {
-                local = max(local, simd_shuffle_xor(local, off));
-            }
-            const float mx = local;
-            // A row that has attended nothing so far keeps its state.
-            const float alpha = mx == -INFINITY ? 1.0f : exp(prev - mx);
-            float psum = 0.0f;
-            for (uint j = j0; j < j0 + COLS; ++j) {
-                const bool on = j < count && ((tok_mask[j] >> row) & 1u);
-                const float p = on ? exp(s_tile[row * uint(BK) + j] * scale - mx) : 0.0f;
-                p_tile[h * uint(BQ * BK) + row * uint(BK) + j] = bfloat(p);
-                psum += p;
-            }
-            for (uint off = 1u; off < LANES; off <<= 1) {
-                psum += simd_shuffle_xor(psum, off);
-            }
-            if (l == 0u) {
-                row_sum[stat] = row_sum[stat] * alpha + psum;
-                row_max[stat] = mx;
-                row_alpha[stat] = alpha;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        // Stage V rows over K.
-        for (uint i = tid; i < uint(BK) * ROW4; i += THREADS) {
-            const uint r = i / ROW4;
-            const uint c = i - r * ROW4;
-            kv4[i] = r < count ? v_head[(ulong)tok_idx[r] * ROW4 + c] : uint4(0u);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        QSA_EACH_HEAD(pv_step)
-        // Finish the tensor ops before the next slice restages kv4/p_tile.
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    QSA_EACH_HEAD(store_acc)
-#undef QSA_EACH_HEAD
-}
-
-// The one-head tile kernel with its K/V staging software-pipelined: while a
-// slice's scores and softmax run on the staged K rows, each thread already
-// holds the slice's V rows in registers, and while P.V runs on the staged V
-// rows it holds the next slice's K rows, so the gathers' latency overlaps
-// the tensor ops instead of being exposed twice per slice. With EARLY the
-// next slice's K rows are fetched a whole slice earlier (twice the
-// registers; measured no better). Same math and accumulation order as
-// qsa_attn_tile_body with HPP = 1.
-template <int BQ, int BK, bool EARLY>
-static void qsa_attn_tile_pipe_body(device bfloat* q,
-                                    device bfloat* k_cache,
-                                    device bfloat* v_cache,
-                                    device const uint* union_blk,
-                                    device const uint* union_mask,
-                                    device const uint* n_union,
-                                    device const uint* tail_mask,
-                                    device bfloat* out,
-                                    uint max_seq,
-                                    uint base_pos,
-                                    uint M,
-                                    uint NQ,
-                                    uint group,
-                                    float scale,
-                                    uint cap,
-                                    uint ratio,
-                                    threadgroup uint4* kv4,
-                                    threadgroup float* s_tile,
-                                    threadgroup bfloat* p_tile,
-                                    threadgroup uint* tok_idx,   // [2][BK]
-                                    threadgroup uint* tok_mask,  // [2][BK]
-                                    threadgroup float* row_max,
-                                    threadgroup float* row_sum,
-                                    threadgroup float* row_alpha,
-                                    uint2 tg,
-                                    uint tid,
-                                    uint2 tg_size) {
-    constexpr uint THREADS = 32u * uint(QSA_TILE_SG);
-    constexpr uint LANES = THREADS / uint(BQ);
-    constexpr uint COLS = uint(BK) / LANES;
-    constexpr uint ROW4 = uint(QSA_TILE_D) * 2u / 16u;  // uint4 words per K/V row
-    constexpr uint WORDS = uint(BK) * ROW4;
-    constexpr uint PER_THREAD = WORDS / THREADS;
-    static_assert(WORDS % THREADS == 0u, "the staged rows split evenly over the threads");
     static_assert(uint(BQ) * LANES == THREADS,
                   "the threadgroup must divide into BQ equal row groups");
     static_assert(uint(BK) % LANES == 0u, "each lane must own a whole number of key columns");
@@ -1216,36 +1079,31 @@ static void qsa_attn_tile_pipe_body(device bfloat* q,
     if (tg_size.x != THREADS) {
         return;
     }
-    const uint tile = tg.x;
+    const uint h = tg.x;
+    const uint local = tg.y;
+    const uint tile = tile0 + local;
     const uint q0 = tile * uint(BQ);
     if (q0 >= M) {
         return;
     }
     const uint qn = min(uint(BQ), M - q0);
-    const uint h = tg.y;
     const uint kh = h / group;
-    const uint p0 = base_pos + q0;
-    const uint vb0 = qsa_visible_blocks(p0, ratio);
-    const uint n_u = min(n_union[tile], cap);
-    const uint in_blocks = n_u * ratio;
-    const uint tail_start = vb0 * ratio;
-    const uint total = in_blocks + (p0 + qn - tail_start);
-    device const uint* ublk = union_blk + (ulong)tile * cap;
-    device const uint* umask = union_mask + (ulong)tile * cap;
-    device const uint* tmask = tail_mask + (ulong)tile * QSA_TILE_TAIL_BLOCKS;
-    device const uint4* k_head =
-        (device const uint4*)(k_cache + (ulong)kh * max_seq * QSA_TILE_D);
-    device const uint4* v_head =
-        (device const uint4*)(v_cache + (ulong)kh * max_seq * QSA_TILE_D);
-    threadgroup bfloat* kv_tile = (threadgroup bfloat*)kv4;
+    const uint total = n_rows[local];
+    const ulong src0 = ((ulong)local * kvh + kh) * slot;
+    device const uint* mask = row_mask + (ulong)local * slot;
 
     if (tid < uint(BQ)) {
         row_max[tid] = -INFINITY;
         row_sum[tid] = 0.0f;
         row_alpha[tid] = 1.0f;
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    auto tKV = tensor(kv_tile, dextents<int32_t, 2>(QSA_TILE_D, BK));
+    const array<int, 2> q_strides{1, int(NQ * uint(QSA_TILE_D))};
+    auto tQ = tensor(q + ((ulong)q0 * NQ + h) * QSA_TILE_D,
+                     dextents<int32_t, 2>(QSA_TILE_D, int(qn)), q_strides);
+    auto tK = tensor(rows_k + src0 * QSA_TILE_D, dextents<int32_t, 2>(QSA_TILE_D, int(total)));
+    auto tV = tensor(rows_v + src0 * QSA_TILE_D, dextents<int32_t, 2>(QSA_TILE_D, int(total)));
     auto tS = tensor(s_tile, dextents<int32_t, 2>(BK, BQ));
     auto tP = tensor(p_tile, dextents<int32_t, 2>(BK, BQ));
     constexpr auto qk_desc = matmul2d_descriptor(
@@ -1256,112 +1114,50 @@ static void qsa_attn_tile_pipe_body(device bfloat* q,
         matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<qk_desc, metal::execution_simdgroups<QSA_TILE_SG>> qk_op;
     matmul2d<pv_desc, metal::execution_simdgroups<QSA_TILE_SG>> pv_op;
-
-    const array<int, 2> q_strides{1, int(NQ * uint(QSA_TILE_D))};
-    auto tQ = tensor(q + ((ulong)q0 * NQ + h) * QSA_TILE_D,
-                     dextents<int32_t, 2>(QSA_TILE_D, int(qn)), q_strides);
     using QT = decltype(tQ);
     using PT = decltype(tP);
-    using KVT = decltype(tKV);
-    auto acc = pv_op.template get_destination_cooperative_tensor<PT, KVT, float>();
+    using KSlice = decltype(tK.slice(0, 0));
+    using VSlice = decltype(tV.slice(0, 0));
+    auto acc = pv_op.template get_destination_cooperative_tensor<PT, VSlice, float>();
     for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
         if (acc.is_valid_element(i)) {
             acc[i] = 0.0f;
         }
     }
 
-    // Which cache rows slice `k0` holds and who attends them, into buffer `buf`.
-    auto describe = [&](uint k0, uint buf) {
-        if (tid < uint(BK)) {
-            const uint j = k0 + tid;
-            uint token = 0u;
-            uint m = 0u;
-            if (j < in_blocks) {
-                const uint u = j / ratio;
-                token = ublk[u] * ratio + (j - u * ratio);
-                m = umask[u];
-            } else if (j < total) {
-                token = tail_start + (j - in_blocks);
-                const uint tb = token / ratio - vb0;
-                const uint tbits = tb < QSA_TILE_TAIL_BLOCKS ? tmask[tb] : 0u;
-                for (uint i = 0; i < qn; ++i) {
-                    const uint p = p0 + i;
-                    const bool causal = token <= p;
-                    const bool own_tail = token >= qsa_visible_blocks(p, ratio) * ratio;
-                    if (causal && (own_tail || ((tbits >> i) & 1u))) {
-                        m |= 1u << i;
-                    }
-                }
-            }
-            tok_idx[buf * uint(BK) + tid] = token;
-            tok_mask[buf * uint(BK) + tid] = m;
-        }
-    };
-    // This thread's words of the slice's rows from `head`, into registers.
-    auto fetch = [&](device const uint4* head, uint k0, uint buf, thread uint4* regs) {
-        const uint count = min(uint(BK), total - k0);
-        for (uint t = 0; t < PER_THREAD; ++t) {
-            const uint i = tid + t * THREADS;
-            const uint r = i / ROW4;
-            const uint c = i - r * ROW4;
-            regs[t] = r < count ? head[(ulong)tok_idx[buf * uint(BK) + r] * ROW4 + c] : uint4(0u);
-        }
-    };
-    auto stage = [&](thread const uint4* regs) {
-        for (uint t = 0; t < PER_THREAD; ++t) {
-            kv4[tid + t * THREADS] = regs[t];
-        }
-    };
-
-    uint4 regs[PER_THREAD];
-    uint4 kregs[EARLY ? PER_THREAD : 1];
-    describe(0u, 0u);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    fetch(k_head, 0u, 0u, regs);
-    stage(regs);
-    if (EARLY && uint(BK) < total) {
-        describe(uint(BK), 1u);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
+    const uint row = tid / LANES;
+    const uint l = tid - row * LANES;
+    const uint j0 = l * COLS;
     for (uint k0 = 0; k0 < total; k0 += uint(BK)) {
-        const uint buf = (k0 / uint(BK)) & 1u;
         const uint count = min(uint(BK), total - k0);
-        const uint next = k0 + uint(BK);
-        // kv4 holds this slice's K rows; its V rows go to registers now (and
-        // with EARLY the next slice's K rows too).
-        fetch(v_head, k0, buf, regs);
-        if (EARLY && next < total) {
-            fetch(k_head, next, buf ^ 1u, kregs);
-        }
-
-        auto sT = qk_op.template get_destination_cooperative_tensor<QT, KVT, float>();
-        qk_op.run(tQ, tKV, sT);
+        auto kS = tK.slice(0, int(k0));
+        auto vS = tV.slice(0, int(k0));
+        auto sT = qk_op.template get_destination_cooperative_tensor<QT, KSlice, float>();
+        qk_op.run(tQ, kS, sT);
         sT.store(tS);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Masked online softmax: LANES lanes per query row.
         {
-            const uint row = tid / LANES;
-            const uint l = tid - row * LANES;
-            const uint j0 = l * COLS;
-            const uint prev_stat = row;
-            const float prev = row_max[prev_stat];
-            float local = prev;
-            for (uint j = j0; j < j0 + COLS; ++j) {
-                if (j < count && ((tok_mask[buf * uint(BK) + j] >> row) & 1u)) {
-                    local = max(local, s_tile[row * uint(BK) + j] * scale);
+            const float prev = row_max[row];
+            float local_max = prev;
+            bool on[COLS];
+            for (uint c = 0; c < COLS; ++c) {
+                const uint j = j0 + c;
+                on[c] = j < count && ((mask[k0 + j] >> row) & 1u);
+                if (on[c]) {
+                    local_max = max(local_max, s_tile[row * uint(BK) + j] * scale);
                 }
             }
             for (uint off = 1u; off < LANES; off <<= 1) {
-                local = max(local, simd_shuffle_xor(local, off));
+                local_max = max(local_max, simd_shuffle_xor(local_max, off));
             }
-            const float mx = local;
+            const float mx = local_max;
             const float alpha = mx == -INFINITY ? 1.0f : exp(prev - mx);
             float psum = 0.0f;
-            for (uint j = j0; j < j0 + COLS; ++j) {
-                const bool on = j < count && ((tok_mask[buf * uint(BK) + j] >> row) & 1u);
-                const float p = on ? exp(s_tile[row * uint(BK) + j] * scale - mx) : 0.0f;
+            for (uint c = 0; c < COLS; ++c) {
+                const uint j = j0 + c;
+                const float p = on[c] ? exp(s_tile[row * uint(BK) + j] * scale - mx) : 0.0f;
                 p_tile[row * uint(BK) + j] = bfloat(p);
                 psum += p;
             }
@@ -1369,23 +1165,12 @@ static void qsa_attn_tile_pipe_body(device bfloat* q,
                 psum += simd_shuffle_xor(psum, off);
             }
             if (l == 0u) {
-                row_sum[prev_stat] = row_sum[prev_stat] * alpha + psum;
-                row_max[prev_stat] = mx;
-                row_alpha[prev_stat] = alpha;
+                row_sum[row] = row_sum[row] * alpha + psum;
+                row_max[row] = mx;
+                row_alpha[row] = alpha;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // V rows over K; without EARLY the next slice's description
-        // alongside, then its K rows fetched under the P.V.
-        stage(regs);
-        if (!EARLY && next < total) {
-            describe(next, buf ^ 1u);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (!EARLY && next < total) {
-            fetch(k_head, next, buf ^ 1u, regs);
-        }
 
         for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
             if (acc.is_valid_element(i)) {
@@ -1393,110 +1178,48 @@ static void qsa_attn_tile_pipe_body(device bfloat* q,
                 acc[i] *= row_alpha[uint(ix[1])];
             }
         }
-        pv_op.run(tP, tKV, acc);
+        pv_op.run(tP, vS, acc);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (next < total) {
-            if (EARLY) {
-                stage(kregs);
-                // The slice after next, into the buffer this slice used.
-                if (next + uint(BK) < total) {
-                    describe(next + uint(BK), buf);
-                }
-            } else {
-                stage(regs);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
     }
 
     for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
         if (acc.is_valid_element(i)) {
             auto ix = acc.get_multidimensional_index(i);
-            const uint row = uint(ix[1]);
+            const uint r = uint(ix[1]);
             const uint col = uint(ix[0]);
-            if (row < qn) {
-                out[((ulong)(q0 + row) * NQ + h) * QSA_TILE_D + col] =
-                    bfloat(acc[i] / row_sum[row]);
+            if (r < qn) {
+                out[((ulong)(q0 + r) * NQ + h) * QSA_TILE_D + col] =
+                    bfloat(acc[i] / row_sum[r]);
             }
         }
     }
 }
 
-#define QSA_TILE_PIPE_KERNEL(NAME, BQ, BK, EARLY)                                     \
+#define QSA_ROWS_KERNEL(NAME, BQ, BK)                                                 \
 kernel void NAME(device bfloat*       q          [[buffer(0)]],                       \
-                 device bfloat*       k_cache    [[buffer(1)]],                        \
-                 device bfloat*       v_cache    [[buffer(2)]],                        \
-                 device const uint*   union_blk  [[buffer(3)]],                        \
-                 device const uint*   union_mask [[buffer(4)]],                        \
-                 device const uint*   n_union    [[buffer(5)]],                        \
-                 device const uint*   tail_mask  [[buffer(6)]],                        \
-                 device bfloat*       out        [[buffer(7)]],                        \
-                 constant uint&       max_seq    [[buffer(8)]],                        \
-                 constant uint&       base_pos   [[buffer(9)]],                        \
-                 constant uint&       M          [[buffer(10)]],                       \
-                 constant uint&       NQ         [[buffer(11)]],                       \
-                 constant uint&       group      [[buffer(12)]],                       \
-                 constant float&      scale      [[buffer(13)]],                       \
-                 constant uint&       cap        [[buffer(14)]],                       \
-                 constant uint&       ratio      [[buffer(15)]],                       \
+                 device bfloat*       rows_k     [[buffer(1)]],                        \
+                 device bfloat*       rows_v     [[buffer(2)]],                        \
+                 device const uint*   row_mask   [[buffer(3)]],                        \
+                 device const uint*   n_rows     [[buffer(4)]],                        \
+                 device bfloat*       out        [[buffer(5)]],                        \
+                 constant uint&       M          [[buffer(6)]],                        \
+                 constant uint&       NQ         [[buffer(7)]],                        \
+                 constant uint&       group      [[buffer(8)]],                        \
+                 constant float&      scale      [[buffer(9)]],                        \
+                 constant uint&       slot       [[buffer(10)]],                       \
+                 constant uint&       kvh        [[buffer(11)]],                       \
+                 constant uint&       tile0      [[buffer(12)]],                       \
                  uint2 tg      [[threadgroup_position_in_grid]],                       \
                  uint  tid     [[thread_index_in_threadgroup]],                        \
                  uint2 tg_size [[threads_per_threadgroup]]) {                          \
-    threadgroup uint4  kv4[(BK) * QSA_TILE_D / 8];                                     \
     threadgroup float  s_tile[(BQ) * (BK)];                                            \
     threadgroup bfloat p_tile[(BQ) * (BK)];                                            \
-    threadgroup uint   tok_idx[2 * (BK)], tok_mask[2 * (BK)];                          \
     threadgroup float  row_max[(BQ)], row_sum[(BQ)], row_alpha[(BQ)];                  \
-    qsa_attn_tile_pipe_body<(BQ), (BK), (EARLY)>(                                      \
-        q, k_cache, v_cache, union_blk, union_mask, n_union, tail_mask, out,          \
-        max_seq, base_pos, M, NQ, group, scale, cap, ratio, kv4, s_tile, p_tile,      \
-        tok_idx, tok_mask, row_max, row_sum, row_alpha, tg, tid, tg_size);            \
+    qsa_attn_rows_body<(BQ), (BK)>(                                                    \
+        q, rows_k, rows_v, row_mask, n_rows, out, M, NQ, group, scale, slot, kvh,     \
+        tile0, s_tile, p_tile, row_max, row_sum, row_alpha, tg, tid, tg_size);        \
 }
 
-#define QSA_TILE_KERNEL(NAME, BQ, BK, HPP)                                            \
-kernel void NAME(device bfloat*       q          [[buffer(0)]],  /* [M, NQ, D] */     \
-                 device bfloat*       k_cache    [[buffer(1)]],  /* [KVH, max_seq, D] */ \
-                 device bfloat*       v_cache    [[buffer(2)]],                        \
-                 device const uint*   union_blk  [[buffer(3)]],  /* [tiles, cap] */    \
-                 device const uint*   union_mask [[buffer(4)]],  /* [tiles, cap] */    \
-                 device const uint*   n_union    [[buffer(5)]],  /* [tiles] */         \
-                 device const uint*   tail_mask  [[buffer(6)]],  /* [tiles, 8] */      \
-                 device bfloat*       out        [[buffer(7)]],  /* [M, NQ, D] */      \
-                 constant uint&       max_seq    [[buffer(8)]],                        \
-                 constant uint&       base_pos   [[buffer(9)]],                        \
-                 constant uint&       M          [[buffer(10)]],                       \
-                 constant uint&       NQ         [[buffer(11)]],                       \
-                 constant uint&       group      [[buffer(12)]],                       \
-                 constant float&      scale      [[buffer(13)]],                       \
-                 constant uint&       cap        [[buffer(14)]],                       \
-                 constant uint&       ratio      [[buffer(15)]],                       \
-                 uint2 tg      [[threadgroup_position_in_grid]],                       \
-                 uint  tid     [[thread_index_in_threadgroup]],                        \
-                 uint2 tg_size [[threads_per_threadgroup]]) {                          \
-    threadgroup uint4  kv4[(BK) * QSA_TILE_D / 8];                                     \
-    threadgroup float  s_tile[(BQ) * (BK)];                                            \
-    threadgroup bfloat p_tile[(HPP) * (BQ) * (BK)];                                    \
-    threadgroup uint   tok_idx[(BK)], tok_mask[(BK)];                                  \
-    threadgroup float  row_max[(HPP) * (BQ)], row_sum[(HPP) * (BQ)], row_alpha[(HPP) * (BQ)]; \
-    qsa_attn_tile_body<(BQ), (BK), (HPP)>(                                             \
-        q, k_cache, v_cache, union_blk, union_mask, n_union, tail_mask, out,          \
-        max_seq, base_pos, M, NQ, group, scale, cap, ratio, kv4, s_tile, p_tile,      \
-        tok_idx, tok_mask, row_max, row_sum, row_alpha, tg, tid, tg_size);            \
-}
-
-// Threadgroup memory: 16 KB of K/V rows (BK = 32 x 512 B) plus BQ x BK score
-// and probability tiles per head, within the 32 KB budget up to four heads.
-// The one-head kernel is the pipelined body (qsa_attn_tile_pipe_body); the
-// multi-head ones share the staged rows across heads instead. Measured per
-// dispatch on the profile transport (256 queries, 24 heads, 1.8x overlap):
-// pipelined 3.9 ms against 4.6 to 4.9 for the plain one-head body at 8K and
-// 7.8 against 8.5 to 10.6 at 32K; the two-head body 5.1 / 10.4, staging 16
-// rows per slice instead of 32 (for occupancy) 6.1 / 12.0, and prefetching
-// the next slice's K rows a whole slice earlier no better than the pipeline.
-QSA_TILE_PIPE_KERNEL(qsa_attn_tile_nax_h1, QSA_TILE_BQ, 32, false)
-QSA_TILE_KERNEL(qsa_attn_tile_nax_h2, QSA_TILE_BQ, 32, 2)
-QSA_TILE_KERNEL(qsa_attn_tile_nax_h4, QSA_TILE_BQ, 32, 4)
-// The plain one-head body, for comparison by name (`LILY_QSA_TILE_KERNEL`).
-QSA_TILE_KERNEL(qsa_attn_tile_nax_h1_plain, QSA_TILE_BQ, 32, 1)
+QSA_ROWS_KERNEL(qsa_attn_rows_nax_h1, QSA_TILE_BQ, QSA_ROWS_BK)
 
 #endif
