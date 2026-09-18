@@ -181,11 +181,18 @@ rotary and bidirectional attention (`vision`).
 ### Decode
 
 A decode step is about 920 to 990 dispatches encoded as one concurrent pass
-with level barriers. Per token it reads 4.135 GB of weights plus the 226 MB
-of GDN recurrent state and 25 to 50 MB of attention caches, so about 4.4 GB.
-Against a probed dense-GEMV bandwidth of 575 GB/s that is a 7.6 ms floor; the
-step measures about 11.0 ms at a 1K prompt, which is 400 GB/s, 70% of the
-probed peak.
+with level barriers, about 709 dependency levels at a 1K prompt. Per token
+it reads 4.135 GB of weights plus the 226 MB of GDN recurrent state and 25
+to 50 MB of attention caches, so about 4.4 GB. A single long stream reads
+at 600 GB/s on this GPU, which would make 7.3 ms; the step measures 10.5 to
+10.7 ms at a 1K prompt, about 415 GB/s. The difference is the chain itself:
+each level is a true data dependency reading 3 to 24 MB, and a streaming
+dispatch reaches only 460 to 485 GB/s at those sizes because every level
+pays its own ramp and drain, so the step's floor at its mix of level sizes
+is about 9.3 ms and it runs within 10 to 15% of that. Every kernel family
+sits within about 10% of the ceiling for its own read size; the
+measurements are in [performance.md](performance.md), "Where the decode
+step's time goes".
 
 Where the 1K step goes, by profiled share:
 
@@ -212,17 +219,31 @@ the step (plain decode at 8K measured 77 to 83 tok/s in one pair of runs).
 `LILY_QSA_SPLIT` sets the token count (32 to 256) and `LILY_QSA_HEAD_SPLIT=0`
 drops the head split. Prefill sub-batches keep the 256-token split.
 
-Block selection is one 256-thread threadgroup per query running a radix
+Block selection is one 512-thread threadgroup per query running a radix
 select over the block scores (four 8-bit digits, most significant first)
 and then a compaction in ascending block order. Every threadgroup-wide step
 is a scan or a simd reduction: the digit is picked by a scan over the 256
-bins (one per thread), the top digit, which the exponent crowds into a few
-bins, is counted with one atomic per distinct bin per simdgroup, and each
-thread owns a run of consecutive blocks (4 to 32, following the context) so
-the compaction is one scan per 32K tokens with each thread placing its own
-blocks in order. Per decode step the twelve selections take 0.21 ms at 8K
-(from 0.41) and 0.59 at 32K (from 0.70); per 64-query prefill chunk they
-take 18 us at 8K (from 108) and 73 at 32K (from 167).
+bins, the top digit, which the exponent crowds into a few bins, is counted
+with one atomic per distinct bin per simdgroup, and each thread owns a run
+of consecutive blocks (following the context) so the compaction is one scan
+per 32K tokens with each thread placing its own blocks in order. The 512
+threads (from 256) only shorten each thread's walk: 16.7 to 7.8 us per
+query at 8K and 31.3 to 15.7 at 32K, exact either way; 1 024 threads gave
+the gain back to the wider scans. Per decode step the twelve selections had
+taken 0.21 ms at 8K (from 0.41 with serial steps) and 0.59 at 32K (from
+0.70) before that; per 64-query prefill chunk 18 us at 8K (from 108) and 73
+at 32K (from 167).
+
+The split kernel's own latency chains were then cut (the token ids staged
+once per split, four K/V rows requested per step, one barrier for the four
+heads' softmax sums): split plus combine 48.9 to 42.5 us per layer at 8K
+and 86.2 to 76.8 at 32K, bit-identical. What remains in it is the per-token
+score and reduction chain: two redesigns without cross-simdgroup staging
+measured within 1.6 us of it. The GDN step walks its 128 x 128 state in
+register blocks of eight rows (19 to 16.3 us per layer), and the MoE down
+gather runs four simdgroups per row pair over alternate routed slots with
+the slot sums combined in slot order, bit-identical (23.8 to 22.3 us per
+layer, 413 GB/s for its 9.2 MB).
 
 The hyper-connection read is fused into two dispatches instead of six. The
 down kernel uses one threadgroup per output row with one simdgroup per
@@ -239,31 +260,31 @@ prompt). Weights are read once per chunk, 71.1 GB, which is 17.4 MB per
 token, 240 times less than decode's 4.1 GB per token. Adding activation
 traffic (the 84 MB wide residual read or written about eight times per layer,
 the MoE row gather, the intermediates) gives a bandwidth floor of about
-0.25 s per chunk. A chunk measures 2.95 s at an 8K prompt. **Prefill is
+0.25 s per chunk. A chunk measures about 1.8 s at an 8K real-text prompt
+(2.95 s when the sparse attention still ran per query). **Prefill is
 compute- and efficiency-bound, not bandwidth-bound.**
 
-Where a 4 096-token chunk goes at an 8K prompt:
+Where a 4 096-token chunk goes at an 8K prompt, per pass in the per-kernel
+profile:
 
-| kernel                                     | share | achieved   |
-|--------------------------------------------|-------|------------|
-| sparse attention (`qsa_attn_split`)        | 40.2% | 2.1 TFLOP/s |
-| grouped Q4 expert GEMM                     | 19.9% | 33 TFLOP/s |
-| dense bf16 GEMM (tensor ops)               | 18.8% | 54 TFLOP/s |
-| GDN prefill scan                           | 9.2%  | sequential recurrence (since: four value columns per simdgroup, 27% less) |
-| elementwise passes over the wide residual  | 3.7%  |            |
-| MoE input gather                           | 1.8%  | since: eight elements per thread, 2x |
+| kernel                                       | ms    | share | achieved   |
+|----------------------------------------------|------:|------:|------------|
+| grouped Q4 expert GEMM                       | 572   | 34%   | about 34 TFLOP/s |
+| dense bf16 GEMM (tensor ops)                 | 554   | 33%   | 54 TFLOP/s |
+| sparse attention over gathered rows + gather | 134 + 29 | 10% | about 25 TFLOP/s; the gather at 400 to 460 GB/s |
+| GDN prefill scan, chunked (scan + WY pass)   | 72 + 31 | 6%  | bound by streaming each chunk's rows |
+| hyper-connection mix and inject              | 79    | 5%    |            |
+| norms, MoE row gather and combine, convolutions, gates, indexer | 233 | 14% | |
 
-At a 1K prompt, where attention is dense, the grouped expert GEMM (40.4%) and
-the dense GEMM (29.3%) dominate instead.
+At a 1K prompt, where attention is dense, the grouped expert GEMM and the
+dense GEMM dominate alike. The per-query sparse-attention kernel had been the
+outlier: past the dense limit the whole chunk ran through the decode-style
+split kernel in 256-query sub-batches, score, select, then attend per query,
+gathering that query's 512 blocks of K and V with no reuse across queries and
+no tensor operations, 40% of the chunk at 2.1 TFLOP/s next to a dense kernel
+at 29 on the same head shapes.
 
-The sparse-attention prefill kernel is the outlier. Past the dense limit the
-whole chunk runs through the decode-style split kernel in 256-query
-sub-batches: score, select, then attend per query, gathering that query's
-512 blocks of K and V with no reuse across queries and no tensor operations.
-At 2.1 TFLOP/s next to a dense kernel at 29 on the same head shapes, it is
-the single largest remaining item in the engine.
-
-Two things address it. The rows of a chunk whose causal window still fits
+Two things addressed it. The rows of a chunk whose causal window still fits
 the budget (the prefix up to the dense limit) take the dense kernel, which
 is exact for them, and only the rest goes through the indexer. And the
 default route past the limit is now **tiled**: `qsa_tile_union` merges the
@@ -573,7 +594,7 @@ already mask per row. Such a position is restricted to single-row passes
 whose candidate range spans less than one indexer block, which keeps "at most
 one block completes" true.
 
-The GDN prefill scan of a chunk of 128 rows or more runs in chunked form
+The GDN prefill scan of a batch of 128 rows or more runs in chunked form
 on the tensor ops (`gdn_chunk_wy3` + `gdn_chunk_scan` in `gdn.metal`): the
 recurrence over each 64-token chunk is written as a WY product. A first
 pass, parallel over (chunk, key head), forms `A[i][j] = beta_i (k_i . k_j)

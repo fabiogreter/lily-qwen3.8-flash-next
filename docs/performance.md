@@ -1,8 +1,9 @@
 # Performance
 
-What the engine measures, how it was measured, and what is left on the table.
-Every number here is either **measured**, and then says under what
-conditions, or an **estimate**, and then says what assumption it rests on.
+What the engine measures, how it was measured, what was done to get there,
+what was tried and dropped, and what is left. Every number here is either
+**measured**, and then says under what conditions, or an **estimate**, and
+then says what assumption it rests on.
 
 ## Method
 
@@ -10,10 +11,14 @@ conditions, or an **estimate**, and then says what assumption it rests on.
   mains power, GPU otherwise idle. The benchmark refuses to start on battery.
 - **Model.** The full 48-layer Qwen3.8-Flash-Next conversion, 103.1 GB, with
   the draft head, `--ngram-preload` on.
-- **Prompts.** 1 024, 8 192 and 32 768 synthetic tokens. The token at
-  position `i` is `((i * 2654435761) mod 2^32) mod vocab_size`. It is not
-  text, and a model free-running on it takes a different trajectory from one
-  running on prose, which matters for draft acceptance.
+- **Prompts.** Real text: the first 1 024, 8 192 or 32 768 tokens of a file
+  cut from this repository's documentation and source and two sibling
+  repositories (`lily-bench --prompt-text`, `tools/bench/corpus.py`). The
+  matrices before 2026-09-18 used synthetic tokens (the token at position
+  `i` is `((i * 2654435761) mod 2^32) mod vocab_size`); a model free-running
+  on those takes a different trajectory from one running on prose, which
+  matters for draft acceptance and expert routing, so the two kinds of
+  matrix are not compared with each other.
 - **Decoding.** Greedy, 96 generated tokens per run, batch size 1.
 - **Repeats.** 3 per cell. A cell reports the median; the range in
   parentheses is the minimum and maximum and is the noise band to hold
@@ -31,6 +36,13 @@ conditions, or an **estimate**, and then says what assumption it rests on.
 - **3 to 4% between identical binaries.** Two runs of the same engine code
   differed by 3 to 4% in decode (80.4 against 77.3 tok/s at 1K, 69.6 against
   67.5 at 8K). Differences inside that band mean nothing.
+- **The GPU has two clock states under sustained load.** Through a day of
+  back-to-back kernel work the machine drifted between a fast and a slow
+  state (an 8 MB streaming probe at 487 against 372 GB/s, a 1K decode step
+  at 10.7 against 13.9 ms), sometimes between consecutive runs. Every
+  paired comparison in this document was taken within one state; the
+  `level_size_bandwidth_probe` line is the canary to run before trusting a
+  batch, and a pair whose two halves fell into different states was redone.
 - **Repeated large model loads distort everything.** This is the trap worth
   stating loudest. Each run loads 73 GB. After several back-to-back loads,
   with 7 to 10 GB of swap in use, runs measured **1.5 to 4 times slower**
@@ -66,76 +78,81 @@ conditions, or an **estimate**, and then says what assumption it rests on.
   and loses intra-level overlap. Against unprofiled spans: decode +14%,
   the 3-row verify pass +55 to 60%, the draft pass about +20%, prefill within
   1 to 4%. Rankings and shares from the profiler are reliable; absolute
-  milliseconds of tiny kernels are not. The prefill tables below are
-  production numbers, the decode ones are not.
+  milliseconds of tiny kernels are not. Where the decode step's time goes
+  was therefore measured with two production-shape tools instead (below).
+- **Draft acceptance is a property of one trajectory.** Over 256 greedy
+  tokens on one prompt the acceptance rate swings by 10 to 20 points
+  between two builds whose logits differ in the last bits, because the two
+  trajectories part at some near-tie and then sample different text. A
+  change to prefill numerics is judged by its logits against the previous
+  build's on the same prompt (`lily-probe`, top-64 of the last prefill
+  row) and by acceptance totals over several prompts, never by one cell.
 
 ## The numbers
 
-Measured 2026-09-17 at commit `7d2a0ac`, median of three repeats, range in
-parentheses, interleaved with the commit before that day's kernel work
-(`d7cf7a6`, in the second row of each table) right after a reboot (see the
-compositor note above). The README's table is the headline: real prompts
-over HTTP; these are the synthetic prompts of the fixed matrix.
+Measured 2026-09-18 at commit `8ec67f0` against the commit before that
+day's kernel work (`37cc34c`), interleaved per repeat, median of three,
+range in parentheses, on the first tokens of one real-text prompt
+(`docs/bench/prompts/p0.txt`). The README's table is the headline: fresh
+real prompts over HTTP at 4K to 64K; this is the fixed `lily-bench`
+matrix.
 
 ### Prefill, tok/s
 
-| commit    | 1K prompt         | 8K prompt         | 32K prompt        |
-|-----------|-------------------|-------------------|-------------------|
-| `7d2a0ac` | 1 940 (1 612 to 2 073) | 2 136 (1 938 to 2 137) | 1 562 (1 561 to 1 599) |
-| `d7cf7a6` | 1 893 (1 088 to 1 954) | 1 942 (1 941 to 2 009) | 1 445 (1 348 to 1 483) |
+| commit    | 1K prompt              | 8K prompt              | 32K prompt             |
+|-----------|------------------------|------------------------|------------------------|
+| `8ec67f0` | 2 118 (1 808 to 2 132) | 2 257 (2 050 to 2 277) | 2 051 (2 046 to 2 052) |
+| `37cc34c` | 1 901 (1 835 to 1 952) | 1 981 (1 926 to 2 110) | 1 747 (1 593 to 1 772) |
 
-The 1K column is unreliable and the 32K column is clock-limited, both for the
-reasons above. The 8K and 32K gains (10% and 8%) are the pipelined tile
-kernel, the four-column GDN scan and the vectorized MoE gather.
+11%, 14% and 17%: the chunked GDN scan on the tensor ops, the expert
+GEMM's last tiles at half and quarter height, and the sparse attention over
+gathered rows, all described below.
 
 ### Decode without drafts, tok/s
 
-| commit    | 1K prompt        | 8K prompt        | 32K prompt       |
-|-----------|------------------|------------------|------------------|
-| `7d2a0ac` | 85.2 (79.5 to 93.7) | 87.6 (86.0 to 87.6) | 83.7 (82.3 to 83.9) |
-| `d7cf7a6` | 88.1 (71.1 to 93.5) | 86.9 (86.9 to 87.4) | 82.5 (72.8 to 83.8) |
+| commit    | 1K prompt           | 8K prompt           | 32K prompt          |
+|-----------|---------------------|---------------------|---------------------|
+| `8ec67f0` | 93.9 (80.9 to 94.7) | 87.1 (83.0 to 88.8) | 85.5 (85.3 to 85.8) |
+| `37cc34c` | 93.1 (87.0 to 93.4) | 87.5 (85.2 to 87.6) | 83.3 (81.7 to 83.6) |
 
-Unchanged within the noise band: none of that day's commits touch the plain
-decode step.
+Within the band at 1K and 8K, 2.6% at 32K: the block selection over 512
+threads, the GDN state walk in register blocks, the split attention kernel's
+shorter latency chains and the four-simdgroup down gather are each a
+percent or less and grow with context.
 
 ### Decode with 2 drafts per step, tok/s
 
-| commit    | 1K prompt          | 8K prompt          | 32K prompt         |
-|-----------|--------------------|--------------------|--------------------|
-| `7d2a0ac` | 100.8 (93.3 to 113.2), 64% accepted | 118.1 (117.6 to 118.3), 76% accepted | 82.4 (79.9 to 101.5), 64% accepted |
-| `d7cf7a6` | 106.8 (85.1 to 115.1), 70% accepted | 118.4 (118.1 to 118.4), 80% accepted | 93.4 (90.1 to 101.3), 64% accepted |
+| commit    | 1K prompt                          | 8K prompt                           | 32K prompt                         |
+|-----------|------------------------------------|-------------------------------------|------------------------------------|
+| `8ec67f0` | 79.2 (70.2 to 80.4), 33% accepted  | 88.3 (85.0 to 89.7), 48% accepted   | 83.4 (82.8 to 84.5), 44% accepted  |
+| `37cc34c` | 93.1 (87.2 to 93.2), 46% accepted  | 100.7 (100.2 to 101.0), 59% accepted | 83.3 (77.7 to 85.7), 46% accepted |
 
-**The lower acceptance at `7d2a0ac` is the trajectory, not the sampling
-rework.** At 8K both commits emit the same 96 tokens (same digest) while
-the head's proposals differ (74 proposed and 59 accepted against 76 and
-58): the four-column GDN scan's fast-math contraction perturbs the draft
-head's near-ties on this random-token prompt. Running `7d2a0ac` with the
-single-column scan kept for comparison (`LILY_GDN_SCAN_KERNEL=gdn_prefill_
-regscan_c1`) reproduces `d7cf7a6`'s drafts and digests exactly (59/74 at
-96 steps, 152/208 at 256). The 1K and 32K speculative cells have ranges of
-20 tok/s on both commits; the greedy path itself is unchanged. Over six
-real-text prompts of 8K tokens (documentation and code, `lily-bench
---prompt-text`, 256 greedy tokens each) the two scans accept 45.5 / 74.3 /
-60.3 / 79.3 / 76.7 / 74.3% (one column) against 63.3 / 82.0 / 54.9 / 67.4 /
-82.0 / 76.7% (four columns), 68.4% against 71.1% on average with three
-prompts each way: acceptance over 256 tokens swings by 10 to 20 points
-with the trajectory, and the four-column scan is not systematically worse.
+**The lower speculative cells are this prompt's trajectory, not a slower
+engine.** The chunked GDN scan and the gathered-row attention change the
+order of floating-point operations, so the logits move in their last bits
+and the greedy continuation of this prompt parts from the old one at its
+second token at 1K and its fourth at 8K; the new continuation happens to be
+one the draft head predicts less well. Over the six real-text prompts the
+totals are 893 of 1 286 drafts accepted (69.4%) with the chunked scan
+against 897 of 1 278 (70.2%) with the serial one at 8K, and 873 of 1 326
+(65.8%) against 901 of 1 270 (70.9%) at 1K, where the whole gap is this one
+prompt (40.8 against 73.1%); on the full model the last prefill row's top-64
+logits differ between the two scans by a mean of 0.12 to 0.39 and at most
+1.2 where the top logit is about 17, the top token unchanged on all twelve
+prompt-and-length pairs, and the earlier one-column serial scan differs from
+the shipped one by 0.09 to 0.46 and at most 1.2 and flips one top token. The
+new kernels sit inside the rounding band the old ones already spanned. The
+HTTP table in the README, which gives every run a fresh prompt, is the
+measurement of speculative throughput; a single-prompt matrix cell is not.
 
-On the same real text (the first 8K tokens of the corpus, 256 tokens, 2
-drafts) the exact speculative sampling accepts 49 / 67 / 62% of sampled
-drafts over the sampler's three seeds where argmax drafting under the
-target-only rule accepted 66 / 57 / 46%, 2.19 against 2.13 tokens per
-step; the per-seed swing is again the trajectory, so three seeds bound
-the gain loosely at a few percent on prose and code.
+The matrix of the day before (synthetic prompts, `7d2a0ac` against
+`d7cf7a6`, right after the reboot that cleared the stuck compositor):
+prefill 2 136 against 1 942 tok/s at 8K and 1 562 against 1 445 at 32K
+(the pipelined tile kernel, the four-column GDN scan and the vectorized
+MoE gather), plain decode unchanged (87.6 against 86.9 at 8K), 2-draft
+decode 118.1 against 118.4 at 8K with the same 96 tokens emitted.
 
-**32K speculative cells are trajectory artifacts in general.** The 32K
-sequences with and without drafts diverge from one another at token 1 on
-this random token prompt, and an earlier matrix's cell fell into a run of a
-repeated special token that the draft head predicts poorly (37% accepted).
-The kernels involved do not depend on position, and the 4-layer differential
-test of the speculative step at position 33 000 passes. Acceptance on real
-code and prose has measured 66% over 86 000 generated tokens and 78 to 98%
-in shorter runs, so the synthetic figures are lower bounds.
+### Speculative decoding
 
 Speculative decoding changes no output: every emitted token is the trunk's
 own draw and the draft count changes only how many rows a pass confirms.
@@ -149,19 +166,124 @@ its proposals under the request's sampler and the verify rows running exact
 speculative sampling against them (`docs/architecture.md`), the same three
 seeds accept 65%, 67% and 65% (2.31 to 2.35 tokens per step), about 5% more
 tokens per step on this prompt, on which the head and the trunk disagree
-more than on text; the output distribution is unchanged by construction. Each sampled draw (two draft proposals and three verify rows per step
-under the defaults) then went from about 175 us on one threadgroup to about
-85 us in two phases (64 slices' top-k, then the draw over their union),
+more than on text; the output distribution is unchanged by construction. On
+real text (the first 8K tokens of the corpus, 256 tokens, 2 drafts) the
+exact scheme accepts 49 / 67 / 62% of sampled drafts over the sampler's
+three seeds where argmax drafting under the target-only rule accepted 66 /
+57 / 46%, 2.19 against 2.13 tokens per step; the per-seed swing is again the
+trajectory, so three seeds bound the gain loosely at a few percent on prose
+and code. Each sampled draw (two draft proposals and three verify rows per
+step under the defaults) takes about 85 us in two phases (64 slices' top-k,
+then the draw over their union), down from about 175 us on one threadgroup,
 about 0.45 ms per speculative step.
 
-Three drafts per step were measured again under the exact scheme (8K
-synthetic prompt, 256 tokens, `7d2a0ac`, healthy machine): greedy 113.9
-tok/s with two drafts against 100.8 with three (72% against 57% of drafts
-accepted), and the sampler's three seeds 111.9 / 101.3 / 106.0 against
-96.6 / 106.1 / 98.7 (71 / 61 / 64% against 55 / 64 / 57%). Two drafts
-remain the default: the third position is accepted rarely enough that the
-extra verify row and draft pass cost more than it returns, on this prompt
-and on real text earlier (`README.md`).
+Three drafts per step were measured under the exact scheme (8K synthetic
+prompt, 256 tokens, healthy machine): greedy 113.9 tok/s with two drafts
+against 100.8 with three (72% against 57% of drafts accepted), and the
+sampler's three seeds 111.9 / 101.3 / 106.0 against 96.6 / 106.1 / 98.7. Two
+drafts remain the default: the third position is accepted rarely enough that
+the extra verify row and draft pass cost more than it returns, on this prompt
+and on real text over HTTP (below).
+
+Acceptance on real code and prose has measured 66% over 86 000 generated
+tokens and 78 to 98% in shorter runs; synthetic-prompt figures are lower
+bounds, and the 32K cells of the synthetic matrices were trajectory artifacts
+(the sequences with and without drafts diverging at token 1, one cell
+falling into a run of a repeated special token that the head predicts
+poorly). The kernels involved do not depend on position, and the 4-layer
+differential test of the speculative step at position 33 000 passes.
+
+### Against llama.cpp
+
+Measured with `tools/bench/http_bench.py`, which drives both servers over
+HTTP with the same prompts and reads each engine's own timings. The other
+side is Unsloth's llama.cpp fork (build b11007, Unsloth Studio 2026.9.5)
+serving `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ4_XS, 87 GB, KV cache f16,
+four slots over a unified 131 072-token context, flash attention off because
+the fork aborts at startup with it on for this model, measured 2026-09-17.
+lily's rows are from 2026-09-18 at commit `8ec67f0` with `--max-seq 131072`
+and the disk tier off so that no run could hit a cache (the records under
+`docs/bench/2026-09-18-http/`); its rows of 2026-09-17 at commit `0c9ee63`
+are kept in the second table for the record.
+
+- **Prompts.** Cut from this repository's documentation and source with the
+  model's tokenizer, a fresh region of the corpus for every run, at 1K, 4K,
+  16K, 32K and 64K tokens. The 1K prefill column is not reported: it sits
+  inside the GPU's clock ramp (see above).
+- **Generation.** 256 greedy tokens of new text, a task unrelated to the
+  prompt. The fork's default speculation is an n-gram drafter that copies
+  from the context; on a "continue the document" task it reached full
+  acceptance and four times plain decode by copying, which says nothing about
+  generating. On new text it gains nothing (11% acceptance) and is left out.
+- **Repeats.** Three, interleaved per repeat, ten seconds between runs;
+  medians.
+- **Both models at once do not fit** in 128 GB, so the two sides ran one
+  after the other with the other server stopped.
+
+Prefill, tok/s:
+
+| context | lily `8ec67f0` | lily `0c9ee63` | llama.cpp | ratio, current |
+|--------:|---------------:|---------------:|----------:|---------------:|
+| 4 096   | 1 416   | 1 300 | 887 | 1.60x |
+| 16 384  | 1 706  | 1 546 | 882 | 1.93x |
+| 32 768  | 1 677  | 1 499 | 713 | 2.35x |
+| 65 536  | 1 624  | 1 382 | 550 | 2.95x |
+
+Decode, tok/s:
+
+| context | lily plain | lily 2 drafts | llama.cpp plain | llama.cpp MTP 2 | ratio, best against best |
+|--------:|-----------:|--------------:|----------------:|----------------:|-------------------------:|
+| 1 024   | 85.8  | 103.3  | 42.0 | 54.7 | 1.89x |
+| 4 096   | 86.7  | 95.9  | 39.1 | 51.8 | 1.85x |
+| 16 384  | 85.4 | 98.8 | 31.4 | 44.1 | 2.24x |
+| 32 768  | 84.8 | 94.4 | 25.2 | 37.0 | 2.55x |
+| 65 536  | 81.7 | 94.1 | 17.0 | 27.0 | 3.49x |
+
+lily's prefill column is the server as shipped, with the draft head
+loaded and caught up during prefill; without it (`--mtp-drafts 0`) the
+same runs measured 1 471 / 1 807 / 1 811 / 1 710. Its decode rows of
+2026-09-17 were 90.2 / 86.0 / 85.5 / 83.9 / 81.8 plain and 98.9 / 101.7 /
+102.0 / 101.5 / 97.7 with two drafts; the speculative medians of a
+three-prompt cell move with which prompts the corpus offsets land on (the
+2-draft cells of 2026-09-18 range from 89.9 to 112.1 within one context
+length), the plain rows do not. Draft
+acceptance at two drafts per step was 64% on lily over the 2026-09-18
+runs (63% on 2026-09-17) and 66% on the fork, so the head behaves alike in
+both engines. At three drafts both fell to 50 to 53% and decoded slower than
+at two (lily 83 to 94 tok/s, the fork 25 to 51), so three is not worth it on
+either.
+
+**The fork's MTP needs a patched build.** Unsloth Studio's shipped build
+aborts while loading the MTP drafter (`GGML_ASSERT(ggml_can_repeat)` in the
+qwen4exp MTP graph; the draft head's `hc_head_norm` tensor is declared with
+a shape the trunk's norms moved away from) and then starts a third time
+without any drafter while its settings page still says MTP. The bug is
+reported on the fork's MTP pull request and in unslothai/unsloth issue
+11143 with a one-line fix; the MTP rows above come from a build of the same
+source with that fix. Everything else is the shipped build.
+
+**Prompt cache behaviour**, tokens recomputed out of the prompt, from the
+harness's `cache` test with lily's disk tier on (2026-09-17):
+
+| request | lily | llama.cpp |
+|---|---|---|
+| the same 16K prefix, first new question | 16 404 (full), then a durable entry | 512 |
+| the same prefix, later questions | 1 to 16 | 512 to 516 |
+| a conversation growing 575 tokens per turn | about 535, in 0.49 s | about 535, in 0.87 s |
+| six 12K conversations interleaved, second round | 25 each, in 0.15 s | 25 each, in 0.31 s |
+
+The fork resumes from a checkpoint below the divergence and recomputes about
+512 tokens every time. lily's checkpoint sits at the end of the previous
+prompt, so the first divergence recomputes the prompt and writes a durable
+prefix entry; from then on the tail alone is recomputed. Both engines keep
+more conversations than the fork's four slots, the fork through a host-RAM
+cache of evicted slots.
+
+Caveats: the quantizations differ (affine 4-bit, group 64, against IQ4_XS at
+4.25 bits per weight); llama.cpp's `prompt_ms` and lily's `prefill_ms` both
+include their engine's own bookkeeping around the prefill, and lily's
+includes the recurrent-state checkpoint; and the fork ran with flash
+attention off, its only working configuration for this model that day.
 
 ### Against mlx-lm
 
@@ -222,353 +344,215 @@ figures for an M5 Max: MTPLX (Apache-2.0) reports 79 tok/s at 9K and 61 at
 109K with its MTP path under the model's default sampling, 44 plain, and
 810 tok/s prefill at 131K; oMLX reports 58 to 70 tok/s with its speculative
 path in its 0.7.0 development builds. None of these were measured with this
-harness, so they are cited, not compared; lily's plain decode of 82 to 86 in
-the table below exceeds their speculative figures, and its 2-draft rate is
-measured greedily, which is worth about 10 % over sampled drafting.
+harness, so they are cited, not compared; lily's plain decode of 82 to 87
+exceeds their speculative figures, and its 2-draft rate is measured greedily,
+which is worth about 10% over sampled drafting.
 
-### Against llama.cpp
+### Smaller machines
 
-Measured 2026-09-17 with `tools/bench/http_bench.py`, which drives both
-servers over HTTP with the same prompts and reads each engine's own timings.
-The other side is Unsloth's llama.cpp fork (build b11007, Unsloth Studio
-2026.9.5) serving `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ4_XS, 87 GB, KV
-cache f16, four slots over a unified 131 072-token context, flash attention
-off because the fork aborts at startup with it on for this model. lily ran
-commit 0c9ee63 with `--max-seq 131072`, the disk tier off for the matrix so
-that no run could hit a cache.
+On a machine whose memory cannot hold the checkpoint the engine keeps a
+usage-ranked share of the routed experts on the GPU and reads the rest from
+the checkpoint as they are routed to (`docs/low-ram-experts.md`). Measured
+with the reads cold under a 60 GB locked balloon, as on a 64 GB machine,
+on the 8K real-text prompt with 256 generated tokens, digests identical to
+the resident path: 929 tok/s prefill and 64.4 tok/s plain
+decode at commit `8ec67f0` (977 and 54.6 at `37cc34c` the day before; the
+cold runs' misses depend on what the page cache still holds), against 2 257 and
+87 with everything resident. Speculative decoding is off under the cache
+because its three trunk passes per step each pay the per-layer handshake
+and the misses (14 to 15 tok/s with it on).
 
-- **Prompts.** Cut from this repository's documentation and source with the
-  model's tokenizer, a fresh region of the corpus for every run, at 1K, 4K,
-  16K, 32K and 64K tokens. The 1K column is not reported: it sits inside the
-  GPU's clock ramp (see above) and lily's runs there ranged from 631 to
-  1 679 tok/s.
-- **Generation.** 256 greedy tokens of new text, a task unrelated to the
-  prompt. The fork's default speculation is an n-gram drafter that copies
-  from the context; on a "continue the document" task it reached full
-  acceptance and four times plain decode by copying, which says nothing about
-  generating. On new text it gains nothing (11 % acceptance) and is left out.
-- **Repeats.** Three, interleaved per repeat, ten seconds between runs;
-  medians, ranges in the records under `docs/bench/2026-09-17-vs-unsloth/`.
-- **Both models at once do not fit** in 128 GB, so the two sides ran one
-  after the other with the other server stopped.
+## What was done
 
-Prefill, tok/s:
+Grouped by the phase it serves. Each item names the measurement that kept
+it; the kernel-level detail is in `docs/architecture.md`.
 
-| context | lily | llama.cpp | ratio |
-|--------:|-----:|----------:|------:|
-| 4 096   | 1 300 | 887 | 1.47x |
-| 16 384  | 1 546 | 882 | 1.75x |
-| 32 768  | 1 499 | 713 | 2.10x |
-| 65 536  | 1 382 | 550 | 2.51x |
+### Prefill
 
-Decode, tok/s:
+A 4 096-token chunk reads the weights once (17.4 MB per token) and is bound
+by compute and kernel efficiency, not bandwidth. Where a chunk of an 8K
+real-text prompt goes, per pass in the per-kernel profile, `37cc34c`
+against `8ec67f0` in one clock state (the dense GEMM, untouched, reads
+557 against 554 ms in the two):
 
-| context | lily plain | lily 2 drafts | llama.cpp plain | llama.cpp MTP 2 | ratio, best against best |
-|--------:|-----------:|--------------:|----------------:|----------------:|-------------------------:|
-| 1 024   | 90.2 | 98.9  | 42.0 | 54.7 | 1.81x |
-| 4 096   | 86.0 | 101.7 | 39.1 | 51.8 | 1.96x |
-| 16 384  | 85.5 | 102.0 | 31.4 | 44.1 | 2.31x |
-| 32 768  | 83.9 | 101.5 | 25.2 | 37.0 | 2.74x |
-| 65 536  | 81.8 | 97.7  | 17.0 | 27.0 | 3.62x |
+| kernel | `37cc34c` ms | `8ec67f0` ms | share now |
+|---|---:|---:|---:|
+| grouped Q4 expert GEMM (`gemm_q4_nt_nax_grouped_t64x4`) | 669 | 572 | 34% |
+| dense bf16 tensor-op GEMM (`gemm_bf16_nt_nax`) | 558 | 554 | 33% |
+| sparse attention past the limit (`qsa_attn_tile_nax_h1`, then `qsa_attn_rows_nax_h1` + `qsa_tile_gather`) | 278 | 134 + 29 | 10% |
+| GDN prefill scan (`gdn_prefill_regscan`, then `gdn_chunk_scan` + `gdn_chunk_wy3`) | 176 | 72 + 31 | 6% |
+| hyper-connection mix and inject | 81 | 79 | 5% |
+| norms, the MoE row gather and combine, convolutions, gates, scores, selection, dequant | 236 | 233 | 14% |
+| kernel sum per pass | 1 998 | 1 702 | |
 
-Draft acceptance at two drafts per step was 63 % on lily and 66 % on the
-fork, so the head behaves alike in both engines. At three drafts both fell to
-50 to 53 % and decoded slower than at two (lily 83 to 94 tok/s, the fork
-25 to 51), so three is not worth it on either.
+The dense GEMM runs at 54 TFLOP/s, the ceiling this GPU reached on any
+shape; the expert GEMM at about 34 by the same accounting. The kept work,
+in order of size:
 
-**The fork's MTP needs a patched build.** Unsloth Studio's shipped build
-aborts while loading the MTP drafter (`GGML_ASSERT(ggml_can_repeat)` in the
-qwen4exp MTP graph; the draft head's `hc_head_norm` tensor is declared with
-a shape the trunk's norms moved away from) and then starts a third time
-without any drafter while its settings page still says MTP. The bug is
-reported on the fork's MTP pull request and in unslothai/unsloth issue
-11143 with a one-line fix; the MTP rows above come from a build of the same
-source with that fix. Everything else is the shipped build.
+1. **Tiled sparse attention over gathered rows.** Past the dense limit the
+   per-query kernel attended to each query's 512 selected blocks with no
+   reuse and no tensor operations, 40% of the chunk at 2.1 TFLOP/s. The
+   tiled route merges 16 consecutive queries' selections into one block list
+   with a query mask per block (on real text the union is 1.9 times one
+   query's selection at 8K and 3.2 at 32K, against 16 for disjoint
+   selections), and then, after a first tiled kernel that staged the union's
+   rows into threadgroup memory 32 at a time, `qsa_tile_gather` copies the
+   union's K and V rows once per KV head into a contiguous 512 MB device
+   scratch and `qsa_attn_rows_nax_h1` runs the dense kernel's tensor-op loop
+   over them, one query head per threadgroup. Per pass past the limit in the
+   full model's profile: 1 200 ms (per query) to 290 (staged tiles) to
+   153 + 35 (gathered rows) at 8K, 1 480 to about 570 to about 300 + 78 at
+   32K. The gathered-row kernel runs at about 25 TFLOP/s, the dense kernel's
+   rate; the gather is bandwidth-bound at 400 to 460 GB/s. Its rounding
+   differs from the per-query kernel's (a different slice height changes the
+   online softmax's order); the 4-layer tile-against-split comparison stays
+   within 0.011 on a logit scale of 2.93. The rows of a chunk whose causal
+   window fits the budget take the dense kernel, which is exact for them.
+2. **The expert GEMM's last tiles.** With about 80 routed rows per expert per
+   chunk, 64-row tiles padded the rows by 47% and the tensor work on the
+   padding was what the kernel paid for (a row-tile sweep, 32 / 64 / 96 /
+   128 rows, had put every other height further behind). An expert's last
+   tile now runs its product at the smallest of the full, half and quarter
+   heights that covers its rows, bit-identical: padding 10%, the three
+   grouped GEMMs per 8K prefill 573 to 583 ms against 666 to 677 in paired
+   profiles (14% off the kernel), 628 against 710 per 32K prefill, 229 to
+   232 against 246 per 1K prefill.
+3. **The GDN prefill scan in chunked form on the tensor ops.** The scan over
+   a chunk's rows was a token-serial recurrence, one simdgroup per head; it
+   first gained four value columns per simdgroup (384 to 281 ms per 8K chunk
+   in the profile), and then left the serial form for batches of 128 rows or
+   more: 64-token chunks in WY form, a parallel pass forming and inverting
+   each chunk's `I + A` and a sequential pass per head and block of 16 state
+   columns carrying the fp32 state. In paired profiles per 8K prefill 99 to
+   109 ms against 171 to 190, per 1K 26 against 51, per 32K 116 to 125
+   against 191. The scan pass is bound by streaming each chunk's rows into
+   the cores, not by the products (with cache-resident operands it took
+   0.49 of its 1.9 ms). Against the per-token CPU reference its outputs are
+   as close as the serial scan's and its final state within 0.5% of scale
+   (serial 0.2%); the 4-layer golden gaps went from 0.025 / 0.043 to 0.028 /
+   0.045 with argmax agreement unchanged; on the full model its logits sit
+   inside the band the serial variants already span (above). A batch's
+   ragged tail continues through the serial scan, which also serves the
+   verify passes and records the per-row states the rollback needs.
+4. **The block selection without serial steps**: a radix select over the
+   block scores with scan-picked digits and one compaction scan, 15.6 to
+   2.6 ms per 8K prefill and 30.1 to 13.1 per 32K; then 512 threads per
+   query. **The MoE input gather** moving eight bf16 elements per thread on
+   its aligned rows, 1.07 to 0.52 ms per call, about 26 ms per 8K chunk.
+   **The dense rows below the limit** through the dense kernel.
 
-**Prompt cache behaviour**, tokens recomputed out of the prompt, from the
-harness's `cache` test with lily's disk tier on:
+### Decode
 
-| request | lily | llama.cpp |
+A decode step reads about 4.4 GB for one token (4.135 GB of weights, the
+226 MB of GDN state, 25 to 50 MB of attention caches), so it is bandwidth
+work, and the engine's job is not to waste bandwidth and not to wait
+between steps. At `8ec67f0` a 1K step takes 10.5 to 10.7 ms in the fast
+clock state, about 415 GB/s. What got it there:
+
+1. **The transport.** One command buffer per step, level barriers between
+   dependency levels instead of a barrier after every dispatch, the next
+   step encoded and committed while the current one runs and parked on a
+   shared event until the host has staged its n-gram rows, the accepted
+   draft count and the chained positions decided on the GPU and read by
+   later dispatches as inline parameters. The host is not on the critical
+   path of either loop; the measured GPU idle between a verify and a draft
+   pass is 0.013 ms.
+2. **The hyper-connection read** fused from six dispatches to two, with the
+   RMS normalization folded into the down projection; **the sampler** on the
+   GPU with a two-phase top-k (64 slices, then the union) so that only the
+   token id crosses to the host.
+3. **Sparse attention at decode.** 64-token splits and one threadgroup per
+   four query heads (1.64 to 0.49 ms per 8K step for the kernel, the combine
+   0.07 to 0.17); the block selection without serial steps (0.41 to 0.21 ms
+   per 8K step, 0.70 to 0.59 at 32K) and then over 512 threads per query
+   (16.7 to 7.8 us per query at 8K, 31.3 to 15.7 at 32K; 1 024 threads gave
+   the gain back); the split kernel's latency chains cut (token ids staged
+   once, four rows in flight, one barrier for the four heads' softmax sums):
+   split plus combine 48.9 to 42.5 us per layer at 8K and 86.2 to 76.8 at
+   32K. All bit-identical.
+4. **The GDN step** with the state walked in register blocks of eight rows,
+   19 to 16.3 us per layer; **the MoE down gather** with four simdgroups per
+   row pair taking alternate routed slots, 23.8 to 22.3 us per layer (385 to
+   413 GB/s), the slot sums combined in slot order so the result is
+   bit-identical. Both under the step's noise on their own; together with
+   item 3 about one percent at 1K and 2.6% at 32K in the matrix above.
+5. **The verify pass's skinny GEMMs** computing two rows per simdgroup with
+   each activation block loaded once, 5.80 to 5.46 ms per profiled 3-row
+   pass (the Q8 one 1.41 to 1.14).
+
+### Speculative decoding
+
+The draft head's proposals verified in one batched trunk pass with
+acceptance by exact equality; the accepted count decided on the GPU; the
+rollback from recorded per-row GDN states with no recomputation; and, under
+sampling, the head drawing its proposals from its own distribution with the
+request's sampler and the verify rows running exact speculative sampling
+against them (`min(1, p / q)`, the residual `max(0, p - q)`), which changes
+no output distribution and accepts 65 to 67% of sampled proposals against 55
+to 65% for argmax proposals on the synthetic prompt. Two drafts per step.
+
+### Smaller machines
+
+The expert cache: a slab of expert slots on the GPU, a slot table per layer,
+a service thread that resolves each MoE layer's routed experts between the
+router and the gather through a shared-event handshake, placement by a
+usage ranking with a small LRU region, misses read straight into the slot
+on 16 threads. Engaged from physical memory, or `--memory-gb`; nothing
+changes on a machine that fits the checkpoint. `docs/low-ram-experts.md`.
+
+## What was tried and dropped
+
+Every one of these measured slower, or equal, in a paired comparison, and
+none is kept behind a knob. The reason is what the measurement said.
+
+### Prefill
+
+| tried | measured | why it lost |
 |---|---|---|
-| the same 16K prefix, first new question | 16 404 (full), then a durable entry | 512 |
-| the same prefix, later questions | 1 to 16 | 512 to 516 |
-| a conversation growing 575 tokens per turn | about 535, in 0.49 s | about 535, in 0.87 s |
-| six 12K conversations interleaved, second round | 25 each, in 0.15 s | 25 each, in 0.31 s |
+| grouped expert GEMM with a 128-deep K step (half the B-tile barriers per FLOP) | within 2% of the 64-deep one | the barriers were not the cost |
+| grouped expert GEMM row tiles of 32, 96 and 128 rows | 645 / 659 / 698 to 759 ms against 593 to 622 per chunk | tensor work on padded rows; solved instead by the last-tile heights |
+| a 32-query tile for the staged attention kernel | 4.68 against 3.89 ms per 256-query dispatch at 8K, 13.1 against 7.6 at 32K | the union grows faster than the reuse; the kernel was bound per slice, not per gather |
+| the staged attention kernel with 8 simdgroups, 16-row slices, two staged slices, two heads per pass | all slower | same: a serial chain of gathered fetches, dependent tensor ops and barriers per slice |
+| the staged attention kernel with 12 KB more threadgroup memory (an occupancy probe) | 12 to 14% slower | it already ran more than one threadgroup per core; no occupancy lever there |
+| the gathered-row attention with 64-key slices | 2.49 against 1.98 ms | fewer keys per tensor op |
+| the gather double-buffered (each group's gather on the previous group's level) | 3.14 against 2.76 and 5.78 against 5.06 ms by the clock | the two groups' rows compete for the cache that the single group fits |
+| the gather split over eight threadgroups per tile | no change | bandwidth-bound either way |
+| a row scratch of 1.1 GB (every tile at once) or 256 MB (three tiles) instead of 512 MB | equal at 32K and 7% slower at 8K; 60 to 70% slower | a group's rows fitting the cache matters more than dispatch width |
+| the chunked GDN scan with 8, 32, 64 or 128 state columns per threadgroup | 3.8 / 2.2 / 2.8 / 3.2 ms against 1.9 (16 columns) | narrower doubles the row bytes, wider runs too few threadgroups to hide the dependent-product latency |
+| the chunked GDN scan with eight simdgroups, pre-transposed keys, next-chunk prefetch touches, fp16 operand copies | no gain | the pass streams rows; none of these change the bytes |
+| the four-column serial scan kept for batches over 128 rows | 171 to 190 against 99 to 109 ms per 8K prefill | the serial recurrence |
+| fusing the elementwise glue (about 9% of a chunk) | not built | the profile shows no dispatch paying a launch floor at these sizes |
 
-The fork resumes from a checkpoint below the divergence and recomputes about
-512 tokens every time. lily's checkpoint sits at the end of the previous
-prompt, so the first divergence recomputes the prompt and writes a durable
-prefix entry; from then on the tail alone is recomputed. Both engines keep
-more conversations than the fork's four slots, the fork through a host-RAM
-cache of evicted slots.
+### Decode
 
-Caveats: the quantizations differ (affine 4-bit, group 64, against IQ4_XS at
-4.25 bits per weight); llama.cpp's `prompt_ms` and lily's `prefill_ms` both
-include their engine's own bookkeeping around the prefill, and lily's
-includes the recurrent-state checkpoint; and the fork ran with flash
-attention off, its only working configuration for this model that day.
+| tried | measured | why it lost |
+|---|---|---|
+| the write-gate inject folded into the branch matvec's and the MoE combine's epilogues (96 dispatches fewer, bit-identical) | 6.6 to 6.8 ms over the three kernels against 6.3 to 6.7 | the epilogues cost what the inject kernel cost; a tiny level between streaming levels is free |
+| same-level matvecs folded into one four-set GEMV dispatch (router, shared expert, attention and indexer projections, PLE keys and values: 110 dispatches fewer, bit-identical) | 92.8 against 93.2 tok/s at 1K over three interleaved pairs, within noise at 8K | dispatches on one level already overlap; only levels cost |
+| the router GEMV with the top-k run by its last threadgroup (48 levels fewer, 661 against 709) | 10.55 / 10.61 against 10.54 / 10.54 ms per step; one wrong selection in 2 400 chained dispatches | the top-k level was free (its 0.35 ms ablation figure was an artifact of stale routing hitting cache); the cross-threadgroup handoff is not trustworthy on this GPU |
+| expert gathers with every weight block requested up front | 2.30 against 1.21 ms (down) and 2.08 against 1.90 (gate/up) per 1K step, 82 against 92 tok/s | the registers the prefetch holds cost more occupancy than the stalls it hides |
+| the down gather with two routed slots per iteration; one row per simdgroup over 32 lanes; five, eight or ten simdgroups per row pair | 22.9 against 23.7 us; 23.6 to 23.9; 22.3 to 22.8 | at the level ceiling for its 9 MB; four simdgroups took the last 1.5 us |
+| the hyper-connection down kernel's streams over two simdgroups; its five weight blocks per lane requested up front; an unroll pragma; the up kernel's epilogue loads hoisted; the reads with their activation or weight loads stripped | 9.2 to 14.2 us against 8.7 to 10.6; the stripped variants no faster | within 10% of the 4 MB level ceiling; neither the activations nor the weights are the limiter |
+| the decode matvecs through the one-row register-A skinny kernel | 4.08 to 4.12 ms against 3.90 to 4.07 for the 192 Q4 projections; the routers 0.64 against 0.50 | isolation rates (three times faster on the routers) do not survive the chain |
+| the split attention kernel with a barrier-free lane-per-token design; 32-token splits; a 128-thread threadgroup; the combine's prologue parallelized | 82 us against 49; 58; 3 us faster but reorders the reductions; noise and not bit-identical | the barriers and staging were not the cost |
+| the split attention kernel with eight K rows in flight and the V rows requested before the softmax barriers; one threadgroup per K/V head and split with no cross-simdgroup staging (bit-identical) | 49.5 against 44.4 us; 42.8 against 44.4 at 8K and 43.3 against 44.4 at 32K | register pressure; and 1.6 us was not worth a new kernel, since what remains is the per-token score and reduction chain |
+| the GDN step with 16- or 32-row register blocks, or the head split over thread groups or column groups | equal, not bit-identical; 15 to 16 us | no faster than eight rows |
+| the pacer's sleeps scaled by the measured 25% `nanosleep` overshoot | 93.1 against 93.1 tok/s | the shipped pacer's own adaptation already covers it |
+| three drafts per step | 100.8 against 113.9 tok/s greedy, 96.6 to 106.1 against 101.3 to 111.9 sampled | the third draft is accepted too rarely for its verify row and draft pass |
 
-## Known limits and remaining levers
+### Smaller machines
 
-Ranked by expected gain per unit of effort for one interactive coding agent
-with long prompts. The evidence in each is measured; the upside in each is an
-estimate with its assumption named.
+Transparent paging of memory-mapped GPU buffers (the GPU faults random
+2.8 MB expert slices at 64 ms each, 16 KB pages one at a time), a blocking
+wait in the cache's service thread (30% of decode against 7% spinning), and
+speculative decoding under the cache (14 to 15 tok/s against 55 plain).
 
-1. **The sparse-attention prefill kernel.** Measured: 40.2% of every prefill
-   chunk past the dense limit, running at 2.1 TFLOP/s next to a dense
-   attention kernel at 29 TFLOP/s on the same head shapes, because it
-   attends per query and gathers that query's 512 blocks with no reuse and no
-   tensor operations. Estimated: 8K prefill from 1 396 to about 1 950 to
-   2 100 tok/s and 32K from 1 195 to about 1 700 to 1 900, assuming a
-   block-gathered tensor-op kernel reaches a quarter to a half of the dense
-   rate and that neighbouring queries' selected blocks overlap enough to
-   share, which is **not measured**. Highest effort in this list.
-   *Done since* (branch `sparse-prefill-tiles`): the overlap measured 1.9x
-   one query's selection per 16-query tile at 8K and 3.2x at 32K on real
-   text; the tiled tensor-op route cuts the chunk's sparse attention from
-   about 1 200 to 350 ms at 8K and 1 480 to 850 ms at 32K, prefill to about
-   1 700 tok/s at 8K and 1 450 at 32K in single profile runs, the dense
-   kernel taking the rows below the limit besides (`docs/architecture.md`).
-   The one-head tile kernel then had its K/V gathers software-pipelined
-   (the slice's V rows and the next slice's K rows fetched into registers
-   under the tensor ops): 18 to 25% off the kernel per 8K chunk and 12 to
-   15% per 32K chunk in paired profile runs, about 4% and 5% of the chunk.
-   The GDN prefill scan then went from one to four value columns per
-   simdgroup (the per-token k, q and gate loads shared): 384 to 281 ms per
-   8K chunk in paired profile runs, 27% of the kernel and about 3% of the
-   chunk. Its results differ from the single-column scan only by fast-math
-   contraction, which is enough to move the 8K greedy speculative
-   trajectory (the digest 9e5cd959e0842bc7 of the earlier rows became
-   74f9aab8ea2e7f87, 151/210 drafts accepted instead of 152/208); the
-   4-layer golden gaps shrank slightly. The scan then left the token-serial
-   form for prefill batches of 128 rows or more: the chunked WY form on the
-   tensor ops (64-token chunks; a parallel pass forms and inverts each
-   chunk's `I + A`, a sequential pass per head and block of 16 state columns
-   carries the state; `docs/architecture.md`). Per dispatch at the chunk
-   shape on the profile transport, 0.84 + 1.9 ms against 4.7; in paired
-   kernel profiles per 8K prefill (two chunks) 99 to 109 ms against 171 to
-   190, per 1K prefill 26 against 51, per 32K prefill 116 to 125 against
-   191: about 4% of the 8K prefill and 3% of the 32K one. The scan pass is
-   bound by streaming each chunk's rows into the cores, not by the
-   products (with every threadgroup reading one head's cache-resident rows
-   it took 0.49 ms, the same as with no products at all); wider column
-   blocks read fewer bytes but ran too few threadgroups to hide the
-   dependent-product latency (32: 2.2 ms, 64: 2.8, 128 with the state
-   copy in device memory: 3.2), narrower ones doubled the bytes (8: 3.8),
-   and touching the next chunk's lines ahead, pre-transposed keys and
-   eight simdgroups did not help. Its results differ from the serial scan
-   by the bf16 rounding of the state and pseudo-value reads (against the
-   per-token CPU reference the output error is the serial scan's, the
-   final state's 0.5% of scale against 0.2%; the 4-layer golden gaps
-   0.028 / 0.045 against 0.025 / 0.043, argmax agreement unchanged), which
-   moves every digest; over the six real 8K prompts greedy 2-draft
-   acceptance averaged 65.0% against 68.7% with the serial scan (46.0 /
-   76.3 / 50.0 / 79.7 / 76.3 / 61.6 against 59.1 / 76.3 / 59.1 / 67.1 /
-   83.3 / 67.1), the same kind of per-prompt swing as between the one- and
-   four-column serial scans. Over 256 steps the totals are 893 of 1 286
-   drafts accepted (69.4%) against 897 of 1 278 (70.2%) at 8K and 873 of
-   1 326 (65.8%) against 901 of 1 270 (70.9%) at 1K, the 1K gap being one
-   prompt (40.8 against 73.1%, the two trajectories parting at the second
-   token). On the full model the last prefill row's top-64 logits
-   (`lily-probe`, six prompts at about 1K and 8K tokens) differ from the
-   four-column serial scan's by a mean of 0.12 to 0.39 and at most 1.2 where the
-   top logit is about 17, the top token unchanged on all twelve; the
-   one-column serial scan differs from it by 0.09 to 0.46 and at most 1.2
-   and flips one top token. The chunked scan sits inside the rounding band
-   the serial variants already span. The MoE input gather (one bf16 element per thread) now moves eight
-   per thread on its 16-byte-aligned rows: 1.07 to 0.52 ms per call at the
-   chunk shape, about 26 ms per 8K chunk (1.3%). A 128-deep K step for the
-   grouped expert GEMM (half the B-tile barriers per FLOP) measured within
-   2% of the 64-deep one in paired profiles and was not kept.
-   The grouped expert GEMM's row tile was swept afterwards on the 4096-token
-   chunk (about 80 routed rows per expert): 32 rows 645 ms, 64 rows 593 to
-   622, 96 rows 659, 128 rows 759 (four simdgroups) and 698 (eight), so the
-   shipped 64-row tile stays and the tensor work on padded rows, not the
-   dequant staging, is what the kernel pays for. The padding then went
-   instead: an expert's last tile, which usually holds fewer rows than the
-   tile height, runs its product at the smallest of the full, half and
-   quarter heights that covers its rows (the block map, the dequant
-   staging and the results are unchanged, bit for bit). On the measured
-   routing histogram 64-row tiles pad the rows by 47% and the mixed
-   heights by 10%; in paired kernel profiles the three grouped GEMMs per
-   8K prefill took 573 to 583 ms against 666 to 677 (14% off the kernel,
-   about 4.5% of the prefill), per 32K prefill 628 against 710, and with
-   the 32-row tile of the 1K prefill 229 to 232 against 246 over four
-   interleaved pairs (7%). A 32-query tile for the
-   one-head kernel (twice the queries per staged slice; the union grows
-   from 1 935 to 2 065 blocks per tile at 8K and 3 676 to 5 610 at 32K in
-   the harness, so each query fetches about half the rows) measured slower
-   everywhere: 4.68 against 3.89 ms per 256-query dispatch at 8K and 13.1
-   against 7.6 at 32K on the profile transport, 410 to 426 against 324 ms
-   per 8K chunk in paired kernel profiles. The kernel is bound by its
-   per-slice softmax and tensor-op work, not by the gathers, so the next
-   lever there is per-slice cost or occupancy, not tile height. The
-   occupancy was then probed: the same kernel declaring 12 KB more
-   threadgroup memory (32 KB in all) measured 4.45 against 3.90 ms per
-   256-query dispatch at 8K and 8.5 against 7.6 at 32K in the harness, so
-   at its 20 KB the kernel already runs more than one threadgroup per
-   core and a diet below 16 KB would buy one more; with 32 staged rows the
-   K/V staging alone is 16 KB (16 rows per slice measured slower earlier,
-   and the tensor ops take the slice height in multiples of 16), so that
-   diet is not available to this design. Taking the kernel apart in the
-   harness at 8K (min ms per 256-query dispatch of 24 heads) showed why:
-   3.88 whole, 3.31 with the softmax arithmetic skipped, 2.15 with no QK
-   product, 3.41 with no P.V product, 0.34 with neither, 2.05 with the K/V
-   fetches skipped; the removals do not add, because each 32-row slice is
-   a serial chain of gathered fetches, two dependent tensor ops and five
-   barriers that only the three threadgroups a core holds overlap. The
-   dense kernel has none of that: 128-key slices read by the tensor ops
-   straight from device memory, 12 KB of threadgroup memory. So the
-   staged design was replaced: `qsa_tile_gather` copies each tile's union
-   rows (K, V and the per-row query mask) once per KV head into a
-   contiguous device scratch, and `qsa_attn_rows_nax_h1` runs the dense
-   kernel's loop over them, one query head per threadgroup with a tile's
-   heads adjacent so they share the rows in cache. Harness: 1.98 + 0.61
-   (gather) against 3.87 ms at 8K and 3.64 + 1.21 against 7.61 at 32K;
-   by the clock on production-shape passes 2.76 against 4.09 and 5.06
-   against 7.78. In paired kernel profiles on the full model the sparse
-   attention of a pass went from 290 to 153 + 35 ms at 8K (5.4% of the
-   pass) and from 565 to 573 down to 295 to 303 + 78 at 32K (8.6%), 32K
-   prefill 1 937 and 1 871 against 1 789 and 1 811 tok/s; by the clock,
-   three interleaved pairs at 32K gave 1 700, 1 734 and 1 723 against
-   1 600, 1 639 and 1 596 tok/s (6%) and at 8K 1 876, 1 934 and 2 117
-   against 1 846, 1 894 and 2 087 (2%; the GEMMs in the same passes read
-   2 to 9% slower next to the new kernels in four profile pairs, in
-   either order, which is inside the machine's drift band but consistent
-   enough to note). The gather is
-   bandwidth-bound at 400 to 460 GB/s (splitting it over eight
-   threadgroups per tile changed nothing); 64-key slices measured 2.49
-   against 1.98; gathering and attending in two groups of eight tiles
-   with each group's gather on the previous group's level (a double
-   buffer) measured 3.14 against 2.76 and 5.78 against 5.06 by the clock,
-   so in the harness the scratch would hold every tile of a batch. In the
-   model's profile, where a real prompt's unions are about half the
-   harness's, the opposite holds: with a 512 MB scratch (six of the
-   sixteen tiles per group at 32K contexts and beyond) the attention
-   kernel took 136 to 141 ms per 8K pass against 146 to 149 with 1.1 GB
-   (every tile at once) and the gather 29 against 34, equal within noise
-   at 32K, and with 256 MB (three tiles) 232 to 328 and 617 to 623; a
-   group's rows fitting the cache matters more than dispatch width, so
-   the scratch is 512 MB (`LILY_QSA_ROWS_MB`). The staged kernels
-   (`_h1`, `_h2`, `_h4`, `_plain`) were dropped. The
-   tile route's digests move (a different slice height changes the online
-   softmax's order); the 4-layer tile-against-split comparison stays
-   within 0.011 on a logit scale of 2.93.
-2. **The verify pass's kernel shapes.** Measured: for the same 1.64 GB of
-   dense weights a 3-row verify pass spends 8.04 ms in the register-resident
-   skinny Q4 GEMM where a decode step spends 3.85 ms in the 2-row GEMV, about
-   205 GB/s against 420; the m3 hyper-connection kernels show the same
-   pattern. Estimated: +7 to +15% speculative tok/s at every context length
-   from closing half that gap, assuming the loss is weight streaming in the
-   skinny kernel rather than anything intrinsic to the row count.
-   *Partly done since*: the register-A skinny kernels compute two rows per
-   simdgroup, load each activation block once and dot the raw codes like
-   the decode GEMV; in isolation the 3-row kernel streams 360 to 540 GB/s on
-   the model's shapes, in the profiled verify pass it went from 5.80 to 5.46
-   ms (the Q8 one from 1.41 to 1.14), about 5% of the pass, so most of the
-   gap is elsewhere in the pass. Splitting each stream of the
-   hyper-connection down kernels over two simdgroups was measured slower
-   (9.2 to 9.8 us at one row, 12.8 to 14.2 at three) and not kept; so were
-   three more variants of the single-row pair, timed per dispatch on the
-   profile transport against the shipped kernels (which measure 8.7 to 9.3
-   us for the down read and 10.0 to 10.6 for the up read, 320 to 360 GB/s):
-   the down kernel's five weight blocks per lane requested up front (20.5
-   us), an unroll pragma on its loop (11.7), and the up kernel's epilogue
-   loads hoisted ahead of its weight walk (13.4). The `fused_read_kernels_
-   dispatch_timing` test is the harness for that comparison. Routing
-   the decode step's own matvecs through the one-row register-A kernel was
-   measured in the profiled 8K step and not kept either: the 192 dense Q4
-   projections took 4.08 to 4.12 ms against 3.90 to 4.07 with the packed
-   GEMV and the 96 Q8 router matvecs 0.64 against 0.50 to 0.52, although in
-   isolation the routers had streamed three times faster through it (the
-   `skinny_reg_vs_gemv_timing` test now covers every decode shape).
-3. **The sparse-attention occupancy parameter at decode.** Measured: with a
-   512-block budget and a 256-token split the decode dispatch is 18
-   threadgroups on a 40-core GPU, 134 us per call at 31 GB/s; with block
-   selection and scoring that is 2.2 to 2.5 ms of a 12.9 to 13.2 ms step past
-   2 051 tokens. Estimated: +10 to +14% plain decode at 8K and beyond, and
-   comparable for the verify pass, assuming 4 to 8 times the threadgroups
-   brings the kernel near the dense split kernel's rate. The split count is
-   already a parameter of the existing kernel, so this is the cheapest item
-   to test. *Done since*: 64-token splits and one threadgroup per four query
-   heads for batches of up to four rows take the kernel from 1.64 to 0.49 ms
-   per decode step at 8K (the combine from 0.07 to 0.17), about 8% of the
-   step; the verify pass's from 1.98 to 1.32 ms. The block selection, a
-   single threadgroup per query, was then rewritten without serial steps
-   (scan-picked radix digits, simd-aggregated counting of the top digit,
-   thread-contiguous blocks compacted with one scan): 0.41 to 0.21 ms per
-   decode step at 8K, 0.70 to 0.59 at 32K, 0.46 to 0.30 per verify pass at
-   8K, and 15.6 to 2.6 ms per 8K prefill (30.1 to 13.1 per 32K prefill).
-   At 32K the 32 blocks each thread walks per pass are what remains.
-   *Then*: the selection threadgroup went from 256 threads (one per radix
-   bin) to 512, the extra threads only shortening each thread's walk: 8K
-   decode 16.7 to 7.8 us per query, 32K 31.3 to 15.7, the verify rows
-   alike; 1 024 threads gave the gain back to the wider scans. Exact, so
-   bit-identical.
-4. **Dispatch fusion in the decode graph.** Measured: about 966 dispatches
-   per step, with a 1.4 us floor for a trivial dispatch plus barrier, and the
-   fused hyper-connection kernels reading 0.68 GB at about 315 GB/s against
-   the 575 GB/s probe. Estimated: 0.4 to 0.7 ms per step (4 to 6%) from
-   halving the dispatch count, plus 0.6 to 1.0 ms from the down kernel's
-   occupancy; the upper bound if every dispatch paid the floor would be
-   1.35 ms. *Measured since*: folding the write-gate inject into the
-   epilogues of the branch matvec and the MoE combine (96 dispatches fewer
-   per step, bit-identical) cost as much in those kernels' epilogues as the
-   inject kernel took (6.6 to 6.8 ms over the three kernels against 6.3 to
-   6.7 in paired profiles), so the 989 dispatches stay; the floor is not
-   what those dispatches pay. Folding same-level matvecs into one dispatch
-   (the router, the shared expert's gate|up and the shared gate over the
-   FFN input; the attention and indexer projections; the PLE key and value
-   projections: 110 dispatches fewer per step, bit-identical through a
-   four-set GEMV kernel) measured 92.8 against 93.2 tok/s at 1K over three
-   interleaved pairs and within noise at 8K, and was not kept: dispatches
-   on one level of the concurrent encoder already overlap, so only levels
-   (barriers) cost. *Measured since* (the section below): a step has 709
-   levels at 1K, a level holding a tiny kernel between two streaming ones
-   costs nothing (the 96 inject levels ablate to 0.00 ms), and what a
-   streaming level pays is its own ramp and drain, 2 to 4 us for a read
-   of a few megabytes; removing or merging levels of tiny kernels is
-   therefore not a lever either. The expert
-   gathers with their weight blocks requested up front (every routed
-   expert's block per lane in the down kernel, every block of the lane's
-   row in the gate/up kernel; bit-identical) measured slower in paired 1K
-   profiles, 2.30 against 1.21 ms per step for the down kernel and 2.08
-   against 1.90 for gate/up, and 82.2 against 91.6 tok/s unprofiled: the
-   registers the prefetch holds cost more occupancy than the stalls it
-   hides. Not kept.
-5. **Continuous batching across sessions.** Measured: an extra row in a
-   verify pass costs about 3 ms on a 12 to 13 ms base, because it adds its
-   own experts but shares the 2.8 GB of dense weights. Estimated: x1.5 to
-   x1.7 aggregate throughput for two concurrent sessions and x2 to x2.3 for
-   three, at unchanged or slightly worse per-session latency, assuming item 2
-   is fixed first so the batched rows do not pay the skinny-GEMM penalty.
-   This is the only item that changes the engine's shape: per-row cache
-   pointers and positions in every attention, GDN and n-gram kernel, per-row
-   sampler state, and a scheduler that admits and retires sessions per step.
+## Where the decode step's time goes
 
-Two smaller ones, for completeness. The decode loop's pacer sleeps until
-1.5 ms before the predicted step end and then polls; `nanosleep` on this
-machine overshoots by 25% of the requested time (timer coalescing, capped
-at 5 ms), and a pacer that scaled its requests by the measured overshoot
-measured 93.1 against 93.1 tok/s at 1K over three interleaved pairs, so
-the shipped pacer's own adaptation already covers it. The disk tier writes on the engine thread
-at eviction time, measured at 0.10 to 0.37 s for 21 000 to 100 000 tokens and
-once 1.17 s; copying to host memory and writing from a background thread
-would take that off the request path, but it only bites under a tight cache
-budget. And the LM head already runs at the probed peak, so it is not a
-lever.
-
-Where bytes could be saved instead of time (3-bit experts, Q4
-hyper-connection mixers, 8-bit KV), the quality cost is **not measured**, and
-the 4-layer Hugging Face comparison cannot see expert quantization error at
-scale. A perplexity or task run on the full model would have to come first.
-
-### Where the decode step's time goes
-
-Measured on 2026-09-18 (branch `decode-explore`) with two tools that time the
-production shape, because the per-kernel profile mode (one command buffer
-per dispatch) sums to 14.1 ms for a 1K step that runs in 10.7 and cannot
-say where the gap to the bandwidth floor sits.
+Measured 2026-09-18 with two tools that time the production shape, because
+the per-kernel profile mode (one command buffer per dispatch) sums to 14.1
+ms for a 1K step that runs in 10.7 and cannot say where the gap to the
+bandwidth floor sits.
 
 **The level chain.** `lily-bench --gpu-timing` counts the dependency levels
 (barriers) a step encodes: 709 at 1K, 733 past the dense limit. A pure
@@ -578,7 +562,8 @@ but 479 to 487 GB/s when each level reads 8 MB, 459 at 4 MB, 306 to 404 at
 2 MB and 176 at 1 MB: every streaming level pays its own ramp and drain,
 about 2 to 4 us. The step's floor is therefore the sum of its levels' bytes
 at those per-size ceilings, not the 4.37 GB it reads at 600 GB/s (7.3 ms);
-at the mix of level sizes the step has, that floor is about 9.3 ms.
+at the mix of level sizes the step has, that floor is about 9.3 ms, and the
+step runs within 10 to 15% of it.
 
 **Marginal costs.** `LILY_ABLATE=group` skips a kernel group's dispatches
 (and the levels only it occupies); the step time without it is the group's
@@ -591,104 +576,117 @@ cost in the chain. At 1K (GPU span per step, median of 96, the whole step
 | hyper-connection reads (97 pairs) | 1.97 | 0.68 GB | 345 |
 | MoE (router, top-k, gathers, shared) | 3.72 | 1.52 GB | 409 |
 | of which the expert gathers | 3.01 | 1.32 GB | 440 |
-| of which the top-k level (48 tiny levels) | 0.35 | | 7 us per level |
 | of which the shared-expert matvecs | 0.00 | 0.13 GB | overlap the router and gather levels |
 | attention layers (12) | 0.90 at 1K, 1.58 at 8K, 2.76 at 32K | | |
 | GDN conv + step + out projection | 1.57 | | |
 | LM head | 0.57 | 0.36 GB | at peak |
 | the 96 inject levels | 0.00 | | a tiny level between streaming kernels is free |
 
+The top-k level is not in the table: skipping it "saved" 0.35 ms only
+because the stale indices then routed every slot to one expert whose rows
+the gathers read from cache (skipping the selection kernel alone "saved"
+0.97 ms the same way); the fused-router experiment above measured its real
+cost as nothing.
+
 **Kernels in their chain.** The chained harnesses (`*_chain_timing`, one
-dispatch per layer over distinct weights, a barrier between, best of
-several passes) put each family against the level ceiling of its size:
-the expert gate/up gather at 35.4 us for 18.4 MB (521 GB/s, at the 16 MB
-ceiling), the down gather 23.7 us for 9.2 MB (390; two routed slots per
-simdgroup iteration instead of one measured 22.9 and was not kept; it
-now runs four simdgroups per row pair taking alternate slots, 22.3 us at
-413 GB/s, bit-identical, with five, eight and ten simdgroups at 22.3 to
-22.8 and one row per simdgroup over all 32 lanes no better at any count;
-in the model the 1.5 us per layer sit under the step's noise), the
-hyper-connection pair 16.9 us for 7 MB as two 3.5 MB levels (413 and 428
-GB/s each, within 10% of the 4 MB ceiling; variants with the activation
-loads or the weight loads removed showed neither is the limiter, and the
-kernels were already tuned three ways in an earlier pass), the GDN step
-19 us for 6.2 MB of state (taken to 16.3 by the register blocks; splitting
-the head over thread groups or column groups measured the same 15 to 16),
-the router top-k 4.3 us per level against a 1.35 us floor. The dense
-GEMVs read 24 MB levels at the peak. What remains at 1K after the kept
-changes is about 0.1 ms in the hyper-connection reads, one percent.
+dispatch per layer over distinct weights, a barrier between, warmed for 300
+ms first because the clock ramps, best of several passes) put each family
+against the level ceiling of its size: the expert gate/up gather at 35.4 us
+for 18.4 MB (521 GB/s, at the 16 MB ceiling), the down gather 22.3 us for
+9.2 MB (413), the hyper-connection pair 16.9 us for 7 MB as two 3.5 MB
+levels (413 and 428 GB/s each, within 10% of the 4 MB ceiling), the GDN step
+16.3 us for 6.2 MB of state, the dense GEMVs' 24 MB levels at the peak.
+What remains at 1K is about 0.1 ms in the hyper-connection reads, one
+percent.
 
-**The top-k level is free.** The 0.35 ms the ablation charged to it is an
-artifact: with the selection skipped the stale indices route every slot to
-one expert, and the gathers read one expert's rows ten times over from
-cache. Skipping the selection kernel alone measured 0.97 ms for the same
-reason. The real measure was a fused router (the Q8 router GEMV with the
-selection run by the last threadgroup to finish, the logits handed over
-through relaxed atomics; 48 levels fewer per step, 661 against 709): 10.55
-and 10.61 ms per step against 10.54 and 10.54 over three interleaved pairs
-at 1K, nothing. A tiny level between two streaming levels costs what the
-inject levels cost, nothing, and the fused kernel was not kept; its
-cross-threadgroup handoff also produced one wrong selection in 2 400
-chained layer dispatches of the bit-identity test, so the pattern is not
-trustworthy on this GPU either.
+**Attention past 2K.** The branch costs 0.90 ms at 1K, 1.58 at 8K and 2.76
+at 32K. Per layer at 32K in the chain: block scores 12 us, the selection 16,
+the split kernel about 40 and its combine 5 to 8. The split kernel's 40 us
+for 4 MB of K/V is structural: with its V loads removed it measured 2.5 us
+less and with its K loads removed 5.4 less, and the two redesigns in the
+table above showed the barriers and staging are not the rest either, so
+what remains is its per-token score and reduction chain, which only a
+reordering of the arithmetic (rounding moves) could shorten. The kernel
+measures the same at 8K and 32K in the chain; the 32K step's extra
+attention cost is in the block selection (0.14 to 0.44 ms per step in the
+profile) and the block scores.
 
-**Attention past 2K.** The branch costs 0.90 ms at 1K, 1.58 at 8K and
-2.76 at 32K. Per layer at 32K in the chain: block scores 12 us, the
-selection 31 (now 16), the split kernel about 40 and its combine 5 to 8.
-The split kernel's 40 us for 4 MB of K/V is structural: with its V loads
-removed it measured 2.5 us less and with its K loads removed 5.4 less, so
-the rest is the barriers, the cross-simdgroup staging and the per-token
-reductions of the eight-simdgroup design. Cutting its latency chains
-(token ids staged once, four rows requested per step, one barrier for the
-four heads' softmax sums, two heads staged per barrier pair) took the
-split-plus-combine pair from 48.9 to 42.5 us at 8K and 86.2 to 76.8 at
-32K, bit-identical. Not kept: a 128-thread threadgroup (3 us faster,
-reorders the reductions), a barrier-free one-simdgroup-per-split design
-with lanes owning tokens for the scores and dims for the values (82 us),
-32-token splits (58 us), and a combine kernel with its statistics
-prologue parallelized (within noise, and not bit-identical because
-fast-math reassociates the serial sum it replaced). Two more, measured
-in the warmed chain (`sparse_decode_chain_timing` now runs untimed rounds
-for 300 ms first; cold it read 90 us per layer against 44 to 45 warm):
-all eight K rows of a simdgroup requested at once with its V rows
-requested before the softmax barriers (49.5 against 44.4 us, register
-pressure), and a redesign with one threadgroup per K/V head and split
-holding one simdgroup per query head, each walking the whole split with
-no cross-simdgroup staging and one barrier for the token ids, bit-identical
-through eight accumulators per lane (42.8 against 44.4 at 8K, 43.3
-against 44.4 at 32K). The 1.6 us per layer were not kept: the barriers
-and staging were not the cost, so what remains in the split kernel is its
-per-token score and reduction chain, which only a reordering of the
-arithmetic (rounding moves) could shorten. The kernel measures the same
-at 8K and 32K in the chain; in the model the 32K step's extra attention
-cost is in the block selection (0.14 to 0.44 ms per step in the profile)
-and the block scores, not the split kernel.
+## What is left, and what is out of scope
 
-**Kept, with the paired in-model result** (interleaved base/final runs on
-p0.txt, 96 steps): plain
-decode at 1K 10.67/10.68/10.65 ms per step (base) against 10.58/10.60/10.60
-(final), 91.5 against 92.4 tok/s; at 8K, where the machine changed clock
-state mid-batch, 11.39 against 11.18 ms in the first pair and within 0.05
-ms in the two slower pairs, 85.7 against 86.9 tok/s in the fast pair;
-with two drafts 93.0 against 93.3 tok/s at 1K and 98.1 against 99.5 at
-8K, the same 46 of 100 and 52 of 88 drafts accepted. Every digest is
-unchanged (plain d66084da31d95a1c and 9d9ad65da00e33ad, speculative
-a9de616648498453 and d413fc8311fcbbab). About one percent at 1K and one
-to two at 8K, as the chained harnesses predicted; the gains grow with
-context (the selection and split kernels scale with it).
+**Decode is at its floor for this design.** The step is a chain of about
+709 barrier-separated levels, each a true data dependency, each reading 3
+to 24 MB, and a streaming dispatch reaches only 460 to 485 GB/s at those
+sizes. Every kernel family sits within about 10% of that ceiling, every
+fusion and folding of levels measured a wash because tiny levels are free
+and streaming levels pay their own ramp regardless, and the remaining
+per-kernel items are a percent each. The 2 ms between the step and the
+7.3 ms its bytes would take at 600 GB/s is the ramp and drain of those
+levels. Three things would attack it, and none belongs in this server:
 
-**The machine's clock state.** Both streams' measurements drifted between
-a fast and a slow GPU state during this work (the 8 MB level probe at 487
-against 372 GB/s, a 1K step at 10.7 against 13.9 ms) while the other
-worktree ran prefill kernels; every comparison above is paired within one
-state, and the probe line is the canary to run before trusting a batch.
-The second round's closing pairs (base 5f815b6 against the four-simdgroup
-gather, p0.txt, median GPU span per step) drifted the same way: at 1K
-11.34/11.15/10.72 ms against 12.75/10.66/10.49, at 8K 11.28/11.19 against
-11.20/11.20, at 32K 11.70 against 11.48 (one pair, 64 steps); with two
-drafts 86.5 against 87.8 tok/s at 8K and 79.6 against 79.8 at 1K, the
-same drafts accepted; every digest unchanged (3046f489a837c310,
-35a5cf1f2b25d0ce, 3ee310fa14c80068, fe9c573893eeb992, d588021698d20eeb).
+- **Weight streams issued before the barrier.** The weights (4.4 GB of the
+  traffic) depend on nothing; only the kilobytes of activations do. A
+  persistent kernel whose threadgroups load the next level's weight rows
+  and then spin on a device-memory counter until the previous level is done
+  would keep the weight stream running through the ramp and drain. It is
+  what the megakernel work on other hardware does, and here it would
+  recover at most the in-model shortfalls of the hyper-connection reads and
+  the gathers, about 0.5 to 0.6 ms (5% at 1K), bounded by how many weight
+  bytes the waiting threadgroups can hold. Its failure mode is a GPU hang:
+  a waiting threadgroup that occupies a core its producer needs deadlocks
+  the GPU, Metal promises no forward progress, and the residency the scheme
+  depends on belongs to whatever else the GPU is running, a browser tab or
+  the compositor. On a dedicated inference box one could size the grid to
+  residency; on the daily-driver laptop this server is meant to run on in
+  the background, one cannot, and no measurement changes that.
+- **Prefetch touches into the system level cache.** A dependency-free
+  dispatch on each level reading the next level's weights so the dependent
+  kernel finds them in cache. It rests on the cache keeping a level's bytes
+  across a streaming neighbour, which nothing documents and which any other
+  application streaming through the cache would undo: a performance that
+  varies with what the user is doing, the wrong property for a background
+  server.
+- **Reordering the split attention kernel's score arithmetic** at long
+  context, one to two percent at 32K, at the cost of moving the rounding
+  of every decode step; and **continuous batching across sessions**, x1.5
+  to x1.7 aggregate throughput for two concurrent sessions by the measured
+  3 ms an extra verify row costs, which changes the engine's shape (per-row
+  cache pointers and positions in every attention, GDN and n-gram kernel,
+  per-row sampler state, a scheduler that admits and retires sessions per
+  step) for a server that serves one agent at a time by design.
+
+**Prefill has two levers left, both against ceilings already measured.**
+The grouped expert GEMM runs at about 34 TFLOP/s against the dense GEMM's
+54 on the same GPU, 34% of the chunk; with padding at 10% and the K step and
+tile heights swept, what separates them is the per-tile dequantization and
+the expert-grouped B tiles, and closing the gap would be a new kernel with
+no measured design to point at. The gathered-row attention runs at the dense
+kernel's rate and its gather is at bandwidth, so the only lever there is
+gathering less, which the tile union already sets. The GDN scan streams
+rows at the level ceiling. The elementwise glue is 9% of a chunk in about
+180 dispatches none of which pays a launch floor.
+
+**Where bytes could be saved instead of time** (3-bit experts, Q4
+hyper-connection mixers, 8-bit KV), the quality cost is **not measured**, and
+the 4-layer Hugging Face comparison cannot see expert quantization error at
+scale. A perplexity or task run on the full model would have to come first,
+and the fork's goal is the model at this precision.
+
+**Smaller machines.** A usage ranking that includes decode-time routing, a
+larger LRU region (30% measured 6.9% against 8.8% of decode lookups missing,
+at the price of prefill misses), and 8 192-token prefill chunks as the
+default under the cache (cold: 1 161 against 945 tok/s prefill, 59.9
+against 54.4 decode at `37cc34c`; kept opt-in behind `LILY_PREFILL_CHUNK`
+because under an extreme balloon it produced a timing-dependent digest that
+no other configuration did). All three want a run on a real 64 GB machine
+rather than a balloon.
+
+**Two small ones.** The disk tier writes on the engine thread at eviction
+time, 0.10 to 0.37 s for 21 000 to 100 000 tokens and once 1.17 s; a
+background writer would take that off the request path, but it only bites
+under a tight cache budget. And the draft head's proposals leave penalties
+out, so a request with penalties drafts from a distribution that is not the
+trunk's kept one; the verify rows correct it exactly, at a lower acceptance
+that has not been measured.
 
 ## Reproducing this
 
@@ -702,6 +700,7 @@ the GPU.
 target/release/lily-bench \
   --model ~/models/Qwen3.8-Flash-Next-lily-q4 \
   --prompt-len 8192 \
+  --prompt-text docs/bench/prompts/p0.txt \
   --decode-steps 96 \
   --ngram-preload \
   --gpu-timing \
@@ -710,9 +709,12 @@ target/release/lily-bench \
 
 | flag               | meaning                                                                 |
 |--------------------|-------------------------------------------------------------------------|
-| `--prompt-len N`   | synthetic prompt length                                                 |
+| `--prompt-len N`   | prompt length in tokens                                                 |
+| `--prompt-text F`  | the first `N` tokens of this file under the model's tokenizer; without it a synthetic token sequence |
 | `--decode-steps N` | generated tokens (96 for the matrix below)                              |
 | `--drafts N`       | measure speculative decoding with N drafts per step and report acceptance instead of the one-token loop |
+| `--sample`         | draw with the checkpoint's sampler defaults instead of greedily (`--seed`) |
+| `--memory-gb G`    | plan for a machine with this much memory (engages the expert cache)     |
 | `--ngram-preload`  | stream the paged n-gram table through the page cache before measuring   |
 | `--gpu-timing`     | add command-buffer GPU timestamps and host marks, and print the levels per step |
 | `--kernel-profile` | per-kernel GPU times per pass; wall-clock results under this flag are not comparable to a normal run |
@@ -721,7 +723,13 @@ target/release/lily-bench \
 `LILY_ABLATE=hc,inject,gdn_proj,gdn_step,attn,head,ple,moe,router,shared,topk,gather,down`
 (any subset) skips those kernel groups' dispatches in the decode graph; the
 results are garbage, the step time without a group is its marginal cost in
-the level chain.
+the level chain. `LILY_GDN_SCAN_KERNEL=gdn_prefill_regscan` routes every
+prefill through the token-serial scan, `LILY_QSA_ROUTE=split` through the
+per-query attention kernel, for comparisons against the shipped kernels.
+The timing harnesses (`cargo test --release --lib -- --ignored <name>`):
+`level_size_bandwidth_probe`, the `*_chain_timing` tests per kernel family,
+`tiled_attention_timing`, `gdn_prefill_scan_timing`; each takes an env
+variable listing the kernel variants to rotate, named in its source.
 
 ### The matrix
 
@@ -730,17 +738,29 @@ the level chain.
 summarizes the records with `tools/bench/summarize.py`.
 
 ```sh
-tools/bench/timeline.sh --note "what changed"
-tools/bench/timeline.sh --commit <old> --commit HEAD --cooldown 20
+tools/bench/timeline.sh --prompt-text docs/bench/prompts/p0.txt --note "what changed"
+tools/bench/timeline.sh --commit <old> --commit HEAD --prompt-text docs/bench/prompts/p0.txt
 ```
 
 With several `--commit` flags it builds them all first, in worktrees under
 `target/timeline/`, and then interleaves them per repeat. `HEAD` or
 `worktree` means the working tree, labelled `-dirty` when tracked sources are
-modified. It refuses to start on battery power unless told
-`--allow-battery`, runs only when invoked, and costs about 10 minutes of GPU
-time per commit. Each run's JSON, a `run.json` with the commit, note, power
-source and host, and a `.env.txt` with swap, paging counters and the thermal
-level land in `docs/bench/<date>-<sha>/`. Those records and the timeline
-document `summarize.py` writes are local output, not part of the published
+modified. `--prompt-text` runs every cell on real text and refuses a commit
+whose `lily-bench` lacks the flag, so the cells stay comparable. It refuses
+to start on battery power unless told `--allow-battery`, runs only when
+invoked, and costs about 10 minutes of GPU time per commit. Each run's JSON,
+a `run.json` with the commit, note, power source and host, and a `.env.txt`
+with swap, paging counters and the thermal level land in
+`docs/bench/<date>-<sha>/`. Those records and the timeline document
+`summarize.py` writes are local output, not part of the published
 repository.
+
+### Over HTTP
+
+`tools/bench/http_bench.py matrix` drives a running server (lily, or a
+llama.cpp one) with fresh real-text prompts at 1K, 4K, 16K, 32K and 64K
+tokens, three interleaved repeats, 256 greedy tokens of new text, and
+`report` prints the medians from the records; `cache` measures what a prompt
+cache gives back. It needs the `tokenizers` package (`uv venv tools/.venv;
+uv pip install --python tools/.venv/bin/python tokenizers`). The README's
+table comes from it.

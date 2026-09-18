@@ -7,11 +7,13 @@ than mlx-lm ([their write-up](https://www.perplexity.ai/hub/blog/optimizing-on-d
 The fork ports that engine to Qwen3.8-Flash-Next's architecture and tunes it
 for this one model on this class of machine: the model runs as hand-written
 Metal kernels, decode steps are pipelined so the GPU does not wait for the
-host, speculative decoding uses the model's own draft head, and conversations
-are cached across requests, forks and restarts.
+host, speculative decoding uses the model's own draft head, conversations
+are cached across requests, forks and restarts, and on a machine with half
+the memory the checkpoint needs it keeps the busiest experts resident and
+reads the rest on demand.
 
 Measured against Unsloth's llama.cpp fork with the same model, prompts and
-machine, prefill is 1.5 to 2.5 times faster and decode 2 to 3.6 times
+machine, prefill is 1.6 to 3 times faster and decode 1.8 to 3.5 times
 faster; the difference grows with context.
 
 ## Performance
@@ -19,44 +21,49 @@ faster; the difference grows with context.
 M5 Max, 40-core GPU, 128 GB. Same prompts on both engines, cut from real
 documentation and code, a fresh prompt for every run, 256 greedy tokens of
 new text, medians of three interleaved repeats, each engine's own timings
-over HTTP.
+over HTTP. This fork at commit `8ec67f0` (2026-09-18), llama.cpp on
+2026-09-17.
 
 | tokens per second | 4K context | 16K | 32K | 64K |
 |---|---:|---:|---:|---:|
-| **prefill** this fork | 1 300 | 1 546 | 1 499 | 1 382 |
+| **prefill** this fork | 1 416 | 1 706 | 1 677 | 1 624 |
 | prefill llama.cpp | 887 | 882 | 713 | 550 |
-| **decode** this fork, 2 drafts | 102 | 102 | 102 | 98 |
+| **decode** this fork, 2 drafts | 96 | 99 | 94 | 94 |
 | decode llama.cpp, MTP 2 drafts | 52 | 44 | 37 | 27 |
-| decode this fork, no drafts | 86 | 86 | 84 | 82 |
+| decode this fork, no drafts | 87 | 85 | 85 | 82 |
 | decode llama.cpp, no drafts | 39 | 31 | 25 | 17 |
 
 The fork's decode is nearly flat from 1K to 64K because the architecture allows
 it and the sparse-attention kernels keep the cost of context at a few percent
 of a step. Both engines were also run with three drafts per step; acceptance
 fell to about 50 % and decode was slower than with two, so those rows are
-left out.
+left out. A speculative cell is the median over three prompts whose draft
+acceptance differs (64 % over all runs), so its noise band is wider than
+the plain rows'.
 
 The quantizations differ slightly: the fork's affine 4-bit with group 64 against
 llama.cpp's UD-IQ4_XS. The llama.cpp MTP rows come from a build with a
-one-line fix that the shipped one lacks. Method, noise band and the full
-record: [docs/performance.md](docs/performance.md).
+one-line fix that the shipped one lacks. Method, noise band, the fixed
+`lily-bench` matrix and the full record: [docs/performance.md](docs/performance.md).
 
 ### Smaller machines
 
-The checkpoint is 104.6 GB, most of it the 68 GB of routed experts. On a
-machine whose memory cannot hold it the engine keeps a usage-ranked
-two thirds (or whatever fits) of the experts on the GPU and reads the
-rest from the checkpoint files as they are routed to, sized automatically
-from physical memory; nothing changes on a machine that fits it.
-Measured with the reads cold, as on a 64 GB machine: about 950 tok/s
-prefill and 55 tok/s plain decode on an 8K real-text prompt, against
-2 100 and 86 with everything resident. Speculative decoding is off there
-because its extra trunk passes cost more than they return. Nothing to
-configure: the server sizes it from the machine's memory; `--memory-gb 64`
-plans for that much instead (also the way to try the mode on a bigger
-machine), and an `expert-usage.json` next to the checkpoint (the one
-measured for this model is `tools/bench/expert-usage-qwen38-flash-next.json`)
-tells it which experts to keep. Details, measurements and knobs:
+The checkpoint is 104.6 GB, most of it the 68 GB of routed experts, and
+the fork runs it on machines that cannot hold all of that. On a 64 GB
+machine the engine keeps a usage-ranked two thirds of the experts on the
+GPU and reads the rest from the checkpoint files as they are routed to,
+sized automatically from physical memory; nothing changes on a machine
+that fits it. Measured with the reads cold, as on a 64 GB machine, on an
+8K real-text prompt: about 930 tok/s prefill and 55 to 65 tok/s plain
+decode, against 2 250 and 87 with everything resident, with the same
+tokens produced. Speculative decoding is off there because its extra trunk
+passes cost more than they return. Nothing to configure: the server sizes
+it from the machine's memory and keeps 12 GB or a sixth of it free for
+everything else; `--memory-gb 64` plans for that much instead (also the
+way to try the mode on a bigger machine), and an `expert-usage.json` next
+to the checkpoint (the one measured for this model is
+`tools/bench/expert-usage-qwen38-flash-next.json`) tells it which experts
+to keep. Details, measurements and knobs:
 [docs/low-ram-experts.md](docs/low-ram-experts.md); `lily-experts`
 measures the expert usage that places them.
 
@@ -92,8 +99,10 @@ rather than uploaded. The layout is documented in
 ## Running it
 
 You need an Apple GPU of family 10 or later (M5 and newer), macOS 26 for
-Metal 4 and tensor operations, 128 GB of unified memory, and the Rust
-toolchain pinned by `rust-toolchain.toml`.
+Metal 4 and tensor operations, the Rust toolchain pinned by
+`rust-toolchain.toml`, and 128 GB of unified memory to hold the whole
+checkpoint, or 64 GB with the expert cache above (the n-gram table lives in
+the page cache either way).
 
 ```sh
 cargo build --release --locked
@@ -181,22 +190,32 @@ engine measured about 30 % over mlx-lm on its model.
   not on the critical path, and control flow such as the accepted draft
   count decided on the GPU.
 - Speculative decoding through the model's own head, with the verify pass on
-  small-row GEMMs written for it.
-- Kernel fusion guided by a per-kernel profile: the hyper-connection read
-  from six dispatches to two, the sparse-attention selection with no serial
-  steps, tiled sparse attention for prefill.
+  small-row GEMMs written for it and exact speculative sampling when the
+  request samples.
+- Decode kernels taken to the ceiling their read sizes allow: the
+  hyper-connection read from six dispatches to two, the sparse-attention
+  selection with no serial steps, the split attention kernel with its
+  latency chains cut, the expert gathers and the recurrent-state step tuned
+  in a chained harness. A decode step is a chain of about 700 dependency
+  levels, and the measurement of what such a chain can stream is what says
+  the step is within 10 to 15 % of its floor.
+- Prefill on the tensor ops where it was not: sparse attention over the
+  gathered union of neighbouring queries' selections (from 40 % of a chunk to
+  10 %), the Gated DeltaNet scan in chunked form instead of a token-serial
+  recurrence, and the expert GEMM's last tiles at half and quarter height.
+- The expert cache that runs the model on half the memory.
 - The session cache with recurrent-state checkpoints, forks, the disk tier
   and durable prefixes, and the full OpenAI request surface around it.
 
 Part of this is specific to the model and part is not. The transport,
-parking, GPU-side control flow, kernel fusion, speculative decoding and the
-caching are properties of the engine and apply to any model served from any
-framework, MLX included. The sparse-attention and recurrent-state work is
-specific to this architecture family, and the paged n-gram table to this
-model alone. The detailed account, with every
-measurement, is [docs/architecture.md](docs/architecture.md); what was
-tried, what it measured and what remains is the last part of
-[docs/performance.md](docs/performance.md).
+parking, GPU-side control flow, speculative decoding, the caching and the
+expert cache are properties of the engine and apply to any model served from
+any framework, MLX included. The sparse-attention and recurrent-state work
+is specific to this architecture family, and the paged n-gram table to this
+model alone. The detailed account, with every measurement, is
+[docs/architecture.md](docs/architecture.md); what was done, what was tried
+and dropped and why, and what is left but outside this project's target is
+the second half of [docs/performance.md](docs/performance.md).
 
 ## Converting a checkpoint
 

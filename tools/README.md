@@ -155,7 +155,9 @@ numbers behind them, are in `reference/VISION.md`.
 
 The performance timeline. `timeline.sh` runs
 the fixed `lily-bench` matrix (1K / 8K / 32K prompts, 0 and 2 drafts, 96
-tokens, 3 repeats) at one or more commits (`--commit <rev>`, older commits are
+tokens, 3 repeats; synthetic tokens, or the first tokens of a text file with
+`--prompt-text FILE`, which is how the matrix is run now) at one or more
+commits (`--commit <rev>`, older commits are
 built in worktrees under `target/timeline/`, `HEAD` is the working tree),
 writes every run's JSON, a `.env.txt` snapshot (swap, paging, thermal level)
 and a `run.json` into `docs/bench/<date>-<sha>/`, and calls `summarize.py` to
@@ -172,6 +174,7 @@ needs only the system `python3`; both work with macOS bash 3.2.
 ```sh
 tools/bench/timeline.sh --note "what changed"                        # working tree
 tools/bench/timeline.sh --commit f5b3317 --commit HEAD --cooldown 20  # compare two commits
+tools/bench/timeline.sh --commit 37cc34c --commit HEAD --prompt-text docs/bench/prompts/p0.txt  # on real text
 tools/bench/timeline.sh --dry-run --commit HEAD                       # print the commands only
 ```
 
