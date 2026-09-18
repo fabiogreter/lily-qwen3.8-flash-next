@@ -174,6 +174,7 @@ pub fn gemv_quant(
     )
 }
 
+
 /// Writes `out[N, K] = dequant(W)` in bf16.
 fn dequant_to_bf16(
     ctx: &MetalContext,

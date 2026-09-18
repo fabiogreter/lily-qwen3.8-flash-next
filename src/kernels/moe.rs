@@ -424,8 +424,16 @@ pub fn moe_gather_gemv_down_combine_named(
             &u32_bytes(slots),
             &u32_bytes(shared.is_some() as usize),
         ],
-        Grid::Threadgroups { groups: (h / 2, 1, 1), threadgroup: (32, 1, 1) },
+        down_combine_grid(name, h),
     )
+}
+
+/// The down gather's dispatch shape by kernel name: two rows per
+/// threadgroup, four simdgroups on them for the shipped kernel and one for
+/// the `_sg1` reference form.
+fn down_combine_grid(name: &str, h: usize) -> Grid {
+    let sgs = if name.ends_with("_sg1") { 1 } else { 4 };
+    Grid::Threadgroups { groups: (h / 2, 1, 1), threadgroup: (32 * sgs, 1, 1) }
 }
 
 /// Routes each BF16 `[m, E]` row into indices and F32 scores.

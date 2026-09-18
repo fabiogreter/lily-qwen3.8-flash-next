@@ -272,38 +272,48 @@ kernel void moe_gather_gemv_q4_gate_up(
     }
 }
 
-kernel void moe_gather_gemv_q4_down_combine(
-    device const uint*   codes       [[buffer(0)]],
-    device const bfloat* scales      [[buffer(1)]],
-    device const bfloat* biases      [[buffer(2)]],
-    device const bfloat* x           [[buffer(3)]],
-    device const uint*   indices     [[buffer(4)]],
-    device const float*  scores      [[buffer(5)]],
-    device const bfloat* shared_out  [[buffer(6)]],
-    device const float*  shared_gate [[buffer(7)]],
-    device bfloat*       out         [[buffer(8)]],
-    constant uint&       K           [[buffer(9)]],
-    constant uint&       GS          [[buffer(10)]],
-    constant uint&       H           [[buffer(11)]],
-    constant uint&       S           [[buffer(12)]],
-    constant uint&       has_shared  [[buffer(13)]],
-    uint group [[threadgroup_position_in_grid]],
-    uint lane  [[thread_index_in_threadgroup]]) {
-    const uint hlane = lane % 16;
-    const uint row = group * 2 + lane / 16;
+// The routed experts' down projections gathered and combined with the
+// scores (and the gated shared expert): LANES lanes per output row (16, two
+// rows per simdgroup) and SG simdgroups per threadgroup taking alternate
+// routed slots for the same rows, their per-slot sums exchanged through
+// threadgroup memory and combined in slot order. The shipped kernel runs
+// four simdgroups: the one-simdgroup form walks the ten slots in one
+// dependent chain of 16-lane row reads and measured 23.8 us per layer in
+// the decode chain (`moe_gather_chain_timing`), two simdgroups 23.0, four
+// 22.3, five 22.3, eight 22.8, ten 22.7; one row per simdgroup with 32
+// lanes (every block of a row requested at once) gained nothing at any
+// simdgroup count. Every SG keeps the same per-slot reduction order and the
+// slot-ordered combine, so the results are bit-identical
+// (`down_combine_variants_bit_identical`).
+template <uint LANES, uint SG>
+static inline void moe_down_combine_body(device const uint*   codes,
+                                         device const bfloat* scales,
+                                         device const bfloat* biases,
+                                         device const bfloat* x,
+                                         device const uint*   indices,
+                                         device const float*  scores,
+                                         device const bfloat* shared_out,
+                                         device const float*  shared_gate,
+                                         device bfloat*       out,
+                                         uint K, uint GS, uint H, uint S, uint has_shared,
+                                         uint group, uint sg, uint lane,
+                                         threadgroup float* xchg) {
+    constexpr uint ROWS = 32 / LANES;
+    const uint hlane = lane % LANES;
+    const uint rl = lane / LANES;
+    const uint row = group * ROWS + rl;
     const uint words = K / 8;
     const uint blocks = words / 4;
     const uint bpg = GS / 32;
     const uint groups = K / GS;
+    constexpr uint STRIDE = MOE_MAX_K / SG + 1;
     float combined = 0.0f;
-    for (uint slot = 0; slot < S; ++slot) {
+    for (uint slot = sg; slot < S; slot += SG) {
         const ulong grow = (ulong)indices[slot] * H + row;
-        device const uint4* wrow =
-            (device const uint4*)(codes + grow * words);
-        device const bfloat4* xv =
-            (device const bfloat4*)(x + (ulong)slot * K);
+        device const uint4* wrow = (device const uint4*)(codes + grow * words);
+        device const bfloat4* xv = (device const bfloat4*)(x + (ulong)slot * K);
         float sum = 0.0f;
-        for (uint i = hlane; i < blocks; i += 16) {
+        for (uint i = hlane; i < blocks; i += LANES) {
             const uint g = i / bpg;
             const float scale = float(scales[grow * groups + g]);
             const float bias = float(biases[grow * groups + g]);
@@ -325,14 +335,36 @@ kernel void moe_gather_gemv_q4_down_combine(
             }
             sum += scale * qx + bias * xs;
         }
-        for (uint off = 8; off > 0; off >>= 1) {
+        for (uint off = LANES / 2; off > 0; off >>= 1) {
             sum += simd_shuffle_down(sum, off);
         }
         if (hlane == 0) {
-            combined += scores[slot] * float(bfloat(sum));
+            if (SG == 1) {
+                combined += scores[slot] * float(bfloat(sum));
+            } else {
+                xchg[(sg * ROWS + rl) * STRIDE + slot / SG] = float(bfloat(sum));
+            }
         }
     }
-    if (hlane == 0) {
+    if (SG == 1) {
+        if (hlane == 0) {
+            if (has_shared != 0) {
+                const float gate = 1.0f / (1.0f + exp(-shared_gate[0]));
+                combined += gate * float(shared_out[row]);
+            }
+            out[row] = bfloat(combined);
+        }
+        return;
+    }
+    // xchg[(sg * ROWS + rl) * STRIDE + j]: simdgroup sg's j-th slot sum for
+    // its rl-th row.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0 && hlane == 0) {
+        for (uint slot = 0; slot < S; ++slot) {
+            const uint s = slot % SG;
+            const uint j = slot / SG;
+            combined += scores[slot] * xchg[(s * ROWS + rl) * STRIDE + j];
+        }
         if (has_shared != 0) {
             const float gate = 1.0f / (1.0f + exp(-shared_gate[0]));
             combined += gate * float(shared_out[row]);
@@ -340,6 +372,35 @@ kernel void moe_gather_gemv_q4_down_combine(
         out[row] = bfloat(combined);
     }
 }
+
+#define MOE_DOWN_COMBINE_VARIANT(NAME, LANES, SG)                              \
+    kernel void NAME(device const uint*   codes       [[buffer(0)]],          \
+                     device const bfloat* scales      [[buffer(1)]],          \
+                     device const bfloat* biases      [[buffer(2)]],          \
+                     device const bfloat* x           [[buffer(3)]],          \
+                     device const uint*   indices     [[buffer(4)]],          \
+                     device const float*  scores      [[buffer(5)]],          \
+                     device const bfloat* shared_out  [[buffer(6)]],          \
+                     device const float*  shared_gate [[buffer(7)]],          \
+                     device bfloat*       out         [[buffer(8)]],          \
+                     constant uint&       K           [[buffer(9)]],          \
+                     constant uint&       GS          [[buffer(10)]],         \
+                     constant uint&       H           [[buffer(11)]],         \
+                     constant uint&       S           [[buffer(12)]],         \
+                     constant uint&       has_shared  [[buffer(13)]],         \
+                     uint group [[threadgroup_position_in_grid]],             \
+                     uint sg    [[simdgroup_index_in_threadgroup]],           \
+                     uint lane  [[thread_index_in_simdgroup]]) {              \
+        threadgroup float xchg[SG * (32 / LANES) * (MOE_MAX_K / SG + 1)];     \
+        moe_down_combine_body<LANES, SG>(codes, scales, biases, x, indices,   \
+                                         scores, shared_out, shared_gate,     \
+                                         out, K, GS, H, S, has_shared, group, \
+                                         sg, lane, xchg);                     \
+    }
+
+MOE_DOWN_COMBINE_VARIANT(moe_gather_gemv_q4_down_combine, 16, 4)
+// The one-simdgroup form, the reference of the bit-identity test.
+MOE_DOWN_COMBINE_VARIANT(moe_gather_gemv_q4_down_combine_sg1, 16, 1)
 
 // Small-M GEMV reuses each selected expert across its routed rows.
 

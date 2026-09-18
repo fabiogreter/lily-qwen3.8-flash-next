@@ -1465,7 +1465,10 @@ fn moe_gather_chain_timing() {
         .unwrap_or_else(|_| vec![("moe_gather_gemv_q4_gate_up", "moe_gather_gemv_q4_down_combine")]);
     let modes = [("pair", true, true), ("gate_up", true, false), ("down", false, true)];
     let mut best = vec![[f64::INFINITY; 3]; pairs.len()];
-    for round in 0..6 {
+    let warm = crate::kernels::qsa::tests::chain_warmup();
+    let mut round = 0usize;
+    loop {
+        let timed = warm.elapsed() >= crate::kernels::qsa::tests::chain_warmup_ms();
         for k_pair in 0..pairs.len() {
             let which = (round + k_pair) % pairs.len();
             let (gname, dname) = pairs[which];
@@ -1490,10 +1493,16 @@ fn moe_gather_chain_timing() {
                 }
                 let done = pass.commit().expect("commit").wait_retain().expect("wait");
                 let t = done.timing().expect("timing");
-                if round > 0 {
+                if timed && round > 0 {
                     best[which][m] =
                         best[which][m].min((t.gpu_end_secs - t.gpu_start_secs) / layers as f64);
                 }
+            }
+        }
+        if timed {
+            round += 1;
+            if round == 6 {
+                break;
             }
         }
     }
@@ -1511,3 +1520,48 @@ fn moe_gather_chain_timing() {
         );
     }
 }
+
+/// The shipped down gather (four simdgroups per row pair, alternate routed
+/// slots each) reproduces the one-simdgroup form (`_sg1`, the ten slots in
+/// one chain) bit for bit at the model's shape over several random
+/// routings, with and without the shared expert.
+#[test]
+fn down_combine_variants_bit_identical() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(93);
+    let (e, inter, h, top_k, gs) = (128usize, 640usize, 2560usize, 10usize, 64usize);
+    let down = random_q4_stack(&ctx, &mut rng, e * h, inter, gs);
+    let shared_gate = Tensor::from_f32(&ctx, &[0.3], &[1]).expect("gate");
+    let variants = ["moe_gather_gemv_q4_down_combine"];
+    for trial in 0..3 {
+        let inp = smallm_inputs(&ctx, &mut rng, e, h, h, 1, top_k, "random");
+        let act = Tensor::from_f32_as_bf16(
+            &ctx,
+            &random_vec(&mut rng, top_k * inter, -2.0, 2.0),
+            &[top_k, inter],
+        )
+        .expect("act");
+        let run = |name: &'static str, shared: bool| -> Vec<u8> {
+            let out = Tensor::zeros(&ctx, &[h], DType::BF16).expect("out");
+            let pass = ctx.begin_concurrent().expect("pass");
+            moe_gather_gemv_down_combine_named(
+                &ctx, &pass, name, &down, h, &act, &inp.indices, &inp.scores,
+                if shared { Some((&inp.shared_out, &shared_gate)) } else { None }, &out,
+            )
+            .expect("dispatch");
+            pass.commit_wait().expect("commit");
+            out.contents().to_vec()
+        };
+        for shared in [true, false] {
+            let want = run("moe_gather_gemv_q4_down_combine_sg1", shared);
+            for name in variants {
+                let got = run(name, shared);
+                assert!(
+                    got == want,
+                    "trial {trial}, shared {shared}: {name} differs from the one-simdgroup form"
+                );
+            }
+        }
+    }
+}
+

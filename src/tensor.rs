@@ -221,7 +221,7 @@ impl Tensor {
         unsafe { self.buf.contents().as_ptr().cast::<u8>().add(self.offset) }
     }
 
-    fn contents(&self) -> &[u8] {
+    pub fn contents(&self) -> &[u8] {
         // SAFETY: shared-storage buffer holding at least offset + numel*size
         // bytes (checked at construction); the GPU is idle when hosts read
         // (callers commit_wait first).

@@ -119,6 +119,7 @@ static inline float gemv_q4_packed_sum(device const uint* codes,
 
 GEMV_Q4_PACKED_KERNEL(gemv_q4_bf16_2row, 2)
 
+
 // 8-bit variant: one code word holds 4 elements (low byte first).
 static inline float dot_word_q8(uint word, float s, float b,
                                 device const bfloat4* xv, uint w) {
