@@ -447,6 +447,11 @@ estimate with its assumption named.
    decode step at 8K, 0.70 to 0.59 at 32K, 0.46 to 0.30 per verify pass at
    8K, and 15.6 to 2.6 ms per 8K prefill (30.1 to 13.1 per 32K prefill).
    At 32K the 32 blocks each thread walks per pass are what remains.
+   *Then*: the selection threadgroup went from 256 threads (one per radix
+   bin) to 512, the extra threads only shortening each thread's walk: 8K
+   decode 16.7 to 7.8 us per query, 32K 31.3 to 15.7, the verify rows
+   alike; 1 024 threads gave the gain back to the wider scans. Exact, so
+   bit-identical.
 4. **Dispatch fusion in the decode graph.** Measured: about 966 dispatches
    per step, with a 1.4 us floor for a trivial dispatch plus barrier, and the
    fused hyper-connection kernels reading 0.68 GB at about 315 GB/s against
@@ -465,9 +470,12 @@ estimate with its assumption named.
    four-set GEMV kernel) measured 92.8 against 93.2 tok/s at 1K over three
    interleaved pairs and within noise at 8K, and was not kept: dispatches
    on one level of the concurrent encoder already overlap, so only levels
-   (barriers) cost, and a level is about the 1.4 us floor. With about 450
-   levels per step that bounds the whole lever near 0.6 ms; it is not where
-   the 3.4 ms between the step and its bandwidth floor sits. The expert
+   (barriers) cost. *Measured since* (the section below): a step has 709
+   levels at 1K, a level holding a tiny kernel between two streaming ones
+   costs nothing (the 96 inject levels ablate to 0.00 ms), and what a
+   streaming level pays is its own ramp and drain, 2 to 4 us for a read
+   of a few megabytes; removing or merging levels of tiny kernels is
+   therefore not a lever either. The expert
    gathers with their weight blocks requested up front (every routed
    expert's block per lane in the down kernel, every block of the lane's
    row in the gate/up kernel; bit-identical) measured slower in paired 1K
@@ -502,6 +510,95 @@ hyper-connection mixers, 8-bit KV), the quality cost is **not measured**, and
 the 4-layer Hugging Face comparison cannot see expert quantization error at
 scale. A perplexity or task run on the full model would have to come first.
 
+### Where the decode step's time goes
+
+Measured on 2026-09-18 (branch `decode-explore`) with two tools that time the
+production shape, because the per-kernel profile mode (one command buffer
+per dispatch) sums to 14.1 ms for a 1K step that runs in 10.7 and cannot
+say where the gap to the bandwidth floor sits.
+
+**The level chain.** `lily-bench --gpu-timing` counts the dependency levels
+(barriers) a step encodes: 709 at 1K, 733 past the dense limit. A pure
+streaming read, one dispatch per barrier-separated level over distinct
+regions (`level_size_bandwidth_probe`), reaches 600 GB/s with no barriers
+but 479 to 487 GB/s when each level reads 8 MB, 459 at 4 MB, 306 to 404 at
+2 MB and 176 at 1 MB: every streaming level pays its own ramp and drain,
+about 2 to 4 us. The step's floor is therefore the sum of its levels' bytes
+at those per-size ceilings, not the 4.37 GB it reads at 600 GB/s (7.3 ms);
+at the mix of level sizes the step has, that floor is about 9.3 ms.
+
+**Marginal costs.** `LILY_ABLATE=group` skips a kernel group's dispatches
+(and the levels only it occupies); the step time without it is the group's
+cost in the chain. At 1K (GPU span per step, median of 96, the whole step
+10.68 ms):
+
+| group ablated | ms saved | bytes per step | implied GB/s |
+|---|---|---|---|
+| dense GDN projections (36 in, 36 out) | 1.97 | 1.17 GB | 595 (at the probed peak) |
+| hyper-connection reads (97 pairs) | 1.97 | 0.68 GB | 345 |
+| MoE (router, top-k, gathers, shared) | 3.72 | 1.52 GB | 409 |
+| of which the expert gathers | 3.01 | 1.32 GB | 440 |
+| of which the top-k level (48 tiny levels) | 0.35 | | 7 us per level |
+| of which the shared-expert matvecs | 0.00 | 0.13 GB | overlap the router and gather levels |
+| attention layers (12) | 0.90 at 1K, 1.58 at 8K, 2.76 at 32K | | |
+| GDN conv + step + out projection | 1.57 | | |
+| LM head | 0.57 | 0.36 GB | at peak |
+| the 96 inject levels | 0.00 | | a tiny level between streaming kernels is free |
+
+**Kernels in their chain.** The chained harnesses (`*_chain_timing`, one
+dispatch per layer over distinct weights, a barrier between, best of
+several passes) put each family against the level ceiling of its size:
+the expert gate/up gather at 35.4 us for 18.4 MB (521 GB/s, at the 16 MB
+ceiling), the down gather 23.7 us for 9.2 MB (390; two routed slots per
+simdgroup iteration instead of one measured 22.9 and was not kept), the
+hyper-connection pair 16.9 us for 7 MB as two 3.5 MB levels (413 and 428
+GB/s each, within 10% of the 4 MB ceiling; variants with the activation
+loads or the weight loads removed showed neither is the limiter, and the
+kernels were already tuned three ways in an earlier pass), the GDN step
+19 us for 6.2 MB of state (taken to 16.3 by the register blocks; splitting
+the head over thread groups or column groups measured the same 15 to 16),
+the router top-k 4.3 us per level against a 1.35 us floor. The dense
+GEMVs read 24 MB levels at the peak. What remains at 1K after the kept
+changes is about 0.15 ms in the down gather, 0.15 in the top-k level and
+0.1 in the hyper-connection reads: each one to two percent, each needing
+its own kernel design.
+
+**Attention past 2K.** The branch costs 0.90 ms at 1K, 1.58 at 8K and
+2.76 at 32K. Per layer at 32K in the chain: block scores 12 us, the
+selection 31 (now 16), the split kernel about 40 and its combine 5 to 8.
+The split kernel's 40 us for 4 MB of K/V is structural: with its V loads
+removed it measured 2.5 us less and with its K loads removed 5.4 less, so
+the rest is the barriers, the cross-simdgroup staging and the per-token
+reductions of the eight-simdgroup design. Cutting its latency chains
+(token ids staged once, four rows requested per step, one barrier for the
+four heads' softmax sums, two heads staged per barrier pair) took the
+split-plus-combine pair from 48.9 to 42.5 us at 8K and 86.2 to 76.8 at
+32K, bit-identical. Not kept: a 128-thread threadgroup (3 us faster,
+reorders the reductions), a barrier-free one-simdgroup-per-split design
+with lanes owning tokens for the scores and dims for the values (82 us),
+32-token splits (58 us), and a combine kernel with its statistics
+prologue parallelized (within noise, and not bit-identical because
+fast-math reassociates the serial sum it replaced).
+
+**Kept, with the paired in-model result** (interleaved base/final runs on
+p0.txt, 96 steps): plain
+decode at 1K 10.67/10.68/10.65 ms per step (base) against 10.58/10.60/10.60
+(final), 91.5 against 92.4 tok/s; at 8K, where the machine changed clock
+state mid-batch, 11.39 against 11.18 ms in the first pair and within 0.05
+ms in the two slower pairs, 85.7 against 86.9 tok/s in the fast pair;
+with two drafts 93.0 against 93.3 tok/s at 1K and 98.1 against 99.5 at
+8K, the same 46 of 100 and 52 of 88 drafts accepted. Every digest is
+unchanged (plain d66084da31d95a1c and 9d9ad65da00e33ad, speculative
+a9de616648498453 and d413fc8311fcbbab). About one percent at 1K and one
+to two at 8K, as the chained harnesses predicted; the gains grow with
+context (the selection and split kernels scale with it).
+
+**The machine's clock state.** Both streams' measurements drifted between
+a fast and a slow GPU state during this work (the 8 MB level probe at 487
+against 372 GB/s, a 1K step at 10.7 against 13.9 ms) while the other
+worktree ran prefill kernels; every comparison above is paired within one
+state, and the probe line is the canary to run before trusting a batch.
+
 ## Reproducing this
 
 ### One cell
@@ -526,9 +623,14 @@ target/release/lily-bench \
 | `--decode-steps N` | generated tokens (96 for the matrix below)                              |
 | `--drafts N`       | measure speculative decoding with N drafts per step and report acceptance instead of the one-token loop |
 | `--ngram-preload`  | stream the paged n-gram table through the page cache before measuring   |
-| `--gpu-timing`     | add command-buffer GPU timestamps and host marks                        |
+| `--gpu-timing`     | add command-buffer GPU timestamps and host marks, and print the levels per step |
 | `--kernel-profile` | per-kernel GPU times per pass; wall-clock results under this flag are not comparable to a normal run |
 | `--json-out PATH`  | write the record                                                        |
+
+`LILY_ABLATE=hc,inject,gdn_proj,gdn_step,attn,head,ple,moe,router,shared,topk,gather,down`
+(any subset) skips those kernel groups' dispatches in the decode graph; the
+results are garbage, the step time without a group is its marginal cost in
+the level chain.
 
 ### The matrix
 
