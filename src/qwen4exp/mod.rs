@@ -17,6 +17,7 @@ pub mod vision;
 pub mod vision_weights;
 pub mod weights;
 
+pub use expert_cache::ExpertCacheStats;
 pub use model::{
     DecodeState, Encoder, ImageEmbeds, MAX_DRAFTS, Qwen4ExpModel, Scratch, VisionInput,
 };

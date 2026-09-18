@@ -210,3 +210,80 @@ fn store_reads_match_checkpoint() {
         .expect("nine buffers");
     assert!(store.read_into(0, 0, dst).is_err());
 }
+
+/// Live usage: decode lookups outweigh prefill ones, a cold expert that
+/// out-earns the least-used pinned one takes its role without any table
+/// change, a freshly promoted slot is protected, and the merged ranking
+/// round-trips through the usage file.
+#[test]
+fn live_usage_promotes_by_score_with_hysteresis() {
+    // Two layers of three experts, six slots: four pinned, two LRU.
+    let r = ranking(&[&[50, 40, 30], &[20, 10, 0]]);
+    let mut p = SlotPolicy::new(6, 2, 3, &r, 1.0 / 3.0).expect("policy");
+    assert_eq!(p.pinned(), 4);
+    // Pinned: (0,0)=slot0 (0,1)=1 (0,2)=2 (1,0)=3; LRU: (1,1)=4 (1,2)=5.
+    let mut u = LiveUsage::new(&r, 6, 2);
+    // The prior sums to PRIOR_TOKENS * layers * top_k * DECODE_WEIGHT.
+    let total: u64 = (0..2)
+        .flat_map(|l| (0..3).map(move |e| (l, e)))
+        .map(|(l, e)| u.score(l, e))
+        .sum();
+    assert_eq!(total, LiveUsage::PRIOR_TOKENS * 2 * 2 * LiveUsage::DECODE_WEIGHT);
+    // Prefill lookups barely move a score; decode lookups do.
+    for _ in 0..50 {
+        u.record(1, 2, false);
+    }
+    assert_eq!(u.score(1, 2), 50);
+    assert_eq!(
+        u.promote(&mut p, 1),
+        0,
+        "50 prefill lookups do not beat a pinned prior"
+    );
+    // (1,2) at decode: the least-used pinned is (1,0) with prior 20/150 of
+    // the total; promote once its score clears 1.5x that plus the margin.
+    let low = u.score(1, 0);
+    let needed = (low + low / 2 + LiveUsage::MARGIN_LOOKUPS * LiveUsage::DECODE_WEIGHT
+        - 50)
+        / LiveUsage::DECODE_WEIGHT
+        + 1;
+    for _ in 0..needed {
+        u.record(1, 2, true);
+    }
+    assert_eq!(u.promote(&mut p, 100), 1);
+    assert_eq!(u.promotions(), 1);
+    assert!(p.is_pinned(5) && !p.is_pinned(3), "roles swapped, not slots");
+    assert_eq!(p.pinned(), 4);
+    assert_eq!(p.slot_of(1, 2), Some(5), "no data moved");
+    assert_eq!(p.slot_of(1, 0), Some(3));
+    // Slot 3 is now evictable, slot 5 is not: a miss takes 3 or 4, never 5.
+    match p.lookup(0, 2, 101) {
+        Lookup::Hit(2) => {}
+        other => panic!("{other:?}"),
+    }
+    // (1,0), now cold in slot 3, out-earns every unprotected pinned slice:
+    // it takes the least-used one's role (slot 2, (0,2)), while slot 5,
+    // freshly promoted, keeps its role although its score is the lowest of
+    // the pinned set.
+    for _ in 0..2000 {
+        u.record(1, 0, true);
+    }
+    assert_eq!(u.promote(&mut p, 200), 1);
+    assert!(p.is_pinned(3) && p.is_pinned(5) && !p.is_pinned(2), "slot 5 protected");
+    // Past the protection window slot 5 is demotable: once (0,2), cold in
+    // slot 2, out-earns (1,2) in slot 5 by the margin, they swap roles.
+    for _ in 0..1000 {
+        u.record(0, 2, true);
+    }
+    assert_eq!(u.promote(&mut p, 200 + LiveUsage::PROTECT_TICKS), 1);
+    assert!(p.is_pinned(2) && !p.is_pinned(5));
+    assert_eq!(p.pinned(), 4);
+    // Persistence: the merged ranking orders by score and round-trips.
+    let merged = u.merged();
+    let dir = std::env::temp_dir().join(format!("lily-usage-{}", std::process::id()));
+    let path = dir.join("expert-usage.json");
+    merged.save(&path, "test").expect("save");
+    let back = UsageRanking::load(&path).expect("load");
+    assert_eq!(back.counts, merged.counts);
+    assert_eq!(back.ranked()[0], (1, 0), "the most-used slice ranks first");
+    std::fs::remove_dir_all(&dir).ok();
+}

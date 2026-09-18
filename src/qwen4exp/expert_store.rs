@@ -11,7 +11,7 @@ use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::config::Qwen4ExpConfig;
 use crate::safetensors::{Checkpoint, SafetensorsDType};
@@ -252,9 +252,10 @@ impl ExpertStore {
     }
 }
 
-/// Routing counts per (layer, expert), as `lily-experts` writes them, from
-/// which the slot placement is derived.
-#[derive(Clone, Deserialize, Debug)]
+/// Routing counts per (layer, expert), as `lily-experts` writes them (and
+/// as the cache persists its live usage), from which the slot placement is
+/// derived.
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct UsageRanking {
     pub layers: usize,
     pub experts: usize,
@@ -289,6 +290,35 @@ impl UsageRanking {
             self.experts
         );
         Ok(())
+    }
+
+    /// Writes the ranking as `lily-experts` JSON (`layers`, `experts`,
+    /// `counts[layer][expert]`, plus a `source` note), atomically.
+    pub fn save(&self, path: impl AsRef<Path>, source: &str) -> Result<()> {
+        let path = path.as_ref();
+        #[derive(Serialize)]
+        struct Record<'a> {
+            layers: usize,
+            experts: usize,
+            source: &'a str,
+            counts: &'a [Vec<u64>],
+        }
+        let record = Record {
+            layers: self.layers,
+            experts: self.experts,
+            source,
+            counts: &self.counts,
+        };
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("creating {}", dir.display()))?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec(&record)?)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| {
+            format!("renaming {} to {}", tmp.display(), path.display())
+        })
     }
 
     /// Every (layer, expert) by count descending, ties by (layer, expert)
@@ -329,7 +359,10 @@ pub enum Lookup {
 /// here; the model uploads [`Self::slot_table`] after each change.
 pub struct SlotPolicy {
     experts: usize,
+    /// Pinned slots; how many, and which (a role that
+    /// [`Self::swap_roles`] can move between slots without moving data).
     pinned: usize,
+    is_pinned: Vec<bool>,
     /// `[layer * experts + expert]` -> slot or [`Self::NONE`].
     slot_of: Vec<u32>,
     /// `[slot]` -> resident (layer, expert).
@@ -371,9 +404,12 @@ impl SlotPolicy {
         let ranked = ranking.ranked();
         let pinned = ((n_slots as f64) * (1.0 - lru_share)).round() as usize;
         let pinned = pinned.min(n_slots).min(ranked.len());
+        let mut is_pinned = vec![false; n_slots];
+        is_pinned[..pinned].fill(true);
         let mut policy = Self {
             experts,
             pinned,
+            is_pinned,
             slot_of: vec![Self::NONE; layers * experts],
             slice_in: vec![None; n_slots],
             last_used: vec![None; n_slots],
@@ -389,9 +425,27 @@ impl SlotPolicy {
         self.slice_in.len()
     }
 
-    /// Slots `0..pinned` never change after construction.
+    /// How many slots are pinned: their experts are never evicted by a
+    /// miss. Initially slots `0..pinned`; [`Self::swap_roles`] moves the
+    /// role between slots.
     pub fn pinned(&self) -> usize {
         self.pinned
+    }
+
+    /// Whether `slot` is pinned.
+    pub fn is_pinned(&self, slot: u32) -> bool {
+        self.is_pinned[slot as usize]
+    }
+
+    /// Pins `promote` (an LRU-region slot) and releases `demote` (a pinned
+    /// slot) into the LRU region. No data moves and no table changes: both
+    /// experts stay resident where they are, only which one a future miss
+    /// may evict changes.
+    pub fn swap_roles(&mut self, promote: u32, demote: u32) {
+        let (p, d) = (promote as usize, demote as usize);
+        debug_assert!(!self.is_pinned[p] && self.is_pinned[d]);
+        self.is_pinned[p] = true;
+        self.is_pinned[d] = false;
     }
 
     /// The slot holding `expert` of `layer`, if resident.
@@ -434,8 +488,8 @@ impl SlotPolicy {
             return Lookup::Hit(slot);
         }
         let n_slots = self.n_slots();
-        let victim = (self.pinned..n_slots)
-            .filter(|&s| self.last_used[s] != Some(tick))
+        let victim = (0..n_slots)
+            .filter(|&s| !self.is_pinned[s] && self.last_used[s] != Some(tick))
             .min_by_key(|&s| match (self.slice_in[s], self.last_used[s]) {
                 (None, _) => (0u8, 0u64, s),
                 (Some(_), None) => (1, 0, n_slots - s),
@@ -456,6 +510,149 @@ impl SlotPolicy {
     fn assign(&mut self, slot: usize, layer: usize, expert: usize) {
         self.slot_of[layer * self.experts + expert] = slot as u32;
         self.slice_in[slot] = Some((layer, expert));
+    }
+}
+
+/// What the cache learns while it serves: how often each (layer, expert)
+/// was routed to at decode and at prefill, on top of the loaded ranking as
+/// a prior, and the promotion of cold experts that out-earn pinned ones.
+///
+/// A slice's score is `prior + DECODE_WEIGHT * decode + prefill`. Decode
+/// lookups weigh [`Self::DECODE_WEIGHT`] prefill lookups because prefill
+/// routes nearly every expert of a layer once per chunk whatever the text,
+/// so its counts carry little ranking information, while a decode lookup
+/// is one token's routing and a decode miss stalls that token. The prior is
+/// the loaded ranking scaled to the score [`Self::PRIOR_TOKENS`] decoded
+/// tokens would accumulate, so it decides the placement until about that
+/// much live decoding has been seen and the live counts dominate after.
+pub struct LiveUsage {
+    layers: usize,
+    experts: usize,
+    top_k: usize,
+    prior: Vec<u64>,
+    decode: Vec<u32>,
+    prefill: Vec<u32>,
+    /// `[slot]` -> the tick a slot was last pinned by a promotion.
+    pinned_at: Vec<u64>,
+    promotions: u64,
+}
+
+impl LiveUsage {
+    /// Score of one decode-time lookup, in prefill-lookup units.
+    pub const DECODE_WEIGHT: u64 = 100;
+    /// The prior's weight, in decoded tokens' worth of lookups.
+    pub const PRIOR_TOKENS: u64 = 1000;
+    /// A cold expert is promoted over the least-used pinned one when its
+    /// score exceeds that one's by half again and by this many decode
+    /// lookups.
+    pub const MARGIN_LOOKUPS: u64 = 2;
+    /// Ticks (cached-layer resolutions) a freshly promoted slot is
+    /// protected from demotion: about 200 decoded tokens at 48 layers.
+    pub const PROTECT_TICKS: u64 = 9_600;
+    /// Candidates compared per promotion pass.
+    const PAIRS: usize = 16;
+
+    pub fn new(ranking: &UsageRanking, n_slots: usize, top_k: usize) -> Self {
+        let (layers, experts) = (ranking.layers, ranking.experts);
+        let total: u64 = ranking.counts.iter().flatten().sum();
+        let target =
+            Self::PRIOR_TOKENS * (layers as u64) * (top_k as u64) * Self::DECODE_WEIGHT;
+        let scale = if total == 0 { 0.0 } else { target as f64 / total as f64 };
+        let prior = ranking
+            .counts
+            .iter()
+            .flatten()
+            .map(|&n| (n as f64 * scale).round() as u64)
+            .collect();
+        Self {
+            layers,
+            experts,
+            top_k,
+            prior,
+            decode: vec![0; layers * experts],
+            prefill: vec![0; layers * experts],
+            pinned_at: vec![0; n_slots],
+            promotions: 0,
+        }
+    }
+
+    /// Counts one lookup of `expert` in `layer`, at decode or at prefill.
+    pub fn record(&mut self, layer: usize, expert: usize, decode: bool) {
+        let i = layer * self.experts + expert;
+        let counts = if decode { &mut self.decode } else { &mut self.prefill };
+        counts[i] = counts[i].saturating_add(1);
+    }
+
+    /// The slice's score (see the type's documentation).
+    pub fn score(&self, layer: usize, expert: usize) -> u64 {
+        let i = layer * self.experts + expert;
+        self.prior[i]
+            + Self::DECODE_WEIGHT * u64::from(self.decode[i])
+            + u64::from(self.prefill[i])
+    }
+
+    /// Promotions made so far.
+    pub fn promotions(&self) -> u64 {
+        self.promotions
+    }
+
+    /// One promotion pass at `tick`: the [`Self::PAIRS`] lowest-scored
+    /// pinned slots not protected since their own promotion against the
+    /// highest-scored resident slots of the LRU region, best against worst;
+    /// each pair whose cold score clears the hysteresis swaps roles in
+    /// `policy`. Returns the swaps made.
+    pub fn promote(&mut self, policy: &mut SlotPolicy, tick: u64) -> usize {
+        let n_slots = policy.n_slots();
+        let mut pinned: Vec<(u64, u32)> = Vec::new();
+        let mut cold: Vec<(u64, u32)> = Vec::new();
+        for slot in 0..n_slots as u32 {
+            let Some((l, e)) = policy.slice_in(slot) else { continue };
+            let score = self.score(l, e);
+            if policy.is_pinned(slot) {
+                let since = self.pinned_at[slot as usize];
+                if since == 0 || tick.saturating_sub(since) >= Self::PROTECT_TICKS {
+                    pinned.push((score, slot));
+                }
+            } else {
+                cold.push((score, slot));
+            }
+        }
+        let k = Self::PAIRS.min(pinned.len()).min(cold.len());
+        if k == 0 {
+            return 0;
+        }
+        pinned.select_nth_unstable_by_key(k - 1, |&(s, slot)| (s, slot));
+        pinned.truncate(k);
+        pinned.sort_unstable();
+        cold.select_nth_unstable_by_key(k - 1, |&(s, slot)| (u64::MAX - s, slot));
+        cold.truncate(k);
+        cold.sort_unstable_by(|a, b| b.cmp(a));
+        let mut swaps = 0;
+        for (&(low, demote), &(high, promote)) in pinned.iter().zip(&cold) {
+            let bar = low + low / 2 + Self::MARGIN_LOOKUPS * Self::DECODE_WEIGHT;
+            if high <= bar {
+                break;
+            }
+            policy.swap_roles(promote, demote);
+            self.pinned_at[promote as usize] = tick.max(1);
+            swaps += 1;
+        }
+        self.promotions += swaps as u64;
+        swaps
+    }
+
+    /// The live usage merged with the prior as a ranking to persist: each
+    /// slice's score, so a later load ranks by what this machine ran.
+    pub fn merged(&self) -> UsageRanking {
+        let counts = (0..self.layers)
+            .map(|l| (0..self.experts).map(|e| self.score(l, e)).collect())
+            .collect();
+        UsageRanking { layers: self.layers, experts: self.experts, counts }
+    }
+
+    /// Experts per token the prior was scaled for.
+    pub fn top_k(&self) -> usize {
+        self.top_k
     }
 }
 

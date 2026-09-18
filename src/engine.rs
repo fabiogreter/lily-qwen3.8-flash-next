@@ -191,6 +191,11 @@ pub struct LoadOptions {
     /// are cached and served from disk (`docs/low-ram-experts.md`).
     /// `LILY_MEMORY_GB` overrides it.
     pub memory_budget: Option<u64>,
+    /// Where the expert cache persists the usage it measures while serving
+    /// (the loader prefers this file, when present, over the shipped
+    /// ranking); `None` persists nothing. `LILY_EXPERT_USAGE_OUT` overrides
+    /// it.
+    pub expert_usage_out: Option<std::path::PathBuf>,
 }
 
 /// Which draw a decode pass ends with.
@@ -202,9 +207,9 @@ pub struct Draw<'p> {
 }
 
 pub trait LanguageModel: Sized {
-    /// Distinct expert lookups and misses of an expert cache, when the
-    /// model serves its experts from one (`LoadOptions::expert_slots`).
-    fn expert_cache_stats(&self) -> Option<(u64, u64)> {
+    /// The expert cache's counters, when the model serves its experts from
+    /// one (`LoadOptions::expert_slots`).
+    fn expert_cache_stats(&self) -> Option<crate::qwen4exp::ExpertCacheStats> {
         None
     }
 

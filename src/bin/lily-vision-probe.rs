@@ -466,6 +466,7 @@ fn forward(cli: &Cli, model_dir: &Path, golden_path: &Path) -> Result<()> {
         None,
         None,
         None,
+        None,
     )?;
     let generator = Generator::from_model_dir(model_dir)?;
 

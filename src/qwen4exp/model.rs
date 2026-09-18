@@ -57,6 +57,7 @@ use crate::moe_ffn::{
 };
 use crate::tensor::{DType, Tensor};
 
+use super::expert_cache::ExpertCacheStats;
 use super::vision::{self, VisionScratch};
 
 use super::config::{GateAct, Qwen4ExpConfig};
@@ -1312,6 +1313,7 @@ impl Qwen4ExpModel {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -1328,6 +1330,7 @@ impl Qwen4ExpModel {
         expert_slots: Option<usize>,
         expert_usage: Option<std::path::PathBuf>,
         memory_budget: Option<u64>,
+        expert_usage_out: Option<std::path::PathBuf>,
     ) -> Result<Self> {
         let config = Qwen4ExpConfig::from_model_dir(&dir)?;
         ensure!(
@@ -1351,6 +1354,7 @@ impl Qwen4ExpModel {
             expert_slots,
             expert_usage,
             memory_budget,
+            expert_usage_out,
         )?;
         let hasher = match &config.ple {
             Some(p) => Some(NgramHasher::new(
@@ -1613,9 +1617,8 @@ impl Qwen4ExpModel {
         Ok(())
     }
 
-    /// Distinct expert lookups and misses of the expert cache so far
-    /// (`None` without a cache).
-    pub fn expert_cache_stats(&self) -> Option<(u64, u64)> {
+    /// The expert cache's counters so far (`None` without a cache).
+    pub fn expert_cache_stats(&self) -> Option<ExpertCacheStats> {
         self.weights.expert_cache.as_ref().map(|c| c.link().stats())
     }
 
@@ -3679,7 +3682,7 @@ impl LanguageModel for Qwen4ExpModel {
 
     const MODEL_ID: &'static str = "Qwen3.8-Flash-Next";
 
-    fn expert_cache_stats(&self) -> Option<(u64, u64)> {
+    fn expert_cache_stats(&self) -> Option<ExpertCacheStats> {
         Qwen4ExpModel::expert_cache_stats(self)
     }
 
@@ -3698,6 +3701,7 @@ impl LanguageModel for Qwen4ExpModel {
             .and_then(|v| v.parse::<f64>().ok())
             .map(|gb| (gb * (1u64 << 30) as f64) as u64)
             .or(options.memory_budget);
+        let expert_usage_out = options.expert_usage_out.clone();
         Qwen4ExpModel::load_with(
             ctx,
             dir,
@@ -3707,6 +3711,7 @@ impl LanguageModel for Qwen4ExpModel {
             expert_slots,
             expert_usage,
             memory_budget,
+            expert_usage_out,
         )
     }
 

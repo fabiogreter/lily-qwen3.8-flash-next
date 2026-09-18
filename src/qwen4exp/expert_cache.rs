@@ -20,9 +20,19 @@
 //! and the loaded one's to its slot), and signals `ready`. The GPU is
 //! stalled at the wait meanwhile, so no kernel reads a slot being
 //! refilled.
+//!
+//! The service thread also keeps [`LiveUsage`]: every resolved expert is
+//! counted (decode-time and prefill-time apart), every
+//! [`PROMOTE_EVERY`] resolutions the cold experts that out-earned the
+//! least-used pinned ones take over their pinned role (no data moves),
+//! and the counts, merged with the loaded ranking, are written to the
+//! usage file every [`PERSIST_SECS`] and at drop, so the next load places
+//! experts by what this machine ran. `LILY_EXPERT_ADAPT=0` keeps the
+//! counts but never promotes.
 
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -30,7 +40,7 @@ use std::thread::JoinHandle;
 
 use anyhow::{Result, ensure};
 
-use super::expert_store::{ExpertStore, Lookup, REGIONS, SlotPolicy};
+use super::expert_store::{ExpertStore, LiveUsage, Lookup, REGIONS, SlotPolicy};
 use crate::config::QuantizationConfig;
 use crate::metal::{MetalContext, SharedEvent};
 use crate::tensor::{DType, Tensor};
@@ -55,8 +65,65 @@ struct Service {
     stop: AtomicBool,
     lookups: AtomicU64,
     misses: AtomicU64,
+    decode_lookups: AtomicU64,
+    decode_misses: AtomicU64,
+    promotions: AtomicU64,
     stale: AtomicU64,
 }
+
+/// Counters of the cache's service so far.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExpertCacheStats {
+    /// Distinct expert lookups and the misses among them, all passes.
+    pub lookups: u64,
+    pub misses: u64,
+    /// The same for decode-class passes (batches of a few rows).
+    pub decode_lookups: u64,
+    pub decode_misses: u64,
+    /// Cold experts promoted into the pinned set.
+    pub promotions: u64,
+}
+
+impl ExpertCacheStats {
+    /// The counters since `earlier`.
+    pub fn since(self, earlier: ExpertCacheStats) -> ExpertCacheStats {
+        ExpertCacheStats {
+            lookups: self.lookups - earlier.lookups,
+            misses: self.misses - earlier.misses,
+            decode_lookups: self.decode_lookups - earlier.decode_lookups,
+            decode_misses: self.decode_misses - earlier.decode_misses,
+            promotions: self.promotions - earlier.promotions,
+        }
+    }
+
+    fn rate(misses: u64, lookups: u64) -> f64 {
+        100.0 * misses as f64 / lookups.max(1) as f64
+    }
+
+    /// `misses of lookups (x%), decode m of n (y%), p promotions`.
+    pub fn describe(&self) -> String {
+        format!(
+            "{} misses of {} lookups ({:.1}%), decode {} of {} ({:.1}%), {} promotions",
+            self.misses,
+            self.lookups,
+            Self::rate(self.misses, self.lookups),
+            self.decode_misses,
+            self.decode_lookups,
+            Self::rate(self.decode_misses, self.decode_lookups),
+            self.promotions
+        )
+    }
+}
+
+/// Resolutions between promotion passes: about ten decoded tokens at 48
+/// cached layers, or ten prefill chunks; a pass over the slots costs a
+/// few tens of microseconds.
+const PROMOTE_EVERY: u64 = 480;
+/// Seconds between writes of the usage file while serving.
+const PERSIST_SECS: u64 = 300;
+/// Routed ids per resolution up to which a pass counts as decode-class
+/// (a step, a verify pass of a few rows), above it as prefill.
+const DECODE_IDS: usize = 256;
 
 /// What a cached layer's `MoeWeights` holds: the events of the protocol
 /// and the request queue the service thread drains.
@@ -85,12 +152,16 @@ impl ExpertCacheLink {
         seq
     }
 
-    /// Distinct expert lookups and misses served so far.
-    pub fn stats(&self) -> (u64, u64) {
-        (
-            self.service.lookups.load(Ordering::Relaxed),
-            self.service.misses.load(Ordering::Relaxed),
-        )
+    /// The counters so far.
+    pub fn stats(&self) -> ExpertCacheStats {
+        let s = &self.service;
+        ExpertCacheStats {
+            lookups: s.lookups.load(Ordering::Relaxed),
+            misses: s.misses.load(Ordering::Relaxed),
+            decode_lookups: s.decode_lookups.load(Ordering::Relaxed),
+            decode_misses: s.decode_misses.load(Ordering::Relaxed),
+            promotions: s.promotions.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -113,7 +184,9 @@ pub struct ExpertCache {
     hidden: usize,
     quant: QuantizationConfig,
     link: Rc<ExpertCacheLink>,
-    worker: Option<JoinHandle<()>>,
+    worker: Option<JoinHandle<LiveUsage>>,
+    /// Where the live usage is persisted (`None`: not persisted).
+    usage_out: Option<PathBuf>,
 }
 
 impl ExpertCache {
@@ -163,6 +236,9 @@ impl ExpertCache {
                 stop: AtomicBool::new(false),
                 lookups: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
+                decode_lookups: AtomicU64::new(0),
+                decode_misses: AtomicU64::new(0),
+                promotions: AtomicU64::new(0),
                 stale: AtomicU64::new(0),
             }),
         });
@@ -178,6 +254,7 @@ impl ExpertCache {
             quant,
             link,
             worker: None,
+            usage_out: None,
         })
     }
 
@@ -246,12 +323,16 @@ impl ExpertCache {
 
     /// Fills the slab per `policy` from `store` (every pinned slice and
     /// the LRU region's prefill), points the tables at the slots, and
-    /// starts the service thread that resolves misses. Must run before any
-    /// pass reads the slab.
+    /// starts the service thread that resolves misses, counts `usage`,
+    /// promotes when `adapt` and persists to `usage_out`. Must run before
+    /// any pass reads the slab.
     pub fn fill_and_serve(
         &mut self,
         store: ExpertStore,
         mut policy: SlotPolicy,
+        mut usage: LiveUsage,
+        adapt: bool,
+        usage_out: Option<PathBuf>,
     ) -> Result<()> {
         ensure!(self.worker.is_none(), "the expert cache is already being served");
         ensure!(
@@ -279,39 +360,59 @@ impl ExpertCache {
         let service = self.link.service.clone();
         let (routed, ready) = (self.link.routed.clone(), self.link.ready.clone());
         let experts = self.experts;
+        self.usage_out = usage_out.clone();
         self.worker =
             Some(std::thread::Builder::new().name("expert-cache".into()).spawn(
                 move || {
                     serve(
                         store,
                         &mut policy,
+                        &mut usage,
+                        adapt,
+                        usage_out.as_deref(),
                         slab,
                         tables,
                         experts,
                         routed,
                         ready,
                         service,
-                    )
+                    );
+                    usage
                 },
             )?);
         Ok(())
     }
 }
 
+/// Writes the merged usage to `path`, logging rather than failing.
+fn persist(usage: &LiveUsage, path: &std::path::Path) {
+    match usage
+        .merged()
+        .save(path, "lily expert cache, live usage over the loaded ranking")
+    {
+        Ok(()) => {}
+        Err(e) => eprintln!("expert cache: writing usage to {}: {e:#}", path.display()),
+    }
+}
+
 impl Drop for ExpertCache {
     fn drop(&mut self) {
-        let (lookups, misses) = self.link.stats();
-        if lookups > 0 {
+        let stats = self.link.stats();
+        if stats.lookups > 0 {
             eprintln!(
-                "expert cache: {lookups} distinct expert lookups, {misses} misses ({:.2}%), {} stale reads",
-                100.0 * misses as f64 / lookups as f64,
+                "expert cache: {}, {} stale reads",
+                stats.describe(),
                 self.link.service.stale.load(Ordering::Relaxed)
             );
         }
         self.link.service.stop.store(true, Ordering::Release);
         self.link.service.wake.notify_all();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+        if let Some(worker) = self.worker.take()
+            && let Ok(usage) = worker.join()
+            && let Some(path) = &self.usage_out
+            && stats.lookups > 0
+        {
+            persist(&usage, path);
         }
     }
 }
@@ -399,6 +500,9 @@ unsafe fn set_entry(
 fn serve(
     store: ExpertStore,
     policy: &mut SlotPolicy,
+    usage: &mut LiveUsage,
+    adapt: bool,
+    usage_out: Option<&std::path::Path>,
     slab: SlabPointers,
     tables: Vec<usize>,
     experts: usize,
@@ -409,6 +513,8 @@ fn serve(
     let mut ids: Vec<u32> = Vec::new();
     let mut misses: Vec<(u32, usize, usize)> = Vec::new();
     let debug = std::env::var_os("LILY_EXPERT_CACHE_DEBUG").is_some();
+    let mut served = 0u64;
+    let mut persisted = std::time::Instant::now();
     loop {
         let request = {
             let mut queue = service.requests.lock().unwrap_or_else(|e| e.into_inner());
@@ -472,7 +578,11 @@ fn serve(
         }
         ids.sort_unstable();
         ids.dedup();
+        let decode = request.count <= DECODE_IDS;
         service.lookups.fetch_add(ids.len() as u64, Ordering::Relaxed);
+        if decode {
+            service.decode_lookups.fetch_add(ids.len() as u64, Ordering::Relaxed);
+        }
         misses.clear();
         for &e in &ids {
             let expert = e as usize;
@@ -482,6 +592,7 @@ fn serve(
                 );
                 std::process::abort();
             }
+            usage.record(request.layer, expert, decode);
             match policy.lookup(request.layer, expert, request.seq) {
                 Lookup::Hit(_) => {}
                 Lookup::Miss { slot, evicted } => {
@@ -509,6 +620,23 @@ fn serve(
             std::process::abort();
         }
         service.misses.fetch_add(misses.len() as u64, Ordering::Relaxed);
+        if decode {
+            service.decode_misses.fetch_add(misses.len() as u64, Ordering::Relaxed);
+        }
         ready.signal(request.seq);
+        // Off the GPU's critical path: the pass has its slots.
+        served += 1;
+        if adapt && served.is_multiple_of(PROMOTE_EVERY) {
+            let swaps = usage.promote(policy, request.seq);
+            if swaps > 0 {
+                service.promotions.fetch_add(swaps as u64, Ordering::Relaxed);
+            }
+        }
+        if let Some(path) = usage_out
+            && persisted.elapsed().as_secs() >= PERSIST_SECS
+        {
+            persist(usage, path);
+            persisted = std::time::Instant::now();
+        }
     }
 }

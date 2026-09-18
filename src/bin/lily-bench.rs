@@ -57,6 +57,10 @@ struct Cli {
     /// what the checkpoint needs the experts are cached (docs/low-ram-experts.md).
     #[arg(long)]
     memory_gb: Option<f64>,
+    /// Where the expert cache writes the usage it measured (the next load
+    /// prefers that file over the shipped ranking); nothing by default.
+    #[arg(long)]
+    expert_usage_out: Option<PathBuf>,
     #[arg(long)]
     json_out: PathBuf,
 }
@@ -332,6 +336,7 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
         &LoadOptions {
             mtp_drafts: cli.drafts,
             memory_budget: cli.memory_gb.map(|gb| (gb * (1u64 << 30) as f64) as u64),
+            expert_usage_out: cli.expert_usage_out.clone(),
             ..LoadOptions::default()
         },
     )?;
@@ -368,8 +373,10 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
     }
 
     let mut state = model.new_state(&ctx, max_seq)?;
+    let cache_before = model.expert_cache_stats();
     let prefill_start = Instant::now();
     model.prefill(&ctx, &mut state, &mut scratch, &prompt, Some(draw(0)))?;
+    let cache_after_prefill = model.expert_cache_stats();
 
     // Production cadence: the next step is encoded while the previous one
     // runs. With parking (the server's protocol) it is also committed right
@@ -566,6 +573,15 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
         },
     });
     std::fs::write(&cli.json_out, serde_json::to_vec_pretty(&report)?)?;
+    if let (Some(s0), Some(s1), Some(s2)) =
+        (cache_before, cache_after_prefill, model.expert_cache_stats())
+    {
+        eprintln!(
+            "expert cache: prefill: {}; decode: {}",
+            s1.since(s0).describe(),
+            s2.since(s1).describe()
+        );
+    }
     prepare_secs.sort_by(f64::total_cmp);
     if let Some(median) = prepare_secs.get(prepare_secs.len() / 2) {
         eprintln!(
@@ -622,17 +638,13 @@ fn bench_speculative<M: LanguageModel>(
             &mut |_| Ok(true),
         )?;
         let decode_secs = decode_start.elapsed().as_secs_f64();
-        if let (Some((l0, m0)), Some((l1, m1)), Some((l2, m2))) =
+        if let (Some(s0), Some(s1), Some(s2)) =
             (cache_before, cache_after_prefill, model.expert_cache_stats())
         {
             eprintln!(
-                "expert cache: prefill {} misses of {} lookups ({:.1}%), decode {} of {} ({:.1}%)",
-                m1 - m0,
-                l1 - l0,
-                100.0 * (m1 - m0) as f64 / (l1 - l0).max(1) as f64,
-                m2 - m1,
-                l2 - l1,
-                100.0 * (m2 - m1) as f64 / (l2 - l1).max(1) as f64
+                "expert cache: prefill: {}; decode: {}",
+                s1.since(s0).describe(),
+                s2.since(s1).describe()
             );
         }
         Ok((prefill_secs, decode_secs, outcome.drafted, outcome.accepted, tokens))

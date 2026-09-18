@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 
 use super::expert_cache::ExpertCache;
-use super::expert_store::{ExpertStore, SlotPolicy, UsageRanking};
+use super::expert_store::{ExpertStore, LiveUsage, SlotPolicy, UsageRanking};
 use crate::weights::{LinearWeights, Loader, MlpWeights, MoeWeights, expect_shape};
 
 use super::config::{LayerType, Qwen4ExpConfig, VISION_PREFIX};
@@ -565,6 +565,7 @@ pub fn load(
     expert_slots: Option<usize>,
     expert_usage: Option<PathBuf>,
     memory_budget: Option<u64>,
+    expert_usage_out: Option<PathBuf>,
 ) -> Result<ModelWeights> {
     let ckpt = Checkpoint::open(&dir)?;
     ensure!(
@@ -606,15 +607,27 @@ pub fn load(
         Some(n_slots) => {
             let (layers, e) = (config.num_hidden_layers, config.num_experts);
             let store = ExpertStore::open(loader.checkpoint(), config)?;
-            let usage = expert_usage.or_else(|| {
-                let next_to_it = dir.as_ref().join("expert-usage.json");
-                next_to_it.exists().then_some(next_to_it)
-            });
+            // The usage the cache persists between runs (`LoadOptions::
+            // expert_usage_out`, `LILY_EXPERT_USAGE_OUT`); when the file
+            // exists it is the ranking, unless one was named explicitly;
+            // the shipped one next to the checkpoint comes after; uniform
+            // without any.
+            let usage_out = std::env::var_os("LILY_EXPERT_USAGE_OUT")
+                .map(PathBuf::from)
+                .or(expert_usage_out);
+            let usage = expert_usage
+                .or_else(|| usage_out.clone().filter(|p| p.exists()))
+                .or_else(|| {
+                    let next_to_it = dir.as_ref().join("expert-usage.json");
+                    next_to_it.exists().then_some(next_to_it)
+                });
             let ranking = match &usage {
                 Some(path) => UsageRanking::load(path)
                     .with_context(|| format!("expert usage {}", path.display()))?,
                 None => UsageRanking::uniform(layers, e),
             };
+            let adapt = std::env::var("LILY_EXPERT_ADAPT").map_or(true, |v| v != "0");
+            let live = LiveUsage::new(&ranking, n_slots, config.num_experts_per_tok);
             ensure!(
                 n_slots >= 2 * e,
                 "an expert cache needs at least {} slots (two layers' worth), got {n_slots}",
@@ -640,13 +653,17 @@ pub fn load(
                 config.quantization,
             )?;
             eprintln!(
-                "expert cache: {n_slots} slots for {} experts, usage {}",
+                "expert cache: {n_slots} slots for {} experts, usage {}, live promotion {}, persisted to {}",
                 layers * e,
                 usage
                     .as_ref()
-                    .map_or("uniform".to_string(), |p| p.display().to_string())
+                    .map_or("uniform".to_string(), |p| p.display().to_string()),
+                if adapt { "on" } else { "off (LILY_EXPERT_ADAPT=0)" },
+                usage_out
+                    .as_ref()
+                    .map_or("nowhere".to_string(), |p| p.display().to_string())
             );
-            cache.fill_and_serve(store, policy)?;
+            cache.fill_and_serve(store, policy, live, adapt, usage_out)?;
             Some(cache)
         }
         None => None,

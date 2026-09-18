@@ -559,6 +559,11 @@ impl<M: LanguageModel> Engine<M> {
                 expert_slots: None,
                 expert_usage: None,
                 memory_budget: options.memory_budget,
+                // The usage the cache measures goes next to the disk tier.
+                expert_usage_out: options
+                    .disk_cache_dir
+                    .as_ref()
+                    .map(|d| d.join("expert-usage.json")),
             },
         )?;
         let drafts = options.mtp_drafts.min(model.max_drafts());
