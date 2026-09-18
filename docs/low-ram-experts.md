@@ -123,7 +123,7 @@ every expert per 4 096-token chunk, so the cold third is read once per
 chunk, 38 GB per 8K prompt, at the SSD's rate) and 8.8% of decode's. So
 a 64 GB machine lands near 950 tok/s prefill and 55 tok/s decode on this
 prompt, against 2 100 and 86 here: a 2x prefill and 1.6x decode cost,
-not a cliff. The same cold run the next day at commit `8ec67f0`, after
+not a cliff. The same cold run the next day at commit `38d2642`, after
 the prefill kernel work of 2026-09-18 (`docs/performance.md`): 929 tok/s
 prefill and 64.4 tok/s plain decode, 13.6% of all lookups missing, no
 stale reads; against 2 257 and 87 resident. Cold-run figures move with

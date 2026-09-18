@@ -21,7 +21,7 @@ faster; the difference grows with context.
 M5 Max, 40-core GPU, 128 GB. Same prompts on both engines, cut from real
 documentation and code, a fresh prompt for every run, 256 greedy tokens of
 new text, medians of three interleaved repeats, each engine's own timings
-over HTTP. This fork at commit `8ec67f0` (2026-09-18), llama.cpp on
+over HTTP. This fork at commit `38d2642` (2026-09-18), llama.cpp on
 2026-09-17.
 
 | tokens per second | 4K context | 16K | 32K | 64K |

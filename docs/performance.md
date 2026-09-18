@@ -130,7 +130,7 @@ then says what assumption it rests on.
 
 ## The numbers
 
-Measured 2026-09-18 at commit `8ec67f0` against the commit before that
+Measured 2026-09-18 at commit `38d2642` against the commit before that
 day's kernel work (`37cc34c`), interleaved per repeat, median of three,
 range in parentheses, on the first tokens of one real-text prompt
 (`docs/bench/prompts/p0.txt`). The README's table is the headline: fresh
@@ -141,7 +141,7 @@ matrix.
 
 | commit    | 1K prompt              | 8K prompt              | 32K prompt             |
 |-----------|------------------------|------------------------|------------------------|
-| `8ec67f0` | 2 118 (1 808 to 2 132) | 2 257 (2 050 to 2 277) | 2 051 (2 046 to 2 052) |
+| `38d2642` | 2 118 (1 808 to 2 132) | 2 257 (2 050 to 2 277) | 2 051 (2 046 to 2 052) |
 | `37cc34c` | 1 901 (1 835 to 1 952) | 1 981 (1 926 to 2 110) | 1 747 (1 593 to 1 772) |
 
 11%, 14% and 17%: the chunked GDN scan on the tensor ops, the expert
@@ -152,7 +152,7 @@ gathered rows, all described below.
 
 | commit    | 1K prompt           | 8K prompt           | 32K prompt          |
 |-----------|---------------------|---------------------|---------------------|
-| `8ec67f0` | 93.9 (80.9 to 94.7) | 87.1 (83.0 to 88.8) | 85.5 (85.3 to 85.8) |
+| `38d2642` | 93.9 (80.9 to 94.7) | 87.1 (83.0 to 88.8) | 85.5 (85.3 to 85.8) |
 | `37cc34c` | 93.1 (87.0 to 93.4) | 87.5 (85.2 to 87.6) | 83.3 (81.7 to 83.6) |
 
 Within the band at 1K and 8K, 2.6% at 32K: the block selection over 512
@@ -164,7 +164,7 @@ percent or less and grow with context.
 
 | commit    | 1K prompt                          | 8K prompt                           | 32K prompt                         |
 |-----------|------------------------------------|-------------------------------------|------------------------------------|
-| `8ec67f0` | 79.2 (70.2 to 80.4), 33% accepted  | 88.3 (85.0 to 89.7), 48% accepted   | 83.4 (82.8 to 84.5), 44% accepted  |
+| `38d2642` | 79.2 (70.2 to 80.4), 33% accepted  | 88.3 (85.0 to 89.7), 48% accepted   | 83.4 (82.8 to 84.5), 44% accepted  |
 | `37cc34c` | 93.1 (87.2 to 93.2), 46% accepted  | 100.7 (100.2 to 101.0), 59% accepted | 83.3 (77.7 to 85.7), 46% accepted |
 
 **The lower speculative cells are this prompt's trajectory, not a slower
@@ -241,7 +241,7 @@ side is Unsloth's llama.cpp fork (build b11007, Unsloth Studio 2026.9.5)
 serving `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ4_XS, 87 GB, KV cache f16,
 four slots over a unified 131 072-token context, flash attention off because
 the fork aborts at startup with it on for this model, measured 2026-09-17.
-lily's rows are from 2026-09-18 at commit `8ec67f0` with `--max-seq 131072`
+lily's rows are from 2026-09-18 at commit `38d2642` with `--max-seq 131072`
 and the disk tier off so that no run could hit a cache (the records under
 `docs/bench/2026-09-18-http/`); its rows of 2026-09-17 at commit `0c9ee63`
 are kept in the second table for the record.
@@ -262,7 +262,7 @@ are kept in the second table for the record.
 
 Prefill, tok/s:
 
-| context | lily `8ec67f0` | lily `0c9ee63` | llama.cpp | ratio, current |
+| context | lily `38d2642` | lily `0c9ee63` | llama.cpp | ratio, current |
 |--------:|---------------:|---------------:|----------:|---------------:|
 | 4 096   | 1 435 | 1 300 | 887 | 1.62x |
 | 16 384  | 1 756 | 1 546 | 882 | 1.99x |
@@ -402,7 +402,7 @@ the checkpoint as they are routed to (`docs/low-ram-experts.md`). Measured
 with the reads cold under a 60 GB locked balloon, as on a 64 GB machine,
 on the 8K real-text prompt with 256 generated tokens, digests identical to
 the resident path: 929 tok/s prefill and 64.4 tok/s plain
-decode at commit `8ec67f0` (977 and 54.6 at `37cc34c` the day before; the
+decode at commit `38d2642` (977 and 54.6 at `37cc34c` the day before; the
 cold runs' misses depend on what the page cache still holds), against 2 257 and
 87 with everything resident. Speculative decoding is off under the cache
 because its three trunk passes per step each pay the per-layer handshake
@@ -418,10 +418,10 @@ it; the kernel-level detail is in `docs/architecture.md`.
 A 4 096-token chunk reads the weights once (17.4 MB per token) and is bound
 by compute and kernel efficiency, not bandwidth. Where a chunk of an 8K
 real-text prompt goes, per pass in the per-kernel profile, `37cc34c`
-against `8ec67f0` in one clock state (the dense GEMM, untouched, reads
+against `38d2642` in one clock state (the dense GEMM, untouched, reads
 557 against 554 ms in the two):
 
-| kernel | `37cc34c` ms | `8ec67f0` ms | share now |
+| kernel | `37cc34c` ms | `38d2642` ms | share now |
 |---|---:|---:|---:|
 | grouped Q4 expert GEMM (`gemm_q4_nt_nax_grouped_t64x4`) | 669 | 572 | 34% |
 | dense bf16 tensor-op GEMM (`gemm_bf16_nt_nax`) | 558 | 554 | 33% |
@@ -492,7 +492,7 @@ in order of size:
 A decode step reads about 4.4 GB for one token (4.135 GB of weights, the
 226 MB of GDN state, 25 to 50 MB of attention caches), so it is bandwidth
 work, and the engine's job is not to waste bandwidth and not to wait
-between steps. At `8ec67f0` a 1K step takes 10.5 to 10.7 ms in the fast
+between steps. At `38d2642` a 1K step takes 10.5 to 10.7 ms in the fast
 clock state, about 415 GB/s. What got it there:
 
 1. **The transport.** One command buffer per step, level barriers between
