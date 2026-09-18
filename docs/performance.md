@@ -392,7 +392,15 @@ estimate with its assumption named.
    against 7.6 at 32K on the profile transport, 410 to 426 against 324 ms
    per 8K chunk in paired kernel profiles. The kernel is bound by its
    per-slice softmax and tensor-op work, not by the gathers, so the next
-   lever there is per-slice cost or occupancy, not tile height.
+   lever there is per-slice cost or occupancy, not tile height. The
+   occupancy was then probed: the same kernel declaring 12 KB more
+   threadgroup memory (32 KB in all) measured 4.45 against 3.90 ms per
+   256-query dispatch at 8K and 8.5 against 7.6 at 32K in the harness, so
+   at its 20 KB the kernel already runs more than one threadgroup per
+   core and a diet below 16 KB would buy one more; with 32 staged rows the
+   K/V staging alone is 16 KB (16 rows per slice measured slower earlier,
+   and the tensor ops take the slice height in multiples of 16), so that
+   diet is not available to this design.
 2. **The verify pass's kernel shapes.** Measured: for the same 1.64 GB of
    dense weights a 3-row verify pass spends 8.04 ms in the register-resident
    skinny Q4 GEMM where a decode step spends 3.85 ms in the 2-row GEMV, about
