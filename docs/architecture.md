@@ -578,18 +578,30 @@ already mask per row. Such a position is restricted to single-row passes
 whose candidate range spans less than one indexer block, which keeps "at most
 one block completes" true.
 
-The GDN prefill scan runs one simdgroup per (head, value column) group
-sequentially over the chunk's tokens with the state column in registers.
-It takes four value columns per simdgroup: the single-column form had 128
-simdgroups per head each reloading the same k, q and gate rows per token,
-and sharing them over four columns took the scan from 384 to 281 ms per
-8K chunk in paired profile runs (27%, about 3% of the chunk); two columns
-and eight measured between, sixteen far slower (registers), and loading
-the next token's operands a token ahead slower at every width, so the
-recurrence's own latency is the chain. The per-column arithmetic order is
-unchanged; results differ from the single-column scan only by fast-math
-contraction (the 4-layer golden gaps moved from 0.045 / 0.031 to 0.043 /
-0.025).
+The GDN prefill scan of a chunk of 128 rows or more runs in chunked form
+on the tensor ops (`gdn_chunk_wy3` + `gdn_chunk_scan` in `gdn.metal`): the
+recurrence over each 64-token chunk is written as a WY product. A first
+pass, parallel over (chunk, key head), forms `A[i][j] = beta_i (k_i . k_j)
+exp(G_i - G_j)` from the chunk's `K K^T` product and the cumulative
+log-decay `G`, inverts `I + A` by forward substitution (one column per
+lane, the three value heads of a key head at once), and stores per value
+head `W = T diag(beta exp(G)) K`, `U = T diag(beta) V` and the decayed
+causal `Q K^T`. The second pass walks the chunks of one head in order, one
+threadgroup per block of 16 state columns, with the fp32 state block in a
+cooperative-tensor accumulator and a bf16 copy of it as the operand of the
+two reads: `u~ = U - W S`, `S = exp(G_C) S + K^T diag(exp(G_C - G)) u~`,
+`o = exp(G) q S + P u~`. The state is handed to the decode step in the
+same fp32 layout as before. Results differ from the token-serial scan by
+the bf16 rounding of the state and pseudo-value reads and by the products'
+accumulation order: against the per-token CPU reference the outputs are
+as close as the serial scan's (0.2% of scale) and the final state within
+0.5% (serial: 0.2%); the 4-layer golden gaps went from 0.025 / 0.043 to
+0.028 / 0.045. A batch's ragged tail past the last whole chunk continues
+from the chunked state through the token-serial scan. The token-serial scan (`gdn_prefill_regscan`, one
+simdgroup per head and four value columns, the state in registers) serves
+the verify passes and short batches, and records the per-row states the
+rollback needs; `LILY_GDN_SCAN_KERNEL=gdn_prefill_regscan` routes every
+prefill through it for comparison.
 
 **Rollback needs no recomputation.** The GDN prefill scan records the state
 after every row, so the accepted one is copied back by index; the convolution

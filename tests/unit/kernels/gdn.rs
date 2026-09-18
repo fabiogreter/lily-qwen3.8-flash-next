@@ -218,9 +218,9 @@ fn gdn_prefill_matches_looped_step() {
         let out = Tensor::zeros(&ctx, &[m, h, dim], DType::BF16).expect("out");
 
         // The default route is the register scan and needs staging.
-        let (qk_norm, decay, beta) = staging_tensors(&ctx, m, hk, h);
+        let st = staging_tensors(&ctx, m, hk, h);
         let staging =
-            GdnRegscanStaging { qk_norm: &qk_norm, decay: &decay, beta: &beta };
+            st.staging();
         let pass = ctx.begin().expect("pass");
         gdn_prefill(
             &ctx, &pass, &t_qkv, &ta, &tb, &t_a_log, &t_dt_bias, &staging, &t_state,
@@ -301,9 +301,9 @@ fn gdn_prefill_nonzero_state_matches_looped_step() {
         let out = Tensor::zeros(&ctx, &[m, h, dim], DType::BF16).expect("out");
 
         // The default route is the register scan and needs staging.
-        let (qk_norm, decay, beta) = staging_tensors(&ctx, m, hk, h);
+        let st = staging_tensors(&ctx, m, hk, h);
         let staging =
-            GdnRegscanStaging { qk_norm: &qk_norm, decay: &decay, beta: &beta };
+            st.staging();
         let pass = ctx.begin().expect("pass");
         gdn_prefill(
             &ctx, &pass, &t_qkv, &ta, &tb, &t_a_log, &t_dt_bias, &staging, &t_state,
@@ -354,17 +354,40 @@ fn gdn_prefill_nonzero_state_matches_looped_step() {
 
 /// Fresh regscan staging tensors for one chunk shape (the default route
 /// needs them, like the production per-chunk scratch views).
-fn staging_tensors(
-    ctx: &MetalContext,
-    m: usize,
-    hk: usize,
-    h: usize,
-) -> (Tensor, Tensor, Tensor) {
-    (
-        Tensor::zeros(ctx, &[m, 2 * hk * GDN_HEAD_DIM], DType::BF16).expect("qk_norm"),
-        Tensor::zeros(ctx, &[m, h], DType::F32).expect("decay"),
-        Tensor::zeros(ctx, &[m, h], DType::F32).expect("beta"),
-    )
+fn staging_tensors(ctx: &MetalContext, m: usize, hk: usize, h: usize) -> StagingTensors {
+    let [w, u, p, g] = gdn_chunk_staging_shapes(m, h);
+    StagingTensors {
+        qk_norm: Tensor::zeros(ctx, &[m, 2 * hk * GDN_HEAD_DIM], DType::BF16).expect("qk_norm"),
+        decay: Tensor::zeros(ctx, &[m, h], DType::F32).expect("decay"),
+        beta: Tensor::zeros(ctx, &[m, h], DType::F32).expect("beta"),
+        w: Tensor::zeros(ctx, &w.0, w.1).expect("w"),
+        u: Tensor::zeros(ctx, &u.0, u.1).expect("u"),
+        p: Tensor::zeros(ctx, &p.0, p.1).expect("p"),
+        g: Tensor::zeros(ctx, &g.0, g.1).expect("g"),
+    }
+}
+
+/// Owned staging for both scans; `staging()` borrows it the way the model's
+/// scratch does.
+struct StagingTensors {
+    qk_norm: Tensor,
+    decay: Tensor,
+    beta: Tensor,
+    w: Tensor,
+    u: Tensor,
+    p: Tensor,
+    g: Tensor,
+}
+
+impl StagingTensors {
+    fn staging(&self) -> GdnRegscanStaging<'_> {
+        GdnRegscanStaging {
+            qk_norm: &self.qk_norm,
+            decay: &self.decay,
+            beta: &self.beta,
+            chunk: Some(GdnChunkStaging { w: &self.w, u: &self.u, p: &self.p, g: &self.g }),
+        }
+    }
 }
 
 #[test]
@@ -385,11 +408,11 @@ fn gdn_regscan_staging_stages_match_cpu() {
     let tb = Tensor::from_f32_as_bf16(&ctx, &b, &[m, h]).expect("b");
     let t_a_log = Tensor::from_f32(&ctx, &a_log, &[h]).expect("a_log");
     let t_dt_bias = Tensor::from_f32_as_bf16(&ctx, &dt_bias, &[h]).expect("dt_bias");
-    let (qk_norm, decay, beta) = staging_tensors(&ctx, m, hk, h);
+    let st = staging_tensors(&ctx, m, hk, h);
 
     let pass = ctx.begin().expect("pass");
-    gdn_qk_l2norm(&ctx, &pass, &t_qkv, &qk_norm, scale, hk, h).expect("gdn_qk_l2norm");
-    gdn_gates(&ctx, &pass, &ta, &tb, &t_a_log, &t_dt_bias, &decay, &beta)
+    gdn_qk_l2norm(&ctx, &pass, &t_qkv, &st.qk_norm, scale, hk, h).expect("gdn_qk_l2norm");
+    gdn_gates(&ctx, &pass, &ta, &tb, &t_a_log, &t_dt_bias, &st.decay, &st.beta)
         .expect("gdn_gates");
     pass.commit_wait().expect("commit");
 
@@ -414,7 +437,7 @@ fn gdn_regscan_staging_stages_match_cpu() {
     }
     let expected_qk = cpu_ref::round_bf16(&expected_qk);
     cpu_ref::assert_close(
-        &qk_norm.to_f32().expect("read qk_norm"),
+        &st.qk_norm.to_f32().expect("read qk_norm"),
         &expected_qk,
         2e-2,
         2e-2,
@@ -438,13 +461,13 @@ fn gdn_regscan_staging_stages_match_cpu() {
         expected_beta.extend(token_beta);
     }
     cpu_ref::assert_close(
-        &decay.to_f32().expect("read decay"),
+        &st.decay.to_f32().expect("read decay"),
         &expected_decay,
         1e-5,
         1e-5,
     );
     cpu_ref::assert_close(
-        &beta.to_f32().expect("read beta"),
+        &st.beta.to_f32().expect("read beta"),
         &expected_beta,
         1e-5,
         1e-5,
@@ -473,13 +496,16 @@ fn run_regscan(
     let t_qkv = Tensor::from_f32_as_bf16(ctx, qkv, &[m, c]).expect("qkv");
     let ta = Tensor::from_f32_as_bf16(ctx, a, &[m, h]).expect("a");
     let tb = Tensor::from_f32_as_bf16(ctx, b, &[m, h]).expect("b");
-    let (qk_norm, decay, beta) = staging_tensors(ctx, m, hk, h);
-    let staging = GdnRegscanStaging { qk_norm: &qk_norm, decay: &decay, beta: &beta };
+    let st = staging_tensors(ctx, m, hk, h);
+    let staging = st.staging();
     let out = Tensor::zeros(ctx, &[m, h, dim], DType::BF16).expect("out");
 
     let pass = ctx.begin().expect("pass");
-    gdn_prefill(
-        ctx, &pass, &t_qkv, &ta, &tb, a_log, dt_bias, &staging, state, &out, scale, hk,
+    // The token-serial scan by name: the default route takes the chunked
+    // scan from `GDN_CHUNK_MIN_ROWS` rows.
+    gdn_prefill_scan_named(
+        ctx, &pass, &t_qkv, &ta, &tb, a_log, dt_bias, &staging, state, &out, scale, hk, None,
+        "gdn_prefill_regscan",
     )
     .expect("gdn_prefill");
     pass.commit_wait().expect("commit");
@@ -495,8 +521,8 @@ fn gdn_prefill_regscan_rejects_bf16_state() {
     let b = Tensor::zeros(&ctx, &[m, h], DType::BF16).expect("b");
     let a_log = Tensor::zeros(&ctx, &[h], DType::F32).expect("a_log");
     let dt_bias = Tensor::zeros(&ctx, &[h], DType::BF16).expect("dt_bias");
-    let (qk_norm, decay, beta) = staging_tensors(&ctx, m, hk, h);
-    let staging = GdnRegscanStaging { qk_norm: &qk_norm, decay: &decay, beta: &beta };
+    let st = staging_tensors(&ctx, m, hk, h);
+    let staging = st.staging();
     let state = Tensor::zeros(&ctx, &[h, dim, dim], DType::BF16).expect("state");
     let out = Tensor::zeros(&ctx, &[m, h, dim], DType::BF16).expect("out");
     let pass = ctx.begin().expect("pass");
@@ -668,6 +694,116 @@ fn gdn_prefill_regscan_matches_cpu() {
             }
             cpu_ref::assert_close(&out_reg, &expected, 2e-2, 2e-2);
             cpu_ref::assert_close(&state_reg, &ref_state, 5e-3, 5e-3);
+        }
+    }
+}
+
+/// The chunked scan against the per-token CPU reference and against the
+/// serial scan, at the model's head shape and at small ones, with chunk
+/// counts of one, several and a ragged last chunk, from a nonzero state.
+/// It reads the state and the pseudo values through bf16 copies, so the
+/// tolerance is looser than the serial scan's.
+#[test]
+fn gdn_prefill_chunked_matches_cpu() {
+    let ctx = MetalContext::new().expect("metal context");
+    let dim = GDN_HEAD_DIM;
+    let scale = 1.0 / (dim as f32).sqrt();
+    for (seed, hk, h, ms) in [
+        (61u64, 4usize, 4usize, &[64usize, 100, 200, 333][..]),
+        (63, 2, 6, &[128, 250][..]),
+        (65, 16, 48, &[200, 1024][..]),
+    ] {
+        for &m in ms {
+            let mut rng = StdRng::seed_from_u64(seed + m as u64);
+            let c = (2 * hk + h) * dim;
+            let a_log = random_vec(&mut rng, h, -2.0, 0.5);
+            let dt_bias = random_vec(&mut rng, h, -0.5, 0.5);
+            let qkv = random_vec(&mut rng, m * c, -1.0, 1.0);
+            let a = random_vec(&mut rng, m * h, -1.0, 1.0);
+            let b = random_vec(&mut rng, m * h, -1.0, 1.0);
+            let init_state = random_vec(&mut rng, h * dim * dim, -0.5, 0.5);
+
+            let t_a_log = Tensor::from_f32(&ctx, &a_log, &[h]).expect("a_log");
+            let t_dt_bias =
+                Tensor::from_f32_as_bf16(&ctx, &dt_bias, &[h]).expect("dt_bias");
+            // The inputs and the normalized rows sit in front of 64 rows of
+            // NaN: a kernel reading past its rows shows in the results.
+            let guarded = |data: &[f32], cols: usize| {
+                let mut padded = data.to_vec();
+                padded.extend(std::iter::repeat_n(f32::NAN, 64 * cols));
+                Tensor::from_f32_as_bf16(&ctx, &padded, &[m + 64, cols])
+                    .expect("padded")
+                    .view(0, &[m, cols])
+                    .expect("view")
+            };
+            let t_qkv = guarded(&qkv, c);
+            let ta = Tensor::from_f32_as_bf16(&ctx, &a, &[m, h]).expect("a");
+            let tb = Tensor::from_f32_as_bf16(&ctx, &b, &[m, h]).expect("b");
+            let st = staging_tensors(&ctx, m, hk, h);
+            let qk_guard = guarded(&vec![0.0f32; m * 2 * hk * dim], 2 * hk * dim);
+            let run = |name: &str| {
+                let staging = GdnRegscanStaging { qk_norm: &qk_guard, ..st.staging() };
+                let state =
+                    Tensor::from_f32(&ctx, &init_state, &[h, dim, dim]).expect("state");
+                let out = Tensor::zeros(&ctx, &[m, h, dim], DType::BF16).expect("out");
+                let pass = ctx.begin().expect("pass");
+                gdn_prefill_scan_named(
+                    &ctx, &pass, &t_qkv, &ta, &tb, &t_a_log, &t_dt_bias, &staging, &state,
+                    &out, scale, hk, None, name,
+                )
+                .expect("scan");
+                pass.commit_wait().expect("commit");
+                (out.to_f32().expect("out"), state.to_f32().expect("state"))
+            };
+            let (out_chunk, state_chunk) = run(GDN_CHUNK_SCAN);
+            let (out_reg, state_reg) = run("gdn_prefill_regscan");
+
+            let (rqkv, ra, rb) = (
+                cpu_ref::round_bf16(&qkv),
+                cpu_ref::round_bf16(&a),
+                cpu_ref::round_bf16(&b),
+            );
+            let rdt = cpu_ref::round_bf16(&dt_bias);
+            let mut ref_state = init_state.clone();
+            let mut expected = Vec::new();
+            for t in 0..m {
+                let row = &rqkv[t * c..(t + 1) * c];
+                let (decay, beta) = cpu_ref::gdn_gates(
+                    &a_log,
+                    &ra[t * h..(t + 1) * h],
+                    &rdt,
+                    &rb[t * h..(t + 1) * h],
+                );
+                expected.extend(cpu_ref::gdn_step(
+                    &row[..hk * dim],
+                    &row[hk * dim..2 * hk * dim],
+                    &row[2 * hk * dim..],
+                    &mut ref_state,
+                    &decay,
+                    &beta,
+                    scale,
+                    h,
+                    hk,
+                    dim,
+                    dim,
+                ));
+            }
+            let max_err = |x: &[f32], y: &[f32]| {
+                x.iter().zip(y).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max)
+            };
+            let scale_of = |x: &[f32]| x.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            eprintln!(
+                "hk {hk} h {h} m {m}: out |chunk - cpu| {:.4}, |serial - cpu| {:.4} (scale {:.2}); state |chunk - cpu| {:.5}, |serial - cpu| {:.5} (scale {:.2})",
+                max_err(&out_chunk, &expected),
+                max_err(&out_reg, &expected),
+                scale_of(&expected),
+                max_err(&state_chunk, &ref_state),
+                max_err(&state_reg, &ref_state),
+                scale_of(&ref_state),
+            );
+            assert!(out_chunk.iter().all(|x| x.is_finite()), "non-finite output");
+            cpu_ref::assert_close(&out_chunk, &expected, 5e-2, 5e-2);
+            cpu_ref::assert_close(&state_chunk, &ref_state, 2e-2, 2e-2);
         }
     }
 }
@@ -1054,8 +1190,8 @@ fn gdn_prefill_regscan_mid_states_match_prefix_scans() {
     let t_qkv = Tensor::from_f32_as_bf16(&ctx, &qkv, &[m, c]).expect("qkv");
     let ta = Tensor::from_f32_as_bf16(&ctx, &a, &[m, h]).expect("a");
     let tb = Tensor::from_f32_as_bf16(&ctx, &b, &[m, h]).expect("b");
-    let (qk_norm, decay, beta) = staging_tensors(&ctx, m, hk, h);
-    let staging = GdnRegscanStaging { qk_norm: &qk_norm, decay: &decay, beta: &beta };
+    let st = staging_tensors(&ctx, m, hk, h);
+    let staging = st.staging();
     let out = Tensor::zeros(&ctx, &[m, h, dim], DType::BF16).expect("out");
     let pass = ctx.begin().expect("pass");
     gdn_prefill_mid(
@@ -1227,14 +1363,14 @@ fn gdn_small_m_timing() {
             &[m, h * dim],
         )
         .expect("z");
-        let (qk_norm, decay, beta) = staging_tensors(&ctx, m, hk, h);
+        let st = staging_tensors(&ctx, m, hk, h);
         let staging =
-            GdnRegscanStaging { qk_norm: &qk_norm, decay: &decay, beta: &beta };
+            st.staging();
         let out = Tensor::zeros(&ctx, &[m, h, dim], DType::BF16).expect("out");
         let gated = Tensor::zeros(&ctx, &[h * dim], DType::BF16).expect("gated");
         for variant in ["regscan", "step-loop"] {
             let mut best = f64::MAX;
-            for _ in 0..3 {
+            for _ in 0..5 {
                 let pass = ctx.begin_concurrent().expect("pass");
                 for state in &states {
                     if variant == "regscan" {
@@ -1304,8 +1440,8 @@ fn gdn_prefill_scan_timing() {
     let t_qkv = Tensor::from_f32_as_bf16(&ctx, &qkv, &[m, c]).expect("qkv");
     let ta = Tensor::from_f32_as_bf16(&ctx, &a, &[m, h]).expect("a");
     let tb = Tensor::from_f32_as_bf16(&ctx, &b, &[m, h]).expect("b");
-    let (qk_norm, decay, beta) = staging_tensors(&ctx, m, hk, h);
-    let staging = GdnRegscanStaging { qk_norm: &qk_norm, decay: &decay, beta: &beta };
+    let st = staging_tensors(&ctx, m, hk, h);
+    let staging = st.staging();
     let state = Tensor::zeros(&ctx, &[h, dim, dim], DType::F32).expect("state");
     let out = Tensor::zeros(&ctx, &[m, h, dim], DType::BF16).expect("out");
     let names: Vec<String> = std::env::var("LILY_GDN_SCAN_KERNELS")
@@ -1316,9 +1452,14 @@ fn gdn_prefill_scan_timing() {
                 "gdn_prefill_regscan_c1".to_string(),
             ]
         });
-    crate::metal::profile::take();
+    // The GPU clock ramps over the first hundred milliseconds of work, so
+    // warm it up before the measured rounds.
     let rounds = 8;
-    for round in 0..rounds {
+    let warmup = std::env::var("LILY_GDN_SCAN_WARMUP").ok().and_then(|v| v.parse().ok()).unwrap_or(40usize);
+    for round in 0..warmup + rounds {
+        if round == warmup {
+            crate::metal::profile::take();
+        }
         for k in 0..names.len() {
             let name = &names[(k + round) % names.len()];
             let pass = ctx.begin().expect("pass");
@@ -1332,11 +1473,21 @@ fn gdn_prefill_scan_timing() {
     }
     let passes = crate::metal::profile::take();
     for name in &names {
+        // The chunked scan is two dispatches per pass; report their sum.
+        let matches = |kernel: &str| {
+            kernel == name.as_str() || (name == GDN_CHUNK_SCAN && kernel.starts_with("gdn_chunk"))
+        };
         let mut ms: Vec<f64> = passes
             .iter()
-            .flat_map(|p| p.kernels.iter())
-            .filter(|s| s.name == name.as_str())
-            .map(|s| s.gpu_secs * 1e3)
+            .filter_map(|p| {
+                let s: f64 = p
+                    .kernels
+                    .iter()
+                    .filter(|s| matches(&s.name))
+                    .map(|s| s.gpu_secs * 1e3)
+                    .sum();
+                (s > 0.0).then_some(s)
+            })
             .collect();
         ms.sort_by(|x, y| x.total_cmp(y));
         let n = ms.len();
@@ -1346,5 +1497,19 @@ fn gdn_prefill_scan_timing() {
             ms[0],
             ms[n / 2]
         );
+        if name == GDN_CHUNK_SCAN {
+            for part in ["gdn_chunk_wy", "gdn_chunk_scan"] {
+                let mut ms: Vec<f64> = passes
+                    .iter()
+                    .flat_map(|p| p.kernels.iter())
+                    .filter(|s| s.name.starts_with(part))
+                    .map(|s| s.gpu_secs * 1e3)
+                    .collect();
+                ms.sort_by(|x, y| x.total_cmp(y));
+                if !ms.is_empty() {
+                    eprintln!("  {part}: min {:.2} ms, median {:.2} ms", ms[0], ms[ms.len() / 2]);
+                }
+            }
+        }
     }
 }

@@ -340,7 +340,32 @@ estimate with its assumption named.
    contraction, which is enough to move the 8K greedy speculative
    trajectory (the digest 9e5cd959e0842bc7 of the earlier rows became
    74f9aab8ea2e7f87, 151/210 drafts accepted instead of 152/208); the
-   4-layer golden gaps shrank slightly. The MoE input gather (one bf16 element per thread) now moves eight
+   4-layer golden gaps shrank slightly. The scan then left the token-serial
+   form for prefill batches of 128 rows or more: the chunked WY form on the
+   tensor ops (64-token chunks; a parallel pass forms and inverts each
+   chunk's `I + A`, a sequential pass per head and block of 16 state columns
+   carries the state; `docs/architecture.md`). Per dispatch at the chunk
+   shape on the profile transport, 0.84 + 1.9 ms against 4.7; in paired
+   kernel profiles per 8K prefill (two chunks) 99 to 109 ms against 171 to
+   190, per 1K prefill 26 against 51, per 32K prefill 116 to 125 against
+   191: about 4% of the 8K prefill and 3% of the 32K one. The scan pass is
+   bound by streaming each chunk's rows into the cores, not by the
+   products (with every threadgroup reading one head's cache-resident rows
+   it took 0.49 ms, the same as with no products at all); wider column
+   blocks read fewer bytes but ran too few threadgroups to hide the
+   dependent-product latency (32: 2.2 ms, 64: 2.8, 128 with the state
+   copy in device memory: 3.2), narrower ones doubled the bytes (8: 3.8),
+   and touching the next chunk's lines ahead, pre-transposed keys and
+   eight simdgroups did not help. Its results differ from the serial scan
+   by the bf16 rounding of the state and pseudo-value reads (against the
+   per-token CPU reference the output error is the serial scan's, the
+   final state's 0.5% of scale against 0.2%; the 4-layer golden gaps
+   0.028 / 0.045 against 0.025 / 0.043, argmax agreement unchanged), which
+   moves every digest; over the six real 8K prompts greedy 2-draft
+   acceptance averaged 65.0% against 68.7% with the serial scan (46.0 /
+   76.3 / 50.0 / 79.7 / 76.3 / 61.6 against 59.1 / 76.3 / 59.1 / 67.1 /
+   83.3 / 67.1), the same kind of per-prompt swing as between the one- and
+   four-column serial scans. The MoE input gather (one bf16 element per thread) now moves eight
    per thread on its 16-byte-aligned rows: 1.07 to 0.52 ms per call at the
    chunk shape, about 26 ms per 8K chunk (1.3%). A 128-deep K step for the
    grouped expert GEMM (half the B-tile barriers per FLOP) measured within
@@ -357,8 +382,7 @@ estimate with its assumption named.
    against 7.6 at 32K on the profile transport, 410 to 426 against 324 ms
    per 8K chunk in paired kernel profiles. The kernel is bound by its
    per-slice softmax and tensor-op work, not by the gathers, so the next
-   lever there is per-slice cost (or occupancy: the 20 KB of threadgroup
-   memory allow about one threadgroup per core), not tile height.
+   lever there is per-slice cost or occupancy, not tile height.
 2. **The verify pass's kernel shapes.** Measured: for the same 1.64 GB of
    dense weights a 3-row verify pass spends 8.04 ms in the register-resident
    skinny Q4 GEMM where a decode step spends 3.85 ms in the 2-row GEMV, about

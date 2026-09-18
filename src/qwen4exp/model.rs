@@ -28,7 +28,8 @@ use crate::kernels::elementwise::{
 };
 use crate::kernels::gdn::{
     GDN_HEAD_DIM, GDN_STATE_DTYPE, GdnGate, GdnRegscanStaging, conv1d_prefill,
-    conv1d_step, gated_rmsnorm, gdn_prefill_mid, gdn_step_gated_fused,
+    conv1d_step, gated_rmsnorm, gdn_chunk_staging_shapes, gdn_prefill_mid, gdn_step_gated_fused,
+    GdnChunkStaging,
 };
 use crate::kernels::hc::{
     HC_FUSED_MAX_ROWS, fused_read_supported, hc_broadcast_bf16, hc_inject_bf16,
@@ -1082,6 +1083,47 @@ struct GdnStageScratch {
     qk_norm: Tensor,
     decay: Tensor,
     beta: Tensor,
+    /// The chunked scan's per-chunk WY staging (`gdn_chunk_staging_shapes`).
+    w: Tensor,
+    u: Tensor,
+    p: Tensor,
+    g: Tensor,
+}
+
+impl GdnStageScratch {
+    fn new(ctx: &MetalContext, m: usize, hk: usize, heads: usize) -> Result<Self> {
+        let [w, u, p, g] = gdn_chunk_staging_shapes(m, heads);
+        Ok(Self {
+            qk_norm: Tensor::zeros(ctx, &[m, 2 * hk * GDN_HEAD_DIM], DType::BF16)?,
+            decay: Tensor::zeros(ctx, &[m, heads], DType::F32)?,
+            beta: Tensor::zeros(ctx, &[m, heads], DType::F32)?,
+            w: Tensor::zeros(ctx, &w.0, w.1)?,
+            u: Tensor::zeros(ctx, &u.0, u.1)?,
+            p: Tensor::zeros(ctx, &p.0, p.1)?,
+            g: Tensor::zeros(ctx, &g.0, g.1)?,
+        })
+    }
+
+    fn prefix(&self, m: usize) -> Result<Self> {
+        Ok(Self {
+            qk_norm: prefix_rows(&self.qk_norm, m)?,
+            decay: prefix_rows(&self.decay, m)?,
+            beta: prefix_rows(&self.beta, m)?,
+            w: prefix_rows(&self.w, m)?,
+            u: prefix_rows(&self.u, m)?,
+            p: prefix_rows(&self.p, m)?,
+            g: prefix_rows(&self.g, m)?,
+        })
+    }
+
+    fn staging(&self) -> GdnRegscanStaging<'_> {
+        GdnRegscanStaging {
+            qk_norm: &self.qk_norm,
+            decay: &self.decay,
+            beta: &self.beta,
+            chunk: Some(GdnChunkStaging { w: &self.w, u: &self.u, p: &self.p, g: &self.g }),
+        }
+    }
 }
 
 impl PrefillScratch {
@@ -1122,11 +1164,7 @@ impl PrefillScratch {
             b: Tensor::zeros(ctx, &[m, heads], bf)?,
             gdn_out: Tensor::zeros(ctx, &[m, heads, GDN_HEAD_DIM], bf)?,
             gdn_gated: Tensor::zeros(ctx, &[m, dim_v], bf)?,
-            gdn_stage: GdnStageScratch {
-                qk_norm: Tensor::zeros(ctx, &[m, 2 * hk * GDN_HEAD_DIM], bf)?,
-                decay: Tensor::zeros(ctx, &[m, heads], DType::F32)?,
-                beta: Tensor::zeros(ctx, &[m, heads], DType::F32)?,
-            },
+            gdn_stage: GdnStageScratch::new(ctx, m, hk, heads)?,
             qg: Tensor::zeros(ctx, &[m, nq * 2 * hd], bf)?,
             q: Tensor::zeros(ctx, &[m, nq, hd], bf)?,
             gate: Tensor::zeros(ctx, &[m, nq, hd], bf)?,
@@ -1190,11 +1228,7 @@ impl PrefillScratch {
             b: prefix_rows(&self.b, m)?,
             gdn_out: prefix_rows(&self.gdn_out, m)?,
             gdn_gated: prefix_rows(&self.gdn_gated, m)?,
-            gdn_stage: GdnStageScratch {
-                qk_norm: prefix_rows(&self.gdn_stage.qk_norm, m)?,
-                decay: prefix_rows(&self.gdn_stage.decay, m)?,
-                beta: prefix_rows(&self.gdn_stage.beta, m)?,
-            },
+            gdn_stage: self.gdn_stage.prefix(m)?,
             qg: prefix_rows(&self.qg, m)?,
             q: prefix_rows(&self.q, m)?,
             gate: prefix_rows(&self.gate, m)?,
@@ -2358,11 +2392,7 @@ impl Qwen4ExpModel {
             &ps.qkv_conv,
         )?;
         pass.level_barrier(&[&ps.qkv_conv, &conv_windows[1 - conv_slot]])?;
-        let staging = GdnRegscanStaging {
-            qk_norm: &ps.gdn_stage.qk_norm,
-            decay: &ps.gdn_stage.decay,
-            beta: &ps.gdn_stage.beta,
-        };
+        let staging = ps.gdn_stage.staging();
         gdn_prefill_mid(
             ctx,
             pass,

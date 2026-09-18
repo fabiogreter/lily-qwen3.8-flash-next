@@ -98,6 +98,41 @@ pub struct GdnRegscanStaging<'a> {
     pub decay: &'a Tensor,
     /// F32 `[M, H]` sigmoid(b) gates.
     pub beta: &'a Tensor,
+    /// The chunked scan's staging; without it every prefill takes the
+    /// token-serial scan.
+    pub chunk: Option<GdnChunkStaging<'a>>,
+}
+
+/// Tokens per chunk of the chunked prefill scan (`GDN_CHUNK` in gdn.metal).
+pub const GDN_CHUNK: usize = 64;
+/// State columns per `gdn_chunk_scan` threadgroup (`GDN_CHUNK_NB`).
+pub const GDN_CHUNK_NB: usize = 16;
+/// Rows from which a prefill takes the chunked scan; shorter batches (the
+/// verify passes) stay on the token-serial scan.
+pub const GDN_CHUNK_MIN_ROWS: usize = 128;
+
+/// Per-chunk WY staging the chunked scan writes in its first pass and reads
+/// in its second: [`gdn_chunk_staging_shapes`] gives the tensors' shapes.
+pub struct GdnChunkStaging<'a> {
+    /// BF16 `[M, H, 128]` W = T diag(beta exp(G)) K.
+    pub w: &'a Tensor,
+    /// BF16 `[M, H, 128]` U = T diag(beta) V.
+    pub u: &'a Tensor,
+    /// BF16 `[M, H, 64]` causal, decayed Q K^T within the chunk.
+    pub p: &'a Tensor,
+    /// F32 `[M, H]` cumulative log-decay within the chunk.
+    pub g: &'a Tensor,
+}
+
+/// Shapes and dtypes of the chunk staging tensors (`w`, `u`, `p`, `g`) for
+/// `m` rows and `num_heads` value heads.
+pub fn gdn_chunk_staging_shapes(m: usize, num_heads: usize) -> [(Vec<usize>, DType); 4] {
+    [
+        (vec![m, num_heads, GDN_HEAD_DIM], DType::BF16),
+        (vec![m, num_heads, GDN_HEAD_DIM], DType::BF16),
+        (vec![m, num_heads, GDN_CHUNK], DType::BF16),
+        (vec![m, num_heads], DType::F32),
+    ]
 }
 
 /// L2-normalizes q/k into BF16 `[M, 2*HK*128]`; q is pre-scaled.
@@ -235,10 +270,17 @@ pub fn gdn_prefill_mid(
     num_k_heads: usize,
     mid: Option<&Tensor>,
 ) -> Result<()> {
-    // `LILY_GDN_SCAN_KERNEL` names an alternative scan (timing experiments).
+    // `LILY_GDN_SCAN_KERNEL` names an alternative scan (timing experiments):
+    // a token-serial kernel by name, or `gdn_chunk` for the chunked scan.
     static FORCED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let forced = FORCED.get_or_init(|| std::env::var("LILY_GDN_SCAN_KERNEL").ok());
-    let scan_name = forced.as_deref().unwrap_or(GDN_SCAN_KERNEL);
+    let m = a.numel() / a_log.numel().max(1);
+    let default = if mid.is_none() && staging.chunk.is_some() && m >= GDN_CHUNK_MIN_ROWS {
+        GDN_CHUNK_SCAN
+    } else {
+        GDN_SCAN_KERNEL
+    };
+    let scan_name = forced.as_deref().unwrap_or(default);
     gdn_prefill_scan_named(
         ctx,
         pass,
@@ -257,8 +299,10 @@ pub fn gdn_prefill_mid(
     )
 }
 
-/// The shipped prefill scan kernel.
+/// The token-serial prefill scan kernel.
 const GDN_SCAN_KERNEL: &str = "gdn_prefill_regscan";
+/// The name that selects the chunked scan (`gdn_chunk_wy` + `gdn_chunk_scan`).
+pub const GDN_CHUNK_SCAN: &str = "gdn_chunk";
 
 /// [`gdn_prefill_mid`] through the scan kernel given by name (the shipped
 /// scan takes four value columns per simdgroup; `_c1` / `_c2` are the
@@ -312,6 +356,81 @@ pub fn gdn_prefill_scan_named(
         "beta must be F32 [M, H]"
     );
 
+    if scan_name == GDN_CHUNK_SCAN {
+        ensure!(mid.is_none(), "the chunked scan records no mid states");
+        let chunk = staging
+            .chunk
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("the chunked scan needs its chunk staging"))?;
+        // Whole chunks through the tensor kernels; a ragged tail continues
+        // from their state through the token-serial scan (its kernels read
+        // whole chunks of rows, see gdn.metal).
+        let m_main = m - m % GDN_CHUNK;
+        if m_main == m {
+            return gdn_prefill_chunked(
+                ctx, pass, qkv, a, b, a_log, dt_bias, staging, chunk, state, out, scale,
+                num_k_heads,
+            );
+        }
+        let rows = |t: &Tensor, start: usize, len: usize| -> Result<Tensor> {
+            let mut shape = t.shape().to_vec();
+            let per_row = t.numel() / shape[0];
+            shape[0] = len;
+            t.view(start * per_row, &shape)
+        };
+        if m_main > 0 {
+            let head = GdnRegscanStaging {
+                qk_norm: &rows(staging.qk_norm, 0, m_main)?,
+                decay: staging.decay,
+                beta: staging.beta,
+                chunk: Some(GdnChunkStaging {
+                    w: &rows(chunk.w, 0, m_main)?,
+                    u: &rows(chunk.u, 0, m_main)?,
+                    p: &rows(chunk.p, 0, m_main)?,
+                    g: &rows(chunk.g, 0, m_main)?,
+                }),
+            };
+            gdn_prefill_chunked(
+                ctx,
+                pass,
+                &rows(qkv, 0, m_main)?,
+                &rows(a, 0, m_main)?,
+                &rows(b, 0, m_main)?,
+                a_log,
+                dt_bias,
+                &head,
+                head.chunk.as_ref().expect("chunk staging"),
+                state,
+                &rows(out, 0, m_main)?,
+                scale,
+                num_k_heads,
+            )?;
+            pass.level_barrier(&[state])?;
+        }
+        let tail_len = m - m_main;
+        let tail = GdnRegscanStaging {
+            qk_norm: &rows(staging.qk_norm, m_main, tail_len)?,
+            decay: &rows(staging.decay, m_main, tail_len)?,
+            beta: &rows(staging.beta, m_main, tail_len)?,
+            chunk: None,
+        };
+        return gdn_prefill_scan_named(
+            ctx,
+            pass,
+            &rows(qkv, m_main, tail_len)?,
+            &rows(a, m_main, tail_len)?,
+            &rows(b, m_main, tail_len)?,
+            a_log,
+            dt_bias,
+            &tail,
+            state,
+            &rows(out, m_main, tail_len)?,
+            scale,
+            num_k_heads,
+            None,
+            GDN_SCAN_KERNEL,
+        );
+    }
     let mid_count = match mid {
         Some(t) => {
             ensure!(
@@ -362,6 +481,90 @@ pub fn gdn_prefill_scan_named(
         Grid::Threadgroups {
             groups: (num_heads, dim / (4 * cols_per_sg), 1),
             threadgroup: (32, 4, 1),
+        },
+    )
+}
+
+/// The chunked scan: `gdn_chunk_wy` over every (chunk, key head), then
+/// `gdn_chunk_scan` over every (column block, value head) walking the
+/// chunks in order. Same operands, state and output as the serial scan.
+#[allow(clippy::too_many_arguments)]
+fn gdn_prefill_chunked(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    qkv: &Tensor,
+    a: &Tensor,
+    b: &Tensor,
+    a_log: &Tensor,
+    dt_bias: &Tensor,
+    staging: &GdnRegscanStaging<'_>,
+    chunk: &GdnChunkStaging<'_>,
+    state: &Tensor,
+    out: &Tensor,
+    scale: f32,
+    num_k_heads: usize,
+) -> Result<()> {
+    let num_heads = a_log.numel();
+    let dim = GDN_HEAD_DIM;
+    let vpk = num_heads / num_k_heads;
+    let m = a.numel() / num_heads;
+    ensure!(m > 0 && m.is_multiple_of(GDN_CHUNK), "the chunked scan takes whole chunks of {GDN_CHUNK} rows, got {m}");
+    for ((t, name), (shape, dtype)) in [(chunk.w, "w"), (chunk.u, "u"), (chunk.p, "p"), (chunk.g, "g")]
+        .into_iter()
+        .zip(gdn_chunk_staging_shapes(m, num_heads))
+    {
+        ensure!(
+            t.numel() >= shape.iter().product::<usize>() && t.dtype() == dtype,
+            "chunk staging {name} must hold {dtype:?} {shape:?}, got {:?} {:?}",
+            t.dtype(),
+            t.shape()
+        );
+    }
+    ensure!(dt_bias.dtype() == DType::BF16 && a.dtype() == DType::BF16 && b.dtype() == DType::BF16,
+            "a, b and dt_bias must be BF16");
+    gdn_qk_l2norm(ctx, pass, qkv, staging.qk_norm, scale, num_k_heads, num_heads)?;
+    pass.level_barrier(&[staging.qk_norm])?;
+    // The three-heads-at-once pass covers up to three value heads per key
+    // head; wider grouping takes the per-head pass.
+    let (wy_name, wy_threads) = if vpk <= 3 { ("gdn_chunk_wy3", 256) } else { ("gdn_chunk_wy", 128) };
+    let wy = ctx.pipeline(wy_name, SOURCE, MslVersion::V4_0)?;
+    pass.dispatch_at(
+        &wy,
+        &[
+            qkv.binding(),
+            staging.qk_norm.binding(),
+            a.binding(),
+            b.binding(),
+            a_log.binding(),
+            dt_bias.binding(),
+            chunk.w.binding(),
+            chunk.u.binding(),
+            chunk.p.binding(),
+            chunk.g.binding(),
+        ],
+        &[&u32_bytes(m), &u32_bytes(num_heads), &u32_bytes(vpk)],
+        Grid::Threadgroups {
+            groups: (m.div_ceil(GDN_CHUNK), num_k_heads, 1),
+            threadgroup: (wy_threads, 1, 1),
+        },
+    )?;
+    pass.level_barrier(&[chunk.w, chunk.u, chunk.p, chunk.g])?;
+    let scan = ctx.pipeline("gdn_chunk_scan", SOURCE, MslVersion::V4_0)?;
+    pass.dispatch_at(
+        &scan,
+        &[
+            staging.qk_norm.binding(),
+            chunk.w.binding(),
+            chunk.u.binding(),
+            chunk.p.binding(),
+            chunk.g.binding(),
+            state.binding(),
+            out.binding(),
+        ],
+        &[&u32_bytes(m), &u32_bytes(num_heads), &u32_bytes(vpk)],
+        Grid::Threadgroups {
+            groups: (dim / GDN_CHUNK_NB, num_heads, 1),
+            threadgroup: (32 * 4, 1, 1),
         },
     )
 }
