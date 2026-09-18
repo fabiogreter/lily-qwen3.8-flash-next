@@ -894,6 +894,18 @@ regardless of k; per draw in the profiled model the two phases take about
 before them, and the drawn tokens are the same to the digest. Larger k
 keeps the single threadgroup (the 1 024-candidate cap 184 us).
 
+While a request runs the engine thread holds a process activity assertion
+(`src/activity.rs`: `NSProcessInfo` `beginActivity` with the
+user-initiated and latency-critical options, ended with the request). A
+server has no window and nobody types into it, and about 90 seconds into a
+series of requests the system stopped treating its work as done for the
+user: a `powermetrics` trace showed the GPU at 1 234 to 1 241 MHz and 24 W
+where the first requests had run at 1 620 MHz and 50 W, the 3-row verify
+pass 18.0 to 21.4 ms and prefill sagging alike, while memory-bound plain
+decode did not notice. With the assertion the same repeat held 1 489 to
+1 551 MHz ([performance.md](performance.md), the noise section). Between
+requests nothing is asserted, so an idle machine sleeps as before.
+
 Stop signals are taken synchronously rather than in a signal handler: SIGTERM
 and SIGINT are blocked before the first thread is spawned, so every thread
 inherits the mask, and one thread `sigwait`s for them. The inherited

@@ -105,6 +105,21 @@ then says what assumption it rests on.
   competitor does the same and worse (the 4-layer test model decoding in
   parallel took speculative decode from 115 to 60 tok/s and plain from 92
   to 73), and four CPU-hog processes changed nothing in either loop.
+  A `powermetrics` trace under the series then showed what the sag is:
+  in the first repeat decode ran at 1 620 MHz drawing 48 to 55 W, in the
+  second at 1 234 to 1 241 MHz drawing 24 W, the 4K prefill at a median
+  791 MHz and 16 W. Clock and power fell together to half, which is not a
+  thermal limiter (that holds power at its cap while the clock falls) but
+  the system taking the performance envelope away from a windowless
+  process it no longer counts as working for the user. The server now
+  holds an `NSProcessInfo` activity assertion, user-initiated and
+  latency-critical, for each request (`src/activity.rs`; released between
+  requests, so an idle machine still sleeps; `lily-bench` holds one for
+  its run). With it the same second repeat ran at 1 489 to 1 551 MHz and
+  38 to 42 W, 22.0 to 23.4 ms per speculative step against 25 to 27, and
+  the third at 1 540 to 1 620. The sag that remains, from 1 620 to about
+  1 500 to 1 550 MHz under sustained load, is the machine's own power
+  management; High Power mode is the lever for that, not software.
 - **Draft acceptance is a property of one trajectory.** Over 256 greedy
   tokens on one prompt the acceptance rate swings by 10 to 20 points
   between two builds whose logits differ in the last bits, because the two
@@ -249,32 +264,35 @@ Prefill, tok/s:
 
 | context | lily `8ec67f0` | lily `0c9ee63` | llama.cpp | ratio, current |
 |--------:|---------------:|---------------:|----------:|---------------:|
-| 4 096   | 1 386 | 1 300 | 887 | 1.56x |
-| 16 384  | 1 727 | 1 546 | 882 | 1.96x |
-| 32 768  | 1 725 | 1 499 | 713 | 2.42x |
-| 65 536  | 1 641 | 1 382 | 550 | 2.98x |
+| 4 096   | 1 435 | 1 300 | 887 | 1.62x |
+| 16 384  | 1 756 | 1 546 | 882 | 1.99x |
+| 32 768  | 1 864 | 1 499 | 713 | 2.61x |
+| 65 536  | 1 651 | 1 382 | 550 | 3.00x |
 
 Decode, tok/s:
 
 | context | lily plain | lily 2 drafts | llama.cpp plain | llama.cpp MTP 2 | ratio, best against best |
 |--------:|-----------:|--------------:|----------------:|----------------:|-------------------------:|
-| 1 024   | 85.8 | 101.0 | 42.0 | 54.7 | 1.85x |
-| 4 096   | 86.7 | 98.9 | 39.1 | 51.8 | 1.91x |
-| 16 384  | 85.4 | 95.8 | 31.4 | 44.1 | 2.17x |
-| 32 768  | 84.8 | 95.7 | 25.2 | 37.0 | 2.59x |
-| 65 536  | 81.7 | 96.1 | 17.0 | 27.0 | 3.56x |
+| 1 024   | 85.8 | 105.8 | 42.0 | 54.7 | 1.93x |
+| 4 096   | 86.7 | 98.1 | 39.1 | 51.8 | 1.89x |
+| 16 384  | 85.4 | 97.2 | 31.4 | 44.1 | 2.20x |
+| 32 768  | 84.8 | 102.0 | 25.2 | 37.0 | 2.76x |
+| 65 536  | 81.7 | 92.4 | 17.0 | 27.0 | 3.42x |
 
 lily's prefill column is the server as shipped, with the draft head
 loaded and caught up during prefill; without it (`--mtp-drafts 0`) a
 series measured 1 471 / 1 807 / 1 811 / 1 710. Its decode rows of
 2026-09-17 were 90.2 / 86.0 / 85.5 / 83.9 / 81.8 plain and 98.9 / 101.7 /
 102.0 / 101.5 / 97.7 with two drafts. The 2-draft and prefill rows are
-medians over a seven-minute series and carry the sustained-load clock sag
-described in the noise section: the first repeat of the 2026-09-18 series,
-at full clock, decoded 114 / 108 / 108 / 103 / 99 tok/s with two drafts
-(20.6 to 22.2 ms per speculative step), the second and third 22.2 to 24.2
-ms per step with the same drafts accepted. The plain rows do not move,
-because a plain step is memory-bound. Draft
+medians over a seven-minute series with the activity assertion held (the
+series that found the clock sag, below, ran before it existed) and carry
+the sustained-load clock sag that remains: the first repeat, at 1 620 MHz,
+decoded 113 / 105 / 109 / 109 / 90 tok/s with two drafts (20.4 to 21.5 ms
+per speculative step, the 64K cell at 24.2 with the clock already down),
+the second and third at 1 490 to 1 620 MHz 22.0 to 23.4 ms per step with
+the same drafts accepted. The plain rows, from the series before the
+assertion, do not move with the clock, because a plain step is
+memory-bound. Draft
 acceptance at two drafts per step was 64% on lily over the 2026-09-18
 runs (63% on 2026-09-17) and 66% on the fork, so the head behaves alike in
 both engines. At three drafts both fell to 50 to 53% and decoded slower than

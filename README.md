@@ -13,7 +13,7 @@ the memory the checkpoint needs it keeps the busiest experts resident and
 reads the rest on demand.
 
 Measured against Unsloth's llama.cpp fork with the same model, prompts and
-machine, prefill is 1.6 to 3 times faster and decode 1.8 to 3.6 times
+machine, prefill is 1.6 to 3 times faster and decode 1.9 to 3.4 times
 faster; the difference grows with context.
 
 ## Performance
@@ -26,9 +26,9 @@ over HTTP. This fork at commit `8ec67f0` (2026-09-18), llama.cpp on
 
 | tokens per second | 4K context | 16K | 32K | 64K |
 |---|---:|---:|---:|---:|
-| **prefill** this fork | 1 386 | 1 727 | 1 725 | 1 641 |
+| **prefill** this fork | 1 435 | 1 756 | 1 864 | 1 651 |
 | prefill llama.cpp | 887 | 882 | 713 | 550 |
-| **decode** this fork, 2 drafts | 99 | 96 | 96 | 96 |
+| **decode** this fork, 2 drafts | 98 | 97 | 102 | 92 |
 | decode llama.cpp, MTP 2 drafts | 52 | 44 | 37 | 27 |
 | decode this fork, no drafts | 87 | 85 | 85 | 82 |
 | decode llama.cpp, no drafts | 39 | 31 | 25 | 17 |
@@ -38,12 +38,15 @@ it and the sparse-attention kernels keep the cost of context at a few percent
 of a step. Both engines were also run with three drafts per step; acceptance
 fell to about 50 % and decode was slower than with two, so those rows are
 left out. The speculative and prefill rows are medians over a seven-minute
-series: the M5 Max lowers its GPU clock after about 90 seconds of
-continuous load, which costs compute-bound passes about 15 % (the first
-repeat of the series, at full clock, decoded 108 / 108 / 103 / 99 tok/s
-with two drafts) and leaves memory-bound plain decode untouched. A long
-agent session runs in the sustained state, so the medians are the honest
-figure; the detail is in the noise section of the performance document.
+series, and the first repeat of it, at the GPU's full 1 620 MHz, decoded
+105 / 109 / 109 / 90 tok/s with two drafts: under sustained load the M5
+Max lets the GPU clock sag to about 1 500 to 1 550 MHz, which costs
+compute-bound passes a few percent and leaves memory-bound plain decode
+untouched. It used to be worse: a windowless process loses its performance
+envelope after about 90 seconds and ran at 1 240 MHz and 24 W, so the
+server now holds a user-initiated, latency-critical activity assertion for
+each request. The trace and the numbers are in the noise section of the
+performance document.
 
 The quantizations differ slightly: the fork's affine 4-bit with group 64 against
 llama.cpp's UD-IQ4_XS. The llama.cpp MTP rows come from a build with a
@@ -208,6 +211,9 @@ engine measured about 30 % over mlx-lm on its model.
   10 %), the Gated DeltaNet scan in chunked form instead of a token-serial
   recurrence, and the expert GEMM's last tiles at half and quarter height.
 - The expert cache that runs the model on half the memory.
+- A process activity assertion held while a request runs, so a server
+  with no window keeps the GPU's performance envelope under sustained load
+  and the machine can still sleep when idle.
 - The session cache with recurrent-state checkpoints, forks, the disk tier
   and durable prefixes, and the full OpenAI request surface around it.
 
