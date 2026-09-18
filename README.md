@@ -13,7 +13,7 @@ the memory the checkpoint needs it keeps the busiest experts resident and
 reads the rest on demand.
 
 Measured against Unsloth's llama.cpp fork with the same model, prompts and
-machine, prefill is 1.6 to 3 times faster and decode 1.8 to 3.5 times
+machine, prefill is 1.6 to 3 times faster and decode 1.8 to 3.6 times
 faster; the difference grows with context.
 
 ## Performance
@@ -26,9 +26,9 @@ over HTTP. This fork at commit `8ec67f0` (2026-09-18), llama.cpp on
 
 | tokens per second | 4K context | 16K | 32K | 64K |
 |---|---:|---:|---:|---:|
-| **prefill** this fork | 1 416 | 1 706 | 1 677 | 1 624 |
+| **prefill** this fork | 1 386 | 1 727 | 1 725 | 1 641 |
 | prefill llama.cpp | 887 | 882 | 713 | 550 |
-| **decode** this fork, 2 drafts | 96 | 99 | 94 | 94 |
+| **decode** this fork, 2 drafts | 99 | 96 | 96 | 96 |
 | decode llama.cpp, MTP 2 drafts | 52 | 44 | 37 | 27 |
 | decode this fork, no drafts | 87 | 85 | 85 | 82 |
 | decode llama.cpp, no drafts | 39 | 31 | 25 | 17 |
@@ -37,9 +37,13 @@ The fork's decode is nearly flat from 1K to 64K because the architecture allows
 it and the sparse-attention kernels keep the cost of context at a few percent
 of a step. Both engines were also run with three drafts per step; acceptance
 fell to about 50 % and decode was slower than with two, so those rows are
-left out. A speculative cell is the median over three prompts whose draft
-acceptance differs (64 % over all runs), so its noise band is wider than
-the plain rows'.
+left out. The speculative and prefill rows are medians over a seven-minute
+series: the M5 Max lowers its GPU clock after about 90 seconds of
+continuous load, which costs compute-bound passes about 15 % (the first
+repeat of the series, at full clock, decoded 108 / 108 / 103 / 99 tok/s
+with two drafts) and leaves memory-bound plain decode untouched. A long
+agent session runs in the sustained state, so the medians are the honest
+figure; the detail is in the noise section of the performance document.
 
 The quantizations differ slightly: the fork's affine 4-bit with group 64 against
 llama.cpp's UD-IQ4_XS. The llama.cpp MTP rows come from a build with a

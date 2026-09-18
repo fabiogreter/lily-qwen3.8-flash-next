@@ -80,6 +80,31 @@ then says what assumption it rests on.
   1 to 4%. Rankings and shares from the profiler are reliable; absolute
   milliseconds of tiny kernels are not. Where the decode step's time goes
   was therefore measured with two production-shape tools instead (below).
+- **Sustained load lowers the GPU clock, and only compute-bound passes
+  notice.** After about 90 seconds of continuous GPU load the M5 Max
+  settles into a lower GPU clock and stays there until the load stops for
+  a minute or two. Measured on 2026-09-18 with the server's profiling
+  switches over the 1K-to-64K HTTP series: the 3-row verify pass went from
+  18.0 to 21.4 ms of GPU time on the same 1K request with the same drafts
+  accepted, in every one of five series (with the display on or off, the
+  session cache at 8.6 GB or 1 GB, the n-gram table locked or not, 10 s or
+  no pause between requests, the onset moving with the pause length); the
+  per-token callbacks measured 0.01 ms and the host's finish segment 2.4
+  to 2.6 ms in both states; the profile transport, which serializes
+  dispatches and runs cooler, showed the pass's kernel sum unchanged (21.07
+  against 21.05 ms); the 8 MB streaming probe read 487 GB/s before and
+  after, and plain decode, memory-bound, held 85 to 87 tok/s through the
+  same series. A fresh process two minutes later ran the same step at
+  full speed. Prefill sags the same way (the 1K prefill from 1 844 to 645
+  tok/s after a 10 s pause following a long request; the 32K busy clock at
+  1 340 to 1 560 MHz against 1 620 was measured with `powermetrics` on the
+  17th). So a single-prompt `lily-bench` run measures the full-clock
+  state, a seven-minute HTTP series the sustained one, and the two are not
+  compared with each other; the README table reports the sustained
+  medians because an agent session is sustained load. A light GPU
+  competitor does the same and worse (the 4-layer test model decoding in
+  parallel took speculative decode from 115 to 60 tok/s and plain from 92
+  to 73), and four CPU-hog processes changed nothing in either loop.
 - **Draft acceptance is a property of one trajectory.** Over 256 greedy
   tokens on one prompt the acceptance rate swings by 10 to 20 points
   between two builds whose logits differ in the last bits, because the two
@@ -224,29 +249,32 @@ Prefill, tok/s:
 
 | context | lily `8ec67f0` | lily `0c9ee63` | llama.cpp | ratio, current |
 |--------:|---------------:|---------------:|----------:|---------------:|
-| 4 096   | 1 416   | 1 300 | 887 | 1.60x |
-| 16 384  | 1 706  | 1 546 | 882 | 1.93x |
-| 32 768  | 1 677  | 1 499 | 713 | 2.35x |
-| 65 536  | 1 624  | 1 382 | 550 | 2.95x |
+| 4 096   | 1 386 | 1 300 | 887 | 1.56x |
+| 16 384  | 1 727 | 1 546 | 882 | 1.96x |
+| 32 768  | 1 725 | 1 499 | 713 | 2.42x |
+| 65 536  | 1 641 | 1 382 | 550 | 2.98x |
 
 Decode, tok/s:
 
 | context | lily plain | lily 2 drafts | llama.cpp plain | llama.cpp MTP 2 | ratio, best against best |
 |--------:|-----------:|--------------:|----------------:|----------------:|-------------------------:|
-| 1 024   | 85.8  | 103.3  | 42.0 | 54.7 | 1.89x |
-| 4 096   | 86.7  | 95.9  | 39.1 | 51.8 | 1.85x |
-| 16 384  | 85.4 | 98.8 | 31.4 | 44.1 | 2.24x |
-| 32 768  | 84.8 | 94.4 | 25.2 | 37.0 | 2.55x |
-| 65 536  | 81.7 | 94.1 | 17.0 | 27.0 | 3.49x |
+| 1 024   | 85.8 | 101.0 | 42.0 | 54.7 | 1.85x |
+| 4 096   | 86.7 | 98.9 | 39.1 | 51.8 | 1.91x |
+| 16 384  | 85.4 | 95.8 | 31.4 | 44.1 | 2.17x |
+| 32 768  | 84.8 | 95.7 | 25.2 | 37.0 | 2.59x |
+| 65 536  | 81.7 | 96.1 | 17.0 | 27.0 | 3.56x |
 
 lily's prefill column is the server as shipped, with the draft head
-loaded and caught up during prefill; without it (`--mtp-drafts 0`) the
-same runs measured 1 471 / 1 807 / 1 811 / 1 710. Its decode rows of
+loaded and caught up during prefill; without it (`--mtp-drafts 0`) a
+series measured 1 471 / 1 807 / 1 811 / 1 710. Its decode rows of
 2026-09-17 were 90.2 / 86.0 / 85.5 / 83.9 / 81.8 plain and 98.9 / 101.7 /
-102.0 / 101.5 / 97.7 with two drafts; the speculative medians of a
-three-prompt cell move with which prompts the corpus offsets land on (the
-2-draft cells of 2026-09-18 range from 89.9 to 112.1 within one context
-length), the plain rows do not. Draft
+102.0 / 101.5 / 97.7 with two drafts. The 2-draft and prefill rows are
+medians over a seven-minute series and carry the sustained-load clock sag
+described in the noise section: the first repeat of the 2026-09-18 series,
+at full clock, decoded 114 / 108 / 108 / 103 / 99 tok/s with two drafts
+(20.6 to 22.2 ms per speculative step), the second and third 22.2 to 24.2
+ms per step with the same drafts accepted. The plain rows do not move,
+because a plain step is memory-bound. Draft
 acceptance at two drafts per step was 64% on lily over the 2026-09-18
 runs (63% on 2026-09-17) and 66% on the fork, so the head behaves alike in
 both engines. At three drafts both fell to 50 to 53% and decoded slower than
