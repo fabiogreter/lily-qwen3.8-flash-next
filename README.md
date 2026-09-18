@@ -70,20 +70,24 @@ decode, against 2 250 and 87 with everything resident, with the same
 tokens produced. Speculative decoding is off there because its extra trunk
 passes cost more than they return.
 
-Which experts stay resident is decided once, from a usage ranking
-measured over real text (`lily-experts`; the one measured for this model,
-40 prompts of documentation and code, is
+Which experts stay resident starts from a usage ranking measured over
+real text (`lily-experts`; the one measured for this model, 40 prompts of
+documentation and code, is
 `tools/bench/expert-usage-qwen38-flash-next.json`, and a copy named
 `expert-usage.json` next to the checkpoint is picked up automatically;
-without one the placement is uniform). The ranked hot set stays pinned
-for the life of the process; a small LRU region, 10 % of the slots by
-default, takes whatever else gets routed to and is the only part that
-adapts to the running workload. The engine does not measure usage live or
-re-rank the hot set. Nothing else to configure: the server sizes the
-cache from the machine's memory and keeps 12 GB or a sixth of it free for
-everything else; `--memory-gb 64` plans for that much instead (also the
-way to try the mode on a bigger machine). Details, measurements and
-knobs: [docs/low-ram-experts.md](docs/low-ram-experts.md).
+without one the placement is uniform) and then follows what the machine
+actually runs: the cache counts every expert it serves, decode-time
+lookups weighing far more than prefill's sweep, promotes cold experts
+that out-earn the least-used pinned ones into the pinned set every few
+tokens, and writes the merged counts to its cache directory, from which
+the next load places the experts. Measured on an 8K prompt: a process
+placed from the previous one's counts misses a third less at decode and
+decodes 11 % faster (57 against 52 tok/s). Nothing else to configure: the
+server sizes the cache from the machine's memory and keeps 12 GB or a
+sixth of it free for everything else; `--memory-gb 64` plans for that
+much instead (also the way to try the mode on a bigger machine). Details,
+measurements and knobs:
+[docs/low-ram-experts.md](docs/low-ram-experts.md).
 
 ### MLX engines
 

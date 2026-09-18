@@ -98,6 +98,33 @@ scratch, caches and pipelines); a 64 GB machine therefore gets about
    set: a speculative step runs three trunk passes through the cached
    layers (two drafts, one verify) where plain decode runs one, and the
    handshakes and misses scale with passes.
+5. **Live usage, promotion and persistence.** The service thread counts
+   every resolved (layer, expert), decode-class passes (up to 256 routed
+   ids: a step, a verify pass) apart from prefill. A slice's score is the
+   loaded ranking, scaled to what 1 000 decoded tokens' worth of lookups
+   would accumulate, as a prior, plus 100 per decode lookup and 1 per
+   prefill lookup: prefill routes nearly every expert of a layer once per
+   chunk whatever the text, so its counts carry little ranking
+   information, while a decode lookup is one token's routing and a decode
+   miss stalls that token. Every 480 resolutions (about ten decoded
+   tokens, or ten prefill chunks; a pass over the slots costs tens of
+   microseconds off the GPU's critical path) the 16 lowest-scored
+   unprotected pinned slots are compared with the 16 highest-scored
+   resident slots of the LRU region, and a cold expert whose score
+   exceeds the pinned one's by half again and by two decode lookups takes
+   over its pinned role: no data moves and no table changes, only which
+   slot a later miss may evict; the promoted slot is protected from
+   demotion for 9 600 resolutions (about 200 tokens). The merged scores
+   are written as a `lily-experts` ranking every five minutes and when the
+   cache is dropped, to `LoadOptions::expert_usage_out` (the server:
+   `expert-usage.json` in the disk-cache directory, `~/Library/Caches/
+   lily/sessions/` by default; `lily-bench --expert-usage-out`;
+   `LILY_EXPERT_USAGE_OUT` overrides both), and the loader prefers that
+   file over the ranking next to the checkpoint, so the next load places
+   experts by what this machine actually ran. `LILY_EXPERT_ADAPT=0` keeps
+   the counts but never promotes; the load line says which ranking was
+   used and where the usage goes, and the cache statistics report
+   decode-class misses and promotions.
 
 ### Measured
 
@@ -130,6 +157,29 @@ stale reads; against 2 257 and 87 resident. Cold-run figures move with
 what the page cache still holds when the run starts. The initial fill of 45 GB takes about 20 s from the page
 cache and would take the SSD's 10 to 15 s cold.
 
+### Live usage
+
+Measured the same way (60 GB balloon, `--memory-gb 64`, the shipped
+ranking, `p4.txt`, the prompt with the highest decode miss rate of
+p3 to p5 under that ranking), 8K prompt and 1 024 decoded tokens, digests
+identical to the resident path in every row (cfce735e33882488), 0 stale
+reads:
+
+| configuration                                   | decode misses of 492 960 lookups | decode tok/s |
+|-------------------------------------------------|----------------------------------|--------------|
+| shipped ranking, promotion off                  | 9 478 (1.9%)                     | 51.5         |
+| shipped ranking, promotion on (1 059 promotions) | 8 688 (1.8%)                    | 52.5         |
+| the counts that run persisted, promotion off    | 6 232 (1.3%)                     | 57.2         |
+| the same, promotion on (224 promotions)         | 6 281 (1.3%)                     | 56.6         |
+
+Within one run promotion takes 8% off the decode misses, which is worth
+about the noise band in tok/s; the gain is across runs: a process placed
+from what the previous one measured misses a third less at decode and
+decodes 11% faster, and prefill misses fall too (33 166 against 36 321
+over the run). The persisted counts are the merged scores, so they rank
+by this machine's routing rather than by the 40 corpus prompts the
+shipped file was measured on.
+
 ### Prefill chunks of 8 192 tokens
 
 `LILY_PREFILL_CHUNK=8192` (a per-model value now, `Qwen4ExpModel::
@@ -155,10 +205,10 @@ re-read check on the routed ids found no stale reads). A run on a real
 ### What would move it further
 
 - **Decode misses** cost a cold region read per resolution (about 0.35
-  ms with the nine regions in flight). A ranking that includes decode-time
-  routing, or a larger LRU region (30% measured 6.9% against 8.8% of
-  decode lookups missing, at the price of prefill misses), lowers the
-  count; both are knobs to sweep on a real 64 GB machine.
+  ms with the nine regions in flight). The live ranking above lowers the
+  count run over run; a larger LRU region (30% measured 6.9% against 8.8%
+  of decode lookups missing, at the price of prefill misses) is the other
+  knob, to sweep on a real 64 GB machine.
 - **Prefill** is bound by reading the cold third per chunk; a chunk of
   8 192 tokens would halve that per token at twice the activation
   scratch.
