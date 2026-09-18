@@ -2961,7 +2961,9 @@ impl Qwen4ExpModel {
                     // read the token and staged them.
                     s.sync.encode_wait(pass, value)?;
                 }
-                self.ple_decode(ctx, pass, ple_w, ple_s, pst, conv_slot, s)?;
+                if !crate::ablate::on(crate::ablate::Group::Ple) {
+                    self.ple_decode(ctx, pass, ple_w, ple_s, pst, conv_slot, s)?;
+                }
             }
 
             self.hc_read_decode(ctx, pass, &layer.attn_hc, s)?;
@@ -2996,8 +2998,10 @@ impl Qwen4ExpModel {
                 _ => anyhow::bail!("layer/state kind mismatch"),
             }
             pass.level_barrier(&[&s.branch_out])?;
-            hc_inject_bf16(ctx, pass, &s.hyper, &s.branch_out, &s.hc.inj, h, g)?;
-            pass.level_barrier(&[&s.hyper])?;
+            if !crate::ablate::on(crate::ablate::Group::Inject) {
+                hc_inject_bf16(ctx, pass, &s.hyper, &s.branch_out, &s.hc.inj, h, g)?;
+                pass.level_barrier(&[&s.hyper])?;
+            }
 
             self.hc_read_decode(ctx, pass, &layer.mlp_hc, s)?;
             decode_moe(
@@ -3016,13 +3020,17 @@ impl Qwen4ExpModel {
                 &s.moe,
             )?;
             pass.level_barrier(&[&s.branch_out])?;
-            hc_inject_bf16(ctx, pass, &s.hyper, &s.branch_out, &s.hc.inj, h, g)?;
-            pass.level_barrier(&[&s.hyper])?;
+            if !crate::ablate::on(crate::ablate::Group::Inject) {
+                hc_inject_bf16(ctx, pass, &s.hyper, &s.branch_out, &s.hc.inj, h, g)?;
+                pass.level_barrier(&[&s.hyper])?;
+            }
         }
 
         self.hc_read_decode(ctx, pass, &self.weights.final_mixer, s)?;
-        quant::gemv_quant(ctx, pass, &self.weights.lm_head, &s.hc.mixed, &s.logits)?;
-        pass.level_barrier(&[&s.logits])?;
+        if !crate::ablate::on(crate::ablate::Group::Head) {
+            quant::gemv_quant(ctx, pass, &self.weights.lm_head, &s.hc.mixed, &s.logits)?;
+            pass.level_barrier(&[&s.logits])?;
+        }
         let out = s.next_token.view(slot_out, &[1])?;
         sample_f32(ctx, pass, &s.logits, &s.sampler, draw.params, draw.step, &out)?;
         pass.level_barrier(&[&s.next_token])?;
@@ -3044,6 +3052,9 @@ impl Qwen4ExpModel {
     ) -> Result<()> {
         let cfg = &self.config;
         let (h, g) = (cfg.hidden_size, cfg.hc_count);
+        if crate::ablate::on(crate::ablate::Group::Hc) {
+            return Ok(());
+        }
         hc_read_down_q8(
             ctx,
             pass,
@@ -3156,8 +3167,13 @@ impl Qwen4ExpModel {
         gdn_state: &Tensor,
         conv_window: &Tensor,
     ) -> Result<()> {
-        quant::gemv_quant(ctx, pass, &w.in_proj, &s.hc.mixed, &s.gdn_in)?;
-        pass.level_barrier(&[&s.gdn_in])?;
+        if !crate::ablate::on(crate::ablate::Group::GdnProj) {
+            quant::gemv_quant(ctx, pass, &w.in_proj, &s.hc.mixed, &s.gdn_in)?;
+            pass.level_barrier(&[&s.gdn_in])?;
+        }
+        if crate::ablate::on(crate::ablate::Group::GdnStep) {
+            return Ok(());
+        }
         conv1d_step(ctx, pass, conv_window, &s.qkv, &w.conv_w, &s.qkv_conv)?;
         pass.level_barrier(&[&s.qkv_conv, conv_window])?;
         gdn_step_gated_fused(
@@ -3178,6 +3194,9 @@ impl Qwen4ExpModel {
             self.gdn_gate,
         )?;
         pass.level_barrier(&[&s.gdn_gated, gdn_state])?;
+        if crate::ablate::on(crate::ablate::Group::GdnProj) {
+            return Ok(());
+        }
         quant::gemv_quant(ctx, pass, &w.out_proj, &s.gdn_gated, &s.branch_out)
     }
 
@@ -3209,6 +3228,9 @@ impl Qwen4ExpModel {
             pos
         );
 
+        if crate::ablate::on(crate::ablate::Group::Attn) {
+            return Ok(());
+        }
         quant::gemv_quant(ctx, pass, &w.qkv_proj, &s.hc.mixed, &s.attn_qkv)?;
         quant::gemv_quant(ctx, pass, &w.indexer.qk_proj, &s.hc.mixed, &s.idx_qk)?;
         pass.level_barrier(&[&s.attn_qkv, &s.idx_qk])?;

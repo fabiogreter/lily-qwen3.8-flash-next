@@ -421,8 +421,12 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
     let mut pacer = Pacer::default();
     pacer.begin(Instant::now());
     for index in 1..cli.decode_steps {
+        let levels_before = profile::levels();
         let (parked, encoded) =
             stage_next(&model, &ctx, &mut state, &scratch, index, parking)?;
+        if cli.gpu_timing && index == 1 {
+            eprintln!("levels per step: {}", profile::levels() - levels_before);
+        }
         let completed = if cli.gpu_timing {
             Some(pending.wait_retain_paced(&mut pacer)?)
         } else {

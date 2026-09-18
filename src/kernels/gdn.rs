@@ -49,7 +49,6 @@ pub fn gdn_step_gated_fused(
         num_k_heads > 0 && num_heads.is_multiple_of(num_k_heads),
         "v-heads {num_heads} not a multiple of k-heads {num_k_heads}"
     );
-    let vpk = num_heads / num_k_heads;
     let k_part = num_k_heads * dim;
     let part = num_heads * dim;
     ensure!(qkv.numel() == 2 * k_part + part, "bad fused qkv size");
@@ -62,9 +61,40 @@ pub fn gdn_step_gated_fused(
         "norm_w must be F32 [dim]"
     );
     ensure!(out.numel() == part && out.dtype() == DType::BF16, "bad output size");
+    gdn_step_gated_named(
+        ctx, pass, "gdn_step_gated", qkv, a, b, a_log, dt_bias, state, z, norm_w, out,
+        scale, num_k_heads, eps, gate_act,
+    )
+}
+
+/// [`gdn_step_gated_fused`] through the kernel `name` (a variant with the
+/// shipped kernel's bindings and grid, for the timing harness).
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_step_gated_named(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    name: &'static str,
+    qkv: &Tensor,
+    a: &Tensor,
+    b: &Tensor,
+    a_log: &Tensor,
+    dt_bias: &Tensor,
+    state: &Tensor,
+    z: &Tensor,
+    norm_w: &Tensor,
+    out: &Tensor,
+    scale: f32,
+    num_k_heads: usize,
+    eps: f32,
+    gate_act: GdnGate,
+) -> Result<()> {
+    let num_heads = a.numel();
+    let dim = GDN_HEAD_DIM;
+    let vpk = num_heads / num_k_heads;
+    let k_part = num_k_heads * dim;
     let elem = qkv.dtype().size();
     let (qkv_buf, qkv_off) = qkv.binding();
-    let pipeline = ctx.pipeline("gdn_step_gated", SOURCE, MslVersion::V3_1)?;
+    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
         &[

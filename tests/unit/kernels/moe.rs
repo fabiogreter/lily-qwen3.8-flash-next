@@ -1421,3 +1421,93 @@ fn smallm_moe_timing() {
         }
     }
 }
+
+/// The decode expert gathers as decode runs them: per layer the gate/up
+/// gather over 10 routed experts, a barrier, the down/combine gather, a
+/// barrier, over 12 layers with their own 128-expert stacks (3.8 GB, so the
+/// chain streams from memory). Prints microseconds per level and the weight
+/// bandwidth for the pair chain and for each kernel alone, for every
+/// `gate_up:down` kernel pair in `LILY_MOE_GATHER_KERNELS` (default the
+/// shipped pair). Run with `--ignored --nocapture`.
+#[test]
+#[ignore = "timing only"]
+fn moe_gather_chain_timing() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(91);
+    let (e, inter, h, top_k, gs, layers) = (128usize, 640usize, 2560usize, 10usize, 64usize, 12usize);
+    let stacks: Vec<(QuantWeights, QuantWeights, QuantWeights)> = (0..layers)
+        .map(|_| {
+            (
+                random_q4_stack(&ctx, &mut rng, e * inter, h, gs),
+                random_q4_stack(&ctx, &mut rng, e * inter, h, gs),
+                random_q4_stack(&ctx, &mut rng, e * h, inter, gs),
+            )
+        })
+        .collect();
+    let inputs: Vec<SmallmInputs> =
+        (0..layers).map(|_| smallm_inputs(&ctx, &mut rng, e, h, h, 1, top_k, "random")).collect();
+    let x_in = Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, h, -1.0, 1.0), &[h]).expect("x");
+    let act = Tensor::zeros(&ctx, &[top_k, inter], DType::BF16).expect("act");
+    let out = Tensor::zeros(&ctx, &[h], DType::BF16).expect("out");
+    let shared_gate = Tensor::zeros(&ctx, &[1], DType::F32).expect("gate");
+    let pairs: Vec<(&'static str, &'static str)> = std::env::var("LILY_MOE_GATHER_KERNELS")
+        .map(|v| {
+            v.split(',')
+                .map(|pair| {
+                    let (a, b) = pair.split_once(':').expect("gate_up:down");
+                    (
+                        &*Box::leak(a.to_string().into_boxed_str()),
+                        &*Box::leak(b.to_string().into_boxed_str()),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_else(|_| vec![("moe_gather_gemv_q4_gate_up", "moe_gather_gemv_q4_down_combine")]);
+    let modes = [("pair", true, true), ("gate_up", true, false), ("down", false, true)];
+    let mut best = vec![[f64::INFINITY; 3]; pairs.len()];
+    for round in 0..6 {
+        for k_pair in 0..pairs.len() {
+            let which = (round + k_pair) % pairs.len();
+            let (gname, dname) = pairs[which];
+            for (m, &(_, run_gu, run_down)) in modes.iter().enumerate() {
+                let pass = ctx.begin_concurrent().expect("pass");
+                for ((gate, up, down), inp) in stacks.iter().zip(&inputs) {
+                    if run_gu {
+                        moe_gather_gemv_gate_up_named(
+                            &ctx, &pass, gname, gate, up, inter, &x_in, &inp.indices, &act,
+                        )
+                        .unwrap();
+                        pass.level_barrier(&[&act]).unwrap();
+                    }
+                    if run_down {
+                        moe_gather_gemv_down_combine_named(
+                            &ctx, &pass, dname, down, h, &act, &inp.indices, &inp.scores,
+                            Some((&inp.shared_out, &shared_gate)), &out,
+                        )
+                        .unwrap();
+                        pass.level_barrier(&[&out]).unwrap();
+                    }
+                }
+                let done = pass.commit().expect("commit").wait_retain().expect("wait");
+                let t = done.timing().expect("timing");
+                if round > 0 {
+                    best[which][m] =
+                        best[which][m].min((t.gpu_end_secs - t.gpu_start_secs) / layers as f64);
+                }
+            }
+        }
+    }
+    let q4_bytes = |rows: usize, k: usize| (rows * k / 2 + 2 * rows * k / gs * 2) as f64;
+    let gu_bytes = 2.0 * top_k as f64 * q4_bytes(inter, h);
+    let down_bytes = top_k as f64 * q4_bytes(h, inter);
+    for ((gname, dname), b) in pairs.iter().zip(&best) {
+        eprintln!(
+            "{gname} + {dname}: pair {:.2} us per layer | gate_up alone {:.2} us ({:.0} GB/s) | down alone {:.2} us ({:.0} GB/s)",
+            b[0] * 1e6,
+            b[1] * 1e6,
+            gu_bytes / b[1] / 1e9,
+            b[2] * 1e6,
+            down_bytes / b[2] / 1e9,
+        );
+    }
+}

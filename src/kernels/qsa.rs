@@ -465,6 +465,34 @@ pub fn qsa_attention_with<'t>(
     scale: f32,
     plan: SparseSplitPlan,
 ) -> Result<()> {
+    qsa_attention_named(
+        ctx, pass, q, k_cache, v_cache, sel, n_sel, out, scratch, qb, k_max, ratio,
+        base_pos, scale, plan, None,
+    )
+}
+
+/// [`qsa_attention_with`] through the given `(split, combine)` kernel names
+/// (timing variants share the shipped kernels' bindings and grids); `None`
+/// takes the shipped ones.
+#[allow(clippy::too_many_arguments)]
+pub fn qsa_attention_named<'t>(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    q: &Tensor,
+    k_cache: &Tensor,
+    v_cache: &Tensor,
+    sel: &Tensor,
+    n_sel: &Tensor,
+    out: &Tensor,
+    scratch: &SparseSplitScratch<'_>,
+    qb: usize,
+    k_max: usize,
+    ratio: usize,
+    base_pos: impl Into<Pos<'t>>,
+    scale: f32,
+    plan: SparseSplitPlan,
+    names: Option<(&'static str, &'static str)>,
+) -> Result<()> {
     let base_pos = base_pos.into();
     let (kvh, max_seq, d) =
         (k_cache.shape()[0], k_cache.shape()[1], k_cache.shape()[2]);
@@ -512,7 +540,9 @@ pub fn qsa_attention_with<'t>(
             && scratch.stats.dtype() == DType::F32,
         "sparse stats scratch too small"
     );
-    let stage1 = ctx.pipeline("qsa_attn_split_bf16", SOURCE, MslVersion::V3_1)?;
+    let (split_name, combine_name) =
+        names.unwrap_or(("qsa_attn_split_bf16", "sdpa_decode_combine"));
+    let stage1 = ctx.pipeline(split_name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_with(
         &stage1,
         &[
@@ -543,8 +573,7 @@ pub fn qsa_attention_with<'t>(
         },
     )?;
     pass.level_barrier(&[scratch.partials, scratch.stats])?;
-    let combine =
-        ctx.pipeline("sdpa_decode_combine", attention::SOURCE, MslVersion::V3_1)?;
+    let combine = ctx.pipeline(combine_name, attention::SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &combine,
         &[scratch.partials.binding(), scratch.stats.binding(), out.binding()],

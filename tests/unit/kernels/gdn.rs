@@ -1513,3 +1513,131 @@ fn gdn_prefill_scan_timing() {
         }
     }
 }
+
+/// The decode step kernel as decode runs it: a chain of one dispatch per
+/// GDN layer (36 distinct states), a barrier between, in one concurrent
+/// pass. Prints the microseconds per dispatch (best of several passes) and
+/// the state traffic it implies for every kernel in `LILY_GDN_STEP_KERNELS`
+/// (comma separated; default: the shipped kernel), the order rotated per
+/// pass; `LILY_GDN_STEP_HEADS` sets the head count (default 48). Run with
+/// `--ignored --nocapture`.
+#[test]
+#[ignore = "timing only"]
+fn gdn_step_chain_timing() {
+    let ctx = MetalContext::new().expect("metal context");
+    let h: usize = std::env::var("LILY_GDN_STEP_HEADS").ok().and_then(|v| v.parse().ok()).unwrap_or(48);
+    let (hk, dim, layers) = (h / 3, GDN_HEAD_DIM, 36usize);
+    let scale = 1.0 / (dim as f32).sqrt();
+    let mut rng = StdRng::seed_from_u64(7);
+    let names: Vec<String> = std::env::var("LILY_GDN_STEP_KERNELS")
+        .map(|v| v.split(',').map(str::to_string).collect())
+        .unwrap_or_else(|_| vec!["gdn_step_gated".to_string()]);
+    let names: Vec<&'static str> =
+        names.into_iter().map(|n| &*Box::leak(n.into_boxed_str())).collect();
+    let t_a_log = Tensor::from_f32(&ctx, &random_vec(&mut rng, h, -2.0, 0.5), &[h]).expect("a_log");
+    let t_dt_bias =
+        Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, h, -0.5, 0.5), &[h]).expect("dt");
+    let t_norm_w =
+        Tensor::from_f32(&ctx, &random_vec(&mut rng, dim, 0.5, 1.5), &[dim]).expect("norm_w");
+    let t_qkv = Tensor::from_f32_as_bf16(
+        &ctx,
+        &random_vec(&mut rng, (2 * hk + h) * dim, -1.0, 1.0),
+        &[2 * hk + h, dim],
+    )
+    .expect("qkv");
+    let t_a = Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, h, -1.0, 1.0), &[h]).expect("a");
+    let t_b = Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, h, -1.0, 1.0), &[h]).expect("b");
+    let t_z = Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, h * dim, -1.0, 1.0), &[h, dim])
+        .expect("z");
+    let out = Tensor::zeros(&ctx, &[h, dim], DType::BF16).expect("out");
+    let states: Vec<Tensor> = (0..layers)
+        .map(|_| Tensor::zeros(&ctx, &[h, dim, dim], DType::F32).expect("state"))
+        .collect();
+    let rounds = 7;
+    let mut best = vec![f64::INFINITY; names.len()];
+    for round in 0..rounds {
+        for k in 0..names.len() {
+            let which = (round + k) % names.len();
+            let pass = ctx.begin_concurrent().expect("pass");
+            for state in &states {
+                gdn_step_gated_named(
+                    &ctx, &pass, names[which], &t_qkv, &t_a, &t_b, &t_a_log, &t_dt_bias,
+                    state, &t_z, &t_norm_w, &out, scale, hk, 1e-6, GdnGate::Sigmoid,
+                )
+                .expect(names[which]);
+                pass.level_barrier(&[&out]).expect("barrier");
+            }
+            let done = pass.commit().expect("commit").wait_retain().expect("wait");
+            let t = done.timing().expect("timing");
+            let secs = t.gpu_end_secs - t.gpu_start_secs;
+            if round > 0 {
+                best[which] = best[which].min(secs / layers as f64);
+            }
+        }
+    }
+    let bytes = 2.0 * (h * dim * dim * 4) as f64;
+    for (name, secs) in names.iter().zip(&best) {
+        eprintln!(
+            "{name}: {:.2} us per dispatch in the chain ({:.0} GB/s of state read+write)",
+            secs * 1e6,
+            bytes / secs / 1e9
+        );
+    }
+}
+
+/// The bandwidth the decode step's state traffic (read + write of 36 f32
+/// `[48, 128, 128]` states, one dispatch per layer with a barrier between)
+/// reaches for a range of grid shapes, through a streaming kernel with no
+/// compute: threadgroups of `C * RG` threads, one per (head, column group
+/// of `C` columns), each thread walking `128 / RG` rows. Run with
+/// `--ignored --nocapture`.
+#[test]
+#[ignore = "timing only"]
+fn gdn_state_stream_timing() {
+    let ctx = MetalContext::new().expect("metal context");
+    let (h, dim, layers) = (48usize, GDN_HEAD_DIM, 36usize);
+    let states: Vec<Tensor> = (0..layers)
+        .map(|_| Tensor::zeros(&ctx, &[h, dim, dim], DType::F32).expect("state"))
+        .collect();
+    let out = Tensor::zeros(&ctx, &[dim], DType::F32).expect("out");
+    let pipeline = ctx.pipeline("gdn_state_stream", TEST_SOURCE, MslVersion::V3_1).expect("kernel");
+    let shapes: [(usize, usize); 10] =
+        [(128, 1), (128, 2), (128, 4), (128, 8), (64, 2), (64, 4), (32, 1), (32, 4), (32, 16), (16, 8)];
+    let decay = 0.99f32;
+    let mut best = vec![f64::INFINITY; shapes.len()];
+    for round in 0..6 {
+        for k in 0..shapes.len() {
+            let which = (round + k) % shapes.len();
+            let (c, rg) = shapes[which];
+            let pass = ctx.begin_concurrent().expect("pass");
+            for state in &states {
+                pass.dispatch_at(
+                    &pipeline,
+                    &[state.binding(), out.binding()],
+                    &[&u32_bytes(c), &u32_bytes(rg), &decay.to_ne_bytes()],
+                    Grid::Threadgroups {
+                        groups: (h * (dim / c), 1, 1),
+                        threadgroup: (c * rg, 1, 1),
+                    },
+                )
+                .expect("dispatch");
+                pass.level_barrier(&[&out]).expect("barrier");
+            }
+            let done = pass.commit().expect("commit").wait_retain().expect("wait");
+            let t = done.timing().expect("timing");
+            if round > 0 {
+                best[which] = best[which].min((t.gpu_end_secs - t.gpu_start_secs) / layers as f64);
+            }
+        }
+    }
+    let bytes = 2.0 * (h * dim * dim * 4) as f64;
+    for ((c, rg), secs) in shapes.iter().zip(&best) {
+        eprintln!(
+            "C={c:>3} RG={rg:>2} ({:>4} threadgroups x {:>4} threads): {:.2} us per dispatch, {:.0} GB/s",
+            h * (dim / c),
+            c * rg,
+            secs * 1e6,
+            bytes / secs / 1e9
+        );
+    }
+}

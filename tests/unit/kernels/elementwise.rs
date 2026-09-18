@@ -384,3 +384,87 @@ fn gather_rows_bf16_timing() {
         );
     }
 }
+
+/// Achievable bandwidth as a function of the bytes one dependency level
+/// reads: the decode step is a chain of about 450 levels, most reading one
+/// weight matrix of 2 to 40 MB, and a level cannot start before the previous
+/// one drains. For each level size this streams `K` distinct regions of a
+/// 4 GiB buffer, one dispatch per level with a barrier between (the decode
+/// shape), then the same dispatches with no barriers (what overlapping
+/// would give back), then two dispatches per level of half the size. Prints
+/// GB/s and the microseconds per level; run with `--ignored --nocapture`.
+#[test]
+#[ignore = "timing probe; run with --ignored --nocapture"]
+fn level_size_bandwidth_probe() {
+    let ctx = MetalContext::new().expect("metal context");
+    let bytes = 4usize << 30;
+    let src = Tensor::zeros(&ctx, &[bytes / 4], DType::U32).expect("src");
+    let out = Tensor::zeros(&ctx, &[1024], DType::U32).expect("out");
+    {
+        let fill =
+            ctx.pipeline("bw_fill_u4", TEST_SOURCE, MslVersion::V3_1).expect("fill");
+        let pass = ctx.begin().expect("pass");
+        pass.dispatch_at(
+            &fill,
+            &[src.binding()],
+            &[],
+            Grid::Threads { grid: (bytes / 16, 1, 1), threadgroup: (256, 1, 1) },
+        )
+        .expect("dispatch");
+        pass.commit_wait().expect("fill");
+    }
+    let read = ctx.pipeline("bw_read_u4", TEST_SOURCE, MslVersion::V3_1).expect("read");
+    let per_thread: usize = std::env::var("LILY_LEVEL_PROBE_PER_THREAD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    let per = u32_bytes(per_thread);
+    // Regions far apart so no two levels share cache lines in the system cache.
+    let stride = 96usize << 20;
+    let region = |i: usize, size: usize| ((i * (stride + size)) % (bytes - size)) / 16 * 16;
+    for &mb in &[1usize, 2, 4, 8, 16, 32, 64, 128, 512] {
+        let size = mb << 20;
+        let levels = (1usize << 30) / size;
+        let levels = levels.clamp(2, 128);
+        let dispatch = |pass: &ComputePass<'_>, offset: usize, size: usize| {
+            let view = src.view(offset / 4, &[size / 4]).expect("view");
+            let threads = size / 16 / per_thread;
+            pass.dispatch_at(
+                &read,
+                &[view.binding(), out.binding()],
+                &[&per[..]],
+                Grid::Threads { grid: (threads, 1, 1), threadgroup: (256, 1, 1) },
+            )
+            .expect("dispatch");
+        };
+        let mut results = Vec::new();
+        for (name, barriers, split) in
+            [("barriered", true, 1usize), ("concurrent", false, 1), ("2 per level", true, 2)]
+        {
+            let mut times = Vec::new();
+            for _ in 0..5 {
+                let pass = ctx.begin_concurrent().expect("pass");
+                for i in 0..levels {
+                    let base = region(i, size);
+                    for j in 0..split {
+                        dispatch(&pass, base + j * (size / split), size / split);
+                    }
+                    if barriers {
+                        pass.level_barrier(&[&out]).expect("barrier");
+                    }
+                }
+                let done = pass.commit().expect("commit").wait_retain().expect("wait");
+                let t = done.timing().expect("timing");
+                times.push(t.gpu_end_secs - t.gpu_start_secs);
+            }
+            times.sort_by(f64::total_cmp);
+            let best = times[0];
+            results.push(format!(
+                "{name} {:.0} GB/s ({:.1} us/level)",
+                (levels * size) as f64 / best / 1e9,
+                best / levels as f64 * 1e6
+            ));
+        }
+        eprintln!("level {mb:>3} MB x {levels:>3}: {}", results.join(" | "));
+    }
+}

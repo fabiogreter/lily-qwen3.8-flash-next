@@ -1267,3 +1267,104 @@ fn fused_read_kernels_dispatch_timing() {
         );
     }
 }
+
+/// The decode read gate as decode runs it: a chain of (down, barrier, up,
+/// barrier) over 64 distinct weight sets in one concurrent pass, plus the
+/// down-only and up-only chains, for every `down:up` kernel pair in
+/// `LILY_HC_KERNELS` (comma separated; default the shipped pair). Prints
+/// microseconds per level, best of several passes, order rotated. Run with
+/// `--ignored --nocapture`.
+#[test]
+#[ignore = "timing only"]
+fn hc_read_chain_timing() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(25);
+    let (h, g, r) = (2560usize, 4usize, 320usize);
+    let k = g * h;
+    let sets = 64;
+    let hyper = cpu_ref::round_bf16(&random(&mut rng, k, -3.0, 3.0));
+    let norm_w = cpu_ref::round_bf16(&random(&mut rng, k, -0.5, 0.5));
+    let weights: Vec<(QuantWeights, QuantWeights, QuantWeights)> = (0..sets)
+        .map(|_| {
+            (
+                random_q8(&ctx, &mut rng, r, k).0,
+                random_q8(&ctx, &mut rng, k, r).0,
+                random_q8(&ctx, &mut rng, g, k).0,
+            )
+        })
+        .collect();
+    let t_hyper = Tensor::from_f32_as_bf16(&ctx, &hyper, &[k]).expect("hyper");
+    let t_norm = Tensor::from_f32_as_bf16(&ctx, &norm_w, &[k]).expect("norm");
+    let zeros =
+        |shape: &[usize], dtype| Tensor::zeros(&ctx, shape, dtype).expect("scratch");
+    let down = zeros(&[r], DType::BF16);
+    let inj = zeros(&[g], DType::BF16);
+    let mixed = zeros(&[h], DType::BF16);
+    let inv_rms = zeros(&[g], DType::F32);
+    let pairs: Vec<(&'static str, &'static str)> = std::env::var("LILY_HC_KERNELS")
+        .map(|v| {
+            v.split(',')
+                .map(|pair| {
+                    let (d, u) = pair.split_once(':').expect("down:up");
+                    (
+                        &*Box::leak(d.to_string().into_boxed_str()),
+                        &*Box::leak(u.to_string().into_boxed_str()),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_else(|_| vec![("hc_read_down_q8", "hc_read_up_mix_q8_g4")]);
+    // (label, run down, run up)
+    let modes = [("pair", true, true), ("down", true, false), ("up", false, true)];
+    let mut best = vec![[f64::INFINITY; 3]; pairs.len()];
+    for round in 0..6 {
+        for k_pair in 0..pairs.len() {
+            let which = (round + k_pair) % pairs.len();
+            let (dname, uname) = pairs[which];
+            for (m, &(_, run_down, run_up)) in modes.iter().enumerate() {
+                let pass = ctx.begin_concurrent().expect("pass");
+                for (d, u, j) in &weights {
+                    if run_down {
+                        let dims = check_read_down(
+                            &t_hyper, &t_norm, d, Some(j), &down, &inj, &inv_rms, h, g, 1,
+                        )
+                        .unwrap();
+                        dispatch_read_down(
+                            &ctx, &pass, dname, &t_hyper, &t_norm, d, Some(j), &down, &inj,
+                            &inv_rms, None, dims, h, g, 1e-6, 1.0,
+                        )
+                        .unwrap();
+                        pass.level_barrier(&[&down]).unwrap();
+                    }
+                    if run_up {
+                        dispatch_read_up_mix(
+                            &ctx, &pass, uname, u, &down, &t_hyper, &t_norm, &inv_rms, &mixed,
+                            h, g, 1, true, 1.0,
+                        )
+                        .unwrap();
+                        pass.level_barrier(&[&mixed]).unwrap();
+                    }
+                }
+                let done = pass.commit().expect("commit").wait_retain().expect("wait");
+                let t = done.timing().expect("timing");
+                if round > 0 {
+                    best[which][m] =
+                        best[which][m].min((t.gpu_end_secs - t.gpu_start_secs) / sets as f64);
+                }
+            }
+        }
+    }
+    let mb = |bytes: usize| bytes as f64 / 1e6;
+    let down_bytes = mb(r * k + g * k + 2 * (r + g) * k / 64 * 2);
+    let up_bytes = mb(k * r + 2 * k * r / 64 * 2);
+    for ((dname, uname), b) in pairs.iter().zip(&best) {
+        eprintln!(
+            "{dname} + {uname}: pair {:.2} us per layer | down alone {:.2} us ({:.0} GB/s) | up alone {:.2} us ({:.0} GB/s)",
+            b[0] * 1e6,
+            b[1] * 1e6,
+            down_bytes / b[1] / 1e3,
+            b[2] * 1e6,
+            up_bytes / b[2] / 1e3,
+        );
+    }
+}

@@ -182,6 +182,18 @@ pub mod profile {
     pub fn take() -> Vec<PassProfile> {
         PASSES.lock().map(|mut passes| std::mem::take(&mut *passes)).unwrap_or_default()
     }
+
+    static LEVELS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    pub(super) fn count_level() {
+        LEVELS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Dependency levels (barriers) encoded so far, process-wide: the
+    /// difference across one pass's encoding is that pass's level count.
+    pub fn levels() -> usize {
+        LEVELS.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 pub struct MetalContext {
@@ -1292,6 +1304,7 @@ impl<'a> ComputePass<'a> {
 
     /// Orders one dependency level before the next on a concurrent encoder.
     pub fn level_barrier(&self, _written: &[&Tensor]) -> Result<()> {
+        profile::count_level();
         self.memory_barrier()
     }
 

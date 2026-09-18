@@ -30,3 +30,42 @@ kernel void NAME(device const bfloat* q       [[buffer(0)]],                  \
 
 GDN_STEP_WRAPPER(gdn_step, float)
 #undef GDN_STEP_WRAPPER
+
+// Streaming reference for the decode step's state traffic
+// (`gdn_state_stream_timing`): a threadgroup of C * RG threads per (head,
+// column group); thread (rg, c) reads its DIM/RG rows of column c in blocks
+// of eight loads, scales them and writes them back. No prologue, no
+// reductions: the bandwidth a given grid shape reaches on the step's access
+// pattern.
+kernel void gdn_state_stream(device float*   state [[buffer(0)]],
+                             device float*   out   [[buffer(1)]],
+                             constant uint&  C     [[buffer(2)]],
+                             constant uint&  RG    [[buffer(3)]],
+                             constant float& decay [[buffer(4)]],
+                             uint tg  [[threadgroup_position_in_grid]],
+                             uint tid [[thread_index_in_threadgroup]]) {
+    const uint groups_per_head = DIM / C;
+    const uint h = tg / groups_per_head;
+    const uint cg = tg % groups_per_head;
+    const uint col = cg * C + tid % C;
+    const uint rg = tid / C;
+    const uint rows = DIM / RG;
+    device float* st = state + (ulong)h * DIM * DIM + (ulong)(rg * rows) * DIM + col;
+    float acc = 0.0f;
+    for (uint r0 = 0; r0 < rows; r0 += 8) {
+        float sv[8];
+        _Pragma("clang loop unroll(full)")
+        for (uint j = 0; j < 8; ++j) {
+            sv[j] = st[(r0 + j) * DIM];
+        }
+        _Pragma("clang loop unroll(full)")
+        for (uint j = 0; j < 8; ++j) {
+            const float u = sv[j] * decay;
+            st[(r0 + j) * DIM] = u;
+            acc += u;
+        }
+    }
+    if (acc == 12345.678f) {
+        out[col] = acc;
+    }
+}

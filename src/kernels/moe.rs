@@ -81,6 +81,25 @@ pub fn moe_gather_gemv_gate_up(
     indices: &Tensor,
     y: &Tensor,
 ) -> Result<()> {
+    moe_gather_gemv_gate_up_named(
+        ctx, pass, "moe_gather_gemv_q4_gate_up", gate, up, n_per_expert, x, indices, y,
+    )
+}
+
+/// [`moe_gather_gemv_gate_up`] through the kernel `name` (timing variants
+/// share the shipped kernel's bindings and grid).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_gather_gemv_gate_up_named(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    name: &'static str,
+    gate: &QuantWeights,
+    up: &QuantWeights,
+    n_per_expert: usize,
+    x: &Tensor,
+    indices: &Tensor,
+    y: &Tensor,
+) -> Result<()> {
     ensure!(gate.bits == 4 && up.bits == 4, "expert gate/up fusion is Q4 only");
     ensure!(
         (gate.out_features(), gate.in_features(), gate.group_size)
@@ -101,8 +120,7 @@ pub fn moe_gather_gemv_gate_up(
         y.numel() == slots * n_per_expert && y.dtype() == DType::BF16,
         "y must be BF16 [{slots}, {n_per_expert}]"
     );
-    let pipeline =
-        ctx.pipeline("moe_gather_gemv_q4_gate_up", SOURCE, MslVersion::V3_1)?;
+    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
         &[
@@ -332,6 +350,26 @@ pub fn moe_gather_gemv_down_combine(
     shared: Option<(&Tensor, &Tensor)>,
     out: &Tensor,
 ) -> Result<()> {
+    moe_gather_gemv_down_combine_named(
+        ctx, pass, "moe_gather_gemv_q4_down_combine", w, h, x, indices, scores, shared, out,
+    )
+}
+
+/// [`moe_gather_gemv_down_combine`] through the kernel `name` (timing
+/// variants share the shipped kernel's bindings and grid).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_gather_gemv_down_combine_named(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    name: &'static str,
+    w: &QuantWeights,
+    h: usize,
+    x: &Tensor,
+    indices: &Tensor,
+    scores: &Tensor,
+    shared: Option<(&Tensor, &Tensor)>,
+    out: &Tensor,
+) -> Result<()> {
     let k_in = w.in_features();
     ensure!(w.bits == 4, "fused down/combine requires Q4 weights");
     ensure!(h.is_multiple_of(2), "fused down/combine requires even H");
@@ -365,8 +403,7 @@ pub fn moe_gather_gemv_down_combine(
         Some((shared_out, gate)) => (shared_out, gate),
         None => (x, scores),
     };
-    let pipeline =
-        ctx.pipeline("moe_gather_gemv_q4_down_combine", SOURCE, MslVersion::V3_1)?;
+    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
         &[

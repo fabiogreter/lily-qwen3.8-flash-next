@@ -578,23 +578,32 @@ pub(crate) fn decode_moe(
     // encoding it interleaved puts the two on the same dependency levels.
     let shared = &moe_w.shared;
 
+    if crate::ablate::on(crate::ablate::Group::Moe) {
+        return Ok(());
+    }
     // Level 0 — everything whose only input is `x`.
-    quant::gemv_quant(ctx, pass, &moe_w.gate, io.x, &ms.router_logits)?;
-    quant::gemv_quant(ctx, pass, &shared.gate_up_proj, io.x, io.mlp_gu)?;
-    quant::gemv_quant(ctx, pass, &moe_w.shared_gate, io.x, &ms.shared_gate)?;
+    if !crate::ablate::on(crate::ablate::Group::Router) {
+        quant::gemv_quant(ctx, pass, &moe_w.gate, io.x, &ms.router_logits)?;
+    }
+    if !crate::ablate::on(crate::ablate::Group::Shared) {
+        quant::gemv_quant(ctx, pass, &shared.gate_up_proj, io.x, io.mlp_gu)?;
+        quant::gemv_quant(ctx, pass, &moe_w.shared_gate, io.x, &ms.shared_gate)?;
+    }
     pass.level_barrier(&[&ms.router_logits, io.mlp_gu, &ms.shared_gate])?;
 
     // Level 1 — the routing decision, and the shared expert's activation.
-    moe::moe_router_topk(
-        ctx,
-        pass,
-        &ms.router_logits,
-        &ms.indices,
-        &ms.scores,
-        dims.norm_topk_prob,
-    )?;
-    silu_mul_bf16(ctx, pass, io.mlp_gate, io.mlp_up, io.mlp_act)?;
-    pass.level_barrier(&[&ms.indices, &ms.scores, io.mlp_act])?;
+    if !crate::ablate::on(crate::ablate::Group::Topk) {
+        moe::moe_router_topk(
+            ctx,
+            pass,
+            &ms.router_logits,
+            &ms.indices,
+            &ms.scores,
+            dims.norm_topk_prob,
+        )?;
+        silu_mul_bf16(ctx, pass, io.mlp_gate, io.mlp_up, io.mlp_act)?;
+        pass.level_barrier(&[&ms.indices, &ms.scores, io.mlp_act])?;
+    }
     let slots = match &moe_w.slot_of {
         Some(table) => {
             resolve_experts(pass, moe_w, &ms.indices, dims.top_k)?;
@@ -605,6 +614,9 @@ pub(crate) fn decode_moe(
         None => &ms.indices,
     };
 
+    if crate::ablate::on(crate::ablate::Group::Gather) {
+        return Ok(());
+    }
     moe::moe_gather_gemv_gate_up(
         ctx,
         pass,
@@ -615,9 +627,14 @@ pub(crate) fn decode_moe(
         slots,
         &ms.act,
     )?;
-    quant::gemv_quant(ctx, pass, &shared.down_proj, io.mlp_act, &ms.shared_out)?;
+    if !crate::ablate::on(crate::ablate::Group::Shared) {
+        quant::gemv_quant(ctx, pass, &shared.down_proj, io.mlp_act, &ms.shared_out)?;
+    }
     pass.level_barrier(&[&ms.act, &ms.shared_out])?;
 
+    if crate::ablate::on(crate::ablate::Group::Down) {
+        return Ok(());
+    }
     moe::moe_gather_gemv_down_combine(
         ctx,
         pass,

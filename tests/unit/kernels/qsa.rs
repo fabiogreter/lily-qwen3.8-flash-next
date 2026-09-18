@@ -1169,3 +1169,108 @@ fn tiled_attention_timing() {
         }
     }
 }
+
+
+/// Decode-shape inputs for the sparse split kernels: `layers` K/V caches of
+/// `max_seq` positions, one query at `pos` with 512 random ascending blocks
+/// selected (the production budget).
+struct SparseDecodeSetup {
+    q: Tensor,
+    caches: Vec<(Tensor, Tensor)>,
+    sel: Tensor,
+    n_sel: Tensor,
+    out: Tensor,
+    partials: Tensor,
+    stats: Tensor,
+}
+
+fn sparse_decode_setup(ctx: &MetalContext, rng: &mut StdRng, layers: usize, pos: usize) -> SparseDecodeSetup {
+    let (kvh, group, d, ratio, k_max) = (2usize, 12usize, 256usize, 4usize, 512usize);
+    let nq = kvh * group;
+    let max_seq = pos + 1;
+    let q = Tensor::from_f32_as_bf16(ctx, &random(rng, nq * d, -1.0, 1.0), &[1, nq, d]).expect("q");
+    let caches = (0..layers)
+        .map(|_| {
+            let k = Tensor::from_f32_as_bf16(ctx, &random(rng, kvh * max_seq * d, -1.0, 1.0), &[kvh, max_seq, d]).expect("k");
+            let v = Tensor::from_f32_as_bf16(ctx, &random(rng, kvh * max_seq * d, -1.0, 1.0), &[kvh, max_seq, d]).expect("v");
+            (k, v)
+        })
+        .collect();
+    let nb = visible_blocks(pos, ratio);
+    let mut pool: Vec<u32> = (0..nb as u32).collect();
+    for i in 0..k_max {
+        let pick = rng.gen_range(i..nb);
+        pool.swap(i, pick);
+    }
+    let mut sel_v = pool[..k_max].to_vec();
+    sel_v.sort_unstable();
+    let sel = Tensor::from_bytes(ctx, bytemuck::cast_slice(&sel_v), &[1, k_max], DType::U32).expect("sel");
+    let n_sel = Tensor::from_bytes(ctx, bytemuck::cast_slice(&[k_max as u32]), &[1], DType::U32).expect("n_sel");
+    let out = Tensor::zeros(ctx, &[1, nq, d], DType::BF16).expect("out");
+    let slots = split_scratch_slots(1, k_max, ratio);
+    let partials = Tensor::zeros(ctx, &[slots * nq, d], DType::F32).expect("partials");
+    let stats = Tensor::zeros(ctx, &[slots * nq, 2], DType::F32).expect("stats");
+    SparseDecodeSetup { q, caches, sel, n_sel, out, partials, stats }
+}
+
+fn sparse_decode_dispatch(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    s: &SparseDecodeSetup,
+    layer: usize,
+    pos: usize,
+    names: (&'static str, &'static str),
+) {
+    let (k, v) = &s.caches[layer];
+    let plan = SparseSplitPlan::for_rows(1, 12);
+    qsa_attention_named(
+        ctx, pass, &s.q, k, v, &s.sel, &s.n_sel, &s.out,
+        &SparseSplitScratch { partials: &s.partials, stats: &s.stats },
+        1, 512, 4, pos, 1.0 / 16.0, plan, Some(names),
+    )
+    .expect("sparse attention");
+}
+
+/// The sparse decode attention as decode runs it: per layer the split
+/// kernel, a barrier, the combine, a barrier, over 12 layers with their own
+/// 8K K/V caches, one query with 512 blocks selected. Prints microseconds
+/// per level for every `split:combine` pair in `LILY_QSA_DECODE_KERNELS`
+/// (default the shipped pair). Run with `--ignored --nocapture`.
+#[test]
+#[ignore = "timing only"]
+fn sparse_decode_chain_timing() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(62);
+    let layers = 12;
+    let pos: usize = std::env::var("LILY_QSA_DECODE_POS").ok().and_then(|v| v.parse().ok()).unwrap_or(8191);
+    let s = sparse_decode_setup(&ctx, &mut rng, layers, pos);
+    let pairs: Vec<(&'static str, &'static str)> = std::env::var("LILY_QSA_DECODE_KERNELS")
+        .map(|v| {
+            v.split(',')
+                .map(|pair| {
+                    let (a, b) = pair.split_once(':').expect("split:combine");
+                    (&*Box::leak(a.to_string().into_boxed_str()), &*Box::leak(b.to_string().into_boxed_str()))
+                })
+                .collect()
+        })
+        .unwrap_or_else(|_| vec![("qsa_attn_split_bf16", "sdpa_decode_combine")]);
+    let mut best = vec![f64::INFINITY; pairs.len()];
+    for round in 0..6 {
+        for k in 0..pairs.len() {
+            let which = (round + k) % pairs.len();
+            let pass = ctx.begin_concurrent().expect("pass");
+            for layer in 0..layers {
+                sparse_decode_dispatch(&ctx, &pass, &s, layer, pos, pairs[which]);
+                pass.level_barrier(&[&s.out]).expect("barrier");
+            }
+            let done = pass.commit().expect("commit").wait_retain().expect("wait");
+            let t = done.timing().expect("timing");
+            if round > 0 {
+                best[which] = best[which].min((t.gpu_end_secs - t.gpu_start_secs) / layers as f64);
+            }
+        }
+    }
+    for ((a, b), secs) in pairs.iter().zip(&best) {
+        eprintln!("{a} + {b}: {:.2} us per layer (split + combine, two levels)", secs * 1e6);
+    }
+}
