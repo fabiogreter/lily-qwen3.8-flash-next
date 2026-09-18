@@ -596,6 +596,18 @@ static inline uint qsa_token_at(device const uint* sel_row, uint nblk, uint rati
 // GPU). Emits per-split softmax stats and weighted-V partials laid out like
 // sdpa_decode_split (head index qi*NQ + hq), for sdpa_decode_combine. D
 // must be 256.
+// The kernel's latency chains are cut: the split's token ids are staged
+// once (one dependent load per thread instead of one per K and per V row),
+// each simdgroup requests QSA_KB K (then V) rows before dotting them, the
+// four heads' softmax sums share one barrier (separate partial arrays, so no
+// write-after-read barrier per head) and the V partials of two heads are
+// staged and reduced per barrier pair. The per-token, per-lane and
+// per-simdgroup operation order is unchanged from the plain form of the
+// kernel, which is bit-identical and measured 6 us per layer slower at 8K
+// in the decode chain (docs/performance.md); a variant with the memory
+// loads removed showed the rest of the kernel's time is the barriers and
+// the cross-simdgroup staging, not the K/V traffic.
+#define QSA_KB 4  // K (then V) rows a simdgroup requests per step
 kernel void qsa_attn_split_bf16(device const bfloat* q        [[buffer(0)]],  // [QB, NQ, D]
                                 device const bfloat* k_cache  [[buffer(1)]],  // [KVH, max_seq, D]
                                 device const bfloat* v_cache  [[buffer(2)]],
@@ -605,23 +617,25 @@ kernel void qsa_attn_split_bf16(device const bfloat* q        [[buffer(0)]],  //
                                 device float*        stats    [[buffer(6)]],  // [QB*NQ, splits, 2]
                                 constant uint&       D        [[buffer(7)]],
                                 constant uint&       max_seq  [[buffer(8)]],
-                                constant uint&       group    [[buffer(9)]],   // NQ / KVH
+                                constant uint&       group    [[buffer(9)]],
                                 constant uint&       splits   [[buffer(10)]],
                                 constant uint&       k_max    [[buffer(11)]],
                                 constant uint&       ratio    [[buffer(12)]],
                                 constant uint&       base_pos [[buffer(13)]],
                                 constant float&      scale    [[buffer(14)]],
                                 constant uint&       NQ       [[buffer(15)]],
-                                constant uint&       split    [[buffer(16)]],  // tokens per threadgroup
-                                constant uint&       head_groups [[buffer(17)]],  // threadgroups per KV head
+                                constant uint&       split    [[buffer(16)]],
+                                constant uint&       head_groups [[buffer(17)]],
                                 uint3 tg  [[threadgroup_position_in_grid]],
                                 uint tid  [[thread_index_in_threadgroup]],
                                 uint sg   [[simdgroup_index_in_threadgroup]],
                                 uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float scores[QSA_HPP][QSA_SPLIT];
-    threadgroup float part[QSA_HPP][TG / 32];
+    threadgroup float part[QSA_HPP][(TG / 32)];
+    threadgroup float part_sum[QSA_HPP][(TG / 32)];
     threadgroup float red[QSA_HPP];
-    threadgroup float v_stage[(TG / 32) * 256];
+    threadgroup uint tok[QSA_SPLIT];
+    threadgroup float v_stage[2][((TG / 32)) * 256];
 
     const uint kh = tg.x / head_groups;
     const uint hg = tg.x - kh * head_groups;
@@ -633,7 +647,6 @@ kernel void qsa_attn_split_bf16(device const bfloat* q        [[buffer(0)]],  //
     const uint total = nblk * ratio + (pos + 1 - tail_start);
     const uint slot0 = split_idx * split;
     const uint count = slot0 < total ? min(split, total - slot0) : 0;
-    // This threadgroup's query heads within the KV head.
     const uint h_begin = hg * QSA_HPP;
     const uint h_end = head_groups == 1 ? group : min(h_begin + QSA_HPP, group);
     device const uint* sel_row = sel + (ulong)qi * k_max;
@@ -650,6 +663,11 @@ kernel void qsa_attn_split_bf16(device const bfloat* q        [[buffer(0)]],  //
         }
         return;
     }
+    // The split's cache positions, one dependent load per thread.
+    for (uint p = tid; p < count; p += TG) {
+        tok[p] = qsa_token_at(sel_row, nblk, ratio, tail_start, slot0 + p);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint h0 = h_begin; h0 < h_end; h0 += QSA_HPP) {
         const uint gh = min(uint(QSA_HPP), h_end - h0);
@@ -665,17 +683,30 @@ kernel void qsa_attn_split_bf16(device const bfloat* q        [[buffer(0)]],  //
         for (uint h = 0; h < QSA_HPP; ++h) {
             local_max[h] = -INFINITY;
         }
-        for (uint p = sg; p < count; p += TG / 32) {
-            const uint token = qsa_token_at(sel_row, nblk, ratio, tail_start, slot0 + p);
-            const uint4 kq = ((device const uint4*)(k_head + (ulong)token * D))[lane];
-            const float4 ka = float4(as_type<bfloat4>(kq.xy));
-            const float4 kb = float4(as_type<bfloat4>(kq.zw));
-            for (uint h = 0; h < gh; ++h) {
-                const float s = simd_sum(dot(ka, qa[h]) + dot(kb, qb[h])) * scale;
-                if (lane == 0) {
-                    scores[h][p] = s;
+        // Simdgroup sg takes tokens sg, sg + 8, ... in order, QSA_KB rows
+        // requested per step.
+        for (uint p0 = sg; p0 < count; p0 += QSA_KB * ((TG / 32))) {
+            uint4 kq[QSA_KB];
+            _Pragma("clang loop unroll(full)")
+            for (uint j = 0; j < QSA_KB; ++j) {
+                const uint p = p0 + j * ((TG / 32));
+                const uint token = p < count ? tok[p] : tok[p0];
+                kq[j] = ((device const uint4*)(k_head + (ulong)token * D))[lane];
+            }
+            _Pragma("clang loop unroll(full)")
+            for (uint j = 0; j < QSA_KB; ++j) {
+                const uint p = p0 + j * ((TG / 32));
+                if (p < count) {
+                    const float4 ka = float4(as_type<bfloat4>(kq[j].xy));
+                    const float4 kb = float4(as_type<bfloat4>(kq[j].zw));
+                    for (uint h = 0; h < gh; ++h) {
+                        const float s = simd_sum(dot(ka, qa[h]) + dot(kb, qb[h])) * scale;
+                        if (lane == 0) {
+                            scores[h][p] = s;
+                        }
+                        local_max[h] = max(local_max[h], s);
+                    }
                 }
-                local_max[h] = max(local_max[h], s);
             }
         }
         for (uint h = 0; h < gh; ++h) {
@@ -688,7 +719,7 @@ kernel void qsa_attn_split_bf16(device const bfloat* q        [[buffer(0)]],  //
         if (tid == 0) {
             for (uint h = 0; h < gh; ++h) {
                 float m = -INFINITY;
-                for (uint i = 0; i < TG / 32; ++i) {
+                for (uint i = 0; i < (TG / 32); ++i) {
                     m = max(m, part[h][i]);
                 }
                 red[h] = m;
@@ -703,21 +734,21 @@ kernel void qsa_attn_split_bf16(device const bfloat* q        [[buffer(0)]],  //
                 scores[h][tid] = e;
             }
             const float local_sum = simd_sum(e);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
             if (lane == 0) {
-                part[h][sg] = local_sum;
+                part_sum[h][sg] = local_sum;
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (tid == 0) {
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            for (uint h = 0; h < gh; ++h) {
                 float s = 0.0f;
-                for (uint i = 0; i < TG / 32; ++i) {
-                    s += part[h][i];
+                for (uint i = 0; i < (TG / 32); ++i) {
+                    s += part_sum[h][i];
                 }
                 const ulong hq = (ulong)qi * NQ + (ulong)kh * group + h0 + h;
-                stats[(hq * splits + split_idx) * 2] = chunk_max;
+                stats[(hq * splits + split_idx) * 2] = red[h];
                 stats[(hq * splits + split_idx) * 2 + 1] = s;
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
         float4 acc0[QSA_HPP];
@@ -726,30 +757,46 @@ kernel void qsa_attn_split_bf16(device const bfloat* q        [[buffer(0)]],  //
             acc0[h] = float4(0.0f);
             acc1[h] = float4(0.0f);
         }
-        for (uint p = sg; p < count; p += TG / 32) {
-            const uint token = qsa_token_at(sel_row, nblk, ratio, tail_start, slot0 + p);
-            const uint4 vq = ((device const uint4*)(v_head + (ulong)token * D))[lane];
-            const float4 va = float4(as_type<bfloat4>(vq.xy));
-            const float4 vb = float4(as_type<bfloat4>(vq.zw));
-            for (uint h = 0; h < gh; ++h) {
-                const float wgt = scores[h][p];
-                acc0[h] += wgt * va;
-                acc1[h] += wgt * vb;
+        for (uint p0 = sg; p0 < count; p0 += QSA_KB * ((TG / 32))) {
+            uint4 vq[QSA_KB];
+            _Pragma("clang loop unroll(full)")
+            for (uint j = 0; j < QSA_KB; ++j) {
+                const uint p = p0 + j * ((TG / 32));
+                const uint token = p < count ? tok[p] : tok[p0];
+                vq[j] = ((device const uint4*)(v_head + (ulong)token * D))[lane];
+            }
+            _Pragma("clang loop unroll(full)")
+            for (uint j = 0; j < QSA_KB; ++j) {
+                const uint p = p0 + j * ((TG / 32));
+                if (p < count) {
+                    const float4 va = float4(as_type<bfloat4>(vq[j].xy));
+                    const float4 vb = float4(as_type<bfloat4>(vq[j].zw));
+                    for (uint h = 0; h < gh; ++h) {
+                        const float wgt = scores[h][p];
+                        acc0[h] += wgt * va;
+                        acc1[h] += wgt * vb;
+                    }
+                }
             }
         }
-        for (uint h = 0; h < gh; ++h) {
-            for (uint j = 0; j < 4; ++j) {
-                v_stage[sg * D + lane * 8 + j] = acc0[h][j];
-                v_stage[sg * D + lane * 8 + 4 + j] = acc1[h][j];
+        for (uint hb = 0; hb < gh; hb += 2) {
+            const uint nh = min(2u, gh - hb);
+            for (uint h = 0; h < nh; ++h) {
+                for (uint j = 0; j < 4; ++j) {
+                    v_stage[h][sg * D + lane * 8 + j] = acc0[hb + h][j];
+                    v_stage[h][sg * D + lane * 8 + 4 + j] = acc1[hb + h][j];
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            const ulong hq = (ulong)qi * NQ + (ulong)kh * group + h0 + h;
-            for (uint d = tid; d < D; d += TG) {
-                float acc = 0.0f;
-                for (uint s = 0; s < TG / 32; ++s) {
-                    acc += v_stage[s * D + d];
+            for (uint h = 0; h < nh; ++h) {
+                const ulong hq = (ulong)qi * NQ + (ulong)kh * group + h0 + hb + h;
+                for (uint d = tid; d < D; d += TG) {
+                    float acc = 0.0f;
+                    for (uint s = 0; s < (TG / 32); ++s) {
+                        acc += v_stage[h][s * D + d];
+                    }
+                    partials[(hq * splits + split_idx) * D + d] = acc;
                 }
-                partials[(hq * splits + split_idx) * D + d] = acc;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
