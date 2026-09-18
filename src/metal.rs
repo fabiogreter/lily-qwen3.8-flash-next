@@ -183,7 +183,8 @@ pub mod profile {
         PASSES.lock().map(|mut passes| std::mem::take(&mut *passes)).unwrap_or_default()
     }
 
-    static LEVELS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static LEVELS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
 
     pub(super) fn count_level() {
         LEVELS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

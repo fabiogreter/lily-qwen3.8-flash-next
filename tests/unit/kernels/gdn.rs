@@ -219,8 +219,7 @@ fn gdn_prefill_matches_looped_step() {
 
         // The default route is the register scan and needs staging.
         let st = staging_tensors(&ctx, m, hk, h);
-        let staging =
-            st.staging();
+        let staging = st.staging();
         let pass = ctx.begin().expect("pass");
         gdn_prefill(
             &ctx, &pass, &t_qkv, &ta, &tb, &t_a_log, &t_dt_bias, &staging, &t_state,
@@ -302,8 +301,7 @@ fn gdn_prefill_nonzero_state_matches_looped_step() {
 
         // The default route is the register scan and needs staging.
         let st = staging_tensors(&ctx, m, hk, h);
-        let staging =
-            st.staging();
+        let staging = st.staging();
         let pass = ctx.begin().expect("pass");
         gdn_prefill(
             &ctx, &pass, &t_qkv, &ta, &tb, &t_a_log, &t_dt_bias, &staging, &t_state,
@@ -354,10 +352,16 @@ fn gdn_prefill_nonzero_state_matches_looped_step() {
 
 /// Fresh regscan staging tensors for one chunk shape (the default route
 /// needs them, like the production per-chunk scratch views).
-fn staging_tensors(ctx: &MetalContext, m: usize, hk: usize, h: usize) -> StagingTensors {
+fn staging_tensors(
+    ctx: &MetalContext,
+    m: usize,
+    hk: usize,
+    h: usize,
+) -> StagingTensors {
     let [w, u, p, g] = gdn_chunk_staging_shapes(m, h);
     StagingTensors {
-        qk_norm: Tensor::zeros(ctx, &[m, 2 * hk * GDN_HEAD_DIM], DType::BF16).expect("qk_norm"),
+        qk_norm: Tensor::zeros(ctx, &[m, 2 * hk * GDN_HEAD_DIM], DType::BF16)
+            .expect("qk_norm"),
         decay: Tensor::zeros(ctx, &[m, h], DType::F32).expect("decay"),
         beta: Tensor::zeros(ctx, &[m, h], DType::F32).expect("beta"),
         w: Tensor::zeros(ctx, &w.0, w.1).expect("w"),
@@ -385,7 +389,12 @@ impl StagingTensors {
             qk_norm: &self.qk_norm,
             decay: &self.decay,
             beta: &self.beta,
-            chunk: Some(GdnChunkStaging { w: &self.w, u: &self.u, p: &self.p, g: &self.g }),
+            chunk: Some(GdnChunkStaging {
+                w: &self.w,
+                u: &self.u,
+                p: &self.p,
+                g: &self.g,
+            }),
         }
     }
 }
@@ -411,7 +420,8 @@ fn gdn_regscan_staging_stages_match_cpu() {
     let st = staging_tensors(&ctx, m, hk, h);
 
     let pass = ctx.begin().expect("pass");
-    gdn_qk_l2norm(&ctx, &pass, &t_qkv, &st.qk_norm, scale, hk, h).expect("gdn_qk_l2norm");
+    gdn_qk_l2norm(&ctx, &pass, &t_qkv, &st.qk_norm, scale, hk, h)
+        .expect("gdn_qk_l2norm");
     gdn_gates(&ctx, &pass, &ta, &tb, &t_a_log, &t_dt_bias, &st.decay, &st.beta)
         .expect("gdn_gates");
     pass.commit_wait().expect("commit");
@@ -504,7 +514,19 @@ fn run_regscan(
     // The token-serial scan by name: the default route takes the chunked
     // scan from `GDN_CHUNK_MIN_ROWS` rows.
     gdn_prefill_scan_named(
-        ctx, &pass, &t_qkv, &ta, &tb, a_log, dt_bias, &staging, state, &out, scale, hk, None,
+        ctx,
+        &pass,
+        &t_qkv,
+        &ta,
+        &tb,
+        a_log,
+        dt_bias,
+        &staging,
+        state,
+        &out,
+        scale,
+        hk,
+        None,
         "gdn_prefill_regscan",
     )
     .expect("gdn_prefill");
@@ -748,8 +770,8 @@ fn gdn_prefill_chunked_matches_cpu() {
                 let out = Tensor::zeros(&ctx, &[m, h, dim], DType::BF16).expect("out");
                 let pass = ctx.begin().expect("pass");
                 gdn_prefill_scan_named(
-                    &ctx, &pass, &t_qkv, &ta, &tb, &t_a_log, &t_dt_bias, &staging, &state,
-                    &out, scale, hk, None, name,
+                    &ctx, &pass, &t_qkv, &ta, &tb, &t_a_log, &t_dt_bias, &staging,
+                    &state, &out, scale, hk, None, name,
                 )
                 .expect("scan");
                 pass.commit_wait().expect("commit");
@@ -1364,8 +1386,7 @@ fn gdn_small_m_timing() {
         )
         .expect("z");
         let st = staging_tensors(&ctx, m, hk, h);
-        let staging =
-            st.staging();
+        let staging = st.staging();
         let out = Tensor::zeros(&ctx, &[m, h, dim], DType::BF16).expect("out");
         let gated = Tensor::zeros(&ctx, &[h * dim], DType::BF16).expect("gated");
         for variant in ["regscan", "step-loop"] {
@@ -1455,7 +1476,10 @@ fn gdn_prefill_scan_timing() {
     // The GPU clock ramps over the first hundred milliseconds of work, so
     // warm it up before the measured rounds.
     let rounds = 8;
-    let warmup = std::env::var("LILY_GDN_SCAN_WARMUP").ok().and_then(|v| v.parse().ok()).unwrap_or(40usize);
+    let warmup = std::env::var("LILY_GDN_SCAN_WARMUP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(40usize);
     for round in 0..warmup + rounds {
         if round == warmup {
             crate::metal::profile::take();
@@ -1475,7 +1499,8 @@ fn gdn_prefill_scan_timing() {
     for name in &names {
         // The chunked scan is two dispatches per pass; report their sum.
         let matches = |kernel: &str| {
-            kernel == name.as_str() || (name == GDN_CHUNK_SCAN && kernel.starts_with("gdn_chunk"))
+            kernel == name.as_str()
+                || (name == GDN_CHUNK_SCAN && kernel.starts_with("gdn_chunk"))
         };
         let mut ms: Vec<f64> = passes
             .iter()
@@ -1483,7 +1508,7 @@ fn gdn_prefill_scan_timing() {
                 let s: f64 = p
                     .kernels
                     .iter()
-                    .filter(|s| matches(&s.name))
+                    .filter(|s| matches(s.name))
                     .map(|s| s.gpu_secs * 1e3)
                     .sum();
                 (s > 0.0).then_some(s)
@@ -1507,7 +1532,11 @@ fn gdn_prefill_scan_timing() {
                     .collect();
                 ms.sort_by(|x, y| x.total_cmp(y));
                 if !ms.is_empty() {
-                    eprintln!("  {part}: min {:.2} ms, median {:.2} ms", ms[0], ms[ms.len() / 2]);
+                    eprintln!(
+                        "  {part}: min {:.2} ms, median {:.2} ms",
+                        ms[0],
+                        ms[ms.len() / 2]
+                    );
                 }
             }
         }
@@ -1525,7 +1554,10 @@ fn gdn_prefill_scan_timing() {
 #[ignore = "timing only"]
 fn gdn_step_chain_timing() {
     let ctx = MetalContext::new().expect("metal context");
-    let h: usize = std::env::var("LILY_GDN_STEP_HEADS").ok().and_then(|v| v.parse().ok()).unwrap_or(48);
+    let h: usize = std::env::var("LILY_GDN_STEP_HEADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(48);
     let (hk, dim, layers) = (h / 3, GDN_HEAD_DIM, 36usize);
     let scale = 1.0 / (dim as f32).sqrt();
     let mut rng = StdRng::seed_from_u64(7);
@@ -1534,21 +1566,29 @@ fn gdn_step_chain_timing() {
         .unwrap_or_else(|_| vec!["gdn_step_gated".to_string()]);
     let names: Vec<&'static str> =
         names.into_iter().map(|n| &*Box::leak(n.into_boxed_str())).collect();
-    let t_a_log = Tensor::from_f32(&ctx, &random_vec(&mut rng, h, -2.0, 0.5), &[h]).expect("a_log");
+    let t_a_log = Tensor::from_f32(&ctx, &random_vec(&mut rng, h, -2.0, 0.5), &[h])
+        .expect("a_log");
     let t_dt_bias =
-        Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, h, -0.5, 0.5), &[h]).expect("dt");
-    let t_norm_w =
-        Tensor::from_f32(&ctx, &random_vec(&mut rng, dim, 0.5, 1.5), &[dim]).expect("norm_w");
+        Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, h, -0.5, 0.5), &[h])
+            .expect("dt");
+    let t_norm_w = Tensor::from_f32(&ctx, &random_vec(&mut rng, dim, 0.5, 1.5), &[dim])
+        .expect("norm_w");
     let t_qkv = Tensor::from_f32_as_bf16(
         &ctx,
         &random_vec(&mut rng, (2 * hk + h) * dim, -1.0, 1.0),
         &[2 * hk + h, dim],
     )
     .expect("qkv");
-    let t_a = Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, h, -1.0, 1.0), &[h]).expect("a");
-    let t_b = Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, h, -1.0, 1.0), &[h]).expect("b");
-    let t_z = Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, h * dim, -1.0, 1.0), &[h, dim])
-        .expect("z");
+    let t_a = Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, h, -1.0, 1.0), &[h])
+        .expect("a");
+    let t_b = Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, h, -1.0, 1.0), &[h])
+        .expect("b");
+    let t_z = Tensor::from_f32_as_bf16(
+        &ctx,
+        &random_vec(&mut rng, h * dim, -1.0, 1.0),
+        &[h, dim],
+    )
+    .expect("z");
     let out = Tensor::zeros(&ctx, &[h, dim], DType::BF16).expect("out");
     let states: Vec<Tensor> = (0..layers)
         .map(|_| Tensor::zeros(&ctx, &[h, dim, dim], DType::F32).expect("state"))
@@ -1561,8 +1601,22 @@ fn gdn_step_chain_timing() {
             let pass = ctx.begin_concurrent().expect("pass");
             for state in &states {
                 gdn_step_gated_named(
-                    &ctx, &pass, names[which], &t_qkv, &t_a, &t_b, &t_a_log, &t_dt_bias,
-                    state, &t_z, &t_norm_w, &out, scale, hk, 1e-6, GdnGate::Sigmoid,
+                    &ctx,
+                    &pass,
+                    names[which],
+                    &t_qkv,
+                    &t_a,
+                    &t_b,
+                    &t_a_log,
+                    &t_dt_bias,
+                    state,
+                    &t_z,
+                    &t_norm_w,
+                    &out,
+                    scale,
+                    hk,
+                    1e-6,
+                    GdnGate::Sigmoid,
                 )
                 .expect(names[which]);
                 pass.level_barrier(&[&out]).expect("barrier");
@@ -1600,9 +1654,21 @@ fn gdn_state_stream_timing() {
         .map(|_| Tensor::zeros(&ctx, &[h, dim, dim], DType::F32).expect("state"))
         .collect();
     let out = Tensor::zeros(&ctx, &[dim], DType::F32).expect("out");
-    let pipeline = ctx.pipeline("gdn_state_stream", TEST_SOURCE, MslVersion::V3_1).expect("kernel");
-    let shapes: [(usize, usize); 10] =
-        [(128, 1), (128, 2), (128, 4), (128, 8), (64, 2), (64, 4), (32, 1), (32, 4), (32, 16), (16, 8)];
+    let pipeline = ctx
+        .pipeline("gdn_state_stream", TEST_SOURCE, MslVersion::V3_1)
+        .expect("kernel");
+    let shapes: [(usize, usize); 10] = [
+        (128, 1),
+        (128, 2),
+        (128, 4),
+        (128, 8),
+        (64, 2),
+        (64, 4),
+        (32, 1),
+        (32, 4),
+        (32, 16),
+        (16, 8),
+    ];
     let decay = 0.99f32;
     let mut best = vec![f64::INFINITY; shapes.len()];
     for round in 0..6 {
@@ -1626,7 +1692,8 @@ fn gdn_state_stream_timing() {
             let done = pass.commit().expect("commit").wait_retain().expect("wait");
             let t = done.timing().expect("timing");
             if round > 0 {
-                best[which] = best[which].min((t.gpu_end_secs - t.gpu_start_secs) / layers as f64);
+                best[which] = best[which]
+                    .min((t.gpu_end_secs - t.gpu_start_secs) / layers as f64);
             }
         }
     }

@@ -62,8 +62,22 @@ pub fn gdn_step_gated_fused(
     );
     ensure!(out.numel() == part && out.dtype() == DType::BF16, "bad output size");
     gdn_step_gated_named(
-        ctx, pass, "gdn_step_gated", qkv, a, b, a_log, dt_bias, state, z, norm_w, out,
-        scale, num_k_heads, eps, gate_act,
+        ctx,
+        pass,
+        "gdn_step_gated",
+        qkv,
+        a,
+        b,
+        a_log,
+        dt_bias,
+        state,
+        z,
+        norm_w,
+        out,
+        scale,
+        num_k_heads,
+        eps,
+        gate_act,
     )
 }
 
@@ -156,7 +170,10 @@ pub struct GdnChunkStaging<'a> {
 
 /// Shapes and dtypes of the chunk staging tensors (`w`, `u`, `p`, `g`) for
 /// `m` rows and `num_heads` value heads.
-pub fn gdn_chunk_staging_shapes(m: usize, num_heads: usize) -> [(Vec<usize>, DType); 4] {
+pub fn gdn_chunk_staging_shapes(
+    m: usize,
+    num_heads: usize,
+) -> [(Vec<usize>, DType); 4] {
     [
         (vec![m, num_heads, GDN_HEAD_DIM], DType::BF16),
         (vec![m, num_heads, GDN_HEAD_DIM], DType::BF16),
@@ -305,7 +322,8 @@ pub fn gdn_prefill_mid(
     static FORCED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let forced = FORCED.get_or_init(|| std::env::var("LILY_GDN_SCAN_KERNEL").ok());
     let m = a.numel() / a_log.numel().max(1);
-    let default = if mid.is_none() && staging.chunk.is_some() && m >= GDN_CHUNK_MIN_ROWS {
+    let default = if mid.is_none() && staging.chunk.is_some() && m >= GDN_CHUNK_MIN_ROWS
+    {
         GDN_CHUNK_SCAN
     } else {
         GDN_SCAN_KERNEL
@@ -388,17 +406,27 @@ pub fn gdn_prefill_scan_named(
 
     if scan_name == GDN_CHUNK_SCAN {
         ensure!(mid.is_none(), "the chunked scan records no mid states");
-        let chunk = staging
-            .chunk
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("the chunked scan needs its chunk staging"))?;
+        let chunk = staging.chunk.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("the chunked scan needs its chunk staging")
+        })?;
         // Whole chunks through the tensor kernels; a ragged tail continues
         // from their state through the token-serial scan (its kernels read
         // whole chunks of rows, see gdn.metal).
         let m_main = m - m % GDN_CHUNK;
         if m_main == m {
             return gdn_prefill_chunked(
-                ctx, pass, qkv, a, b, a_log, dt_bias, staging, chunk, state, out, scale,
+                ctx,
+                pass,
+                qkv,
+                a,
+                b,
+                a_log,
+                dt_bias,
+                staging,
+                chunk,
+                state,
+                out,
+                scale,
                 num_k_heads,
             );
         }
@@ -538,10 +566,14 @@ fn gdn_prefill_chunked(
     let dim = GDN_HEAD_DIM;
     let vpk = num_heads / num_k_heads;
     let m = a.numel() / num_heads;
-    ensure!(m > 0 && m.is_multiple_of(GDN_CHUNK), "the chunked scan takes whole chunks of {GDN_CHUNK} rows, got {m}");
-    for ((t, name), (shape, dtype)) in [(chunk.w, "w"), (chunk.u, "u"), (chunk.p, "p"), (chunk.g, "g")]
-        .into_iter()
-        .zip(gdn_chunk_staging_shapes(m, num_heads))
+    ensure!(
+        m > 0 && m.is_multiple_of(GDN_CHUNK),
+        "the chunked scan takes whole chunks of {GDN_CHUNK} rows, got {m}"
+    );
+    for ((t, name), (shape, dtype)) in
+        [(chunk.w, "w"), (chunk.u, "u"), (chunk.p, "p"), (chunk.g, "g")]
+            .into_iter()
+            .zip(gdn_chunk_staging_shapes(m, num_heads))
     {
         ensure!(
             t.numel() >= shape.iter().product::<usize>() && t.dtype() == dtype,
@@ -550,13 +582,18 @@ fn gdn_prefill_chunked(
             t.shape()
         );
     }
-    ensure!(dt_bias.dtype() == DType::BF16 && a.dtype() == DType::BF16 && b.dtype() == DType::BF16,
-            "a, b and dt_bias must be BF16");
+    ensure!(
+        dt_bias.dtype() == DType::BF16
+            && a.dtype() == DType::BF16
+            && b.dtype() == DType::BF16,
+        "a, b and dt_bias must be BF16"
+    );
     gdn_qk_l2norm(ctx, pass, qkv, staging.qk_norm, scale, num_k_heads, num_heads)?;
     pass.level_barrier(&[staging.qk_norm])?;
     // The three-heads-at-once pass covers up to three value heads per key
     // head; wider grouping takes the per-head pass.
-    let (wy_name, wy_threads) = if vpk <= 3 { ("gdn_chunk_wy3", 256) } else { ("gdn_chunk_wy", 128) };
+    let (wy_name, wy_threads) =
+        if vpk <= 3 { ("gdn_chunk_wy3", 256) } else { ("gdn_chunk_wy", 128) };
     let wy = ctx.pipeline(wy_name, SOURCE, MslVersion::V4_0)?;
     pass.dispatch_at(
         &wy,

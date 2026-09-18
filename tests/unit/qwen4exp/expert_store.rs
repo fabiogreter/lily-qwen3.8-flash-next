@@ -27,7 +27,8 @@ fn ranking_json_round_trips() {
         "counts": [[1, 2, 3], [4, 5, 6]],
         "prompts": 40,
     });
-    let dir = std::env::temp_dir().join(format!("lily-expert-store-{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("lily-expert-store-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let path = dir.join("experts.json");
     std::fs::write(&path, serde_json::to_vec(&json).expect("json")).expect("write");
@@ -73,10 +74,7 @@ fn hits_never_move_and_misses_evict_worst_ranked_first() {
     assert_eq!(p.lookup(1, 2, 1), Lookup::Hit(2));
     // Slot 3 (rank 4) is untouched since the fill and worse ranked than
     // slot 2, so the first cold expert evicts it.
-    assert_eq!(
-        p.lookup(0, 2, 1),
-        Lookup::Miss { slot: 3, evicted: Some((0, 0)) }
-    );
+    assert_eq!(p.lookup(0, 2, 1), Lookup::Miss { slot: 3, evicted: Some((0, 0)) });
     assert_eq!(p.slot_of(0, 0), None);
     assert_eq!(p.slot_of(0, 2), Some(3));
     assert_eq!(p.slice_in(3), Some((0, 2)));
@@ -95,21 +93,12 @@ fn lru_evicts_oldest_tick() {
     assert_eq!(p.lookup(1, 2, 1), Lookup::Hit(2));
     assert_eq!(p.lookup(0, 0, 2), Lookup::Hit(3));
     // Slot 2 was last used at tick 1, slot 3 at tick 2.
-    assert_eq!(
-        p.lookup(0, 2, 3),
-        Lookup::Miss { slot: 2, evicted: Some((1, 2)) }
-    );
+    assert_eq!(p.lookup(0, 2, 3), Lookup::Miss { slot: 2, evicted: Some((1, 2)) });
     assert_eq!(p.lookup(0, 2, 4), Lookup::Hit(2));
     // Now slot 3 (tick 2) is older than slot 2 (tick 4).
-    assert_eq!(
-        p.lookup(1, 1, 5),
-        Lookup::Miss { slot: 3, evicted: Some((0, 0)) }
-    );
+    assert_eq!(p.lookup(1, 1, 5), Lookup::Miss { slot: 3, evicted: Some((0, 0)) });
     // The evicted expert comes back through the LRU slot used longest ago.
-    assert_eq!(
-        p.lookup(1, 2, 6),
-        Lookup::Miss { slot: 2, evicted: Some((0, 2)) }
-    );
+    assert_eq!(p.lookup(1, 2, 6), Lookup::Miss { slot: 2, evicted: Some((0, 2)) });
     assert_eq!(p.slot_table(0), &[SlotPolicy::NONE, 0, SlotPolicy::NONE]);
     assert_eq!(p.slot_table(1), &[1, 3, 2]);
 }
@@ -187,9 +176,11 @@ fn store_reads_match_checkpoint() {
         store.read_into(layer, expert, dst).expect("read_into");
         let slice = store.slice(layer, expert);
         for (r, suffix) in REGION_NAMES.iter().enumerate() {
-            let name = format!("model.language_model.layers.{layer}.mlp.experts.{suffix}");
+            let name =
+                format!("model.language_model.layers.{layer}.mlp.experts.{suffix}");
             let meta = ckpt.meta(&name).expect("meta");
-            let per_expert = meta.shape[1] * meta.shape[2] * meta.dtype.size().expect("dtype");
+            let per_expert =
+                meta.shape[1] * meta.shape[2] * meta.dtype.size().expect("dtype");
             assert_eq!(per_expert, lens[r], "{name}");
             assert_eq!(slice.regions[r].len, lens[r], "{name}");
             assert_eq!(
@@ -197,7 +188,11 @@ fn store_reads_match_checkpoint() {
                 meta.start() + (expert * per_expert) as u64,
                 "{name}"
             );
-            assert_eq!(store.shard_path(slice.regions[r].shard), meta.shard(), "{name}");
+            assert_eq!(
+                store.shard_path(slice.regions[r].shard),
+                meta.shard(),
+                "{name}"
+            );
             let whole = ckpt.read(&name).expect("read tensor");
             let want = &whole[expert * per_expert..(expert + 1) * per_expert];
             assert!(bufs[r] == want, "layer {layer} expert {expert} {suffix} differs");

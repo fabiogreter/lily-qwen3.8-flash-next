@@ -813,7 +813,9 @@ fn tile_union_matches_cpu() {
             .expect("sel");
     let t_n = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&n_sel), &[qb], DType::U32)
         .expect("n");
-    let tiles = SparseTileScratch::new(&ctx, qb, max_blocks, k_max, 2, ratio, 512 << 20).expect("tiles");
+    let tiles =
+        SparseTileScratch::new(&ctx, qb, max_blocks, k_max, 2, ratio, 512 << 20)
+            .expect("tiles");
     let pass = ctx.begin().expect("pass");
     qsa_tile_union(&ctx, &pass, &t_sel, &t_n, &tiles, qb, k_max, ratio, base_pos)
         .expect("union");
@@ -929,9 +931,21 @@ fn tiled_attention_matches_split_kernel_and_cpu() {
     // A row budget that holds every tile of the batch, and one that holds
     // a single tile so the batch is gathered and attended in groups.
     for budget in [1100usize << 20, 1 << 20] {
-        let tiles =
-            SparseTileScratch::new(&ctx, qb, max_seq / ratio, k_max, kvh, ratio, budget).expect("tiles");
-        assert_eq!(tiles.row_group(), if budget > 1 << 20 { 3 } else { 1 }, "row group at {budget} bytes");
+        let tiles = SparseTileScratch::new(
+            &ctx,
+            qb,
+            max_seq / ratio,
+            k_max,
+            kvh,
+            ratio,
+            budget,
+        )
+        .expect("tiles");
+        assert_eq!(
+            tiles.row_group(),
+            if budget > 1 << 20 { 3 } else { 1 },
+            "row group at {budget} bytes"
+        );
         let out = Tensor::zeros(&ctx, &[qb, nq, d], DType::BF16).expect("out");
         let pass = ctx.begin().expect("pass");
         qsa_tile_union(&ctx, &pass, &t_sel, &t_n, &tiles, qb, k_max, ratio, base_pos)
@@ -1065,9 +1079,7 @@ fn tiled_attention_timing() {
     let scale = 1.0 / (d as f32).sqrt();
     let kernels: Vec<String> = std::env::var("LILY_QSA_TILE_KERNELS")
         .map(|v| v.split(',').map(str::to_string).collect())
-        .unwrap_or_else(|_| {
-            vec!["qsa_attn_rows_nax_h1".to_string()]
-        });
+        .unwrap_or_else(|_| vec!["qsa_attn_rows_nax_h1".to_string()]);
     for base_pos in [8192usize, 32768] {
         let max_seq = base_pos + qb;
         let q = random(&mut rng, qb * nq * d, -1.0, 1.0);
@@ -1090,8 +1102,16 @@ fn tiled_attention_timing() {
         let t_n =
             Tensor::from_bytes(&ctx, bytemuck::cast_slice(&n_sel), &[qb], DType::U32)
                 .expect("n");
-        let tiles =
-            SparseTileScratch::new(&ctx, qb, max_seq / ratio, k_max, kvh, ratio, 1100 << 20).expect("tiles");
+        let tiles = SparseTileScratch::new(
+            &ctx,
+            qb,
+            max_seq / ratio,
+            k_max,
+            kvh,
+            ratio,
+            1100 << 20,
+        )
+        .expect("tiles");
         let out = Tensor::zeros(&ctx, &[qb, nq, d], DType::BF16).expect("out");
         let pass = ctx.begin().expect("pass");
         qsa_tile_union(&ctx, &pass, &t_sel, &t_n, &tiles, qb, k_max, ratio, base_pos)
@@ -1117,7 +1137,10 @@ fn tiled_attention_timing() {
                 .expect("tiled attention");
                 let t0 = std::time::Instant::now();
                 pass.commit_wait().expect("commit");
-                walls.entry(name.clone()).or_default().push(t0.elapsed().as_secs_f64() * 1e3);
+                walls
+                    .entry(name.clone())
+                    .or_default()
+                    .push(t0.elapsed().as_secs_f64() * 1e3);
             }
         }
         if wall {
@@ -1156,7 +1179,6 @@ fn tiled_attention_timing() {
     }
 }
 
-
 /// Decode-shape inputs for the sparse split kernels: `layers` K/V caches of
 /// `max_seq` positions, one query at `pos` with 512 random ascending blocks
 /// selected (the production budget).
@@ -1170,15 +1192,31 @@ struct SparseDecodeSetup {
     stats: Tensor,
 }
 
-fn sparse_decode_setup(ctx: &MetalContext, rng: &mut StdRng, layers: usize, pos: usize) -> SparseDecodeSetup {
+fn sparse_decode_setup(
+    ctx: &MetalContext,
+    rng: &mut StdRng,
+    layers: usize,
+    pos: usize,
+) -> SparseDecodeSetup {
     let (kvh, group, d, ratio, k_max) = (2usize, 12usize, 256usize, 4usize, 512usize);
     let nq = kvh * group;
     let max_seq = pos + 1;
-    let q = Tensor::from_f32_as_bf16(ctx, &random(rng, nq * d, -1.0, 1.0), &[1, nq, d]).expect("q");
+    let q = Tensor::from_f32_as_bf16(ctx, &random(rng, nq * d, -1.0, 1.0), &[1, nq, d])
+        .expect("q");
     let caches = (0..layers)
         .map(|_| {
-            let k = Tensor::from_f32_as_bf16(ctx, &random(rng, kvh * max_seq * d, -1.0, 1.0), &[kvh, max_seq, d]).expect("k");
-            let v = Tensor::from_f32_as_bf16(ctx, &random(rng, kvh * max_seq * d, -1.0, 1.0), &[kvh, max_seq, d]).expect("v");
+            let k = Tensor::from_f32_as_bf16(
+                ctx,
+                &random(rng, kvh * max_seq * d, -1.0, 1.0),
+                &[kvh, max_seq, d],
+            )
+            .expect("k");
+            let v = Tensor::from_f32_as_bf16(
+                ctx,
+                &random(rng, kvh * max_seq * d, -1.0, 1.0),
+                &[kvh, max_seq, d],
+            )
+            .expect("v");
             (k, v)
         })
         .collect();
@@ -1190,8 +1228,16 @@ fn sparse_decode_setup(ctx: &MetalContext, rng: &mut StdRng, layers: usize, pos:
     }
     let mut sel_v = pool[..k_max].to_vec();
     sel_v.sort_unstable();
-    let sel = Tensor::from_bytes(ctx, bytemuck::cast_slice(&sel_v), &[1, k_max], DType::U32).expect("sel");
-    let n_sel = Tensor::from_bytes(ctx, bytemuck::cast_slice(&[k_max as u32]), &[1], DType::U32).expect("n_sel");
+    let sel =
+        Tensor::from_bytes(ctx, bytemuck::cast_slice(&sel_v), &[1, k_max], DType::U32)
+            .expect("sel");
+    let n_sel = Tensor::from_bytes(
+        ctx,
+        bytemuck::cast_slice(&[k_max as u32]),
+        &[1],
+        DType::U32,
+    )
+    .expect("n_sel");
     let out = Tensor::zeros(ctx, &[1, nq, d], DType::BF16).expect("out");
     let slots = split_scratch_slots(1, k_max, ratio);
     let partials = Tensor::zeros(ctx, &[slots * nq, d], DType::F32).expect("partials");
@@ -1210,9 +1256,22 @@ fn sparse_decode_dispatch(
     let (k, v) = &s.caches[layer];
     let plan = SparseSplitPlan::for_rows(1, 12);
     qsa_attention_named(
-        ctx, pass, &s.q, k, v, &s.sel, &s.n_sel, &s.out,
+        ctx,
+        pass,
+        &s.q,
+        k,
+        v,
+        &s.sel,
+        &s.n_sel,
+        &s.out,
         &SparseSplitScratch { partials: &s.partials, stats: &s.stats },
-        1, 512, 4, pos, 1.0 / 16.0, plan, Some(names),
+        1,
+        512,
+        4,
+        pos,
+        1.0 / 16.0,
+        plan,
+        Some(names),
     )
     .expect("sparse attention");
 }
@@ -1228,18 +1287,25 @@ fn sparse_decode_chain_timing() {
     let ctx = MetalContext::new().expect("metal context");
     let mut rng = StdRng::seed_from_u64(62);
     let layers = 12;
-    let pos: usize = std::env::var("LILY_QSA_DECODE_POS").ok().and_then(|v| v.parse().ok()).unwrap_or(8191);
+    let pos: usize = std::env::var("LILY_QSA_DECODE_POS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8191);
     let s = sparse_decode_setup(&ctx, &mut rng, layers, pos);
-    let pairs: Vec<(&'static str, &'static str)> = std::env::var("LILY_QSA_DECODE_KERNELS")
-        .map(|v| {
-            v.split(',')
-                .map(|pair| {
-                    let (a, b) = pair.split_once(':').expect("split:combine");
-                    (&*Box::leak(a.to_string().into_boxed_str()), &*Box::leak(b.to_string().into_boxed_str()))
-                })
-                .collect()
-        })
-        .unwrap_or_else(|_| vec![("qsa_attn_split_bf16", "sdpa_decode_combine")]);
+    let pairs: Vec<(&'static str, &'static str)> =
+        std::env::var("LILY_QSA_DECODE_KERNELS")
+            .map(|v| {
+                v.split(',')
+                    .map(|pair| {
+                        let (a, b) = pair.split_once(':').expect("split:combine");
+                        (
+                            &*Box::leak(a.to_string().into_boxed_str()),
+                            &*Box::leak(b.to_string().into_boxed_str()),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|_| vec![("qsa_attn_split_bf16", "sdpa_decode_combine")]);
     let mut best = vec![f64::INFINITY; pairs.len()];
     // The GPU clock ramps over the first few hundred milliseconds of work:
     // untimed rounds until `LILY_CHAIN_WARMUP_MS` (300) have passed, then
@@ -1258,7 +1324,8 @@ fn sparse_decode_chain_timing() {
             let done = pass.commit().expect("commit").wait_retain().expect("wait");
             let t = done.timing().expect("timing");
             if timed && round > 0 {
-                best[which] = best[which].min((t.gpu_end_secs - t.gpu_start_secs) / layers as f64);
+                best[which] = best[which]
+                    .min((t.gpu_end_secs - t.gpu_start_secs) / layers as f64);
             }
         }
         if timed {
@@ -1269,7 +1336,10 @@ fn sparse_decode_chain_timing() {
         }
     }
     for ((a, b), secs) in pairs.iter().zip(&best) {
-        eprintln!("{a} + {b}: {:.2} us per layer (split + combine, two levels)", secs * 1e6);
+        eprintln!(
+            "{a} + {b}: {:.2} us per layer (split + combine, two levels)",
+            secs * 1e6
+        );
     }
 }
 
@@ -1282,7 +1352,9 @@ pub(crate) fn chain_warmup() -> std::time::Instant {
 /// ramps over the first few hundred milliseconds of work, and a harness
 /// that measures cold reads up to twice the warm figure.
 pub(crate) fn chain_warmup_ms() -> std::time::Duration {
-    let ms = std::env::var("LILY_CHAIN_WARMUP_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(300u64);
+    let ms = std::env::var("LILY_CHAIN_WARMUP_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300u64);
     std::time::Duration::from_millis(ms)
 }
-

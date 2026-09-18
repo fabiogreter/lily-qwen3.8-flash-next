@@ -421,7 +421,8 @@ fn level_size_bandwidth_probe() {
     let per = u32_bytes(per_thread);
     // Regions far apart so no two levels share cache lines in the system cache.
     let stride = 96usize << 20;
-    let region = |i: usize, size: usize| ((i * (stride + size)) % (bytes - size)) / 16 * 16;
+    let region =
+        |i: usize, size: usize| ((i * (stride + size)) % (bytes - size)) / 16 * 16;
     for &mb in &[1usize, 2, 4, 8, 16, 32, 64, 128, 512] {
         let size = mb << 20;
         let levels = (1usize << 30) / size;
@@ -438,9 +439,11 @@ fn level_size_bandwidth_probe() {
             .expect("dispatch");
         };
         let mut results = Vec::new();
-        for (name, barriers, split) in
-            [("barriered", true, 1usize), ("concurrent", false, 1), ("2 per level", true, 2)]
-        {
+        for (name, barriers, split) in [
+            ("barriered", true, 1usize),
+            ("concurrent", false, 1),
+            ("2 per level", true, 2),
+        ] {
             let mut times = Vec::new();
             for _ in 0..5 {
                 let pass = ctx.begin_concurrent().expect("pass");

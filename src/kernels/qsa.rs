@@ -695,7 +695,8 @@ impl SparseTileScratch {
         let cap = tile_union_capacity(max_blocks, k_max);
         // Batches under a tile's worth of queries take the split route
         // (`SparseAttnRoute::for_rows`) and need no gathered rows.
-        let slot = if qb >= QSA_TILE_BQ { tile_row_slot(cap, ratio) } else { QSA_ROWS_BK };
+        let slot =
+            if qb >= QSA_TILE_BQ { tile_row_slot(cap, ratio) } else { QSA_ROWS_BK };
         let per_tile = kvh * slot * ATTN_D * 2 * 2;
         // Groups balanced over the batch within the budget.
         let max_group = (row_budget / per_tile).clamp(1, tiles);
@@ -853,7 +854,9 @@ pub fn qsa_attention_tiled<'t>(
         Some(f) => Box::leak(f.clone().into_boxed_str()),
         None => "qsa_attn_rows_nax_h1",
     };
-    dispatch_tiled_named(ctx, pass, q, k_cache, v_cache, tiles, out, qb, ratio, base_pos, scale, name)
+    dispatch_tiled_named(
+        ctx, pass, q, k_cache, v_cache, tiles, out, qb, ratio, base_pos, scale, name,
+    )
 }
 
 /// Sparse attention of `qb` queries through the gathered-row kernels: for
@@ -929,7 +932,12 @@ fn qsa_attention_rows(
                 threadgroup: (QSA_ROWS_THREADS, 1, 1),
             },
         )?;
-        pass.level_barrier(&[&tiles.rows_k, &tiles.rows_v, &tiles.row_mask, &tiles.n_rows])?;
+        pass.level_barrier(&[
+            &tiles.rows_k,
+            &tiles.rows_v,
+            &tiles.row_mask,
+            &tiles.n_rows,
+        ])?;
         pass.dispatch_with(
             &attend,
             &[
@@ -1001,7 +1009,9 @@ pub fn dispatch_tiled_named<'t>(
         tiles.tiles()
     );
     let name: &'static str = Box::leak(name.to_string().into_boxed_str());
-    qsa_attention_rows(ctx, pass, q, k_cache, v_cache, tiles, out, qb, ratio, base_pos, scale, name)
+    qsa_attention_rows(
+        ctx, pass, q, k_cache, v_cache, tiles, out, qb, ratio, base_pos, scale, name,
+    )
 }
 
 #[cfg(test)]

@@ -81,11 +81,8 @@ impl ExpertStore {
     /// config: `[E, I, h/8]` U32 codes and `[E, I, h/group]` BF16 scales and
     /// biases for gate and up, `[E, h, I/8]` and `[E, h, I/group]` for down.
     pub fn open(ckpt: &Checkpoint, config: &Qwen4ExpConfig) -> Result<Self> {
-        let (e, i, h) = (
-            config.num_experts,
-            config.moe_intermediate_size,
-            config.hidden_size,
-        );
+        let (e, i, h) =
+            (config.num_experts, config.moe_intermediate_size, config.hidden_size);
         let group = config.quantization.group_size;
         ensure!(
             config.quantization.bits == 4,
@@ -145,8 +142,9 @@ impl ExpertStore {
                 let shard = match shard_index.get(meta.shard()) {
                     Some(&idx) => idx,
                     None => {
-                        let file = File::open(meta.shard())
-                            .with_context(|| format!("opening {}", meta.shard().display()))?;
+                        let file = File::open(meta.shard()).with_context(|| {
+                            format!("opening {}", meta.shard().display())
+                        })?;
                         shards.push((meta.shard().to_path_buf(), file));
                         let idx = shards.len() - 1;
                         shard_index.insert(meta.shard().to_path_buf(), idx);

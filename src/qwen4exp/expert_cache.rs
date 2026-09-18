@@ -145,7 +145,12 @@ impl ExpertCache {
         let none = vec![NONE; experts];
         let slot_of = (0..layers)
             .map(|_| {
-                Tensor::from_bytes(ctx, bytemuck::cast_slice(&none), &[experts], DType::U32)
+                Tensor::from_bytes(
+                    ctx,
+                    bytemuck::cast_slice(&none),
+                    &[experts],
+                    DType::U32,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         let link = Rc::new(ExpertCacheLink {
@@ -196,7 +201,8 @@ impl ExpertCache {
     /// Bytes of each of a slot's nine regions (the order of
     /// `ExpertStore::read_into`).
     pub fn region_lens(&self) -> [usize; REGIONS] {
-        let (i, h, gs, bits) = (self.inter, self.hidden, self.quant.group_size, self.quant.bits);
+        let (i, h, gs, bits) =
+            (self.inter, self.hidden, self.quant.group_size, self.quant.bits);
         let gu_codes = i * (h * bits / 32) * 4;
         let gu_sb = i * (h / gs) * 2;
         let dn_codes = h * (i * bits / 32) * 4;
@@ -242,7 +248,11 @@ impl ExpertCache {
     /// the LRU region's prefill), points the tables at the slots, and
     /// starts the service thread that resolves misses. Must run before any
     /// pass reads the slab.
-    pub fn fill_and_serve(&mut self, store: ExpertStore, mut policy: SlotPolicy) -> Result<()> {
+    pub fn fill_and_serve(
+        &mut self,
+        store: ExpertStore,
+        mut policy: SlotPolicy,
+    ) -> Result<()> {
         ensure!(self.worker.is_none(), "the expert cache is already being served");
         ensure!(
             policy.n_slots() == self.n_slots
@@ -252,7 +262,8 @@ impl ExpertCache {
             "expert store, policy and slab disagree on the layout"
         );
         let slab = self.pointers();
-        let tables: Vec<usize> = self.slot_of.iter().map(|t| t.contents_ptr() as usize).collect();
+        let tables: Vec<usize> =
+            self.slot_of.iter().map(|t| t.contents_ptr() as usize).collect();
         let started = std::time::Instant::now();
         let fill: Vec<(u32, usize, usize)> = policy.initial_fill().collect();
         let filled = fill.len();
@@ -268,9 +279,21 @@ impl ExpertCache {
         let service = self.link.service.clone();
         let (routed, ready) = (self.link.routed.clone(), self.link.ready.clone());
         let experts = self.experts;
-        self.worker = Some(std::thread::Builder::new().name("expert-cache".into()).spawn(
-            move || serve(store, &mut policy, slab, tables, experts, routed, ready, service),
-        )?);
+        self.worker =
+            Some(std::thread::Builder::new().name("expert-cache".into()).spawn(
+                move || {
+                    serve(
+                        store,
+                        &mut policy,
+                        slab,
+                        tables,
+                        experts,
+                        routed,
+                        ready,
+                        service,
+                    )
+                },
+            )?);
         Ok(())
     }
 }
@@ -312,9 +335,8 @@ unsafe fn load_slots(
     if entries.is_empty() {
         return Ok(());
     }
-    let tasks: Vec<(usize, usize)> = (0..entries.len())
-        .flat_map(|i| (0..REGIONS).map(move |r| (i, r)))
-        .collect();
+    let tasks: Vec<(usize, usize)> =
+        (0..entries.len()).flat_map(|i| (0..REGIONS).map(move |r| (i, r))).collect();
     let threads = tasks.len().min(LOAD_THREADS);
     let per = tasks.len().div_ceil(threads);
     let read = |&(i, r): &(usize, usize)| -> Result<()> {
@@ -341,7 +363,9 @@ unsafe fn load_slots(
                 .map(|chunk| scope.spawn(move || chunk.iter().try_for_each(read)))
                 .collect();
             for worker in workers {
-                worker.join().map_err(|_| anyhow::anyhow!("expert load thread panicked"))??;
+                worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("expert load thread panicked"))??;
             }
             Ok::<(), anyhow::Error>(())
         })?;
@@ -359,7 +383,13 @@ const LOAD_THREADS: usize = 16;
 /// # Safety
 ///
 /// `tables[layer]` is a live `U32 [experts]` shared buffer.
-unsafe fn set_entry(tables: &[usize], experts: usize, layer: usize, expert: usize, slot: u32) {
+unsafe fn set_entry(
+    tables: &[usize],
+    experts: usize,
+    layer: usize,
+    expert: usize,
+    slot: u32,
+) {
     debug_assert!(expert < experts);
     // SAFETY: as documented.
     unsafe { (tables[layer] as *mut u32).add(expert).write_volatile(slot) };
@@ -398,7 +428,7 @@ fn serve(
         let mut spins = 0u32;
         while routed.signaled_value() < request.seq {
             spins += 1;
-            if spins % 4096 == 0 {
+            if spins.is_multiple_of(4096) {
                 if service.stop.load(Ordering::Acquire) {
                     return;
                 }
@@ -417,18 +447,24 @@ fn serve(
             // Visibility check: the ids must not change once the signal
             // was seen.
             let first: Vec<u32> = ids.clone();
-            let until = std::time::Instant::now() + std::time::Duration::from_micros(300);
+            let until =
+                std::time::Instant::now() + std::time::Duration::from_micros(300);
             while std::time::Instant::now() < until {
                 std::hint::spin_loop();
             }
             std::sync::atomic::fence(Ordering::SeqCst);
-            let again: Vec<u32> = routed_ids.iter().map(|p| unsafe { std::ptr::read_volatile(p) }).collect();
+            let again: Vec<u32> = routed_ids
+                .iter()
+                .map(|p| unsafe { std::ptr::read_volatile(p) })
+                .collect();
             if first != again {
                 let changed = first.iter().zip(&again).filter(|(a, b)| a != b).count();
                 service.stale.fetch_add(1, Ordering::Relaxed);
                 eprintln!(
                     "expert cache: seq {} layer {}: {changed} of {} ids changed after the signal",
-                    request.seq, request.layer, again.len()
+                    request.seq,
+                    request.layer,
+                    again.len()
                 );
                 ids.clear();
                 ids.extend_from_slice(&again);
@@ -441,7 +477,9 @@ fn serve(
         for &e in &ids {
             let expert = e as usize;
             if expert >= experts {
-                eprintln!("expert cache: routed id {e} out of range; the pass is corrupt");
+                eprintln!(
+                    "expert cache: routed id {e} out of range; the pass is corrupt"
+                );
                 std::process::abort();
             }
             match policy.lookup(request.layer, expert, request.seq) {
@@ -465,7 +503,8 @@ fn serve(
         }
         // SAFETY: the GPU waits at this layer; the slots were just taken
         // from experts whose readers have completed, and are distinct.
-        if let Err(e) = unsafe { load_slots(&store, &slab, &tables, experts, &misses) } {
+        if let Err(e) = unsafe { load_slots(&store, &slab, &tables, experts, &misses) }
+        {
             eprintln!("expert cache: loading layer {}: {e:#}", request.layer);
             std::process::abort();
         }

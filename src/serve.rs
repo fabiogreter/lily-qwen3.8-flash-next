@@ -540,7 +540,14 @@ impl<M: LanguageModel> Engine<M> {
         next_id: u64,
     ) -> Result<Self> {
         let Shared { generator, shutdown, timings } = shared.clone();
-        let ctx = MetalContext::new()?;
+        // `LILY_KERNEL_PROFILE=1`: per-kernel GPU times per pass, printed
+        // after every request (diagnostic; the profile transport serializes
+        // dispatches, so throughput under it is not comparable).
+        let ctx = if std::env::var_os("LILY_KERNEL_PROFILE").is_some() {
+            MetalContext::new_with_profile(true)?
+        } else {
+            MetalContext::new()?
+        };
         let started = Instant::now();
         let model = M::load(
             &ctx,
@@ -1119,6 +1126,9 @@ impl<M: LanguageModel> Engine<M> {
         );
         sessions.release(ctx, session, &images, p.cache_key.as_deref());
 
+        if ctx.profiling() {
+            print_kernel_profile(&crate::metal::profile::take());
+        }
         let completion_tokens = generation.tokens.len();
         let finish_reason = match generation.finish {
             FinishReason::Length => "length",
@@ -2173,3 +2183,46 @@ mod signal {
 #[cfg(test)]
 #[path = "../tests/unit/serve.rs"]
 mod tests;
+
+/// The per-kernel GPU profile of the passes recorded since the last call,
+/// aggregated per pass label (decode, verify, draft, prefill): the twelve
+/// largest kernels by ms per pass. `LILY_KERNEL_PROFILE=1`.
+fn print_kernel_profile(passes: &[crate::metal::profile::PassProfile]) {
+    let mut labels: Vec<&'static str> = Vec::new();
+    for pass in passes {
+        if !labels.contains(&pass.label) {
+            labels.push(pass.label);
+        }
+    }
+    for label in labels {
+        let group: Vec<_> = passes.iter().filter(|p| p.label == label).collect();
+        let n = group.len() as f64;
+        let mut by_kernel: std::collections::HashMap<&'static str, (usize, f64)> =
+            std::collections::HashMap::new();
+        let (mut kernel_secs, mut span_secs) = (0.0f64, 0.0f64);
+        for pass in &group {
+            span_secs += pass.span_secs;
+            for k in &pass.kernels {
+                kernel_secs += k.gpu_secs;
+                let e = by_kernel.entry(k.name).or_insert((0, 0.0));
+                e.0 += 1;
+                e.1 += k.gpu_secs;
+            }
+        }
+        let mut rows: Vec<_> = by_kernel.into_iter().collect();
+        rows.sort_by(|a, b| b.1.1.total_cmp(&a.1.1));
+        eprintln!(
+            "kernel profile [{label}]: {} passes, kernel sum {:.2} ms/pass, span {:.2} ms/pass",
+            group.len(),
+            1e3 * kernel_secs / n,
+            1e3 * span_secs / n
+        );
+        for (name, (calls, secs)) in rows.iter().take(12) {
+            eprintln!(
+                "  {:>9.3} ms  {:>7.1} calls  {name}",
+                1e3 * secs / n,
+                *calls as f64 / n
+            );
+        }
+    }
+}

@@ -237,6 +237,7 @@ enum Draw<'a> {
     Spec(&'a DraftDist, &'a Tensor),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_draw(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,

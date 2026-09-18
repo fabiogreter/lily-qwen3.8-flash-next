@@ -418,6 +418,7 @@ impl Qwen4ExpModel {
     }
 
     /// See [`crate::engine::LanguageModel::draft_initial`].
+    #[allow(clippy::too_many_arguments)]
     pub fn draft_initial(
         &self,
         ctx: &MetalContext,
@@ -518,6 +519,7 @@ impl Qwen4ExpModel {
     /// draws: the accepted rows' successors, garbage past them), chains
     /// `chain` proposals into the spec scratch and writes the next verify
     /// pass's ids (accepted draw, then the proposals).
+    #[allow(clippy::too_many_arguments)]
     fn encode_draft_selected<'a>(
         &self,
         ctx: &'a MetalContext,

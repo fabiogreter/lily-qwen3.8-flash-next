@@ -274,7 +274,9 @@ fn auto_expert_slots(
         let bytes = ckpt.meta(name)?.byte_len() as u64;
         if name.starts_with(PREFIX) && name.contains(".mlp.experts.") {
             experts += bytes;
-        } else if storage == NgramStorage::Paged && name.contains("ngram_embedding.shard_") {
+        } else if storage == NgramStorage::Paged
+            && name.contains("ngram_embedding.shard_")
+        {
             // Read from the files on demand; the page cache holds what it can.
         } else {
             other += bytes;
@@ -294,7 +296,9 @@ fn auto_expert_slots(
     let slices = (config.num_hidden_layers * config.num_experts) as u64;
     let slice = experts / slices.max(1);
     let budget = ram.saturating_sub(other + scratch + reserve);
-    let slots = ((budget / slice.max(1)) as usize).max(2 * config.num_experts).min(slices as usize);
+    let slots = ((budget / slice.max(1)) as usize)
+        .max(2 * config.num_experts)
+        .min(slices as usize);
     eprintln!(
         "expert cache: {:.1} GB of memory holds {:.1} GB of resident weights and {} of {slices} experts ({:.1} of {:.1} GB); the rest is served from the checkpoint",
         ram as f64 / GB as f64,
@@ -329,11 +333,13 @@ fn load_ffn(
             (g, u, d, Some(t), Some((cache.link(), layer)))
         }
         None => {
-            let expert_gate = loader.linear(&[&format!("{p}mlp.experts.gate_proj")], h)?;
+            let expert_gate =
+                loader.linear(&[&format!("{p}mlp.experts.gate_proj")], h)?;
             expert_gate.expect_features(e * i, h, "expert gate_proj")?;
             let expert_up = loader.linear(&[&format!("{p}mlp.experts.up_proj")], h)?;
             expert_up.expect_features(e * i, h, "expert up_proj")?;
-            let expert_down = loader.linear(&[&format!("{p}mlp.experts.down_proj")], i)?;
+            let expert_down =
+                loader.linear(&[&format!("{p}mlp.experts.down_proj")], i)?;
             expert_down.expect_features(e * h, i, "expert down_proj")?;
             (expert_gate, expert_up, expert_down, None, None)
         }
@@ -548,6 +554,7 @@ fn load_ple(
 /// Loads the trunk, the draft head when `with_mtp` is set and the checkpoint
 /// declares one (the `mtp.*` tensors are skipped otherwise), and the vision
 /// tower when `with_vision` is set and the checkpoint declares one.
+#[allow(clippy::too_many_arguments)]
 pub fn load(
     ctx: &MetalContext,
     dir: impl AsRef<Path>,
@@ -592,8 +599,9 @@ pub fn load(
     // slots, placed by the usage ranking next to the checkpoint (or the
     // one named), uniform without one. Asked for explicitly, or sized from
     // the machine's memory when the checkpoint does not fit it.
-    let expert_slots = expert_slots
-        .or_else(|| auto_expert_slots(loader.checkpoint(), config, storage, memory_budget));
+    let expert_slots = expert_slots.or_else(|| {
+        auto_expert_slots(loader.checkpoint(), config, storage, memory_budget)
+    });
     let expert_cache = match expert_slots {
         Some(n_slots) => {
             let (layers, e) = (config.num_hidden_layers, config.num_experts);
@@ -634,7 +642,9 @@ pub fn load(
             eprintln!(
                 "expert cache: {n_slots} slots for {} experts, usage {}",
                 layers * e,
-                usage.as_ref().map_or("uniform".to_string(), |p| p.display().to_string())
+                usage
+                    .as_ref()
+                    .map_or("uniform".to_string(), |p| p.display().to_string())
             );
             cache.fill_and_serve(store, policy)?;
             Some(cache)
@@ -662,7 +672,8 @@ pub fn load(
         };
         let mlp_hc =
             load_hc(&loader, &format!("{p}mlp_hyper_connection."), config, true)?;
-        let ffn = load_ffn(&loader, &p, config, expert_cache.as_ref().map(|c| (c, idx)))?;
+        let ffn =
+            load_ffn(&loader, &p, config, expert_cache.as_ref().map(|c| (c, idx)))?;
         layers.push(LayerWeights { ple, attn_hc, mixer, mlp_hc, ffn });
     }
 
@@ -672,9 +683,12 @@ pub fn load(
     // 15 tok/s against 55 with the reads cold (docs/low-ram-experts.md).
     // So the draft head stays unloaded there unless asked for.
     let with_mtp = with_mtp
-        && (expert_cache.is_none() || std::env::var_os("LILY_EXPERT_CACHE_DRAFTS").is_some());
+        && (expert_cache.is_none()
+            || std::env::var_os("LILY_EXPERT_CACHE_DRAFTS").is_some());
     if expert_cache.is_some() && config.mtp.is_some() && !with_mtp {
-        eprintln!("expert cache: speculative decoding off (plain decode is faster here; LILY_EXPERT_CACHE_DRAFTS=1 keeps it)");
+        eprintln!(
+            "expert cache: speculative decoding off (plain decode is faster here; LILY_EXPERT_CACHE_DRAFTS=1 keeps it)"
+        );
     }
     let mtp = match (&config.mtp, with_mtp) {
         (Some(_), true) => Some(Box::new(load_mtp(&loader, config)?)),
@@ -686,5 +700,13 @@ pub fn load(
     };
 
     loader.finish()?;
-    Ok(ModelWeights { embed_tokens, lm_head, final_mixer, layers, mtp, vision, expert_cache })
+    Ok(ModelWeights {
+        embed_tokens,
+        lm_head,
+        final_mixer,
+        layers,
+        mtp,
+        vision,
+        expert_cache,
+    })
 }

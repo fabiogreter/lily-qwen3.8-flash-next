@@ -27,9 +27,9 @@ use crate::kernels::elementwise::{
     add_bf16, copy_words, gather_row_bf16, sigmoid_mul_bf16,
 };
 use crate::kernels::gdn::{
-    GDN_HEAD_DIM, GDN_STATE_DTYPE, GdnGate, GdnRegscanStaging, conv1d_prefill,
-    conv1d_step, gated_rmsnorm, gdn_chunk_staging_shapes, gdn_prefill_mid, gdn_step_gated_fused,
-    GdnChunkStaging,
+    GDN_HEAD_DIM, GDN_STATE_DTYPE, GdnChunkStaging, GdnGate, GdnRegscanStaging,
+    conv1d_prefill, conv1d_step, gated_rmsnorm, gdn_chunk_staging_shapes,
+    gdn_prefill_mid, gdn_step_gated_fused,
 };
 use crate::kernels::hc::{
     HC_FUSED_MAX_ROWS, fused_read_supported, hc_broadcast_bf16, hc_inject_bf16,
@@ -1132,7 +1132,12 @@ impl GdnStageScratch {
             qk_norm: &self.qk_norm,
             decay: &self.decay,
             beta: &self.beta,
-            chunk: Some(GdnChunkStaging { w: &self.w, u: &self.u, p: &self.p, g: &self.g }),
+            chunk: Some(GdnChunkStaging {
+                w: &self.w,
+                u: &self.u,
+                p: &self.p,
+                g: &self.g,
+            }),
         }
     }
 }
@@ -1195,7 +1200,13 @@ impl PrefillScratch {
                 Tensor::zeros(ctx, &[rows, width], bf)?
             },
             moe: PrefillMoeScratch::new(ctx, &moe_dims(cfg), m)?,
-            qsa: QsaScratch::new(ctx, cfg, max_seq, QSA_QUERY_BATCH.min(m), row_budget)?,
+            qsa: QsaScratch::new(
+                ctx,
+                cfg,
+                max_seq,
+                QSA_QUERY_BATCH.min(m),
+                row_budget,
+            )?,
             ple: table.map(|t| PleScratch::new(ctx, cfg, m, t)).transpose()?,
             mtp_hyper: with_mtp
                 .then(|| Tensor::zeros(ctx, &[m, cfg.hc_width()], bf))
@@ -1292,12 +1303,22 @@ pub(super) struct Capture {
 
 impl Qwen4ExpModel {
     pub fn load(ctx: &MetalContext, dir: impl AsRef<Path>) -> Result<Self> {
-        Self::load_with(ctx, dir, NgramStorage::default(), true, VisionMode::Auto, None, None, None)
+        Self::load_with(
+            ctx,
+            dir,
+            NgramStorage::default(),
+            true,
+            VisionMode::Auto,
+            None,
+            None,
+            None,
+        )
     }
 
     /// Loads with the n-gram table `storage` of choice, the draft head when
     /// `with_mtp` and the checkpoint has one, and the vision tower when
     /// `vision` allows it and the checkpoint has one.
+    #[allow(clippy::too_many_arguments)]
     pub fn load_with(
         ctx: &MetalContext,
         dir: impl AsRef<Path>,
@@ -1557,10 +1578,16 @@ impl Qwen4ExpModel {
     /// (measurement: expert usage skew for weight offloading). The log
     /// covers positions below the scratch's capacity; the draft head's own
     /// routing is not logged.
-    pub fn enable_expert_log(&self, ctx: &MetalContext, scratch: &mut Scratch, capacity: usize) -> Result<()> {
+    pub fn enable_expert_log(
+        &self,
+        ctx: &MetalContext,
+        scratch: &mut Scratch,
+        capacity: usize,
+    ) -> Result<()> {
         let layers = self.weights.layers.len();
         let top_k = self.config.num_experts_per_tok;
-        scratch.expert_log = Some(Tensor::zeros(ctx, &[layers, capacity, top_k], DType::U32)?);
+        scratch.expert_log =
+            Some(Tensor::zeros(ctx, &[layers, capacity, top_k], DType::U32)?);
         Ok(())
     }
 
@@ -1594,7 +1621,11 @@ impl Qwen4ExpModel {
 
     /// Experts and top-k of the routed FFN (for reading the log).
     pub fn moe_shape(&self) -> (usize, usize, usize) {
-        (self.weights.layers.len(), self.config.num_experts, self.config.num_experts_per_tok)
+        (
+            self.weights.layers.len(),
+            self.config.num_experts,
+            self.config.num_experts_per_tok,
+        )
     }
 
     pub fn new_scratch_with_capacity(
@@ -1948,8 +1979,9 @@ impl Qwen4ExpModel {
         pass.level_barrier(&[&ps.hyper])?;
 
         let mut gdn_index = 0usize;
-        let mut layer_index = 0usize;
-        for (layer, lstate) in self.weights.layers.iter().zip(state.layers.iter()) {
+        for (layer_index, (layer, lstate)) in
+            self.weights.layers.iter().zip(state.layers.iter()).enumerate()
+        {
             let ple = match (&layer.ple, &ps.ple, &state.ple) {
                 (Some(w), Some(p), Some(pst)) => Some((w.as_ref(), p, pst)),
                 _ => None,
@@ -2028,7 +2060,6 @@ impl Qwen4ExpModel {
                 )?;
                 pass.level_barrier(&[log])?;
             }
-            layer_index += 1;
         }
 
         match mode {
@@ -3050,7 +3081,13 @@ impl Qwen4ExpModel {
 
         self.hc_read_decode(ctx, pass, &self.weights.final_mixer, s)?;
         if !crate::ablate::on(crate::ablate::Group::Head) {
-            quant::gemv_quant(ctx, pass, &self.weights.lm_head, &s.hc.mixed, &s.logits)?;
+            quant::gemv_quant(
+                ctx,
+                pass,
+                &self.weights.lm_head,
+                &s.hc.mixed,
+                &s.logits,
+            )?;
             pass.level_barrier(&[&s.logits])?;
         }
         let out = s.next_token.view(slot_out, &[1])?;

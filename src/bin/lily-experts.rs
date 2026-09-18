@@ -46,7 +46,11 @@ fn main() -> Result<()> {
     );
 
     let ctx = MetalContext::new()?;
-    let model = <Qwen4ExpModel as LanguageModel>::load(&ctx, &cli.model, &LoadOptions::default())?;
+    let model = <Qwen4ExpModel as LanguageModel>::load(
+        &ctx,
+        &cli.model,
+        &LoadOptions::default(),
+    )?;
     let (layers, experts, top_k) = model.moe_shape();
     let capacity = cli.prompt_len + 1;
     let mut scratch = model.new_scratch_with_capacity(&ctx, capacity)?;

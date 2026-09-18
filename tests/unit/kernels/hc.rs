@@ -1326,20 +1326,43 @@ fn hc_read_chain_timing() {
                 for (d, u, j) in &weights {
                     if run_down {
                         let dims = check_read_down(
-                            &t_hyper, &t_norm, d, Some(j), &down, &inj, &inv_rms, h, g, 1,
+                            &t_hyper,
+                            &t_norm,
+                            d,
+                            Some(j),
+                            &down,
+                            &inj,
+                            &inv_rms,
+                            h,
+                            g,
+                            1,
                         )
                         .unwrap();
                         dispatch_read_down(
-                            &ctx, &pass, dname, &t_hyper, &t_norm, d, Some(j), &down, &inj,
-                            &inv_rms, None, dims, h, g, 1e-6, 1.0,
+                            &ctx,
+                            &pass,
+                            dname,
+                            &t_hyper,
+                            &t_norm,
+                            d,
+                            Some(j),
+                            &down,
+                            &inj,
+                            &inv_rms,
+                            None,
+                            dims,
+                            h,
+                            g,
+                            1e-6,
+                            1.0,
                         )
                         .unwrap();
                         pass.level_barrier(&[&down]).unwrap();
                     }
                     if run_up {
                         dispatch_read_up_mix(
-                            &ctx, &pass, uname, u, &down, &t_hyper, &t_norm, &inv_rms, &mixed,
-                            h, g, 1, true, 1.0,
+                            &ctx, &pass, uname, u, &down, &t_hyper, &t_norm, &inv_rms,
+                            &mixed, h, g, 1, true, 1.0,
                         )
                         .unwrap();
                         pass.level_barrier(&[&mixed]).unwrap();
@@ -1348,8 +1371,8 @@ fn hc_read_chain_timing() {
                 let done = pass.commit().expect("commit").wait_retain().expect("wait");
                 let t = done.timing().expect("timing");
                 if round > 0 {
-                    best[which][m] =
-                        best[which][m].min((t.gpu_end_secs - t.gpu_start_secs) / sets as f64);
+                    best[which][m] = best[which][m]
+                        .min((t.gpu_end_secs - t.gpu_start_secs) / sets as f64);
                 }
             }
         }

@@ -397,6 +397,7 @@ pub trait LanguageModel: Sized {
     /// `first`, the token the prefill drew, proposed under the request's
     /// sampler (`step0` is the draw index of the verify pass that will check
     /// them). Waits for the GPU.
+    #[allow(clippy::too_many_arguments)]
     fn draft_initial(
         &self,
         ctx: &MetalContext,

@@ -82,7 +82,15 @@ pub fn moe_gather_gemv_gate_up(
     y: &Tensor,
 ) -> Result<()> {
     moe_gather_gemv_gate_up_named(
-        ctx, pass, "moe_gather_gemv_q4_gate_up", gate, up, n_per_expert, x, indices, y,
+        ctx,
+        pass,
+        "moe_gather_gemv_q4_gate_up",
+        gate,
+        up,
+        n_per_expert,
+        x,
+        indices,
+        y,
     )
 }
 
@@ -351,7 +359,16 @@ pub fn moe_gather_gemv_down_combine(
     out: &Tensor,
 ) -> Result<()> {
     moe_gather_gemv_down_combine_named(
-        ctx, pass, "moe_gather_gemv_q4_down_combine", w, h, x, indices, scores, shared, out,
+        ctx,
+        pass,
+        "moe_gather_gemv_q4_down_combine",
+        w,
+        h,
+        x,
+        indices,
+        scores,
+        shared,
+        out,
     )
 }
 
@@ -629,7 +646,9 @@ pub fn moe_remap_slots(
         slots.numel()
     );
     ensure!(
-        indices.dtype() == DType::U32 && slots.dtype() == DType::U32 && slot_of.dtype() == DType::U32,
+        indices.dtype() == DType::U32
+            && slots.dtype() == DType::U32
+            && slot_of.dtype() == DType::U32,
         "remap tensors must be U32"
     );
     let pipeline = ctx.pipeline("moe_remap_slots", SOURCE, MslVersion::V3_1)?;

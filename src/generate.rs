@@ -113,6 +113,7 @@ pub fn speculate<M: LanguageModel>(
         // does not (or the row after the last draft) supplies the fresh token.
         let mut kept = 0usize;
         let mut finish = None;
+        let callbacks_began = std::time::Instant::now();
         for (j, &token) in sampled.iter().enumerate() {
             tokens.push(token);
             if is_stop(token) {
@@ -129,6 +130,13 @@ pub fn speculate<M: LanguageModel>(
         }
         drafted += proposals.len();
         accepted += kept;
+        if std::env::var_os("LILY_PROFILE").is_some() {
+            eprintln!(
+                "profile host callbacks: {:.2} ms for {} tokens",
+                callbacks_began.elapsed().as_secs_f64() * 1e3,
+                kept + 1
+            );
+        }
         match finish {
             Some(finish) => {
                 model.finish_speculation(ctx, state, scratch, kept, None, draft)?;

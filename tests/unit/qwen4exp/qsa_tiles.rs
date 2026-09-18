@@ -56,19 +56,30 @@ fn prefill_then_decode(
     )
     .expect("prefill");
     let logits = s.logits.to_f32().expect("logits");
-    let mut tokens = vec![s.next_token().view(0, &[1]).expect("view").to_u32().expect("token")[0]];
+    let mut tokens =
+        vec![s.next_token().view(0, &[1]).expect("view").to_u32().expect("token")[0]];
     let mut slot = 0usize;
     for step in 1..=steps {
         let input = *tokens.last().expect("prefill draw");
         let encoded = model
-            .encode_decode_step(ctx, &state, &s, slot, 1 - slot, Draw { params: &greedy, step }, None)
+            .encode_decode_step(
+                ctx,
+                &state,
+                &s,
+                slot,
+                1 - slot,
+                Draw { params: &greedy, step },
+                None,
+            )
             .expect("encode");
         model.prepare_step_inputs(&mut state, &s, input).expect("inputs");
         let pending = encoded.commit().expect("commit");
         state.advance(1);
         pending.wait().expect("wait");
         slot = 1 - slot;
-        tokens.push(s.next_token().view(slot, &[1]).expect("view").to_u32().expect("token")[0]);
+        tokens.push(
+            s.next_token().view(slot, &[1]).expect("view").to_u32().expect("token")[0],
+        );
     }
     (logits, tokens)
 }
@@ -117,11 +128,7 @@ fn tiled_prefill_matches_split_route() {
                 max_abs <= 0.05 * scale,
                 "{prompt_len} tokens: logits differ by {max_abs} (scale {scale})"
             );
-            assert_eq!(
-                argmax(&got),
-                top,
-                "{prompt_len} tokens: top token differs"
-            );
+            assert_eq!(argmax(&got), top, "{prompt_len} tokens: top token differs");
         }
     }
 }
@@ -149,11 +156,15 @@ fn prefill_chunk_8192_matches_4096() {
             (0..prompt_len).map(|i| 1000 + (i * 37 % 5000) as u32).collect();
         let route = SparseAttnRoute::Tiled;
         model.set_prefill_chunk(4096).expect("chunk");
-        let (reference, tokens_a) = prefill_then_decode(&ctx, &model, &prompt, route, 12);
+        let (reference, tokens_a) =
+            prefill_then_decode(&ctx, &model, &prompt, route, 12);
         model.set_prefill_chunk(8192).expect("chunk");
         let (got, tokens_b) = prefill_then_decode(&ctx, &model, &prompt, route, 12);
         eprintln!("{prompt_len} tokens: decoded {tokens_a:?} against {tokens_b:?}");
-        assert_eq!(tokens_a, tokens_b, "{prompt_len} tokens: the decode after the prefill differs");
+        assert_eq!(
+            tokens_a, tokens_b,
+            "{prompt_len} tokens: the decode after the prefill differs"
+        );
         let top = argmax(&reference);
         let max_abs = got
             .iter()
@@ -165,9 +176,15 @@ fn prefill_chunk_8192_matches_4096() {
             "{prompt_len} tokens: top {} vs {top}, max |dlogit| {max_abs:.4} (logit scale {scale:.2})",
             argmax(&got)
         );
-        assert!(got.iter().all(|x| x.is_finite()), "{prompt_len} tokens: non-finite logits");
+        assert!(
+            got.iter().all(|x| x.is_finite()),
+            "{prompt_len} tokens: non-finite logits"
+        );
         if exact {
-            assert_eq!(got, reference, "{prompt_len} tokens: one chunk either way must match exactly");
+            assert_eq!(
+                got, reference,
+                "{prompt_len} tokens: one chunk either way must match exactly"
+            );
         } else {
             assert!(
                 max_abs <= 0.05 * scale,

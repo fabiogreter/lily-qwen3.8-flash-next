@@ -623,14 +623,16 @@ fn mapped_buffer_read_bandwidth() {
     let path = std::env::var("LILY_MAP_PROBE_FILE").expect("LILY_MAP_PROBE_FILE");
     let len = std::fs::metadata(&path).expect("file").len() as usize;
     let ctx = MetalContext::new().expect("metal context");
-    let (buf, inner) = ctx.new_buffer_mapped(std::path::Path::new(&path), 0, len).expect("map");
+    let (buf, inner) =
+        ctx.new_buffer_mapped(std::path::Path::new(&path), 0, len).expect("map");
     assert_eq!(inner, 0);
     let src = Tensor::from_buffer(buf, &[len / 4], DType::U32).expect("tensor");
     let out = Tensor::zeros(&ctx, &[1], DType::U32).expect("out");
     for pass_name in ["cold", "warm", "warm"] {
         let t0 = Instant::now();
         let pass = ctx.begin().expect("pass");
-        crate::kernels::elementwise::checksum_words(&ctx, &pass, &src, &out).expect("checksum");
+        crate::kernels::elementwise::checksum_words(&ctx, &pass, &src, &out)
+            .expect("checksum");
         pass.commit_wait().expect("commit");
         let secs = t0.elapsed().as_secs_f64();
         eprintln!(
@@ -658,7 +660,8 @@ fn mapped_buffer_random_slice_bandwidth() {
     let slice = slice.next_multiple_of(16);
     let len = std::fs::metadata(&path).expect("file").len() as usize;
     let ctx = MetalContext::new().expect("metal context");
-    let (buf, _) = ctx.new_buffer_mapped(std::path::Path::new(&path), 0, len).expect("map");
+    let (buf, _) =
+        ctx.new_buffer_mapped(std::path::Path::new(&path), 0, len).expect("map");
     let src = Tensor::from_buffer(buf, &[len / 4], DType::U32).expect("tensor");
     let out = Tensor::zeros(&ctx, &[1], DType::U32).expect("out");
     let n = 64usize;
