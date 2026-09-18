@@ -46,6 +46,20 @@ pressure, 0.40 to 0.49 ms (worst 3.5) under the same balloon, 6 to 7 GB/s.
 mapping the shards as GPU buffers is out for them anyway; host reads into
 GPU memory have no such constraint.
 
+## Running it
+
+Nothing to set on the small machine: at load the engine compares the
+checkpoint with `hw.memsize` and engages the cache when it does not fit.
+`lily serve --memory-gb 64` (or `LILY_MEMORY_GB=64`, and `lily-bench
+--memory-gb`) plans for that much memory instead of the machine's, which
+is also how to try the mode here: a 64 GB budget picks 16 441 slots
+(42.3 GB) and turns speculative decoding off. Copy
+`tools/bench/expert-usage-qwen38-flash-next.json` next to the checkpoint
+as `expert-usage.json` (or point `LILY_EXPERT_USAGE` at it) so the
+busiest experts are the resident ones; without it the placement is
+uniform. The load prints what it decided, and the bench prints the
+cache's lookups and misses per phase.
+
 ## What was built
 
 `ExpertCache` (`src/qwen4exp/expert_cache.rs`) with `ExpertStore` and

@@ -265,9 +265,10 @@ fn auto_expert_slots(
     ckpt: &Checkpoint,
     config: &Qwen4ExpConfig,
     storage: NgramStorage,
+    memory_budget: Option<u64>,
 ) -> Option<usize> {
     const GB: u64 = 1 << 30;
-    let ram = physical_memory()?;
+    let ram = memory_budget.or_else(physical_memory)?;
     let (mut experts, mut other) = (0u64, 0u64);
     for name in ckpt.names() {
         let bytes = ckpt.meta(name)?.byte_len() as u64;
@@ -554,6 +555,7 @@ pub fn load(
     with_vision: bool,
     expert_slots: Option<usize>,
     expert_usage: Option<PathBuf>,
+    memory_budget: Option<u64>,
 ) -> Result<ModelWeights> {
     let ckpt = Checkpoint::open(&dir)?;
     ensure!(
@@ -588,7 +590,8 @@ pub fn load(
     // slots, placed by the usage ranking next to the checkpoint (or the
     // one named), uniform without one. Asked for explicitly, or sized from
     // the machine's memory when the checkpoint does not fit it.
-    let expert_slots = expert_slots.or_else(|| auto_expert_slots(loader.checkpoint(), config, storage));
+    let expert_slots = expert_slots
+        .or_else(|| auto_expert_slots(loader.checkpoint(), config, storage, memory_budget));
     let expert_cache = match expert_slots {
         Some(n_slots) => {
             let (layers, e) = (config.num_hidden_layers, config.num_experts);

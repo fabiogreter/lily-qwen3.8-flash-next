@@ -1246,7 +1246,7 @@ pub(super) struct Capture {
 
 impl Qwen4ExpModel {
     pub fn load(ctx: &MetalContext, dir: impl AsRef<Path>) -> Result<Self> {
-        Self::load_with(ctx, dir, NgramStorage::default(), true, VisionMode::Auto, None, None)
+        Self::load_with(ctx, dir, NgramStorage::default(), true, VisionMode::Auto, None, None, None)
     }
 
     /// Loads with the n-gram table `storage` of choice, the draft head when
@@ -1260,6 +1260,7 @@ impl Qwen4ExpModel {
         vision: VisionMode,
         expert_slots: Option<usize>,
         expert_usage: Option<std::path::PathBuf>,
+        memory_budget: Option<u64>,
     ) -> Result<Self> {
         let config = Qwen4ExpConfig::from_model_dir(&dir)?;
         ensure!(
@@ -1282,6 +1283,7 @@ impl Qwen4ExpModel {
             vision == VisionMode::Auto,
             expert_slots,
             expert_usage,
+            memory_budget,
         )?;
         let hasher = match &config.ple {
             Some(p) => Some(NgramHasher::new(
@@ -3580,6 +3582,11 @@ impl LanguageModel for Qwen4ExpModel {
         let expert_usage = std::env::var_os("LILY_EXPERT_USAGE")
             .map(std::path::PathBuf::from)
             .or_else(|| options.expert_usage.clone());
+        let memory_budget = std::env::var("LILY_MEMORY_GB")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|gb| (gb * (1u64 << 30) as f64) as u64)
+            .or(options.memory_budget);
         Qwen4ExpModel::load_with(
             ctx,
             dir,
@@ -3588,6 +3595,7 @@ impl LanguageModel for Qwen4ExpModel {
             options.vision,
             expert_slots,
             expert_usage,
+            memory_budget,
         )
     }
 

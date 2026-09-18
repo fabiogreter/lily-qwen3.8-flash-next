@@ -90,6 +90,14 @@ struct Cli {
     #[arg(long, default_value_t = 2)]
     mtp_drafts: usize,
 
+    /// Memory the engine may plan for, in GB (default: the machine's
+    /// physical memory). Below what the checkpoint needs, the routed experts
+    /// are cached in memory and the rest served from the checkpoint files
+    /// as they are routed to, and speculative decoding is off; see
+    /// docs/low-ram-experts.md. Also how to try that mode on a big machine.
+    #[arg(long)]
+    memory_gb: Option<f64>,
+
     /// The vision tower of a Qwen3.8-Flash-Next conversion that carries it:
     /// `auto` loads it (0.9 GB), `off` leaves it on disk.
     #[arg(long, default_value = "auto")]
@@ -186,6 +194,7 @@ fn main() -> Result<()> {
         ngram_preload: cli.ngram_preload,
         ngram_lock: cli.ngram_lock,
         mtp_drafts: cli.mtp_drafts,
+        memory_budget: cli.memory_gb.map(|gb| (gb * (1u64 << 30) as f64) as u64),
         vision: cli.vision,
         image_max_pixels: cli.image_max_pixels,
         image_min_pixels: cli.image_min_pixels,

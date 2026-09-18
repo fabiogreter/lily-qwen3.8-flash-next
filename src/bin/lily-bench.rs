@@ -53,6 +53,10 @@ struct Cli {
     /// Sampler seed under `--sample`.
     #[arg(long, default_value_t = 0)]
     seed: u64,
+    /// Memory the engine may plan for, in GB (default: the machine's): below
+    /// what the checkpoint needs the experts are cached (docs/low-ram-experts.md).
+    #[arg(long)]
+    memory_gb: Option<f64>,
     #[arg(long)]
     json_out: PathBuf,
 }
@@ -324,7 +328,11 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
     let model = M::load(
         &ctx,
         &cli.model,
-        &LoadOptions { mtp_drafts: cli.drafts, ..LoadOptions::default() },
+        &LoadOptions {
+            mtp_drafts: cli.drafts,
+            memory_budget: cli.memory_gb.map(|gb| (gb * (1u64 << 30) as f64) as u64),
+            ..LoadOptions::default()
+        },
     )?;
     if cli.drafts > 0 {
         return bench_speculative(cli, &ctx, &model);

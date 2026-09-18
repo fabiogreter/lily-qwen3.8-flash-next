@@ -186,6 +186,11 @@ pub struct LoadOptions {
     /// cache; `None` looks for `expert-usage.json` next to the checkpoint
     /// and falls back to uniform. `LILY_EXPERT_USAGE` overrides it.
     pub expert_usage: Option<std::path::PathBuf>,
+    /// Memory the engine may plan for, in bytes; `None` is the machine's
+    /// physical memory. Below what the checkpoint needs, the routed experts
+    /// are cached and served from disk (`docs/low-ram-experts.md`).
+    /// `LILY_MEMORY_GB` overrides it.
+    pub memory_budget: Option<u64>,
 }
 
 /// Which draw a decode pass ends with.

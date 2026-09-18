@@ -143,6 +143,8 @@ pub struct ServeOptions {
     pub ngram_lock: bool,
     /// Draft tokens per speculative step (0 disables the draft head).
     pub mtp_drafts: usize,
+    /// Memory the engine may plan for, in bytes (`None`: the machine's).
+    pub memory_budget: Option<u64>,
     /// Whether to load the vision tower when the checkpoint has one.
     pub vision: VisionMode,
     /// An image with more pixels is scaled down to fit before the tower.
@@ -549,6 +551,7 @@ impl<M: LanguageModel> Engine<M> {
                 vision: options.vision,
                 expert_slots: None,
                 expert_usage: None,
+                memory_budget: options.memory_budget,
             },
         )?;
         let drafts = options.mtp_drafts.min(model.max_drafts());

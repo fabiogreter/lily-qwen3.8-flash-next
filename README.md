@@ -51,9 +51,14 @@ from physical memory; nothing changes on a machine that fits it.
 Measured with the reads cold, as on a 64 GB machine: about 950 tok/s
 prefill and 55 tok/s plain decode on an 8K real-text prompt, against
 2 100 and 86 with everything resident. Speculative decoding is off there
-because its extra trunk passes cost more than they return. Details,
-measurements and knobs: [docs/low-ram-experts.md](docs/low-ram-experts.md);
-`lily-experts` measures the expert usage that places them.
+because its extra trunk passes cost more than they return. Nothing to
+configure: the server sizes it from the machine's memory; `--memory-gb 64`
+plans for that much instead (also the way to try the mode on a bigger
+machine), and an `expert-usage.json` next to the checkpoint (the one
+measured for this model is `tools/bench/expert-usage-qwen38-flash-next.json`)
+tells it which experts to keep. Details, measurements and knobs:
+[docs/low-ram-experts.md](docs/low-ram-experts.md); `lily-experts`
+measures the expert usage that places them.
 
 ### MLX engines
 
