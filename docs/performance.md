@@ -604,12 +604,67 @@ bandwidth floor sits.
 (barriers) a step encodes: 709 at 1K, 733 past the dense limit. A pure
 streaming read, one dispatch per barrier-separated level over distinct
 regions (`level_size_bandwidth_probe`), reaches 600 GB/s with no barriers
-but 479 to 487 GB/s when each level reads 8 MB, 459 at 4 MB, 306 to 404 at
-2 MB and 176 at 1 MB: every streaming level pays its own ramp and drain,
-about 2 to 4 us. The step's floor is therefore the sum of its levels' bytes
-at those per-size ceilings, not the 4.37 GB it reads at 600 GB/s (7.3 ms);
-at the mix of level sizes the step has, that floor is about 9.3 ms, and the
-step runs within 10 to 15% of it.
+but less when each level is its own dispatch behind a barrier:
+
+| bytes per level | GB/s       | at peak | lost per level |
+|-----------------|------------|---------|----------------|
+| no barriers     | 600        |         |                |
+| 8 MB            | 479 to 487 | 13.3 us | about 3 us     |
+| 4 MB            | 459        | 6.7 us  | about 2 us     |
+| 2 MB            | 306 to 404 | 3.3 us  | 2 to 3 us      |
+| 1 MB            | 176        | 1.7 us  | about 4 us     |
+
+Every streaming level loses a roughly fixed 2 to 4 us, so a level's
+efficiency is set by how many bytes it amortizes that over. The step's
+floor is therefore the sum of its levels' bytes at those per-size
+ceilings, not the 4.37 GB it reads at 600 GB/s (7.3 ms); at the mix of
+level sizes the step has (3 to 24 MB each), that floor is about 9.3 ms,
+and the step runs within 10 to 15% of it.
+
+**What a level pays, and why.** Bandwidth is bytes in flight divided by
+latency: RAM delivers its 600 GB/s only while enough load requests are
+queued against it, and with a load-to-data latency of a few hundred
+nanoseconds that is on the order of 300 KB outstanding at every instant
+(an estimate; Apple documents neither figure). Those outstanding loads
+land in registers, and a thread can hold only a handful before it runs
+out of them (the "every weight block requested up front" variants in the
+table above lost occupancy that way), so the 300 KB comes from many
+resident threadgroups each with a few loads pending, not from any thread
+being deep. The caches are a pass-through for the weights, which a GEMV
+touches once; they hold the small reused things, the activation vector a
+level reads and the output vector it writes, which the next level reads
+back from cache rather than RAM. Three dependent levels, A and C streaming
+8 MB of weights each and B a tiny inject kernel between them:
+
+```
+time  ------------------------------------------------------------->
+A     [ramp][===== stream at ~600 GB/s =====][drain]|
+B                                                   [B]|
+C                                                      [ramp][===== stream =====][drain]|
+                                                    ^barrier ^barrier
+bytes in flight
+      0 ..rising.. ~300 KB ..steady.. falling.. 0   0  0 ..rising.. ~300 KB ..steady..
+```
+
+The bandwidth at any instant is the in-flight line divided by the latency,
+so RAM runs at peak only along the steady stretch. At the start of A the
+queues are empty: the scheduler places threadgroups on cores, each thread
+computes its addresses and issues its first loads, and the request count
+climbs toward the steady level. Near the end the threadgroups finish at
+different times, the last few run alone with only their own loads
+pending, the count falls, and then the outputs are written and made
+visible. C's weight reads depend on nothing A produced, but the barrier
+orders all memory, so the GPU cannot issue them early: the in-flight count
+is forced to zero at every level boundary and each streaming level starts
+cold and ends cold. That is the 2 to 4 us per level in the table. B is
+free because it reads tens of KB out of cache and finishes inside the
+bubble the boundary costs anyway; removing it merges two bubbles into one
+that A-to-C paid regardless, which is why the 96 inject levels ablate to
+nothing and why folding same-level matvecs into one dispatch gained
+nothing. The cost is per cold start of a streaming read, not per barrier.
+The per-size ceilings, the free tiny levels, the same-level overlap and the
+register-pressure losses are measurements; the queues filling and emptying
+are the standard account of those numbers, not something observed.
 
 **Marginal costs.** `LILY_ABLATE=group` skips a kernel group's dispatches
 (and the levels only it occupies); the step time without it is the group's
@@ -662,12 +717,14 @@ profile) and the block scores.
 **Decode is at its floor for this design.** The step is a chain of about
 709 barrier-separated levels, each a true data dependency, each reading 3
 to 24 MB, and a streaming dispatch reaches only 460 to 485 GB/s at those
-sizes. Every kernel family sits within about 10% of that ceiling, every
-fusion and folding of levels measured a wash because tiny levels are free
-and streaming levels pay their own ramp regardless, and the remaining
-per-kernel items are a percent each. The 2 ms between the step and the
-7.3 ms its bytes would take at 600 GB/s is the ramp and drain of those
-levels. Three things would attack it, and none belongs in this server:
+sizes because each one starts with no loads in flight and ends with none
+(the section above). Every kernel family sits within about 10% of that
+ceiling, every fusion and folding of levels measured a wash because tiny
+levels are free and streaming levels pay their cold start regardless, and
+the remaining per-kernel items are a percent each. The 2 ms between the
+step and the 7.3 ms its bytes would take at 600 GB/s is the ramp and drain
+of those levels. Three things would attack it, and none belongs in this
+server:
 
 - **Weight streams issued before the barrier.** The weights (4.4 GB of the
   traffic) depend on nothing; only the kilobytes of activations do. A
