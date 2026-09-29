@@ -4,25 +4,59 @@ lily-qwen3.8-flash-next is a Metal inference server for Apple Silicon that
 serves one model, Qwen3.8-Flash-Next. It is a fork of Perplexity's [lily](https://github.com/perplexityai/pplx-garden/tree/main/lily),
 a compact Metal engine for Qwen3.6-35B-A3B that decoded about 30 % faster
 than mlx-lm ([their write-up](https://www.perplexity.ai/hub/blog/optimizing-on-device-inference-for-apple-silicon)).
-The fork ports that engine to Qwen3.8-Flash-Next's architecture and tunes it
-for this one model on this class of machine: the model runs as hand-written
-Metal kernels, decode steps are pipelined so the GPU does not wait for the
-host, speculative decoding uses the model's own draft head, conversations
-are cached across requests, forks and restarts, and on a machine with half
-the memory the checkpoint needs it keeps the busiest experts resident and
-reads the rest on demand.
+The fork ports that engine to Qwen3.8-Flash-Next and tunes it for this
+model: hand-written Metal kernels, pipelined decode steps, speculative
+decoding with the model's own draft head, conversations cached across
+requests and restarts, and an expert cache that runs the model on half the
+memory it needs.
 
-Measured against Unsloth's llama.cpp fork with the same model, prompts and
-machine, prefill is 1.6 to 3 times faster and decode 1.9 to 3.4 times
-faster; the difference grows with context.
+Against Unsloth's llama.cpp fork on the same machine and prompts, prefill is
+1.6 to 3 times faster and decode 1.9 to 3.4 times faster, more so at longer
+context.
+
+## Running it
+
+You need an M5 or newer (Apple GPU family 10), macOS 26, the Rust toolchain
+pinned by `rust-toolchain.toml`, and 128 GB of unified memory, or 64 GB with
+the expert cache (see [Smaller machines](#smaller-machines)).
+
+```sh
+cargo build --release --locked
+
+./target/release/lily --model ~/models/Qwen3.8-Flash-Next-lily-q4 \
+  --bind 127.0.0.1:8000 --max-seq 131072
+```
+
+The checkpoint is on Hugging Face as
+[fabiogreter/Qwen3.8-Flash-Next-lily-q4](https://huggingface.co/fabiogreter/Qwen3.8-Flash-Next-lily-q4).
+The server answers `/health` with `503 loading` while the model loads and
+serves after about 30 seconds. `tools/service/lily-service.sh install` runs
+it as a launchd agent that starts at login and unloads the model after 30
+idle minutes. `--help` lists every flag.
+
+The API is OpenAI-compatible: `POST /v1/chat/completions` (streaming or
+not), `POST /v1/completions` and `GET /v1/models`, with tools,
+`reasoning_content` and `prompt_cache_key`. It is developed against
+opencode. The differences:
+
+- **Images** are base64 data URIs (PNG or JPEG, up to eight per request);
+  the server never fetches URLs. A 1920 x 1080 screenshot costs about 2 000
+  prompt tokens. No video.
+- **One request runs at a time.** Others queue, with 503 when the queue is
+  full.
+- **Thinking is on by default.** `reasoning_effort` (`none`, `low`,
+  `medium`, `high`) sets it per request; `--thinking` and
+  `--reasoning-effort` set the server's default.
+- **Every response carries a `timings` object** with prefill and decode
+  rates, cached tokens and draft acceptance. `GET /v1/timings` keeps the
+  last 32; `tools/opencode-plugin-timings/` shows them in opencode.
+- `max_tokens` beyond the context is clamped, not refused.
 
 ## Performance
 
-M5 Max, 40-core GPU, 128 GB. Same prompts on both engines, cut from real
-documentation and code, a fresh prompt for every run, 256 greedy tokens of
-new text, medians of three interleaved repeats, each engine's own timings
-over HTTP. This fork at commit `38d2642` (2026-09-18), llama.cpp on
-2026-09-17.
+M5 Max, 40-core GPU, 128 GB. Both engines over HTTP with the same real-text
+prompts, 256 greedy tokens, medians of three interleaved repeats. This fork
+at commit `38d2642` (2026-09-18), llama.cpp on 2026-09-17.
 
 | tokens per second | 4K context | 16K | 32K | 64K |
 |---|---:|---:|---:|---:|
@@ -33,230 +67,123 @@ over HTTP. This fork at commit `38d2642` (2026-09-18), llama.cpp on
 | decode this fork, no drafts | 87 | 85 | 85 | 82 |
 | decode llama.cpp, no drafts | 39 | 31 | 25 | 17 |
 
-The fork's decode is nearly flat from 1K to 64K because the architecture allows
-it and the sparse-attention kernels keep the cost of context at a few percent
-of a step. Both engines were also run with three drafts per step; acceptance
-fell to about 50 % and decode was slower than with two, so those rows are
-left out. The speculative and prefill rows are medians over a seven-minute
-series, and the first repeat of it, at the GPU's full 1 620 MHz, decoded
-105 / 109 / 109 / 90 tok/s with two drafts: under sustained load the M5
-Max lets the GPU clock sag to about 1 500 to 1 550 MHz, which costs
-compute-bound passes a few percent and leaves memory-bound plain decode
-untouched. It used to be worse: a windowless process loses its performance
-envelope after about 90 seconds and ran at 1 240 MHz and 24 W, so the
-server now holds a user-initiated, latency-critical activity assertion for
-each request. The trace and the numbers are in the noise section of the
-performance document.
+Decode stays nearly flat up to 64K because the sparse-attention kernels
+keep the cost of context at a few percent of a step. Three drafts per step
+were slower than two on both engines. Under sustained load the GPU clock
+sags a few percent, which slows the speculative and prefill rows slightly.
 
-The quantizations differ slightly: the fork's affine 4-bit with group 64 against
-llama.cpp's UD-IQ4_XS. The llama.cpp MTP rows come from a build with a
-one-line fix that the shipped one lacks. Method, noise band, the fixed
-`lily-bench` matrix and the full record: [docs/performance.md](docs/performance.md).
+The quantizations differ slightly (affine 4-bit, group 64, against
+UD-IQ4_XS), and the llama.cpp MTP rows use a one-line fix the shipped build
+lacks. Method, noise and the full record: [docs/performance.md](docs/performance.md).
 
 ### Smaller machines
 
-The checkpoint is 104.6 GB: 68 GB of routed experts, the 32 GB hashed
-n-gram table, and about 5 GB of everything else. The table never lives on
-the GPU, on any machine: it stays on disk and is read through the page
-cache, 16 rows per token. What has to be resident is the other 72 GB, and
-the fork runs that on machines that cannot hold it. On a 64 GB machine the
-engine keeps a usage-ranked share of the experts on the GPU (about 43 GB,
-two thirds of them) and reads the others from the checkpoint files as they
-are routed to, sized automatically from physical memory, with the table's
-page cache taking whatever memory is left; nothing changes on a machine
-that fits it. Measured with the reads cold, as on a 64 GB machine, on an
-8K real-text prompt: about 930 tok/s prefill and 55 to 65 tok/s plain
-decode, against 2 250 and 87 with everything resident, with the same
-tokens produced. Speculative decoding is off there because its extra trunk
-passes cost more than they return.
+The checkpoint is 104.6 GB: 68 GB of experts, the 32 GB hashed n-gram
+table, and 5 GB of everything else. The table always stays on disk and is
+read through the page cache, so 72 GB is what has to be resident.
 
-Which experts stay resident starts from a usage ranking measured over
-real text (`lily-experts`; the one measured for this model, 40 prompts of
-documentation and code, is
-`tools/bench/expert-usage-qwen38-flash-next.json`, and a copy named
-`expert-usage.json` next to the checkpoint is picked up automatically;
-without one the placement is uniform) and then follows what the machine
-actually runs: the cache counts every expert it serves, decode-time
-lookups weighing far more than prefill's sweep, promotes cold experts
-that out-earn the least-used pinned ones into the pinned set every few
-tokens, and writes the merged counts to its cache directory, from which
-the next load places the experts. Measured on an 8K prompt: a process
-placed from the previous one's counts misses a third less at decode and
-decodes 11 % faster (57 against 52 tok/s). Nothing else to configure: the
-server sizes the cache from the machine's memory and keeps 12 GB or a
-sixth of it free for everything else; `--memory-gb 64` plans for that
-much instead (also the way to try the mode on a bigger machine). Details,
-measurements and knobs:
-[docs/low-ram-experts.md](docs/low-ram-experts.md).
+On a machine that cannot hold that, the engine keeps the most-used experts
+on the GPU (about two thirds of them on 64 GB) and reads the rest from disk
+when they are routed to. The placement starts from a usage ranking
+(`expert-usage.json` next to the checkpoint; the measured one is in
+`tools/bench/`) and adapts to what the machine runs. On an 8K prompt with
+cold reads this gives about 930 tok/s prefill and 55 to 65 tok/s decode,
+against 2 250 and 87 fully resident, with the same tokens. Speculative
+decoding is off in this mode.
+
+The cache sizes itself from physical memory; `--memory-gb 64` plans for
+64 GB instead, which is also how to try the mode on a bigger machine.
+Details: [docs/low-ram-experts.md](docs/low-ram-experts.md).
 
 ### MLX engines
 
-No released mlx-lm runs this model. Several MLX-based engines ship their own
-implementation of the architecture and publish numbers for an M5 Max:
-[MTPLX](https://mtplx.com/benchmarks/) reports 79 tok/s at 9K and 61 tok/s
-at 109K of context with its speculative path, 44 without;
-[oMLX](https://github.com/jundot/omlx/releases) reports 58 to 70 tok/s with
-its speculative path in its 0.7.0 development builds. We have not re-verified
-either with our harness, and their quantizations and sampling settings differ
-from the table above.
+No released mlx-lm runs this model. MLX-based engines with their own
+implementation publish M5 Max numbers:
+[MTPLX](https://mtplx.com/benchmarks/) 79 tok/s at 9K and 61 at 109K with
+its speculative path (44 without), [oMLX](https://github.com/jundot/omlx/releases)
+58 to 70 tok/s with its speculative path in its 0.7.0 development builds.
+We have not re-measured them, and their quantizations and settings differ.
 
 ## The model
 
 [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) is
-Qwen's `qwen4_exp` preview architecture: 48 layers, 36
-of them Gated DeltaNet with a fixed-size recurrent state and 12 sparse
-attention with an indexer that picks 512 blocks per query, a 512-expert MoE
-with 10 active, a four-stream gated residual, a 32 GB hashed n-gram
-embedding, a multi-token-prediction head and a vision tower.
+Qwen's `qwen4_exp` preview architecture: 48 layers, 36 of them Gated
+DeltaNet with a fixed-size recurrent state and 12 sparse attention with an
+indexer that picks 512 blocks per query, a 512-expert MoE with 10 active, a
+four-stream gated residual, a 32 GB hashed n-gram embedding, a
+multi-token-prediction head and a vision tower.
 
-The server runs a 4-bit conversion of it, 98 GiB on disk, produced by
-`tools/convert/convert_qwen38_flash_next.py` from the Hugging Face BF16
-weights and published as
-[fabiogreter/Qwen3.8-Flash-Next-lily-q4](https://huggingface.co/fabiogreter/Qwen3.8-Flash-Next-lily-q4).
-The vision tower is kept in bf16, the draft head is quantized like the
-trunk, and the n-gram table stays on disk and is read through the page cache
-rather than uploaded. The layout is documented in
+The server runs a 4-bit conversion of it (98 GiB), made by
+`tools/convert/convert_qwen38_flash_next.py` from the BF16 weights, with the
+vision tower kept in bf16. The layout is documented in
 [docs/qwen38-flash-next-checkpoint-format.md](docs/qwen38-flash-next-checkpoint-format.md).
 
 ## Exactness
 
-The fork is not logit-identical to any other engine, and no two bf16
-engines are for this model: it turns any rounding difference into different
-near-tie decisions (its router's 10th and 11th expert are often less than
-0.02 logits apart, and at long context the indexer's block scores are
-flat). What the tests show is that the fork sits inside that noise. On the
-same 4-bit weights as the MLX port, byte-identical except the norms, its
-output distribution differs from MLX's by a mean KL of about 2e-3 from 1K to
-32K of context, as much as MLX differs from itself when only its prefill
-chunk size changes; the fork itself is bit-identical across chunk sizes. The
-harness, the teacher-forced replays and the numbers are in
-[tools/README.md](tools/README.md#referencemlx_paritysh); a comparison
-against Hugging Face transformers on a four-layer truncation is described
-beside it.
-
-## Running it
-
-You need an Apple GPU of family 10 or later (M5 and newer), macOS 26 for
-Metal 4 and tensor operations, the Rust toolchain pinned by
-`rust-toolchain.toml`, and 128 GB of unified memory to hold the whole
-checkpoint, or 64 GB with the expert cache above (the n-gram table lives in
-the page cache either way).
-
-```sh
-cargo build --release --locked
-
-./target/release/lily --model ~/models/Qwen3.8-Flash-Next-lily-q4 \
-  --bind 127.0.0.1:8000 --max-seq 131072
-```
-
-The server binds at once, answers `/health` with `503 loading` while the
-model loads, and serves after about 30 seconds. `tools/service/lily-service.sh install`
-turns it into a launchd agent that starts at login and unloads the model
-after 30 idle minutes. `--help` lists every flag.
-
-The API is OpenAI-compatible: `POST /v1/chat/completions` (streaming or
-not) and `POST /v1/completions`, with sampling parameters, stop strings,
-tools and tool calls, `reasoning_content`, `prompt_cache_key`, usage blocks
-and `GET /v1/models`. OpenAI clients and agents work unchanged; opencode is
-what the server is developed against. The quirks:
-
-- **Images are base64 data URIs**, PNG or JPEG, up to eight per request, in
-  user messages. The server never fetches URLs. An image is scaled to at
-  most 2 megapixels and costs one prompt token per 32 x 32 pixels, so a
-  1920 x 1080 screenshot is 2 040 tokens and answers in about three seconds.
-  No video.
-- **One request runs at a time.** Others wait in a queue (503 when it is
-  full). There is no batching across requests.
-- **Thinking is on by default**, as the model's template intends. Per
-  request, `reasoning_effort` takes `none` to turn it off and `low`,
-  `medium` or `high` to set the level (the template's default is high);
-  `chat_template_kwargs` with `enable_thinking` and `reasoning_effort` works
-  too. `--thinking` and `--reasoning-effort` set the server's defaults.
-- **Every response carries a `timings` object**: prompt tokens, cached
-  tokens, prefill and decode rates, draft acceptance. `GET /v1/timings` keeps
-  the last 32. `tools/opencode-plugin-timings/` shows them in opencode.
-- `max_tokens` beyond the context is clamped rather than refused, and
-  `/health` reports `loading`, `ready`, `idle`, `reloading` or `recovering`,
-  the last after a GPU fault the server recovers from on its own.
+The fork is not logit-identical to other engines, and for this model no two
+bf16 engines are: small rounding differences flip near-tie choices in its
+expert router and sparse attention. On the same 4-bit weights as the MLX
+port, the fork's output differs from MLX's by a mean KL of about 2e-3 from
+1K to 32K of context, as much as MLX differs from itself when only its
+prefill chunk size changes. Method and numbers:
+[tools/README.md](tools/README.md#referencemlx_paritysh).
 
 ## Caching
 
-Prompt state is kept in three places. A client notices them only through
+Prompt state is cached in three tiers; clients see them only as
 `cached_tokens` in the usage block.
 
-1. **Resident sessions.** Every conversation's state stays in GPU memory
-   under a byte budget. Continuing it costs only the new tokens; editing,
-   regenerating or branching forks a copy, so parallel conversations do not
-   destroy each other's context.
-2. **The disk tier.** Sessions evicted from GPU memory go to disk and come
-   back in about a second per few gigabytes when their prefix returns. It
-   survives restarts.
-3. **Durable prefixes.** Two runs of the same agent share their preamble,
-   the system prompt, tool schemas and repository instructions, and differ
-   only from the user's message on. The second run cannot resume from the
-   first, because the first run's checkpoint sits at the end of its whole
-   prompt, past the point where the two diverge. When the shared part is at
-   least 1 024 tokens long, the server writes it to disk as a durable entry, and
-   every later run with the same preamble starts from there. Many tasks
-   against the same repository pay for the preamble once.
+1. **Resident sessions.** Each conversation's state stays in GPU memory
+   within a budget, so continuing it costs only the new tokens. Edits,
+   regenerations and branches fork a copy instead of overwriting it.
+2. **Disk.** Sessions evicted from GPU memory move to disk and come back in
+   about a second per few gigabytes. They survive restarts.
+3. **Durable prefixes.** Runs of the same agent share a preamble (system
+   prompt, tool schemas, repository instructions) and diverge at the user's
+   message, so no run can resume another's checkpoint. When the shared part
+   is at least 1 024 tokens, the server stores it separately and every later
+   run starts from there.
 
-Images are identified by their content, not by their placeholder tokens, so
-two screenshots behind the same preamble never share cached state past the
-image. The rules are in [docs/architecture.md](docs/architecture.md), "The
-session cache".
+Images are identified by their content, so two different screenshots never
+share cached state. The rules: [docs/architecture.md](docs/architecture.md),
+"The session cache".
 
 ## How the speed was achieved
 
-A decode step reads about 4.4 GB of weights and state for one token, so it
-is bandwidth-bound, and the work is about not wasting that bandwidth and not
-waiting between steps. Prefill reads the weights once per 4 096-token chunk
-and is compute-bound instead.
+A decode step reads about 4.4 GB of weights and state per token, so decode
+is bandwidth-bound. Prefill reads the weights once per 4 096-token chunk and
+is compute-bound.
 
-**What came from Perplexity.** The Metal kernel foundations and the shape of
-the engine: 4-bit weight streaming kernels adapted from MLX, tensor-op GEMMs,
-the MoE, Gated DeltaNet and attention kernels, a runtime shader compiler, and
-a small greedy server with a token-prefix cache for one checkpoint. That
-engine measured about 30 % over mlx-lm on its model.
+**From Perplexity:** the Metal kernel foundations (4-bit weight streaming
+adapted from MLX, tensor-op GEMMs, the MoE, Gated DeltaNet and attention
+kernels), the runtime shader compiler, and a small server with a
+token-prefix cache.
 
-**What this fork added:**
+**Added in this fork:**
 
 - The Qwen3.8-Flash-Next graph and its converter: sparse attention with the
   indexer, hyper-connections, the paged n-gram table, the draft head, the
   vision tower.
-- A Metal 4 transport with one command buffer per step, level barriers
-  instead of serial ones, decode steps parked on GPU events so the host is
-  not on the critical path, and control flow such as the accepted draft
-  count decided on the GPU.
-- Speculative decoding through the model's own head, with the verify pass on
-  small-row GEMMs written for it and exact speculative sampling when the
-  request samples.
-- Decode kernels taken to the ceiling their read sizes allow: the
-  hyper-connection read from six dispatches to two, the sparse-attention
-  selection with no serial steps, the split attention kernel with its
-  latency chains cut, the expert gathers and the recurrent-state step tuned
-  in a chained harness. A decode step is a chain of about 700 dependency
-  levels, and the measurement of what such a chain can stream is what says
-  the step is within 10 to 15 % of its floor.
-- Prefill on the tensor ops where it was not: sparse attention over the
-  gathered union of neighbouring queries' selections (from 40 % of a chunk to
-  10 %), the Gated DeltaNet scan in chunked form instead of a token-serial
-  recurrence, and the expert GEMM's last tiles at half and quarter height.
-- The expert cache that runs the model on half the memory.
-- A process activity assertion held while a request runs, so a server
-  with no window keeps the GPU's performance envelope under sustained load
-  and the machine can still sleep when idle.
-- The session cache with recurrent-state checkpoints, forks, the disk tier
-  and durable prefixes, and the full OpenAI request surface around it.
+- A Metal 4 transport: one command buffer per step, level barriers, decode
+  steps parked on GPU events so the host is off the critical path, and
+  control flow such as the accepted draft count decided on the GPU.
+- Speculative decoding with the model's own head, exact when the request
+  samples.
+- Decode kernels tuned until a step runs within 10 to 15 % of what its
+  chain of reads can stream.
+- Prefill on the tensor ops: sparse attention over the union of neighbouring
+  queries' selections, a chunked Gated DeltaNet scan, and better tiling for
+  the expert GEMM.
+- The expert cache for half-memory machines.
+- An activity assertion per request, so a server with no window keeps its
+  GPU performance under sustained load.
+- The session cache and the full OpenAI request surface.
 
-Part of this is specific to the model and part is not. The transport,
-parking, GPU-side control flow, speculative decoding, the caching and the
-expert cache are properties of the engine and apply to any model served from
-any framework, MLX included. The sparse-attention and recurrent-state work
-is specific to this architecture family, and the paged n-gram table to this
-model alone. The detailed account, with every measurement, is
-[docs/architecture.md](docs/architecture.md); what was done, what was tried
-and dropped and why, and what is left but outside this project's target is
-the second half of [docs/performance.md](docs/performance.md).
+The transport, parking, speculative decoding, caching and expert cache
+apply to any model and framework, MLX included; the sparse-attention and
+recurrent-state work is specific to this architecture family. The detailed
+account is [docs/architecture.md](docs/architecture.md); what was tried,
+dropped and why is in [docs/performance.md](docs/performance.md).
 
 ## Converting a checkpoint
 
@@ -272,10 +199,9 @@ uv pip install --python .venv/bin/python mlx safetensors numpy torch torchvision
     --src ~/models/Qwen3.8-Flash-Next --dst ~/models/Qwen3.8-Flash-Next-lily-q4
 ```
 
-The full conversion takes about a minute on an M5 Max. `--layers 4` writes
-the small checkpoint the tests use. [tools/README.md](tools/README.md) has the
-other flags and the reference harness that checks the engine against Hugging Face
-transformers on the same weights.
+It takes about a minute on an M5 Max. `--layers 4` writes the small
+checkpoint the tests use. [tools/README.md](tools/README.md) has the other
+flags and the reference harnesses.
 
 ## Tests
 
