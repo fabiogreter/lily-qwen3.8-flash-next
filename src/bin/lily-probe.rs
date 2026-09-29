@@ -14,7 +14,7 @@ use lily::kernels::sample::SamplingParams;
 use lily::metal::MetalContext;
 use lily::qwen4exp::Qwen4ExpModel;
 use lily::serve::checkpoint_model_type;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Parser)]
 #[command(name = "lily-probe", about = "Step-by-step greedy probe with top logits")]
@@ -24,11 +24,18 @@ struct Cli {
     model: PathBuf,
     /// User message, rendered through the checkpoint's chat template with
     /// thinking disabled (what the API server does).
-    #[arg(long, conflicts_with = "tokens")]
+    #[arg(long, conflicts_with_all = ["tokens", "follow"])]
     prompt: Option<String>,
     /// JSON file holding a list of prompt token ids (bypasses the template).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "follow")]
     tokens: Option<PathBuf>,
+    /// Teacher forcing: replay another probe record's prompt and feed its
+    /// chosen tokens instead of this run's own, recording this run's logits
+    /// at the record's ids too (`at_ref_ids`), so two configurations are
+    /// compared on the same path even after one of them flips an argmax.
+    /// Steps follow the record's (`--max-tokens` is ignored).
+    #[arg(long)]
+    follow: Option<PathBuf>,
     /// Greedy steps after the prompt.
     #[arg(long, default_value_t = 8)]
     max_tokens: usize,
@@ -47,7 +54,26 @@ struct Step {
     chosen: u32,
     ids: Vec<u32>,
     logits: Vec<f32>,
+    /// Log-sum-exp over the full vocabulary, so `logit - logsumexp` is the
+    /// exact log-probability of each recorded id.
+    logsumexp: f64,
+    /// `--follow` only: this run's logits at the followed step's ids.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    at_ref_ids: Option<Vec<f32>>,
     debug: serde_json::Value,
+}
+
+/// The part of a probe record `--follow` needs.
+#[derive(Deserialize)]
+struct FollowRecord {
+    prompt_token_ids: Vec<u32>,
+    steps: Vec<FollowStep>,
+}
+
+#[derive(Deserialize)]
+struct FollowStep {
+    chosen: u32,
+    ids: Vec<u32>,
 }
 
 #[derive(Serialize)]
@@ -71,6 +97,11 @@ fn top_k(logits: &[f32], k: usize) -> (Vec<u32>, Vec<f32>) {
     (ids, values)
 }
 
+fn logsumexp(logits: &[f32]) -> f64 {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    max + logits.iter().map(|&l| (l as f64 - max).exp()).sum::<f64>().ln()
+}
+
 fn probe<M: LanguageModel>(cli: &Cli) -> Result<Record> {
     let ctx = MetalContext::new()?;
     let started = Instant::now();
@@ -79,18 +110,37 @@ fn probe<M: LanguageModel>(cli: &Cli) -> Result<Record> {
     let mut generator = Generator::from_model_dir(&cli.model)?;
     generator.add_stop_tokens(&model.eos_token_ids());
 
-    let prompt: Vec<u32> = match (&cli.prompt, &cli.tokens) {
-        (Some(text), None) => generator
+    let follow: Option<FollowRecord> = match &cli.follow {
+        Some(path) => {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            Some(
+                serde_json::from_slice(&bytes)
+                    .context("parsing the followed record")?,
+            )
+        }
+        None => None,
+    };
+    let prompt: Vec<u32> = match (&cli.prompt, &cli.tokens, &follow) {
+        (Some(text), None, None) => generator
             .encode_chat(&vec![Message::new_user(text.clone())], Thinking::Disabled)?,
-        (None, Some(path)) => {
+        (None, Some(path), None) => {
             let bytes = std::fs::read(path)
                 .with_context(|| format!("reading {}", path.display()))?;
             serde_json::from_slice(&bytes).context("parsing token list")?
         }
-        _ => anyhow::bail!("pass exactly one of --prompt or --tokens"),
+        (None, None, Some(record)) => record.prompt_token_ids.clone(),
+        _ => anyhow::bail!("pass exactly one of --prompt, --tokens or --follow"),
     };
     ensure!(!prompt.is_empty(), "empty prompt");
-    let max_seq = prompt.len() + cli.max_tokens + 1;
+    let max_tokens = match &follow {
+        Some(record) => {
+            ensure!(!record.steps.is_empty(), "the followed record has no steps");
+            record.steps.len() - 1
+        }
+        None => cli.max_tokens,
+    };
+    let max_seq = prompt.len() + max_tokens + 1;
     let mut state = model.new_state(&ctx, max_seq)?;
     let mut scratch = model.new_scratch_with_capacity(&ctx, max_seq)?;
 
@@ -105,22 +155,33 @@ fn probe<M: LanguageModel>(cli: &Cli) -> Result<Record> {
     )?;
     let prefill_seconds = started.elapsed().as_secs_f64();
 
-    let read_step = |scratch: &M::Scratch,
-                     slot: usize,
-                     position: usize|
-     -> Result<Step> {
+    let read_step = |scratch: &M::Scratch, slot: usize, step: usize| -> Result<Step> {
         let chosen = scratch.next_token().view(slot, &[1])?.to_u32()?[0];
         let logits = scratch.logits().to_f32()?;
         let (ids, values) = top_k(&logits, cli.top);
-        Ok(Step { position, chosen, ids, logits: values, debug: scratch.debug_json()? })
+        let at_ref_ids = follow.as_ref().map(|record| {
+            record.steps[step].ids.iter().map(|&i| logits[i as usize]).collect()
+        });
+        Ok(Step {
+            position: prompt.len() - 1 + step,
+            chosen,
+            ids,
+            logits: values,
+            logsumexp: logsumexp(&logits),
+            at_ref_ids,
+            debug: scratch.debug_json()?,
+        })
     };
 
-    let mut steps = vec![read_step(&scratch, 0, prompt.len() - 1)?];
+    let mut steps = vec![read_step(&scratch, 0, 0)?];
     let started = Instant::now();
     let mut slot = 0usize;
-    for step in 1..=cli.max_tokens {
+    for step in 1..=max_tokens {
         // Synchronous steps: each one's logits are read before the next runs.
-        let input = steps.last().map(|s: &Step| s.chosen).expect("prefill step");
+        let input = match &follow {
+            Some(record) => record.steps[step - 1].chosen,
+            None => steps.last().map(|s: &Step| s.chosen).expect("prefill step"),
+        };
         let encoded = model.encode_decode_step(
             &ctx,
             &state,
@@ -130,11 +191,22 @@ fn probe<M: LanguageModel>(cli: &Cli) -> Result<Record> {
             Draw { params: &greedy, step },
         )?;
         model.prepare_step_inputs(&mut state, &scratch, input)?;
+        if follow.is_some() {
+            // The step embeds the token the in-graph sampler left in the
+            // input slot; `prepare_step_inputs` only stages the host-side
+            // n-gram rows. Both must see the forced token, or a run whose own
+            // argmax flipped would embed one token and hash another. The
+            // previous step has completed, so the GPU is idle on the buffer.
+            scratch
+                .next_token()
+                .view(slot, &[1])?
+                .write_bytes(bytemuck::bytes_of(&input))?;
+        }
         let pending = encoded.commit()?;
         state.advance(1);
         pending.wait()?;
         slot = 1 - slot;
-        steps.push(read_step(&scratch, slot, prompt.len() - 1 + step)?);
+        steps.push(read_step(&scratch, slot, step)?);
     }
     let decode_seconds = started.elapsed().as_secs_f64();
     let tokens: Vec<u32> = steps.iter().map(|s| s.chosen).collect();

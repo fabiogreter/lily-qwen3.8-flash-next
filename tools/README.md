@@ -73,6 +73,54 @@ steps: against the dequantized weights lily agrees at 9/9 positions with a
 worst shared-id logit gap of 0.26; against the raw bf16 weights 7/9, the rest
 being quantization error.
 
+When both records carry a full-vocabulary `logsumexp` (as `lily-probe` and the
+MLX golden below do), it also reports KL(lily || golden), the log-probability
+gap on lily's chosen token, and lily's top-1/top-2 margin, which shows whether
+a flipped argmax was a near-tie.
+
+## reference/mlx_parity.sh
+
+Full-model parity against the MLX runtime in
+`models/qwen38-flash-next-mlx/` on `Qwen3.8-Flash-Next-mlx-4bit-g3264`, whose
+tensors are byte-identical to lily's checkpoint except the norms (MLX stores
+`bf16(1 + w)`, lily `w`). lily runs first; the MLX side
+(`tools/mlx_reference.py` there) replays lily's prompt as a prefill and lily's
+chosen tokens through its decode path, so both engines take the same path over
+the same tokens. One model at a time: each phase is its own invocation and
+refuses to start while another engine runs. Records go to
+`docs/bench/mlx-parity/`.
+
+```sh
+tools/reference/mlx_parity.sh prompts   # once, CPU only
+tools/reference/mlx_parity.sh lily
+tools/reference/mlx_parity.sh mlx
+tools/reference/mlx_parity.sh compare
+```
+
+Noise floors and interventions replay the base lily record (`lily-probe
+--follow`, teacher forcing on both the embedded and the hashed token) and are
+set against each other with `reference/compare_runs.py`, which reports the
+median and tail of the per-position KL, since a few near-tie positions carry
+most of a mean:
+
+```sh
+FOLLOW=1 LILY_TAG=_c2048 LILY_PREFILL_CHUNK=2048 tools/reference/mlx_parity.sh lily
+MLX_TAG=_p1024 MLX_PREFILL=1024 tools/reference/mlx_parity.sh mlx
+PAIRS="base:mlx mlx:mlx_p1024 base:lily_c2048" tools/reference/mlx_parity.sh runs
+```
+
+`MLX_INTERNALS=1` also records, on every decode step, each attention layer's
+selected blocks, each MoE layer's routed experts with the router's margin, and
+layer 47's block scores (the layer whose scores `lily-probe` dumps).
+
+Result (2026-09-29, nested prefixes of one text at 1K to 32K, 128 steps): lily
+and MLX differ by a mean KL of about 2.2e-3 at every length, the same as MLX
+against itself with a different prefill chunk; lily is bit-identical across
+prefill chunk sizes. The spread comes from near-tie discrete decisions: two
+MLX runs pick different top-10 experts in 20 % of layer-steps (router margins
+around 0.01) and dispute up to 42 of 512 sparse blocks at layer 47, exactly as
+many as lily and MLX do.
+
 ## reference/hf_vision_reference.py, compare_vision.py, make_images.py
 
 The vision counterpart (docs/architecture.md, "How the tower was verified"). `make_images.py`
