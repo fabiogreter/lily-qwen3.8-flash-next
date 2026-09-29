@@ -118,6 +118,22 @@ trunk, and the n-gram table stays on disk and is read through the page cache
 rather than uploaded. The layout is documented in
 [docs/qwen38-flash-next-checkpoint-format.md](docs/qwen38-flash-next-checkpoint-format.md).
 
+## Exactness
+
+The fork is not logit-identical to any other engine, and no two bf16
+engines are for this model: it turns any rounding difference into different
+near-tie decisions (its router's 10th and 11th expert are often less than
+0.02 logits apart, and at long context the indexer's block scores are
+flat). What the tests show is that the fork sits inside that noise. On the
+same 4-bit weights as the MLX port, byte-identical except the norms, its
+output distribution differs from MLX's by a mean KL of about 2e-3 from 1K to
+32K of context, as much as MLX differs from itself when only its prefill
+chunk size changes; the fork itself is bit-identical across chunk sizes. The
+harness, the teacher-forced replays and the numbers are in
+[tools/README.md](tools/README.md#referencemlx_paritysh); a comparison
+against Hugging Face transformers on a four-layer truncation is described
+beside it.
+
 ## Running it
 
 You need an Apple GPU of family 10 or later (M5 and newer), macOS 26 for
