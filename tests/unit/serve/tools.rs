@@ -92,3 +92,79 @@ fn incoming_tool_calls_are_shaped_for_the_template() {
         .is_err()
     );
 }
+
+#[test]
+fn parsed_arguments_keep_the_generated_order() {
+    // Not alphabetical on purpose: sorted keys would put `path` first.
+    let block = "<function=grep>\n<parameter=pattern>\nx\n</parameter>\n\
+                 <parameter=path>\ny\n</parameter>\n<parameter=include>\n*.rs\n</parameter>\n\
+                 </function>";
+    let call = parse_tool_call(block, &[]).expect("parse");
+    assert_eq!(call.arguments, r#"{"pattern":"x","path":"y","include":"*.rs"}"#);
+}
+
+/// The chat template's tool-call and tool-list loops, as the checkpoint's
+/// `chat_template.jinja` writes them.
+fn render_like_the_template(calls: &[Value], tools: &[Value]) -> String {
+    let mut env = minijinja::Environment::new();
+    env.add_template(
+        "t",
+        "{%- for tool in tools %}{{- tool | tojson }}\n{%- endfor %}\
+         {%- for tool_call in tool_calls %}\
+         {%- set tool_call = tool_call.function %}\
+         {{- '<function=' + tool_call.name + '>\n' }}\
+         {%- for args_name, args_value in tool_call.arguments|items %}\
+         {{- '<parameter=' + args_name + '>\n' }}\
+         {%- set args_value = args_value | string if args_value is string else args_value | tojson | safe %}\
+         {{- args_value }}{{- '\n</parameter>\n' }}\
+         {%- endfor %}{{- '</function>' }}{%- endfor %}",
+    )
+    .expect("template");
+    env.get_template("t")
+        .expect("template")
+        .render(minijinja::context! { tool_calls => calls, tools => tools })
+        .expect("render")
+}
+
+#[test]
+fn incoming_arguments_render_in_the_order_the_client_sent() {
+    let calls = template_tool_calls(&[serde_json::json!({"function": {
+        "name": "grep", "arguments": "{\"pattern\":\"x\",\"path\":\"y\"}"
+    }})])
+    .expect("shape");
+    let rendered = render_like_the_template(&calls, &[]);
+    assert_eq!(
+        rendered,
+        "<function=grep>\n<parameter=pattern>\nx\n</parameter>\n\
+         <parameter=path>\ny\n</parameter>\n</function>"
+    );
+}
+
+#[test]
+fn a_generated_call_re_renders_to_the_generated_text() {
+    // The session cache holds the generated tokens; the next request sends
+    // the call back as `arguments` text and must render the same bytes.
+    let block = "<function=edit>\n<parameter=filePath>\na.rs\n</parameter>\n\
+                 <parameter=oldString>\nfoo\n</parameter>\n\
+                 <parameter=newString>\nbar\n</parameter>\n</function>";
+    let call = parse_tool_call(block, &[]).expect("parse");
+    let calls = template_tool_calls(&[serde_json::json!({"function": {
+        "name": call.name, "arguments": call.arguments
+    }})])
+    .expect("shape");
+    assert_eq!(render_like_the_template(&calls, &[]), block);
+}
+
+#[test]
+fn tool_schemas_render_in_the_order_the_client_sent() {
+    let tool: Value = serde_json::from_str(
+        r#"{"type":"function","function":{"name":"grep","parameters":{"type":"object",
+            "properties":{"pattern":{"type":"string"},"path":{"type":"string"}}}}}"#,
+    )
+    .unwrap();
+    let rendered = render_like_the_template(&[], &[tool]);
+    assert_eq!(
+        rendered,
+        r#"{"type":"function","function":{"name":"grep","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}}}}}"#
+    );
+}

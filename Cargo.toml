@@ -38,7 +38,12 @@ clap = { version = "4.5.7", features = ["derive"] }
 half = { version = "2.7.1", features = ["bytemuck"] }
 # Renders the checkpoint's own chat template. `json` supplies `tojson`, which
 # Qwen's template references even though the API does not expose tools.
-minijinja = { version = "2.5", features = ["loader", "json"] }
+# `preserve_order` keeps template maps in insertion order, as the reference's
+# Python dicts do: a tool call's arguments re-render in the order the model
+# generated them and the tool schemas in the order the client sent them.
+# Sorted keys made every multi-parameter tool call re-render differently
+# from the tokens the session cache holds.
+minijinja = { version = "2.5", features = ["loader", "json", "preserve_order"] }
 # `pycompat` supplies the Python string methods (`startswith`, `split`, ...)
 # that Hugging Face chat templates use and that minijinja does not implement
 # natively. Without it the Qwen template dies on `content.startswith(...)`.
@@ -54,7 +59,10 @@ minijinja-contrib = { version = "2.5", features = ["pycompat"] }
 png = { version = "0.18.1", default-features = false }
 zune-jpeg = { version = "0.5.15", default-features = false, features = ["std"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+# `preserve_order` for the same reason: request JSON (tool call arguments,
+# tool schemas) keeps its key order on the way into the template, and the
+# arguments parsed from the model's tool calls keep the generated order.
+serde_json = { version = "1.0.150", features = ["preserve_order"] }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 
 # Metal and the Objective-C runtime. The engine is macOS-only; `lib.rs` gates
