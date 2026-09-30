@@ -399,6 +399,7 @@ fn warm_up_on_load_and_reload() {
         expert_usage: None,
         memory_budget: None,
         expert_usage_out: None,
+        session_context: None,
     };
     for round in ["load", "reload"] {
         let ctx = MetalContext::new().expect("metal");

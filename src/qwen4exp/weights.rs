@@ -152,6 +152,19 @@ pub struct ModelWeights {
     /// machine's physical memory (`None` when neither is known), exactly
     /// what `auto_expert_slots` sized the expert cache from.
     pub planned_memory: Option<u64>,
+    /// What the expert cache's plan kept free for the server's session
+    /// cache: one full session at `SessionContext::max_seq`. `None` when the
+    /// checkpoint fits, when the slots were given explicitly, or when the
+    /// load had no session context (the bench, the probes).
+    pub session_reserve: Option<u64>,
+}
+
+/// The session the server keeps room for under an expert cache: its context
+/// length and how many recurrent checkpoints a session holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionContext {
+    pub max_seq: usize,
+    pub checkpoints: usize,
 }
 
 /// The converter's storage policy: routers, gates and the small mixing
@@ -264,17 +277,50 @@ pub(crate) fn physical_memory() -> Option<u64> {
     (rc == 0 && len == std::mem::size_of::<u64>()).then_some(size)
 }
 
+/// The arithmetic of [`auto_expert_slots`] on its sizes: `ram` the planned
+/// memory, `experts` and `other` the checkpoint's expert and resident
+/// bytes, `slices` the (layer, expert) count, `session` the session
+/// reserve. `None` when everything fits.
+fn plan_expert_slots(
+    ram: u64,
+    experts: u64,
+    other: u64,
+    slices: u64,
+    num_experts: usize,
+    session: u64,
+) -> Option<usize> {
+    const GB: u64 = 1 << 30;
+    // Measured with 16 384 slots: 52.9 GB of process footprint for a
+    // 45.3 GB slab and 3.1 GB of resident weights, so scratch, caches and
+    // pipelines take about 4.5 GB; the tiled attention's gathered rows
+    // (`qsa::tile_row_budget`) add 0.5 GB. The
+    // reserve keeps 12 GB (or a sixth of memory) for the OS, other apps
+    // and the page cache.
+    let scratch = 5 * GB;
+    let reserve = (12 * GB).max(ram / 6);
+    if experts + other + scratch + reserve <= ram {
+        return None;
+    }
+    let slice = experts / slices.max(1);
+    let budget = ram.saturating_sub(other + scratch + session + reserve);
+    Some(((budget / slice.max(1)) as usize).max(2 * num_experts).min(slices as usize))
+}
+
 /// How many expert slots this machine can afford: `None` when the whole
 /// checkpoint fits its memory with room to work (the current footprint),
 /// otherwise the slots left after the resident weights, about 4.5 GB of
-/// scratch and a 12 GB reserve for the OS, other apps and the page cache
-/// (a 64 GB machine gets about 43 GB of experts and keeps about 13 GB
-/// free), at least two layers' worth.
+/// scratch, `session` (the server's session cache, one full session at its
+/// context length) and a 12 GB reserve for the OS, other apps and the page
+/// cache, at least two layers' worth. A 64 GB machine keeps about 13 GB
+/// free; the session takes 4.2 GB of what would be experts at a 131 072-token
+/// context and 7.9 GB at 262 144. `session` does not count toward whether the checkpoint fits:
+/// a machine that holds it keeps its usual session budget.
 fn auto_expert_slots(
     ckpt: &Checkpoint,
     config: &Qwen4ExpConfig,
     storage: NgramStorage,
     memory_budget: Option<u64>,
+    session: u64,
 ) -> Option<usize> {
     const GB: u64 = 1 << 30;
     let ram = memory_budget.or_else(physical_memory)?;
@@ -291,31 +337,26 @@ fn auto_expert_slots(
             other += bytes;
         }
     }
-    // Measured with 16 384 slots: 52.9 GB of process footprint for a
-    // 45.3 GB slab and 3.1 GB of resident weights, so scratch, caches and
-    // pipelines take about 4.5 GB; the tiled attention's gathered rows
-    // (`qsa::tile_row_budget`) add 0.5 GB. The
-    // reserve keeps 12 GB (or a sixth of memory) for the OS, other apps
-    // and the page cache.
-    let scratch = 5 * GB;
-    let reserve = (12 * GB).max(ram / 6);
-    if experts + other + scratch + reserve <= ram {
-        return None;
-    }
     let slices = (config.num_hidden_layers * config.num_experts) as u64;
     let slice = experts / slices.max(1);
-    let budget = ram.saturating_sub(other + scratch + reserve);
-    let slots = ((budget / slice.max(1)) as usize)
-        .max(2 * config.num_experts)
-        .min(slices as usize);
+    let slots =
+        plan_expert_slots(ram, experts, other, slices, config.num_experts, session)?;
     eprintln!(
-        "expert cache: {:.1} GB of memory holds {:.1} GB of resident weights and {} of {slices} experts ({:.1} of {:.1} GB); the rest is served from the checkpoint",
+        "expert cache: {:.1} GB of memory holds {:.1} GB of resident weights, {:.1} GB for one full session and {} of {slices} experts ({:.1} of {:.1} GB); the rest is served from the checkpoint",
         ram as f64 / GB as f64,
         other as f64 / GB as f64,
+        session as f64 / GB as f64,
         slots,
         slots as f64 * slice as f64 / GB as f64,
         experts as f64 / GB as f64
     );
+    if session > 0 {
+        eprintln!(
+            "expert cache: the session reserve costs {} slots ({:.1} GB); a shorter --max-seq keeps more experts resident",
+            (session / slice.max(1)).min(slices),
+            session as f64 / GB as f64
+        );
+    }
     Some(slots)
 }
 
@@ -575,6 +616,7 @@ pub fn load(
     expert_usage: Option<PathBuf>,
     memory_budget: Option<u64>,
     expert_usage_out: Option<PathBuf>,
+    session_context: Option<SessionContext>,
 ) -> Result<ModelWeights> {
     // Every process that loads the model passes here (the server, the
     // bench, the probes, the tests with a real checkpoint): one per machine,
@@ -616,9 +658,30 @@ pub fn load(
     // slots, placed by the usage ranking next to the checkpoint (or the
     // one named), uniform without one. Asked for explicitly, or sized from
     // the machine's memory when the checkpoint does not fit it.
+    // The server's session cache under an expert cache: one full session at
+    // its context length, which the plan keeps free and the server then
+    // budgets exactly (`ModelWeights::session_reserve`). The draft head only
+    // stays loaded under the cache when asked for (below), so only then does
+    // its cache count.
+    let drafts_under_cache = with_mtp
+        && config.mtp.is_some()
+        && std::env::var_os("LILY_EXPERT_CACHE_DRAFTS").is_some();
+    let session = match session_context {
+        Some(s) => super::model::session_bytes(
+            config,
+            drafts_under_cache,
+            s.max_seq,
+            s.checkpoints,
+        )?,
+        None => 0,
+    };
+    let planned = expert_slots.is_none();
     let expert_slots = expert_slots.or_else(|| {
-        auto_expert_slots(loader.checkpoint(), config, storage, memory_budget)
+        auto_expert_slots(loader.checkpoint(), config, storage, memory_budget, session)
     });
+    let session_reserve =
+        (planned && expert_slots.is_some() && session_context.is_some())
+            .then_some(session);
     let expert_cache = match expert_slots {
         Some(n_slots) => {
             let (layers, e) = (config.num_hidden_layers, config.num_experts);
@@ -750,5 +813,10 @@ pub fn load(
         expert_cache,
         buffers,
         planned_memory: memory_budget.or_else(physical_memory),
+        session_reserve,
     })
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/qwen4exp/weights.rs"]
+mod tests;

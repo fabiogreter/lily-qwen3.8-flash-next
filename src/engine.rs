@@ -196,6 +196,11 @@ pub struct LoadOptions {
     /// ranking); `None` persists nothing. `LILY_EXPERT_USAGE_OUT` overrides
     /// it.
     pub expert_usage_out: Option<std::path::PathBuf>,
+    /// The session the server keeps room for when the expert cache engages
+    /// (its `--max-seq` and checkpoints per session): the plan reserves one
+    /// full session and the server budgets exactly that. `None` (the bench,
+    /// the probes) reserves nothing.
+    pub session_context: Option<crate::qwen4exp::weights::SessionContext>,
 }
 
 /// Which draw a decode pass ends with.
@@ -288,6 +293,21 @@ pub trait LanguageModel: Sized {
     /// The memory the load planned for (`LoadOptions::memory_budget`, else
     /// the machine's physical memory); `None` when unknown.
     fn planned_memory(&self) -> Option<u64> {
+        None
+    }
+
+    /// What the expert cache's plan kept free for the session cache (one
+    /// full session, `LoadOptions::session_context`); `None` when no plan
+    /// reserved anything.
+    fn session_reserve(&self) -> Option<u64> {
+        None
+    }
+
+    /// GPU bytes one session holds with caches for `capacity` tokens and
+    /// `checkpoints` recurrent snapshots, from the model's shapes; `None`
+    /// for architectures that do not compute it.
+    fn session_bytes(&self, capacity: usize, checkpoints: usize) -> Option<u64> {
+        let _ = (capacity, checkpoints);
         None
     }
 

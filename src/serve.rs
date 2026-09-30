@@ -48,8 +48,8 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::engine::{
-    DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, VisionMode,
-    VisionTower,
+    DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, SnapshotApi,
+    VisionMode, VisionTower,
 };
 use crate::generate::{FinishReason, GenerateOptions, Generator};
 use crate::kernels::attention::MAX_SEQ;
@@ -57,6 +57,7 @@ use crate::kernels::sample::SamplingParams;
 use crate::metal::MetalContext;
 use crate::qwen4exp::image::ImageLimits;
 use crate::qwen4exp::ngram::BackgroundPreload;
+use crate::qwen4exp::weights::SessionContext;
 use crate::qwen4exp::{
     ImageEmbeds, NgramStorage, Qwen4ExpModel, VisionInput, positions_for_prompt,
 };
@@ -578,6 +579,12 @@ impl<M: LanguageModel> Engine<M> {
                     .disk_cache_dir
                     .as_ref()
                     .map(|d| d.join("expert-usage.json")),
+                // Under an expert cache the plan keeps one full session at
+                // this context free, and the budget below is exactly that.
+                session_context: Some(SessionContext {
+                    max_seq: effective_max_seq(options.max_seq, 0),
+                    checkpoints: CHECKPOINTS_PER_SESSION,
+                }),
             },
         )?;
         let drafts = options.mtp_drafts.min(model.max_drafts());
@@ -662,9 +669,21 @@ impl<M: LanguageModel> Engine<M> {
         let working_set = ctx.recommended_working_set();
         let paged = model.paged_storage_bytes();
         let gb = |bytes: usize| bytes as f64 / 1e9;
-        let budget = match options.cache_bytes {
-            Some(b) => b,
-            None => {
+        let budget = match (options.cache_bytes, model.session_reserve()) {
+            (Some(b), _) => b,
+            // The expert cache's plan kept exactly one full session free:
+            // budget that, not the working-set arithmetic, whose floor would
+            // come on top of the plan and eat the reserve it keeps for the
+            // system and the page cache the experts stream through.
+            (None, Some(reserve)) => {
+                eprintln!(
+                    "session cache budget: {:.1} GB = one full {max_seq}-token session, planned into the \
+                     expert cache's memory; more sessions spill to the disk tier; override with --cache-bytes",
+                    gb(reserve as usize),
+                );
+                reserve as usize
+            }
+            (None, None) => {
                 let (budget, floored) =
                     derive_cache_budget(working_set, allocated, paged);
                 eprintln!(
@@ -1558,6 +1577,23 @@ fn warm_up<M: LanguageModel>(
     // Snapshot/restore compile no shaders but exercise the blit path once.
     let snapshot = state.snapshot(ctx)?;
     state.restore(ctx, &snapshot)?;
+    // The expert cache's plan reserves a session from the shapes alone
+    // (`LanguageModel::session_bytes`); a drift from what a real state and
+    // snapshot hold would silently under- or over-reserve.
+    if let (Some(live), Some(with_one)) =
+        (model.session_bytes(4, 0), model.session_bytes(4, 1))
+    {
+        let (state_bytes, snapshot_bytes) =
+            (state.bytes() as u64, snapshot.bytes() as u64);
+        if live != state_bytes || with_one - live != snapshot_bytes {
+            eprintln!(
+                "warning: the session size formula gives {live} B per state and {} B per snapshot, \
+                 the loaded model holds {state_bytes} and {snapshot_bytes}; the expert cache's session \
+                 reserve is off by that much",
+                with_one - live
+            );
+        }
+    }
     let (built, build_secs) = ctx.build_stats();
     let prefill = crate::stats::counters().since(counters_before).prefill;
     let vm = crate::stats::vm_counters()

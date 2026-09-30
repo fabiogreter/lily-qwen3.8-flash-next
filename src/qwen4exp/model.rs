@@ -1314,6 +1314,7 @@ impl Qwen4ExpModel {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -1331,6 +1332,7 @@ impl Qwen4ExpModel {
         expert_usage: Option<std::path::PathBuf>,
         memory_budget: Option<u64>,
         expert_usage_out: Option<std::path::PathBuf>,
+        session_context: Option<weights::SessionContext>,
     ) -> Result<Self> {
         let config = Qwen4ExpConfig::from_model_dir(&dir)?;
         ensure!(
@@ -1355,6 +1357,7 @@ impl Qwen4ExpModel {
             expert_usage,
             memory_budget,
             expert_usage_out,
+            session_context,
         )?;
         let hasher = match &config.ple {
             Some(p) => Some(NgramHasher::new(
@@ -3420,6 +3423,47 @@ impl Qwen4ExpModel {
     }
 }
 
+/// GPU bytes one session holds with caches for `capacity` tokens and
+/// `checkpoints` recurrent snapshots, the draft head's cache and hidden
+/// included when `mtp`: what `DecodeState::bytes` and `Snapshot::bytes` add
+/// up to, from the config alone, so that the expert cache's plan can reserve
+/// a session before any state exists. `warm_up` in the server compares it
+/// with a real state and snapshot of the loaded model.
+pub(crate) fn session_bytes(
+    cfg: &Qwen4ExpConfig,
+    mtp: bool,
+    capacity: usize,
+    checkpoints: usize,
+) -> Result<u64> {
+    use super::config::LayerType;
+    let capacity = round_capacity(capacity)?;
+    let count =
+        |kind: LayerType| cfg.layer_types.iter().filter(|t| **t == kind).count();
+    // `DecodeState::cache_bytes`: every attention layer, the draft head's too.
+    let attn_layers = count(LayerType::FullAttention) + usize::from(mtp);
+    let per_token = 2 * cfg.num_key_value_heads * cfg.head_dim * 2 + INDEXER_D * 2;
+    let blocks = (capacity / cfg.indexer.compress_ratio).max(1) * INDEXER_D * 2;
+    let caches = attn_layers * (capacity * per_token + blocks);
+    // `Qwen4ExpModel::new_state`: per GDN layer the state and two conv
+    // windows (a snapshot keeps one), the PLE's two windows (one), the draft
+    // head's hidden.
+    let state = cfg.linear_num_value_heads
+        * GDN_HEAD_DIM
+        * GDN_HEAD_DIM
+        * GDN_STATE_DTYPE.size();
+    let conv =
+        cfg.gdn_conv_channels() * (cfg.linear_conv_kernel_dim - 1) * DType::BF16.size();
+    let ple = cfg
+        .ple
+        .as_ref()
+        .map_or(0, |p| cfg.hc_width() * p.conv_state_len() * DType::BF16.size());
+    let hidden = if mtp { cfg.hc_width() * DType::BF16.size() } else { 0 };
+    let gdn_layers = count(LayerType::LinearAttention);
+    let live = caches + gdn_layers * (state + 2 * conv) + 2 * ple + hidden;
+    let snapshot = gdn_layers * (state + conv) + ple + hidden;
+    Ok((live + checkpoints * snapshot) as u64)
+}
+
 /// Rounds a requested capacity up to the growth step, within the kernel limit.
 fn round_capacity(tokens: usize) -> Result<usize> {
     ensure!(tokens <= MAX_SEQ, "capacity {tokens} exceeds kernel limit {MAX_SEQ}");
@@ -3729,6 +3773,7 @@ impl LanguageModel for Qwen4ExpModel {
             expert_usage,
             memory_budget,
             expert_usage_out,
+            options.session_context,
         )
     }
 
@@ -3738,6 +3783,15 @@ impl LanguageModel for Qwen4ExpModel {
 
     fn planned_memory(&self) -> Option<u64> {
         self.weights.planned_memory
+    }
+
+    fn session_reserve(&self) -> Option<u64> {
+        self.weights.session_reserve
+    }
+
+    fn session_bytes(&self, capacity: usize, checkpoints: usize) -> Option<u64> {
+        session_bytes(&self.config, self.weights.mtp.is_some(), capacity, checkpoints)
+            .ok()
     }
 
     fn vision_tower(&self) -> Option<VisionTower> {

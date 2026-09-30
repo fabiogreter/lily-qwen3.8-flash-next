@@ -27,7 +27,11 @@ struct Cli {
     #[arg(long, default_value = "127.0.0.1:8000")]
     bind: String,
 
-    /// Maximum prompt plus completion length per request.
+    /// Maximum prompt plus completion length per request. With the expert
+    /// cache (a machine that cannot hold the checkpoint, or `--memory-gb`)
+    /// it also sizes the session reserve the plan keeps free: one full
+    /// session, 4.2 GB at 131072 and 7.9 GB at 262144, taken from the expert
+    /// slots. 131072 is the sensible choice on 64 GB.
     #[arg(long, default_value_t = 131072)]
     max_seq: usize,
 
@@ -35,7 +39,8 @@ struct Cli {
     /// e.g. `24G`. Default: what the device's recommended working set leaves
     /// after the weights, the paged n-gram table (32 GB of page cache with
     /// `--ngram-table paged`) and 8 GiB of headroom for other applications,
-    /// but at least 8 GiB; the log states the derivation.
+    /// but at least 8 GiB; with the expert cache exactly one full session at
+    /// `--max-seq`, which its plan kept free. The log states the derivation.
     #[arg(long)]
     cache_bytes: Option<String>,
 

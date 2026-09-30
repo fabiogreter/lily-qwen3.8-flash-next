@@ -60,6 +60,31 @@ busiest experts are the resident ones; without it the placement is
 uniform. The load prints what it decided, and the bench prints the
 cache's lookups and misses per phase.
 
+### Sessions and the context length
+
+The server's session cache comes out of the same memory as the slab. The
+plan keeps exactly one full session at `--max-seq` free before it sizes
+the slab, and the server's session budget is then exactly that session
+(`--cache-bytes` still overrides): its per-token caches, the recurrent
+state and three checkpoints of it, without the draft head, which the cache
+leaves unloaded. More sessions spill to the disk tier and come back from
+it. Before, the budget was derived separately and fell to its 8 GiB floor
+on 64 GB, on top of the plan, which left the system about 5 GB of the 13
+the plan keeps for it and for the page cache the experts stream through.
+
+`--max-seq` therefore decides how many experts stay resident:
+
+| `--max-seq` | one session | slots it takes (of 16 441 at 64 GB) |
+|---:|---:|---:|
+| 131 072 (the default) | 4.2 GB | about 1 630 |
+| 262 144 | 7.9 GB | about 3 080 |
+
+On 64 GB, 131 072 is the sensible choice; 262 144 costs a fifth of the
+slots for a context most conversations never reach. The slot counts are
+computed from the sizes, not measured; the load prints the real ones. The
+bench (`lily-bench`) reserves no session and plans as before, so its slot
+counts stay comparable with the measurements below.
+
 ## What was built
 
 `ExpertCache` (`src/qwen4exp/expert_cache.rs`) with `ExpertStore` and
