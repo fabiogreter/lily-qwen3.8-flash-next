@@ -4,7 +4,8 @@ lily-qwen3.8-flash-next is a Metal inference server for Apple Silicon that
 serves one model, Qwen3.8-Flash-Next. It is a fork of Perplexity's [lily](https://github.com/perplexityai/pplx-garden/tree/main/lily),
 a compact Metal engine for Qwen3.6-35B-A3B that decoded about 30 % faster
 than mlx-lm ([their write-up](https://www.perplexity.ai/hub/blog/optimizing-on-device-inference-for-apple-silicon)).
-The fork ports that engine to Qwen3.8-Flash-Next and tunes it for this
+
+This fork ports that engine to Qwen3.8-Flash-Next and tunes it for this
 model: hand-written Metal kernels, pipelined decode steps, speculative
 decoding with the model's own draft head, conversations cached across
 requests and restarts, and an expert cache that runs the model on half the
@@ -44,7 +45,7 @@ opencode. The differences:
   the server never fetches URLs. A 1920 x 1080 screenshot costs about 2 000
   prompt tokens. No video.
 - **One request runs at a time.** Others queue, with 503 when the queue is
-  full.
+  full. Batching was not in scope yet, but could be implemented if required.
 - **Thinking is on by default.** `reasoning_effort` (`none`, `low`,
   `medium`, `high`) sets it per request; `--thinking` and
   `--reasoning-effort` set the server's default.
@@ -73,24 +74,30 @@ keep the cost of context at a few percent of a step. Three drafts per step
 were slower than two on both engines. Under sustained load the GPU clock
 sags a few percent, which slows the speculative and prefill rows slightly.
 
-The quantizations differ slightly (affine 4-bit, group 64, against
+During actual use with opencode, prefill is often quite a bit slower, due to
+most turns being short, so that fixed per-request costs dominate.
+
+Decode in practice is typically faster, probably because the speculative
+decoding gets more hits than in the synthetic tests, usually still >100tok/s
+at 220-230K context. This is most likely task-dependent, as the draft head may
+be better at some tasks than others.
+
+The quantizations for the tests differ slightly (affine 4-bit, group 64, against
 UD-IQ4_XS), and the llama.cpp MTP rows use a one-line fix the shipped build
 lacks. Method, noise and the full record: [docs/performance.md](docs/performance.md).
 
 ### Smaller machines
 
-The checkpoint is 104.6 GB: 68 GB of experts, the 32 GB hashed n-gram
-table, and 5 GB of everything else. The table always stays on disk and is
-read through the page cache, so 72 GB is what has to be resident.
+On smaller machines, lily automatically employs an expert cache that
+keeps only the most used experts in GPU memory and streams the rest from
+disk. Expert usage is tracked during runtime, so the cache adapts to your
+usage. The cached configuration then gets saved to disk and reused on the
+next run.
 
-On a machine that cannot hold that, the engine keeps the most-used experts
-on the GPU (about two thirds of them on 64 GB) and reads the rest from disk
-when they are routed to. The placement starts from a usage ranking
-(`expert-usage.json` next to the checkpoint; the measured one is in
-`tools/bench/`) and adapts to what the machine runs. On an 8K prompt with
-cold reads this gives about 930 tok/s prefill and 55 to 65 tok/s decode,
-against 2 250 and 87 fully resident, with the same tokens. Speculative
-decoding is off in this mode.
+Moving experts around between RAM and disk does of course cost time. On a
+simulated 64 GB machine, prefill was measured at about 930 tok/s, and decode
+at around 50-65 tok/s. Speculative decoding is off in this mode, as it requires
+additional expert reads and thus slows down the process.
 
 The cache sizes itself from physical memory; `--memory-gb 64` plans for
 64 GB instead, which is also how to try the mode on a bigger machine.
@@ -98,11 +105,14 @@ Details: [docs/low-ram-experts.md](docs/low-ram-experts.md).
 
 ### MLX engines
 
-No released mlx-lm runs this model. MLX-based engines with their own
-implementation publish M5 Max numbers:
-[MTPLX](https://mtplx.com/benchmarks/) 79 tok/s at 9K and 61 at 109K with
-its speculative path (44 without), [oMLX](https://github.com/jundot/omlx/releases)
+At the time of testing, no released official mlx-lm ran this model. MLX-based
+engines with their own implementation publish M5 Max numbers:
+
+- [MTPLX](https://mtplx.com/benchmarks/) 79 tok/s at 9K and 61 at 109K with
+its speculative path (44 without)
+- [oMLX](https://github.com/jundot/omlx/releases)
 58 to 70 tok/s with its speculative path in its 0.7.0 development builds.
+
 We have not re-measured them, and their quantizations and settings differ.
 
 ## The model
@@ -172,7 +182,7 @@ token-prefix cache.
 - Speculative decoding with the model's own head, exact when the request
   samples.
 - Decode kernels tuned until a step runs within 10 to 15 % of what its
-  chain of reads can stream.
+  chain of reads can stream (the bandwidth limit, accounting for ramp times).
 - Prefill on the tensor ops: sparse attention over the union of neighbouring
   queries' selections, a chunked Gated DeltaNet scan, and better tiling for
   the expert GEMM.
