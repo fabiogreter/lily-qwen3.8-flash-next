@@ -781,14 +781,15 @@ The store already computes how far a prompt agrees with each lineage and
 threw the number away. Now `acquire` returns the **agreement**: the longest
 common prefix between the prompt and any lineage, resident or on disk,
 capped at `prompt_len - 1`. It is never below the reused position. When the
-agreement is at least `--durable-min-tokens` (default 1 024) and strictly
-beyond where the request resumed, the engine materialises it: it prefills to
+agreement reaches at least `--durable-min-tokens` (default 1 024) beyond
+where the request resumed, the engine materialises it: it prefills to
 the agreement, writes a **durable prefix entry** to the disk tier (the
 per-token caches for the shared prefix and a snapshot of the recurrent state
 at its end, with the boundary as the entry's live end), drops the snapshot,
 and prefills the rest as usual. Two real prompts shared that prefix, so a
 third is likely. Within one growing conversation the agreement equals the
-reused position and nothing is written turn after turn; a parallel run that
+reused position, or runs a few hundred tokens past it when a turn is
+re-rendered differently, and nothing is written turn after turn; a parallel run that
 shares only the preamble writes it once, and the third run resumes from it.
 The prefill is split at the boundary on purpose: chunks are 4 096 tokens and
 the batched kernels are not row-count invariant, so a run resuming at the
@@ -816,8 +817,8 @@ Two diagnostics come with it. The request's `timings` object and
 `GET /v1/timings` carry `agreement_tokens` on every request and
 `durable_prefix_tokens` on the one that wrote an entry; the log line adds
 `agreement N` whenever it exceeds the cached count and `durable prefix N
-written in Ts`. And when a prompt agreed for at least the threshold beyond
-where it could resume, the server prints one `divergence at N` line with the
+written in Ts`. And when a prompt agreed for at least the threshold and
+beyond where it could resume, the server prints one `divergence at N` line with the
 decoded text either side of the seam and what the cached lineage continued
 with. An ordinary hit diverges too, at the user's message, and prints
 nothing: the line is for shared text that was not reusable. A client

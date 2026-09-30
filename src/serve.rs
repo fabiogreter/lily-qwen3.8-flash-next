@@ -1024,6 +1024,9 @@ impl<M: LanguageModel> Engine<M> {
         // once, as the text either side of it in this prompt and what the
         // cached lineage continued with. This is how a client that renders
         // the same preamble differently between runs is found at a glance.
+        // Unlike the durable boundary, the threshold here is absolute: a
+        // short fork inside one conversation (a re-rendered tool call, a
+        // re-tokenized answer) is exactly what this line should surface.
         // An ordinary hit (`agreement == reused`) diverges too, at the user's
         // message, and says nothing worth a line of prompt text in the log.
         if min_tokens > 0

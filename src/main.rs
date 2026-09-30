@@ -53,9 +53,9 @@ struct Cli {
     #[arg(long, default_value = "3d")]
     disk_cache_ttl: String,
 
-    /// A prefix at least this many tokens long that two prompts shared but
-    /// that no cached session could resume from (two agent runs with the
-    /// same preamble diverge before any checkpoint) is written to the disk
+    /// A prefix that two prompts shared for at least this many tokens beyond
+    /// where the request could resume (two agent runs with the same preamble
+    /// diverge before any checkpoint) is written to the disk
     /// tier as a durable prefix entry, so later runs resume from it instead
     /// of prefilling it again. Needs the disk tier; `0` turns it off.
     #[arg(long, default_value_t = 1024)]

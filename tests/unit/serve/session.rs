@@ -94,6 +94,12 @@ fn boundary_rule_materialises_only_a_long_unresumed_agreement() {
     assert_eq!(boundary_position(1, 0, 0, 1), None);
     // Exactly the threshold counts.
     assert_eq!(boundary_position(1024, 0, 3000, 1024), Some(1024));
+    // The threshold is measured from the resume position: a turn that
+    // resumed at 74 000 and diverged 240 tokens later is an ordinary fork
+    // inside one conversation, not a shared preamble.
+    assert_eq!(boundary_position(74_240, 74_000, 90_000, 1024), None);
+    assert_eq!(boundary_position(75_023, 74_000, 90_000, 1024), None);
+    assert_eq!(boundary_position(75_024, 74_000, 90_000, 1024), Some(75_024));
 }
 
 #[test]

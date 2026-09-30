@@ -159,21 +159,21 @@ pub fn agreement<'a>(
 
 /// Where a durable prefix entry should be materialised for a prompt that
 /// agreed with a cached lineage for `agreement` tokens but resumed at
-/// `reused`: the agreement itself when it is long enough to be worth a disk
-/// entry (`min_tokens`; 0 turns the feature off), lies beyond where the run
-/// resumed (so no resumable state exists there yet) and leaves at least one
-/// token to feed. Two real prompts shared that prefix, so a third is likely;
-/// within one growing conversation `reused == agreement` and nothing is
-/// written turn after turn.
+/// `reused`: the agreement itself when it reaches at least `min_tokens`
+/// beyond where the run resumed (0 turns the feature off) and leaves at least
+/// one token to feed. Two real prompts shared that prefix, so a third is
+/// likely. Measuring from the resume position keeps ordinary forks inside one
+/// conversation out of the disk tier: a turn that resumes at the previous
+/// request's end and diverges a few hundred tokens later (a regenerated
+/// answer, a re-tokenized message) has nothing a later run would reuse.
 pub fn boundary_position(
     agreement: usize,
     reused: usize,
     prompt_len: usize,
     min_tokens: usize,
 ) -> Option<usize> {
-    let worth_it = min_tokens > 0 && agreement >= min_tokens;
-    (worth_it && agreement > reused && agreement <= prompt_len.checked_sub(1)?)
-        .then_some(agreement)
+    let worth_it = min_tokens > 0 && agreement.saturating_sub(reused) >= min_tokens;
+    (worth_it && agreement <= prompt_len.checked_sub(1)?).then_some(agreement)
 }
 
 /// The best position to resume `prompt` from given a lineage's tokens,

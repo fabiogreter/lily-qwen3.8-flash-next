@@ -141,7 +141,8 @@ Prompt state is cached in three tiers; clients see them only as
 3. **Durable prefixes.** Runs of the same agent share a preamble (system
    prompt, tool schemas, repository instructions) and diverge at the user's
    message, so no run can resume another's checkpoint. When the shared part
-   is at least 1 024 tokens, the server stores it separately and every later
+   runs at least 1 024 tokens past where a run could resume, the server
+   stores it separately and every later
    run starts from there.
 
 Images are identified by their content, so two different screenshots never
