@@ -63,6 +63,33 @@ fn hasher_matches_reference_and_respects_eos_segments() {
     assert_eq!(NgramHasher::advance(hist, &[]), hist);
 }
 
+/// A chunked prefill hashes chunk k+1 (staged ahead, while the GPU runs
+/// chunk k) with the history advanced over chunk k. For every split point,
+/// eos tokens on and next to the boundary included, that gives the ids of
+/// hashing the whole prompt at once.
+#[test]
+fn chunked_ids_with_advanced_history_equal_whole_prompt_ids() {
+    let mult = [23_703_573_157_769u64, 20_109_073_645_365, 8_052_911_324_071];
+    let sizes: Vec<u64> = (0..16).map(|j| 20_000_003 + 10 * j as u64).collect();
+    let offsets: Vec<u64> = (0..16).map(|j| j as u64 * 20_000_100).collect();
+    let eos = 248_044u32;
+    let hasher = NgramHasher::new(&mult, &sizes, &offsets, 8, eos).expect("hasher");
+    let tokens = vec![17u32, 248_319, eos, 5, 6, eos, eos, 9, 11, eos, 3, 3, 3, 7];
+    let hist = [eos, 42];
+    let mut whole = Vec::new();
+    hasher.ids(&tokens, hist, &mut whole);
+    for chunk in 1..=tokens.len() {
+        let mut h = hist;
+        let mut chunked = Vec::new();
+        for part in tokens.chunks(chunk) {
+            hasher.ids(part, h, &mut chunked);
+            h = NgramHasher::advance(h, part);
+        }
+        assert_eq!(chunked, whole, "chunks of {chunk}");
+        assert_eq!(h, NgramHasher::advance(hist, &tokens));
+    }
+}
+
 /// Writes a two-shard checkpoint holding a tiny table split across two files
 /// (the second shard shares its file with an unrelated tensor) and checks
 /// that paged gathers return the same bytes as the source rows.
@@ -433,16 +460,13 @@ fn paged_gather_overhead() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The preload reads a table that is not in the page cache: a shard written
-/// with `F_NOCACHE` (so its pages bypass the cache) is read back through the
-/// files, ends up resident, and gathers the bytes that were written.
-#[test]
-fn preload_reads_cold_shards_into_the_page_cache() {
+/// Writes a one-shard table of `rows` rows (20 code words, 5 groups) with
+/// `F_NOCACHE`, so its pages bypass the page cache and start cold. Returns
+/// the three tensors' byte lengths and the data they hold, in file order.
+fn write_cold_shard(dir: &Path, rows: usize) -> ([usize; 3], Vec<u8>) {
     use std::os::fd::AsRawFd as _;
-    let dir =
-        std::env::temp_dir().join(format!("lily-ngram-cold-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let (rows, words, groups) = (400_000usize, 20usize, 5usize);
+    std::fs::create_dir_all(dir).expect("temp dir");
+    let (words, groups) = (20usize, 5usize);
     let base =
         "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0";
     let lens = [rows * words * 4, rows * groups * 2, rows * groups * 2];
@@ -471,8 +495,82 @@ fn preload_reads_cold_shards_into_the_page_cache() {
     f.write_all(&header).unwrap();
     f.write_all(&data).unwrap();
     f.sync_all().unwrap();
-    drop(f);
+    (lens, data)
+}
 
+/// Checks that gathered row `i` holds table row `id` of [`write_cold_shard`].
+fn assert_row(
+    lens: &[usize; 3],
+    data: &[u8],
+    staged: (&[u8], &[u8], &[u8]),
+    i: usize,
+    id: u32,
+) {
+    let (words, groups) = (20usize, 5usize);
+    let (codes, scales, biases) = staged;
+    let r = id as usize;
+    let c = r * words * 4;
+    assert_eq!(&codes[i * words * 4..(i + 1) * words * 4], &data[c..c + words * 4]);
+    let s = lens[0] + r * groups * 2;
+    assert_eq!(&scales[i * groups * 2..(i + 1) * groups * 2], &data[s..s + groups * 2]);
+    let b = lens[0] + lens[1] + r * groups * 2;
+    assert_eq!(&biases[i * groups * 2..(i + 1) * groups * 2], &data[b..b + groups * 2]);
+}
+
+/// A prefill-sized batch over a cold table: the 1-in-16 sample finds it cold,
+/// so the other rows are hinted too (and their pages are not counted as
+/// sampled); the rows are the table's. Gathered again, warm, nothing beyond
+/// the sample is checked.
+#[test]
+fn a_cold_prefill_batch_hints_every_row_and_a_warm_one_only_the_sample() {
+    let dir =
+        std::env::temp_dir().join(format!("lily-ngram-dense-{}", std::process::id()));
+    let rows = 400_000usize;
+    let (lens, data) = write_cold_shard(&dir, rows);
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint");
+    let table = PagedTable::open(
+        &ckpt,
+        &shard_bases("model.language_model.layers.1.ple.", 1),
+        32,
+    )
+    .expect("paged table");
+    let cold_before = table.resident_bytes().expect("mincore") < table.bytes() / 2;
+    // 4 096 rows spread over the table, out of order: the parallel path.
+    let ids: Vec<u32> =
+        (0..4096u64).map(|i| (i * 97_331 % rows as u64) as u32).collect();
+    let n = ids.len();
+    let mut codes = vec![0u8; n * 80];
+    let mut scales = vec![0u8; n * 10];
+    let mut biases = vec![0u8; n * 10];
+    let mut gather = || {
+        let before = crate::stats::counters();
+        table.gather(&ids, &mut codes, &mut scales, &mut biases).expect("gather");
+        for (i, &id) in ids.iter().enumerate() {
+            assert_row(&lens, &data, (&codes, &scales, &biases), i, id);
+        }
+        crate::stats::counters().since(before).gather
+    };
+    let cold = gather();
+    assert_eq!(cold.checked_rows, n.div_ceil(PREFILL_CHECK_EVERY) as u64);
+    if cold_before {
+        assert!(cold.cold_pages * DENSE_HINT_SHARE >= cold.pages, "{cold:?}");
+        assert_eq!(cold.hinted_rows + cold.checked_rows, n as u64, "{cold:?}");
+    }
+    let warm = gather();
+    assert_eq!((warm.cold_pages, warm.hinted_rows), (0, 0), "{warm:?}");
+    assert_eq!(warm.checked_rows, cold.checked_rows);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The preload reads a table that is not in the page cache: a shard written
+/// with `F_NOCACHE` (so its pages bypass the cache) is read back through the
+/// files, ends up resident, and gathers the bytes that were written.
+#[test]
+fn preload_reads_cold_shards_into_the_page_cache() {
+    let dir =
+        std::env::temp_dir().join(format!("lily-ngram-cold-{}", std::process::id()));
+    let (rows, words, groups) = (400_000usize, 20usize, 5usize);
+    let (lens, data) = write_cold_shard(&dir, rows);
     let ckpt = Checkpoint::open(&dir).expect("checkpoint");
     let table = PagedTable::open(
         &ckpt,
@@ -497,19 +595,58 @@ fn preload_reads_cold_shards_into_the_page_cache() {
     let mut biases = vec![0u8; ids.len() * groups * 2];
     table.gather(&ids, &mut codes, &mut scales, &mut biases).expect("gather");
     for (i, &id) in ids.iter().enumerate() {
-        let r = id as usize;
-        let c = r * words * 4;
-        assert_eq!(&codes[i * words * 4..(i + 1) * words * 4], &data[c..c + words * 4]);
-        let s = lens[0] + r * groups * 2;
-        assert_eq!(
-            &scales[i * groups * 2..(i + 1) * groups * 2],
-            &data[s..s + groups * 2]
-        );
-        let b = lens[0] + lens[1] + r * groups * 2;
-        assert_eq!(
-            &biases[i * groups * 2..(i + 1) * groups * 2],
-            &data[b..b + groups * 2]
-        );
+        assert_row(&lens, &data, (&codes, &scales, &biases), i, id);
     }
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Host cost of gathering one prefill chunk's rows (65 536 random rows, or
+/// `ROWS`) from a real checkpoint: cold (put the table into a partly cold
+/// state first, e.g. `docs/bench/2026-10-01-ngram-prefetch/evict_table.py`),
+/// then warm twice, with the pages the system read in meanwhile. Run with
+/// `LILY_MODEL_DIR_FLASH=<ckpt> SEED=<n> cargo test --release --lib
+/// paged_cold_chunk_timing -- --ignored --nocapture`; a new `SEED` picks new
+/// rows.
+#[test]
+#[ignore = "timing only; needs LILY_MODEL_DIR_FLASH"]
+fn paged_cold_chunk_timing() {
+    let Ok(dir) = std::env::var("LILY_MODEL_DIR_FLASH") else { return };
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint");
+    let bases = shard_bases("model.language_model.layers.1.ple.", 128);
+    let table = PagedTable::open(&ckpt, &bases, 32).expect("paged table");
+    let env = |name: &str, default: u64| -> u64 {
+        std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    };
+    let n = env("ROWS", 65_536) as usize;
+    let mut seed = env("SEED", 1);
+    let ids: Vec<u32> = (0..n)
+        .map(|_| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) % table.rows() as u64) as u32
+        })
+        .collect();
+    let (cb, gb) = (table.codes_bytes(), table.group_bytes());
+    let mut codes = vec![0u8; n * cb];
+    let mut scales = vec![0u8; n * gb];
+    let mut biases = vec![0u8; n * gb];
+    for pass in ["first", "again", "again"] {
+        let before = crate::stats::counters();
+        let vm = crate::stats::vm_counters();
+        let t = std::time::Instant::now();
+        table.gather(&ids, &mut codes, &mut scales, &mut biases).unwrap();
+        let secs = t.elapsed().as_secs_f64();
+        let pageins = crate::stats::vm_counters()
+            .zip(vm)
+            .map_or(0, |(after, before)| after.since(before).pageins);
+        let g = crate::stats::counters().since(before).gather;
+        eprintln!(
+            "{pass}: {n} rows in {:.1} ms, sampled pages cold {}/{}, {} rows hinted beyond the sample, {pageins} pages read in",
+            secs * 1e3,
+            g.cold_pages,
+            g.pages,
+            g.hinted_rows
+        );
+    }
 }

@@ -352,12 +352,27 @@ const PARALLEL_ROWS: usize = 256;
 /// Decode and verify batches check every row.
 const PREFILL_CHECK_EVERY: usize = 16;
 
+/// A prefill batch whose sampled pages are at least this share cold (1 in
+/// 32) has the pages of every other row checked and hinted too. A cold
+/// page that is not hinted is read when the copy faults on it, one fault
+/// after another per copy thread and with the pager's read-around, which
+/// also reads neighbouring pages the batch does not need: a 4 096-token
+/// chunk with 45 % of its pages cold read 205 000 pages in 1.03 s with one
+/// row in 16 hinted, against the 88 000 it needs in 0.35 s with every row
+/// hinted. Checking every row of a warm chunk costs about 80 ms, so a
+/// sample that finds (next to) nothing cold skips it; at the threshold the
+/// faults cost about what the checks do.
+const DENSE_HINT_SHARE: u64 = 32;
+
 /// What the residency checks of one gather saw.
 #[derive(Default)]
 struct Residency {
     rows: u64,
     pages: u64,
     cold: u64,
+    /// Rows outside the sample checked and hinted because the sample found
+    /// the batch cold.
+    hinted: u64,
 }
 
 impl PagedTable {
@@ -493,8 +508,11 @@ impl PagedTable {
     /// first and the cold ones get a read-ahead hint, so their SSD reads
     /// overlap instead of faulting one after another during the copy
     /// (`madvise` on a resident page is a wasted system call, which the
-    /// check saves). Returns the rows checked, their pages and how many of
-    /// those were cold.
+    /// check saves). When that sample is at least [`DENSE_HINT_SHARE`]
+    /// cold, the other rows are checked and hinted as well. Returns the
+    /// sampled rows, their pages and how many of those were cold (the
+    /// sample alone, so the counts mean the same whether or not the rest
+    /// was hinted), and the rows hinted beyond the sample.
     fn stage_rows(
         &self,
         ids: &[u32],
@@ -505,17 +523,32 @@ impl PagedTable {
     ) -> Result<Residency> {
         let (cb, gb) = (self.codes_bytes(), self.group_bytes());
         let mut seen = Residency::default();
-        for &id in ids.iter().step_by(check_every) {
+        let prefetch_row = |id: u32| -> Result<(u64, u64)> {
             let (region, c, s, b) = self.locate(id as usize)?;
-            seen.rows += 1;
+            let mut seen = (0, 0);
             for (map, offset, len) in [
                 (&region.codes.map, c, cb),
                 (&region.scales.map, s, gb),
                 (&region.biases.map, b, gb),
             ] {
                 let (pages, cold) = map.prefetch(offset, len);
-                seen.pages += pages;
-                seen.cold += cold;
+                seen.0 += pages;
+                seen.1 += cold;
+            }
+            Ok(seen)
+        };
+        for &id in ids.iter().step_by(check_every) {
+            let (pages, cold) = prefetch_row(id)?;
+            seen.rows += 1;
+            seen.pages += pages;
+            seen.cold += cold;
+        }
+        if check_every > 1 && seen.cold * DENSE_HINT_SHARE >= seen.pages.max(1) {
+            for (i, &id) in ids.iter().enumerate() {
+                if i % check_every != 0 {
+                    prefetch_row(id)?;
+                    seen.hinted += 1;
+                }
             }
         }
         for (i, &id) in ids.iter().enumerate() {
@@ -560,6 +593,7 @@ impl PagedTable {
             c.gather.checked_rows += seen.rows;
             c.gather.pages += seen.pages;
             c.gather.cold_pages += seen.cold;
+            c.gather.hinted_rows += seen.hinted;
             c.gather.secs += secs;
         });
         Ok(())
@@ -602,6 +636,7 @@ impl PagedTable {
                 seen.rows += part.rows;
                 seen.pages += part.pages;
                 seen.cold += part.cold;
+                seen.hinted += part.hinted;
             }
             Ok(seen)
         })

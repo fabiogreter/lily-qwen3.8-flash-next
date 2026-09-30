@@ -713,10 +713,32 @@ reads overlap instead of faulting one after another; a resident page gets
 no hint. Decode and verify batches check every row, prefill batches every
 16th: `mincore` costs about 0.4 us a call and the calls do not scale across
 the copy threads, so checking all ~200 000 pages of a 4 096-token chunk took
-80 ms against 2 ms for the copy, and one row in 16 costs about 5 ms. The
-cold pages found are counted in the request's timings. Without the preload
-a token with new n-grams costs 0.6 ms of host time with 8 reader threads,
-or 1.8 ms serially, against 0.05 ms warm.
+80 ms against 2 ms for the copy, and one row in 16 costs about 5 ms. When
+that sample finds at least one page in 32 cold, the batch's other rows are
+checked and hinted as well. A cold page left to the copy is read when the
+copy faults on it, one fault after another per copy thread, and the pager
+reads the pages around it too, which the batch does not need: a 4 096-token
+chunk of random rows with 45% of its pages cold read 205 000 pages in
+1.03 s with one row in 16 hinted, against exactly the 88 000 it needs in
+0.35 s with every row hinted; warm, the same chunk still costs 5.6 ms,
+because a sample that finds nothing cold skips the rest. The cold pages the
+sample found, and the rows hinted beyond it, are counted in the request's
+timings. Without the preload a token with new n-grams costs 0.6 ms of host
+time with 8 reader threads, or 1.8 ms serially, against 0.05 ms warm.
+
+A prompt of more than one chunk stages chunk k+1's rows while the GPU runs
+chunk k: the prefill scratch has a second staging buffer (6.5 MB at the
+4 096-token chunk), chunk k reads buffer k mod 2, and the buffer chunk k+1
+fills was last read by chunk k-1, which completed before chunk k was
+committed. Chunk k+1's ids are hashed with the history advanced over chunk
+k, so the rows are the ones staging each chunk right before its commit
+would gather, and a test holds the two bit-identical (logits, caches and
+recurrent state, across chunk boundaries and across two prefill calls). A
+chunk's gather is a tenth of its GPU time or less, so from the second chunk
+on the staging costs nothing; only the first chunk's is on the critical
+path. That one cannot overlap much: the n-gram gather opens layer 2, so
+only the embedding and two GDN layers (about 4% of the chunk) run before
+it, and parking the pass there would put the wait inside its GPU span.
 
 **Session cache budget.** By default it is the device's recommended working
 set minus what is already allocated minus the paged weights minus 8 GiB of
@@ -1003,8 +1025,9 @@ whether the weights were pinned when the request started. `prefill_phases`
 splits `prefill_ms` so the phases plus `vision_ms` add up to it:
 `session_ms` (cache lookup, fork, disk restore, any eviction the lookup
 caused), `alloc_ms` (growing the state and the prefill scratch), `ngram_ms`
-(hashing and gathering the
-rows), `encode_ms`, `gpu_ms` (the chunks' execution from the commit
+(hashing and gathering the rows, as far as the GPU waited for it: the first
+chunk's staging and whatever of a later chunk's outlasted the chunk before
+it), `encode_ms`, `gpu_ms` (the chunks' execution from the commit
 feedback's GPU timestamps), `wait_ms` (commit to completion minus the GPU
 span), `durable_ms`, `checkpoint_ms` and the remainder `other_ms`; normal
 GPU time next to an exploding total means a host-side stall. `evictions`
@@ -1014,7 +1037,9 @@ at the `release` after the decode: sessions `evicted`, of them
 write ahead still running, and `cancelled_writes`; the log line adds an
 `evictions:` group when a spill, a wait or a cancel happened. `ngram` has the
 gathers of the prefill and the decode separately (rows, pages checked, cold
-pages, time). `memory` has the system's paging deltas (`host_statistics64`:
+pages, rows hinted beyond the sample, time); the prefill's `hidden_ms` is
+the staging time that overlapped the previous chunk's GPU execution, so
+`gather_ms` minus `hidden_ms` is roughly the exposed part in `ngram_ms`. `memory` has the system's paging deltas (`host_statistics64`:
 pageins, pageouts, swapins, swapouts, compressions, decompressions, in 16 KB
 pages) for the prefill and the decode, the memorystatus pressure level and
 the process's physical footprint and compressed bytes at the end. The
@@ -1022,8 +1047,9 @@ engine side is per-thread counters that the code doing the work adds to and
 the request subtracts (`src/stats.rs`); the system side is sampled three
 times per request, a few microseconds each. The log line appends a group
 only when it stands out: a queue over 1 s; more than 0.5 s of the prefill
-off the GPU, which also brings the memory group; n-gram gathers that took
-0.5 s of a prefill or 1 ms per decode step on average; a raised pressure
+off the GPU, which also brings the memory group; n-gram gathers that kept
+the prefill waiting 0.5 s (gather time not hidden) or took 1 ms per decode
+step on average; a raised pressure
 level, 256 MB swapped or 4 GB through the compressor in one phase. A busy
 machine has some cold n-gram pages, a few swapped pages and tens of
 thousands of compressor pages in almost every request, none of which moves

@@ -154,7 +154,9 @@ fn the_json_shape_is_the_documented_one() {
                     "checked_rows": 0,
                     "pages": 0,
                     "cold_pages": 0,
+                    "hinted_rows": 0,
                     "gather_ms": 0.0,
+                    "hidden_ms": 0.0,
                 },
                 "decode": {
                     "batches": 0,
@@ -162,7 +164,9 @@ fn the_json_shape_is_the_documented_one() {
                     "checked_rows": 0,
                     "pages": 0,
                     "cold_pages": 0,
+                    "hinted_rows": 0,
                     "gather_ms": 0.0,
+                    "hidden_ms": 0.0,
                 },
             },
             "memory": {
@@ -323,7 +327,9 @@ fn diagnostics_are_always_in_the_json() {
                 checked_rows: 100,
                 pages: 320,
                 cold_pages: 0,
+                hinted_rows: 0,
                 secs: 0.001,
+                hidden_secs: 0.0005,
             }
             .into(),
             decode: GatherStats::default(),
@@ -339,6 +345,7 @@ fn diagnostics_are_always_in_the_json() {
     assert_eq!(json["prefill_phases"]["gpu_ms"], 900.0);
     assert_eq!(json["ngram"]["prefill"]["rows"], 1600);
     assert_eq!(json["ngram"]["prefill"]["checked_rows"], 100);
+    assert_eq!(json["ngram"]["prefill"]["hidden_ms"], 0.5);
     assert_eq!(json["ngram"]["decode"]["cold_pages"], 0);
     assert_eq!(json["memory"]["pressure"], "normal");
     assert_eq!(json["memory"]["prefill"]["swapins"], 0);
@@ -395,6 +402,25 @@ fn the_log_line_shows_only_what_stands_out() {
     let details = cold.log_details();
     assert!(!details.contains("prefill phases"), "{details}");
     assert!(details.contains("ngram cold pages: prefill 120/840 checked"), "{details}");
+
+    // The same gathers staged ahead, hidden behind the GPU but for 100 ms,
+    // cost the prefill too little to report.
+    let hidden = base.with_diagnostics(
+        0.0,
+        PrefillPhases::split(0.3, 0.0, parts(0.01, 0.25, 0.0)),
+        NgramStats {
+            prefill: GatherStats {
+                cold_pages: 120,
+                pages: 840,
+                gather_ms: 620.0,
+                hidden_ms: 520.0,
+                ..GatherStats::default()
+            },
+            decode: GatherStats { pages: 576, ..GatherStats::default() },
+        },
+        MemoryStats::from_samples([None, None, None], Some(1), None),
+    );
+    assert!(!hidden.log_details().contains("ngram cold"), "{}", hidden.log_details());
     assert!(
         details.contains("memory: pressure warning, footprint 80.1 GB"),
         "{details}"

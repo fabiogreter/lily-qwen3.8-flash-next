@@ -9,6 +9,7 @@ fn counters_are_per_thread_and_subtract_to_what_a_phase_added() {
         c.gather.pages += 50;
         c.gather.cold_pages += 3;
         c.gather.secs += 0.002;
+        c.gather.hidden_secs += 0.25;
         c.prefill.gpu_secs += 1.5;
     });
     let added = counters().since(before);
@@ -22,6 +23,7 @@ fn counters_are_per_thread_and_subtract_to_what_a_phase_added() {
         (1, 16, 50, 3)
     );
     assert!((added.gather.secs - 0.002).abs() < 1e-12);
+    assert!((added.gather.hidden_secs - 0.25).abs() < 1e-12);
     assert!((added.prefill.gpu_secs - 1.5).abs() < 1e-12);
     assert_eq!(added.prefill.chunks, 0);
     // Another thread starts from zero and does not see this one's counts.

@@ -119,8 +119,10 @@ pub struct PrefillPhases {
     pub session_ms: f64,
     /// Growing the decode state's caches and the prefill scratch.
     pub alloc_ms: f64,
-    /// Hashing the n-gram ids and gathering their rows (`ngram.prefill`
-    /// breaks the gathers down).
+    /// Hashing the n-gram ids and gathering their rows, as far as the GPU
+    /// waited for it: the first chunk's staging and whatever of a later
+    /// chunk's outlasted the chunk before it (`ngram.prefill` breaks the
+    /// gathers down; its `hidden_ms` is the part that overlapped the GPU).
     pub ngram_ms: f64,
     /// Encoding the chunks' passes on the host.
     pub encode_ms: f64,
@@ -278,8 +280,16 @@ pub struct GatherStats {
     pub pages: u64,
     /// Of those, the ones that were not resident, each a read from the SSD.
     pub cold_pages: u64,
+    /// Rows outside the prefill's 1-in-16 sample that were checked and
+    /// hinted too, because the sample found their chunk cold (1 page in 32
+    /// or more); 0 for a warm prefill and in the decode.
+    pub hinted_rows: u64,
     /// Wall time in the gathers, the checks included.
     pub gather_ms: f64,
+    /// Staging time (hashing and gathers) that ran while the GPU executed
+    /// the previous prefill chunk and so cost nothing; the exposed rest is
+    /// `prefill_phases.ngram_ms`. Always 0 in the decode.
+    pub hidden_ms: f64,
 }
 
 impl From<stats::Gather> for GatherStats {
@@ -290,7 +300,9 @@ impl From<stats::Gather> for GatherStats {
             checked_rows: g.checked_rows,
             pages: g.pages,
             cold_pages: g.cold_pages,
+            hinted_rows: g.hinted_rows,
             gather_ms: round(g.secs * 1e3, 1e3),
+            hidden_ms: round(g.hidden_secs * 1e3, 1e3),
         }
     }
 }
@@ -369,8 +381,8 @@ const LOG_QUEUE_MS: f64 = 1_000.0;
 /// ... the prefill phases once this much of the prefill was spent off the
 /// GPU (a normal prefill spends a few tens of milliseconds there).
 const LOG_HOST_MS: f64 = 500.0;
-/// ... the n-gram gathers once the prefill spent this long in them (they
-/// are on its critical path) ...
+/// ... the n-gram gathers once the prefill waited this long for them (the
+/// gather time the GPU did not hide) ...
 const LOG_PREFILL_GATHER_MS: f64 = 500.0;
 /// ... or a decode step spent this long in them on average, more than the
 /// parked window that hides the host's staging (docs/architecture.md,
@@ -490,14 +502,15 @@ impl Timings {
         }
         let (np, nd) = (&self.ngram.prefill, &self.ngram.decode);
         let decode_per_step = nd.gather_ms / nd.batches.max(1) as f64;
-        if np.gather_ms >= LOG_PREFILL_GATHER_MS
+        if np.gather_ms - np.hidden_ms >= LOG_PREFILL_GATHER_MS
             || decode_per_step >= LOG_DECODE_GATHER_MS_PER_STEP
         {
             parts.push(format!(
-                "ngram cold pages: prefill {}/{} checked (gather {}), decode {}/{} (gather {})",
+                "ngram cold pages: prefill {}/{} checked (gather {}, {} hidden), decode {}/{} (gather {})",
                 np.cold_pages,
                 np.pages,
                 secs(np.gather_ms),
+                secs(np.hidden_ms),
                 nd.cold_pages,
                 nd.pages,
                 secs(nd.gather_ms),

@@ -344,6 +344,10 @@ pub struct Qwen4ExpModel {
     prefill_chunk: usize,
     /// Bytes the gathered-row scratch of the tiled sparse attention may take.
     tile_row_budget: usize,
+    /// Whether a multi-chunk prefill stages chunk k+1's n-gram rows while
+    /// the GPU runs chunk k (paged table only; on by default, off for the
+    /// bit-identity test of the staging pipeline).
+    ngram_ahead: bool,
 }
 
 pub(super) enum LayerState {
@@ -784,6 +788,10 @@ pub(super) struct PleScratch {
     ids: Tensor,
     /// Gathered rows for the paged table, at full capacity.
     stage: Option<Rc<StagedRows>>,
+    /// A second staging buffer of the same size (prefill scratch only): a
+    /// chunked prefill stages the next chunk's rows here while the GPU reads
+    /// the current chunk's from `stage`, alternating per chunk.
+    stage_alt: Option<Rc<StagedRows>>,
     emb: Tensor,
     key: Tensor,
     key_n: Tensor,
@@ -799,14 +807,15 @@ impl PleScratch {
         cfg: &Qwen4ExpConfig,
         rows: usize,
         table: &NgramTable,
+        double_staging: bool,
     ) -> Result<Self> {
         let ple = cfg.ple.as_ref().expect("PLE scratch without PLE config");
         let (h, wide) = (cfg.hidden_size, cfg.hc_width());
         let bf = DType::BF16;
         let heads = ple.ngram_heads();
-        let (ids, stage) = match table {
+        let (ids, stage, stage_alt) = match table {
             NgramTable::Resident(_) => {
-                (Tensor::zeros(ctx, &[rows, heads], DType::U32)?, None)
+                (Tensor::zeros(ctx, &[rows, heads], DType::U32)?, None, None)
             }
             NgramTable::Paged(paged) => {
                 // Staged rows are gathered with their own sequential ids.
@@ -817,12 +826,17 @@ impl PleScratch {
                     &[rows, heads],
                     DType::U32,
                 )?;
-                (ids, Some(Rc::new(StagedRows::new(ctx, paged, rows * heads)?)))
+                let stage = |ctx| -> Result<Rc<StagedRows>> {
+                    Ok(Rc::new(StagedRows::new(ctx, paged, rows * heads)?))
+                };
+                let alt = if double_staging { Some(stage(ctx)?) } else { None };
+                (ids, Some(stage(ctx)?), alt)
             }
         };
         Ok(Self {
             ids,
             stage,
+            stage_alt,
             emb: Tensor::zeros(ctx, &[rows, ple.embed_dim], bf)?,
             key: Tensor::zeros(ctx, &[rows, wide], bf)?,
             key_n: Tensor::zeros(ctx, &[rows, wide], bf)?,
@@ -834,9 +848,28 @@ impl PleScratch {
     }
 
     fn rows(&self, m: usize) -> Result<Self> {
+        self.rows_on(m, 0)
+    }
+
+    /// [`Self::rows`] reading its staged rows from staging buffer `buffer`
+    /// (0 is `stage`, 1 is `stage_alt`, which must exist for a paged table).
+    /// The view's `stage` is that buffer and it has no second one.
+    pub(super) fn rows_on(&self, m: usize, buffer: usize) -> Result<Self> {
+        let stage = match buffer {
+            0 => self.stage.clone(),
+            1 => {
+                ensure!(
+                    self.stage_alt.is_some() || self.stage.is_none(),
+                    "no second n-gram staging buffer"
+                );
+                self.stage_alt.clone()
+            }
+            _ => anyhow::bail!("n-gram staging buffer {buffer} of 2"),
+        };
         Ok(Self {
             ids: prefix_rows(&self.ids, m)?,
-            stage: self.stage.clone(),
+            stage,
+            stage_alt: None,
             emb: prefix_rows(&self.emb, m)?,
             key: prefix_rows(&self.key, m)?,
             key_n: prefix_rows(&self.key_n, m)?,
@@ -1226,7 +1259,7 @@ impl PrefillScratch {
                 QSA_QUERY_BATCH.min(m),
                 row_budget,
             )?,
-            ple: table.map(|t| PleScratch::new(ctx, cfg, m, t)).transpose()?,
+            ple: table.map(|t| PleScratch::new(ctx, cfg, m, t, true)).transpose()?,
             mtp_hyper: with_mtp
                 .then(|| Tensor::zeros(ctx, &[m, cfg.hc_width()], bf))
                 .transpose()?,
@@ -1408,6 +1441,7 @@ impl Qwen4ExpModel {
             hasher,
             prefill_chunk,
             tile_row_budget,
+            ngram_ahead: true,
         })
     }
 
@@ -1726,7 +1760,7 @@ impl Qwen4ExpModel {
             qsa: QsaScratch::new(ctx, cfg, capacity_tokens, 1, 0)?,
             ple: self
                 .ple_table()
-                .map(|t| PleScratch::new(ctx, cfg, 1, t))
+                .map(|t| PleScratch::new(ctx, cfg, 1, t, false))
                 .transpose()?,
             gdn_in,
             attn_qkv,
@@ -1894,10 +1928,31 @@ impl Qwen4ExpModel {
         let ratio = self.config.indexer.compress_ratio;
         let mut remaining = tokens.len();
         let profile = std::env::var_os("LILY_PROFILE").is_some();
-        for chunk in tokens.chunks(self.prefill_chunk) {
-            let ps = capacity.chunk(chunk)?;
+        let chunks: Vec<&[u32]> = tokens.chunks(self.prefill_chunk).collect();
+        // Staging ahead: while the GPU runs chunk k from one staging buffer,
+        // the host stages chunk k+1's rows into the other (a paged table's
+        // cold rows are SSD reads, and a chunk's gather is a tenth of its
+        // GPU time). Buffer k % 2 serves chunk k; chunk k+1's buffer was
+        // last read by chunk k-1, which completed before chunk k was
+        // committed. The rows are the same ones the unpipelined loop
+        // gathers: chunk k+1's ids follow the history advanced over chunk k.
+        let ahead = self.ngram_ahead
+            && chunks.len() > 1
+            && ple_w.is_some_and(|w| w.table.is_paged())
+            && capacity.ple.as_ref().is_some_and(|p| p.stage_alt.is_some());
+        let buffer = |k: usize| if ahead { k % 2 } else { 0 };
+        let mut staged_ahead = false;
+        for (k, &chunk) in chunks.iter().enumerate() {
+            let mut ps = capacity.chunk(chunk)?;
+            ps.ple = capacity
+                .ple
+                .as_ref()
+                .map(|p| p.rows_on(chunk.len(), buffer(k)))
+                .transpose()?;
             let staged = std::time::Instant::now();
-            if let (Some(w), Some(p), Some(pst)) = (ple_w, &ps.ple, &state.ple) {
+            if !staged_ahead
+                && let (Some(w), Some(p), Some(pst)) = (ple_w, &ps.ple, &state.ple)
+            {
                 self.stage_ngram(w, p, chunk, pst.hist)?;
             }
             let ngram_secs = staged.elapsed().as_secs_f64();
@@ -1925,30 +1980,61 @@ impl Qwen4ExpModel {
             let started = std::time::Instant::now();
             let encoded = self.encode_batch(ctx, state, s, &ps, mode)?;
             let encoded_at = std::time::Instant::now();
-            let completed = encoded.commit()?.wait_retain()?;
+            let pending = encoded.commit()?;
+            // The next chunk's rows, while this one runs.
+            let next = chunks.get(k + 1).filter(|_| ahead);
+            staged_ahead = false;
+            let mut ahead_span = None;
+            if let (Some(&next), Some(w), Some(cap), Some(pst)) =
+                (next, ple_w, &capacity.ple, &state.ple)
+            {
+                let from = crate::metal::host_secs();
+                let p = cap.rows_on(next.len(), buffer(k + 1))?;
+                self.stage_ngram(w, &p, next, NgramHasher::advance(pst.hist, chunk))?;
+                ahead_span = Some((from, crate::metal::host_secs()));
+                staged_ahead = true;
+            }
+            let completed = pending.wait_retain()?;
             // The span from the commit feedback, which arrives a few tens of
             // microseconds after completion; the request's timings split the
             // chunk's wall time into host, GPU and waiting with it.
-            let gpu_secs = completed
-                .timing()
-                .map(|t| t.gpu_end_secs - t.gpu_start_secs)
-                .unwrap_or(0.0);
+            let timing = completed.timing().ok();
+            let gpu_secs = timing.map_or(0.0, |t| t.gpu_end_secs - t.gpu_start_secs);
+            // What of the staging ahead outlasted the chunk kept the GPU
+            // idle: exposed, and not waiting. Without GPU timestamps the
+            // whole of it counts as exposed.
+            let (ahead_exposed, ahead_hidden) = match ahead_span {
+                Some((from, to)) => {
+                    let exposed = match timing {
+                        Some(t) => {
+                            (to - t.gpu_end_secs.max(from)).clamp(0.0, to - from)
+                        }
+                        None => to - from,
+                    };
+                    (exposed, to - from - exposed)
+                }
+                None => (0.0, 0.0),
+            };
             let submitted_secs = encoded_at.elapsed().as_secs_f64();
             let encode_secs = (encoded_at - started).as_secs_f64();
             crate::stats::record(|c| {
                 c.prefill.chunks += 1;
-                c.prefill.ngram_secs += ngram_secs;
+                c.prefill.ngram_secs += ngram_secs + ahead_exposed;
+                c.gather.hidden_secs += ahead_hidden;
                 c.prefill.encode_secs += encode_secs;
                 c.prefill.gpu_secs += gpu_secs;
-                c.prefill.wait_secs += (submitted_secs - gpu_secs).max(0.0);
+                c.prefill.wait_secs +=
+                    (submitted_secs - gpu_secs - ahead_exposed).max(0.0);
             });
             if profile {
                 eprintln!(
-                    "profile prefill m={}: encode {:.2} ms, gpu {:.2} ms, total {:.2} ms",
+                    "profile prefill m={}: encode {:.2} ms, gpu {:.2} ms, total {:.2} ms, ngram {:.2} ms exposed, {:.2} ms ahead",
                     chunk.len(),
                     encode_secs * 1e3,
                     gpu_secs * 1e3,
-                    started.elapsed().as_secs_f64() * 1e3
+                    started.elapsed().as_secs_f64() * 1e3,
+                    (ngram_secs + ahead_exposed) * 1e3,
+                    ahead_hidden * 1e3
                 );
             }
             state.pos += chunk.len();
@@ -1959,6 +2045,14 @@ impl Qwen4ExpModel {
             state.conv_slot = 1 - state.conv_slot;
         }
         Ok(())
+    }
+
+    /// Whether a multi-chunk prefill stages the next chunk's n-gram rows
+    /// while the GPU runs the current one (the default). Off, every chunk
+    /// stages its rows before its commit, as before the pipeline; the
+    /// gathered rows are the same either way (for tests and measurement).
+    pub fn set_ngram_ahead(&mut self, on: bool) {
+        self.ngram_ahead = on;
     }
 
     // --- prefill ------------------------------------------------------------
@@ -4133,3 +4227,7 @@ impl LanguageModel for Qwen4ExpModel {
 #[cfg(test)]
 #[path = "../../tests/unit/qwen4exp/qsa_tiles.rs"]
 mod qsa_tile_tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/qwen4exp/prefill.rs"]
+mod prefill_tests;

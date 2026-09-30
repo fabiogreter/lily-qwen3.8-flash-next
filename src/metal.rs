@@ -1578,10 +1578,34 @@ impl Drop for PendingPass<'_> {
     }
 }
 
+/// A pass's GPU execution span, in seconds on the host clock of
+/// [`host_secs`] (Metal's `GPUStartTime`/`GPUEndTime` count
+/// `mach_absolute_time`), so host and GPU marks can be subtracted.
 #[derive(Clone, Copy, Debug)]
 pub struct PassTiming {
     pub gpu_start_secs: f64,
     pub gpu_end_secs: f64,
+}
+
+/// Host time in seconds on the clock [`PassTiming`] uses
+/// (`mach_absolute_time`).
+pub fn host_secs() -> f64 {
+    #[repr(C)]
+    struct Timebase {
+        numer: u32,
+        denom: u32,
+    }
+    unsafe extern "C" {
+        fn mach_absolute_time() -> u64;
+        fn mach_timebase_info(info: *mut Timebase) -> i32;
+    }
+    let mut tb = Timebase { numer: 0, denom: 0 };
+    // SAFETY: plain libSystem calls with a valid out-pointer.
+    let ticks = unsafe {
+        mach_timebase_info(&mut tb);
+        mach_absolute_time()
+    };
+    ticks as f64 * tb.numer as f64 / tb.denom as f64 * 1e-9
 }
 
 pub struct CompletedPass {

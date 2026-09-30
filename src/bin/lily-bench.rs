@@ -12,7 +12,7 @@ use lily::kernels::attention::MAX_SEQ;
 use lily::kernels::sample::SamplingParams;
 use lily::metal::MetalContext;
 use lily::metal::profile::{self, PassProfile};
-use lily::metal::{EncodedPass, Pacer, PendingPass};
+use lily::metal::{EncodedPass, Pacer, PendingPass, host_secs};
 use lily::qwen4exp::Qwen4ExpModel;
 use lily::serve::checkpoint_model_type;
 
@@ -137,27 +137,6 @@ const fn server_sampling(seed: u64) -> SamplingParams {
         seed,
         ..SamplingParams::greedy()
     }
-}
-
-/// Host time in seconds on the clock Metal's `GPUStartTime`/`GPUEndTime`
-/// use (mach_absolute_time), so host and GPU marks can be subtracted.
-fn host_secs() -> f64 {
-    #[repr(C)]
-    struct Timebase {
-        numer: u32,
-        denom: u32,
-    }
-    unsafe extern "C" {
-        fn mach_absolute_time() -> u64;
-        fn mach_timebase_info(info: *mut Timebase) -> i32;
-    }
-    let mut tb = Timebase { numer: 0, denom: 0 };
-    // SAFETY: plain libSystem calls with a valid out-pointer.
-    let ticks = unsafe {
-        mach_timebase_info(&mut tb);
-        mach_absolute_time()
-    };
-    ticks as f64 * tb.numer as f64 / tb.denom as f64 * 1e-9
 }
 
 fn draw(step: usize) -> Draw<'static> {

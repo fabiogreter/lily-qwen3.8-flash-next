@@ -497,6 +497,38 @@ in order of size:
    query. **The MoE input gather** moving eight bf16 elements per thread on
    its aligned rows, 1.07 to 0.52 ms per call, about 26 ms per 8K chunk.
    **The dense rows below the limit** through the dense kernel.
+5. **The n-gram staging off the critical path** (host side, bit-identical;
+   `docs/architecture.md`, "Memory layout"). With the table partly cold, the
+   state the service is in under interactive use (18 of 32 GB resident),
+   staging a fresh prompt's rows cost 0.6 / 1.7 / 3.4 s at 4K / 16K / 64K.
+   Two changes: a prompt of more than one chunk stages chunk k+1's rows into
+   a second buffer while the GPU runs chunk k, and a prefill batch whose
+   1-in-16 residency sample finds at least one page in 32 cold hints every
+   row's pages, not only the sample's, so the SSD reads overlap and the
+   pager's read-around no longer reads pages nobody asked for (a cold chunk
+   of random rows: 1.03 to 0.35 s, 205 000 to 88 000 pages read; a warm
+   chunk unchanged at 5.6 ms). Over HTTP, interleaved A/B against `00b6b3d`,
+   five server launches per build, fresh prompts from corpus regions no
+   other run used, the table put into the same partly cold state before
+   every launch (`tools/bench/evict_table.py 0.6`, about 17 GB resident, the
+   preload off), medians with min to max:
+
+   | prompt | prefill tok/s before | after | staging exposed, ms, before | after | sampled cold pages before / after |
+   |---|---:|---:|---:|---:|---:|
+   | 4K | 1 781 (1 697 to 2 152) | 2 133 (2 072 to 2 255) | 593 | 210 | 2 399 / 2 654 |
+   | 16K | 1 769 (1 732 to 1 834) | 2 089 (2 052 to 2 103) | 1 663 | 179 | 5 414 / 5 552 |
+   | 64K | 1 655 (1 651 to 1 677) | 1 797 (1 760 to 1 832) | 3 447 | 142 | 12 145 / 12 567 |
+
+   GPU time is the same in both builds. What stays exposed is the first
+   chunk's staging, now 0.1 to 0.27 s. The `wait_ms` of a multi-chunk
+   request grew by 0.1 to 0.2 s at the same time: the first chunk is now
+   committed that much sooner after the request arrived, and a stall that
+   ends a fixed time after arrival used to pass while the host staged (a
+   500 ms pause before the first commit removes it; most likely residency
+   coming back after idle, `docs/architecture.md`, "Residency does not
+   survive an idle second", not verified). The totals above include it.
+   The 4K prompt is one full chunk plus a 7-token tail, so its gain is the
+   denser hints alone; a single-chunk agent turn gets that part too.
 
 ### Decode
 
@@ -579,6 +611,9 @@ none is kept behind a knob. The reason is what the measurement said.
 | the chunked GDN scan with eight simdgroups, pre-transposed keys, next-chunk prefetch touches, fp16 operand copies | no gain | the pass streams rows; none of these change the bytes |
 | the four-column serial scan kept for batches over 128 rows | 171 to 190 against 99 to 109 ms per 8K prefill | the serial recurrence |
 | fusing the elementwise glue (about 9% of a chunk) | not built | the profile shows no dispatch paying a launch floor at these sizes |
+| staging ahead only once the GPU signalled that the chunk began (a queue signal after the embedding gather) | the first chunk's extra 0.1 to 0.2 s of wait unchanged | the staging did not delay the pass; the wait is the post-idle wake the old staging hid |
+| overlapping the first chunk's gather with the GPU work before it (parking the pass at the n-gram gather) | not built | only the embedding and two GDN layers, about 4% of the chunk, precede the gather in layer 2, and the park would sit inside the GPU span |
+| more copy threads for a cold prefill gather (16, 32, 64 with one row in 16 hinted) | 0.69 / 0.55 / 0.50 s against 1.03 (8 threads); every row hinted with 8 threads 0.35 s, with 32 0.44 | the faults, not the thread count, were the cost; the `mincore` calls do not scale across threads |
 
 ### Decode
 

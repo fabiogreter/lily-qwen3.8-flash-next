@@ -33,8 +33,16 @@ pub struct Gather {
     /// Of those, the ones that were not resident: each is a read from the
     /// SSD that the copy then waits for.
     pub cold_pages: u64,
+    /// Prefill rows outside the 1-in-16 sample whose pages were checked and
+    /// hinted as well, because the sample found their batch cold (at least
+    /// 1 page in 32); their pages are not in `pages` or `cold_pages`.
+    pub hinted_rows: u64,
     /// Wall time inside `PagedTable::gather`, residency checks included.
     pub secs: f64,
+    /// Of the prefill's staging time (hashing plus the gathers), the part
+    /// that ran while the GPU was still busy with the previous chunk, so it
+    /// cost the prefill nothing; the rest is `Prefill::ngram_secs`.
+    pub hidden_secs: f64,
 }
 
 /// Where the prefill loop's time went, summed over its chunks.
@@ -44,7 +52,10 @@ pub struct Prefill {
     /// Growing the state's caches and the prefill scratch (allocation and
     /// zeroing, plus the copy of the old caches when the state grows).
     pub alloc_secs: f64,
-    /// Hashing the chunk's n-gram ids and staging their rows.
+    /// Hashing the chunks' n-gram ids and staging their rows, as far as the
+    /// GPU waited for it: the first chunk's whole staging, and whatever of a
+    /// later chunk's (staged while the GPU ran the chunk before it) outlasted
+    /// that chunk. The overlapped rest is `Gather::hidden_secs`.
     pub ngram_secs: f64,
     /// Encoding the chunk's pass on the host.
     pub encode_secs: f64,
@@ -70,7 +81,9 @@ const ZERO: Counters = Counters {
         checked_rows: 0,
         pages: 0,
         cold_pages: 0,
+        hinted_rows: 0,
         secs: 0.0,
+        hidden_secs: 0.0,
     },
     prefill: Prefill {
         chunks: 0,
@@ -113,7 +126,9 @@ impl Counters {
                 checked_rows: g.checked_rows.saturating_sub(e.checked_rows),
                 pages: g.pages.saturating_sub(e.pages),
                 cold_pages: g.cold_pages.saturating_sub(e.cold_pages),
+                hinted_rows: g.hinted_rows.saturating_sub(e.hinted_rows),
                 secs: (g.secs - e.secs).max(0.0),
+                hidden_secs: (g.hidden_secs - e.hidden_secs).max(0.0),
             },
             prefill: Prefill {
                 chunks: p.chunks.saturating_sub(q.chunks),

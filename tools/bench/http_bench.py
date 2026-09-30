@@ -64,7 +64,16 @@ template's first tokens, so the whole prompt is prefilled again, but the n-gram
 rows it gathers are the ones the fresh run just paged in (only the nonce's few
 n-grams are new). The pair separates what a cold region of the n-gram table
 and other first-touch costs add from the prefill itself. Records carry
-`variant` `fresh` or `resend`."""
+`variant` `fresh` or `resend`.
+
+`matrix --offset-start N` lays the runs' regions end to end from corpus token
+N on, so a series started at another N shares no text with this one (an A/B
+across server launches, each arm with its own start); `--corpus-glob`
+(repeatable) replaces the repository with other files, for a corpus large
+enough that every run of a long series gets text no earlier run touched, and
+`--warmup-offset` moves the unrecorded warm-up. Records carry `offset`. For
+cold n-gram pages that are the same in every arm, `tools/bench/evict_table.py`
+puts the table into a fixed partly cold state before each launch."""
 import argparse, glob, json, os, statistics, subprocess, sys, time, urllib.error, urllib.request
 
 # A run counts as a prefill measurement when the prompt cache supplied no more
@@ -84,13 +93,22 @@ INSTRUCTION = ("\n\nIgnore the text above completely. Instead, explain in your o
 class Corpus:
     """The repository's docs and source as one token sequence."""
 
-    def __init__(self, tokenizer_path):
+    def __init__(self, tokenizer_path, globs=None, max_bytes=None):
         import tokenizers
         self.tok = tokenizers.Tokenizer.from_file(tokenizer_path)
-        files = (sorted(glob.glob(os.path.join(REPO, "docs", "*.md"))) + [os.path.join(REPO, "README.md")]
-                 + sorted(glob.glob(os.path.join(REPO, "src", "**", "*.rs"), recursive=True))
-                 + sorted(glob.glob(os.path.join(REPO, "src", "kernels", "metal", "*.metal"))))
-        text = "\n\n".join(open(f, errors="replace").read() for f in files)
+        if globs:
+            files = [f for g in globs for f in sorted(glob.glob(os.path.expanduser(g), recursive=True))]
+        else:
+            files = (sorted(glob.glob(os.path.join(REPO, "docs", "*.md"))) + [os.path.join(REPO, "README.md")]
+                     + sorted(glob.glob(os.path.join(REPO, "src", "**", "*.rs"), recursive=True))
+                     + sorted(glob.glob(os.path.join(REPO, "src", "kernels", "metal", "*.metal"))))
+        parts, size = [], 0
+        for f in files:
+            if max_bytes and size >= max_bytes:
+                break
+            parts.append(open(f, errors="replace").read())
+            size += len(parts[-1])
+        text = "\n\n".join(parts)
         self.ids = self.tok.encode(text).ids
 
     def slice(self, n_tokens, offset):
@@ -178,26 +196,31 @@ def record(out_path, rec):
 # --- matrix ------------------------------------------------------------------
 
 def cmd_matrix(args):
-    corpus = Corpus(args.tokenizer)
+    corpus = Corpus(args.tokenizer, args.corpus_glob, args.corpus_max_bytes)
     lengths = [int(x) for x in args.prompt_tokens.split(",")]
     specs = args.spec.split(",") if args.engine == "llama" else ["server"]
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     print(f"{args.label}: {args.engine} at {args.url}; corpus {len(corpus.ids)} tokens; lengths {lengths}; specs {specs}; "
           f"{args.repeats} repeats, {args.decode_tokens} greedy tokens per run; swap {swap_usage()}")
     # Warm-up at the smallest shape, not recorded: the GPU is ramping after a load.
-    chat(args.engine, args.url, [{"role": "user", "content": prompt_of(corpus, lengths[0], 7)}], 16)
+    chat(args.engine, args.url, [{"role": "user", "content": prompt_of(corpus, lengths[0], args.warmup_offset)}], 16)
     run = 0
+    next_offset = args.offset_start
     for rep in range(args.repeats):
         for n in lengths:
             for spec in specs:
                 run += 1
                 offset = (run * 104729 + rep * 7919) % len(corpus.ids)  # a fresh region every run
+                if next_offset is not None:
+                    # Consecutive regions: no two runs (of this or another
+                    # series given its own start) share any text.
+                    offset, next_offset = next_offset, next_offset + n
                 content = prompt_of(corpus, n, offset)
                 for variant in ("fresh", "resend") if args.resend else ("fresh",):
                     text = content if variant == "fresh" else f"[{os.urandom(4).hex()}]\n" + content
                     res = chat(args.engine, args.url, [{"role": "user", "content": text}], args.decode_tokens, spec)
                     rec = dict(kind="matrix", label=args.label, engine=args.engine, spec=spec, variant=variant, target_tokens=n,
-                               repeat=rep + 1, **res)
+                               repeat=rep + 1, offset=offset, **res)
                     record(args.out, rec)
                     acc = "" if res["drafted_tokens"] is None else f", drafts {res['accepted_tokens']}/{res['drafted_tokens']}"
                     print(f"  rep {rep + 1} {n:>6} {spec:>6} {variant:>6}: prompt {res['prompt_tokens']} (cached {res['cached_tokens']}), "
@@ -362,6 +385,10 @@ def main():
     m.add_argument("--repeats", type=int, default=3)
     m.add_argument("--cooldown", type=float, default=10, help="seconds between runs")
     m.add_argument("--resend", action="store_true", help="follow every fresh run with the same prompt behind a fresh nonce")
+    m.add_argument("--corpus-glob", action="append", help="prompt material instead of this repository (repeatable, `**` recursive)")
+    m.add_argument("--corpus-max-bytes", type=int, help="stop reading corpus files after this many bytes")
+    m.add_argument("--offset-start", type=int, help="lay the runs' regions end to end from this corpus token on, instead of the spread offsets")
+    m.add_argument("--warmup-offset", type=int, default=7, help="corpus token the unrecorded warm-up prompt starts at")
     m.add_argument("--spec", default="none", help="llama only: comma-separated `none` (plain) and `default` (the server's speculative configuration)")
     r = sub.add_parser("report")
     r.add_argument("files", nargs="+")
