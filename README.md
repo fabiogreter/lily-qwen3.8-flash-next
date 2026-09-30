@@ -97,7 +97,10 @@ next run.
 Moving experts around between RAM and disk does of course cost time. On a
 simulated 64 GB machine, prefill was measured at about 930 tok/s, and decode
 at around 50-65 tok/s. Speculative decoding is off in this mode, as it requires
-additional expert reads and thus slows down the process.
+additional expert reads and thus slows down the process. Note that in practice,
+performance may be worse, as there is additional RAM required to hold the session
+KV cache. If anyone wants to test with a real 64 GB machine, your feedback is welcome.
+Less than 64 GB is probably impractical.
 
 The cache sizes itself from physical memory; `--memory-gb 64` plans for
 64 GB instead, which is also how to try the mode on a bigger machine.
