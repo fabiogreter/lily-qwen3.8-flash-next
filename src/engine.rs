@@ -11,6 +11,129 @@ use crate::kernels::sample::SamplingParams;
 use crate::metal::{EncodedPass, MetalContext, PendingPass, SharedEvent};
 use crate::tensor::Tensor;
 
+/// One piece of a persisted layout (a disk-tier file): bytes the layout
+/// computes, such as a position header, or a range of a shared-storage
+/// buffer that holds cache rows or recurrent state.
+///
+/// A layout lets the session cache write a parked session from another
+/// thread: the writer gets addresses and lengths, never the buffers'
+/// handles (which are `Rc`s owned by the engine thread), and writes them
+/// with [`write_layout`] under that function's contract.
+pub enum Segment {
+    Bytes(Vec<u8>),
+    Host(HostRange),
+}
+
+/// An address and a length inside a shared-storage buffer.
+#[derive(Clone, Copy)]
+pub struct HostRange {
+    ptr: *const u8,
+    len: usize,
+}
+
+// SAFETY: a plain address and length; reading through it is `write_layout`'s
+// contract, which the caller upholds on whichever thread it runs.
+unsafe impl Send for HostRange {}
+
+impl Segment {
+    /// The bytes of `t` (honouring a view's offset), by address.
+    pub fn tensor(t: &Tensor) -> Self {
+        Self::host(t.contents())
+    }
+
+    /// `bytes` by address: the segment reads them again when written.
+    pub fn host(bytes: &[u8]) -> Self {
+        Self::Host(HostRange { ptr: bytes.as_ptr(), len: bytes.len() })
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Bytes(bytes) => bytes.len(),
+            Self::Host(range) => range.len,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Bytes a layout writes, total.
+pub fn layout_len(segments: &[Segment]) -> usize {
+    segments.iter().map(Segment::len).sum()
+}
+
+/// Writes `segments` to `w` in order, in pieces of at most 8 MB, stopping
+/// with an error between pieces once `cancel` is set.
+///
+/// # Safety
+///
+/// Every [`Segment::Host`] range must stay allocated, and neither the GPU
+/// nor the host may write it, until this returns: the owner of the buffers
+/// (a session parked for the write, or the state or snapshot a caller holds
+/// borrowed for the call) keeps them alive and idle meanwhile.
+pub unsafe fn write_layout(
+    segments: &[Segment],
+    w: &mut dyn std::io::Write,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    const PIECE: usize = 8 << 20;
+    for segment in segments {
+        let bytes: &[u8] = match segment {
+            Segment::Bytes(bytes) => bytes,
+            // SAFETY: the caller's contract above.
+            Segment::Host(r) => unsafe { std::slice::from_raw_parts(r.ptr, r.len) },
+        };
+        for piece in bytes.chunks(PIECE) {
+            if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+                anyhow::bail!("cancelled");
+            }
+            w.write_all(piece)?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether two layouts write the same bytes (however they are split into
+/// segments).
+///
+/// # Safety
+///
+/// [`write_layout`]'s, for both.
+pub unsafe fn layouts_equal(a: &[Segment], b: &[Segment]) -> bool {
+    fn bytes(s: &Segment) -> &[u8] {
+        match s {
+            Segment::Bytes(bytes) => bytes,
+            // SAFETY: the caller's contract.
+            Segment::Host(r) => unsafe { std::slice::from_raw_parts(r.ptr, r.len) },
+        }
+    }
+    let (mut ia, mut ib) = (a.iter().map(bytes), b.iter().map(bytes));
+    let (mut ca, mut cb): (&[u8], &[u8]) = (&[], &[]);
+    loop {
+        while ca.is_empty() {
+            match ia.next() {
+                Some(s) => ca = s,
+                None => break,
+            }
+        }
+        while cb.is_empty() {
+            match ib.next() {
+                Some(s) => cb = s,
+                None => break,
+            }
+        }
+        if ca.is_empty() || cb.is_empty() {
+            return ca.is_empty() && cb.is_empty();
+        }
+        let n = ca.len().min(cb.len());
+        if ca[..n] != cb[..n] {
+            return false;
+        }
+        (ca, cb) = (&ca[n..], &cb[n..]);
+    }
+}
+
 /// A copy of the recurrent part of a decode state (everything that is not a
 /// per-token cache) at one position. Together with the per-token caches that
 /// are still in place up to that position it lets a state resume from there.
@@ -19,11 +142,19 @@ pub trait SnapshotApi {
     fn pos(&self) -> usize;
     /// GPU bytes the snapshot holds.
     fn bytes(&self) -> usize;
-    /// Serializes the snapshot (for the on-disk session tier; models that
-    /// support it also implement [`LanguageModel::read_snapshot`]). GPU idle.
-    fn write_to(&self, w: &mut dyn std::io::Write) -> Result<()> {
-        let _ = w;
+    /// The serialized snapshot as a layout (for the on-disk session tier;
+    /// models that support it also implement
+    /// [`LanguageModel::read_snapshot`]). The host ranges point into the
+    /// snapshot's own buffers.
+    fn layout(&self) -> Result<Vec<Segment>> {
         anyhow::bail!("this model does not persist sessions")
+    }
+    /// Serializes the snapshot: [`Self::layout`], written. GPU idle.
+    fn write_to(&self, w: &mut dyn std::io::Write) -> Result<()> {
+        let layout = self.layout()?;
+        // SAFETY: the ranges point into `self`'s buffers, borrowed for the
+        // call; nothing writes a snapshot after it was taken.
+        unsafe { write_layout(&layout, w, None) }
     }
 }
 
@@ -84,11 +215,29 @@ pub trait DecodeStateApi: Sized {
         tokens: usize,
     ) -> Result<()>;
 
-    /// Streams the first `tokens` entries of every per-token cache to `w`, in
-    /// the layout [`Self::read_prefix`] expects. GPU idle.
-    fn write_prefix(&self, tokens: usize, w: &mut dyn std::io::Write) -> Result<()> {
-        let _ = (tokens, w);
+    /// The first `tokens` entries of every per-token cache as a layout, in
+    /// the order [`Self::read_prefix`] expects; the host ranges point into
+    /// this state's buffers.
+    fn prefix_layout(&self, tokens: usize) -> Result<Vec<Segment>> {
+        let _ = tokens;
         anyhow::bail!("this model does not persist sessions")
+    }
+
+    /// The recurrent state at the current position as a layout, exactly the
+    /// bytes a [`Self::snapshot`] taken now would write, read from this
+    /// state's own buffers instead of a copy: a state at rest that nothing
+    /// feeds can be persisted without allocating a snapshot.
+    fn live_layout(&self) -> Result<Vec<Segment>> {
+        anyhow::bail!("this model does not persist sessions")
+    }
+
+    /// Streams the first `tokens` entries of every per-token cache to `w`:
+    /// [`Self::prefix_layout`], written. GPU idle.
+    fn write_prefix(&self, tokens: usize, w: &mut dyn std::io::Write) -> Result<()> {
+        let layout = self.prefix_layout(tokens)?;
+        // SAFETY: the ranges point into `self`'s buffers, borrowed for the
+        // call, and the GPU is idle on them (the contract above).
+        unsafe { write_layout(&layout, w, None) }
     }
 
     /// Fills the first `tokens` entries of every per-token cache from `r`,
@@ -524,3 +673,7 @@ pub struct NextStep<'p> {
     /// Draw index of the pass's first row.
     pub step0: usize,
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/engine.rs"]
+mod tests;

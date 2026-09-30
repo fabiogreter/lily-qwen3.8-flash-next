@@ -334,3 +334,53 @@ fn entries_expire_after_the_maximum_age() {
     assert!(live.is_empty());
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn a_reserved_entry_is_invisible_until_committed_and_a_crash_leaves_nothing_readable() {
+    let root = temp_root("reserve");
+    let mut store = DiskStore::open(&root, "fmt", 1 << 20, 0).expect("open");
+    let tokens = [1u32, 2, 3];
+    let reserved = store.reserve();
+    let bytes = write_files(
+        reserved.path(),
+        &[3],
+        &mut |w| Ok(w.write_all(&[7u8; 50])?),
+        &mut |pos, w| Ok(w.write_all(&(pos as u64).to_le_bytes())?),
+    )
+    .expect("write");
+    assert_eq!(bytes, 58);
+    // Written but not committed: no lookup sees it, and a restart (a crash
+    // before the commit) drops the directory, which has no meta file.
+    assert!(store.is_empty());
+    let reopened = DiskStore::open(&root, "fmt", 1 << 20, 0).expect("reopen");
+    assert!(reopened.is_empty());
+    assert!(!reserved.path().exists());
+
+    // A committed one is indexed; an abandoned one is deleted.
+    let reserved = store.reserve();
+    let id = reserved.id().to_owned();
+    let bytes = write_files(
+        reserved.path(),
+        &[3],
+        &mut |w| Ok(w.write_all(&[7u8; 50])?),
+        &mut |pos, w| Ok(w.write_all(&(pos as u64).to_le_bytes())?),
+    )
+    .expect("write");
+    let new = NewEntry {
+        tokens: &tokens,
+        images: &[],
+        cache_key: None,
+        checkpoints: &[3],
+        durable: false,
+    };
+    assert_eq!(store.commit(reserved, &new, bytes).expect("commit"), Some(id.clone()));
+    assert!(store.contains(&id));
+    let abandoned = store.reserve();
+    assert_ne!(abandoned.id(), id, "ids are never reused");
+    fs::create_dir_all(abandoned.path()).expect("mkdir");
+    let path = abandoned.path().to_path_buf();
+    store.abandon(abandoned);
+    assert!(!path.exists());
+    assert_eq!(ids(&store), vec![id]);
+    let _ = fs::remove_dir_all(&root);
+}

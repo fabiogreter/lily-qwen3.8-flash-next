@@ -786,10 +786,11 @@ because under an extreme balloon it produced a timing-dependent digest that
 no other configuration did). All three want a run on a real 64 GB machine
 rather than a balloon.
 
-**Two small ones.** The disk tier writes on the engine thread at eviction
-time, 0.10 to 0.37 s for 21 000 to 100 000 tokens and once 1.17 s; a
-background writer would take that off the request path, but it only bites
-under a tight cache budget. And the draft head's proposals leave penalties
+**Two small ones.** The disk tier wrote on the engine thread at eviction
+time, 0.10 to 0.37 s for 21 000 to 100 000 tokens and once 1.17 s (0.5 to
+1.1 s once the 8.6 GB budget is full, 2026-10-01); the write ahead now does
+that between requests on a background thread ([architecture.md](architecture.md),
+"The session cache"). And the draft head's proposals leave penalties
 out, so a request with penalties drafts from a distribution that is not the
 trunk's kept one; the verify rows correct it exactly, at a lower acceptance
 that has not been measured.

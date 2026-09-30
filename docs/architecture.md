@@ -741,8 +741,64 @@ respected. The index is rebuilt from the meta files at startup. The directory
 is tagged with the model's persistence format, so a different model or a
 changed cache shape never reads the files.
 
-Writes happen on the engine thread at eviction time, at a few gigabytes per
-second, which puts them on the request path.
+**Writing ahead.** An eviction used to write its session inside the request
+that needed the room: 0.5 to 1.1 s of time to first token for every new
+conversation, subagent or fork once the budget was full. Now the engine asks
+the store to write ahead after every request and while it waits for the next
+one. When the room left for a new session (the free budget plus the
+sessions, in eviction order, whose eviction writes nothing) is below the
+size of the largest of the last eight new sessions at their release, and at
+least a 32 768-token session (1.1 GB), the least recently used session
+without a copy on disk is written to the tier on a background thread, at
+utility CPU and I/O priority, while it stays resident. The session that just
+ran is never written ahead, since its next request would make the copy stale
+at once. Evicting a session with a copy is then a drop, and its entry is
+marked used as a spill would have stamped it.
+
+Memory is the constraint. The session being written is parked: out of reach
+of every lookup, still counted in the budget, and freed only by a later
+eviction, never by the write. Nothing is allocated for the write: the live
+end comes from the state's own recurrent buffers (`live_layout`, the bytes a
+snapshot would write, which the warm-up checks against a real snapshot), not
+from a copy. So resident sessions stay within the budget exactly as before,
+plus the new session of the request in progress while it is acquired and
+grown, which the synchronous path allowed too; the old spill's 113 MB
+snapshot copy is gone from both paths. The writer thread gets addresses and
+lengths of the buffers, never their handles, and the parked session's
+`Drop` joins the thread before the buffers go.
+
+What can meet a write in flight: a prompt that resumes the parked session at
+least as far as anything else cancels the write (at its next 8 MB piece),
+deletes the partial files and takes the session back; nothing was indexed,
+since an entry enters the index only when the engine thread commits it after
+the thread finished, and a directory without a meta file is dropped at the
+next start. An eviction that reaches the parked session waits for the write
+to finish and then drops it (a 65 000-token session measured 0.33 s of wait
+back to back, against 0.6 to 1.1 s for a spill). An eviction that reaches a
+session without a copy (the write ahead had no idle moment, or the tier
+deleted the copy since: budget, age) spills it synchronously as before. A
+resumed session's copy is deleted when the session comes back from its
+request, as a live-end disk hit consumes its entry; a fork source keeps its
+copy. The idle unload and the shutdown finish the write in flight and drop
+the sessions that have a copy; a GPU fault cancels it and keeps nothing. The
+durable entries' cap and the tier's LRU see written-ahead entries as ordinary
+evicted sessions. Under the expert cache (the small-machine mode) the budget
+is the one session the plan reserved, so there is no write ahead and
+evictions spill synchronously as before.
+
+Measured on the full model with an empty disk tier, fresh prompts 10 s
+apart (`http_bench.py matrix`, 4K / 16K / 64K, 5 repeats, the budget full
+from the third): the session phase went from 640 ms (the one 4K request
+that spilled) and medians of 622 / 1 127 ms at 16K / 64K (synchronous
+spills) to 52 / 52 / 114 ms, every eviction a drop. Part of that returns as `wait`: after about 10 s without
+GPU work the first submission of a request stalls about 0.4 s, which the old
+spill's snapshot blit used to absorb while the disk write ran; back to back
+the stall is gone (0.00 to 0.03 s). That is the "first-touch stall" of the
+2026-10-01 report, which is therefore idle-bound rather than about fresh
+buffers; its cause is not known. The median session phase plus the median
+wait went from 628 to 452 ms at 16K and from 1 156 to 530 ms at 64K with
+the pauses; back to back the whole session phase is saved, less any wait for
+a write still running.
 
 **Image identity.** An image in a prompt is a run of identical
 `<|image_pad|>` tokens, so two requests carrying different screenshots have
@@ -905,7 +961,12 @@ caused), `alloc_ms` (growing the state and the prefill scratch), `ngram_ms`
 rows), `encode_ms`, `gpu_ms` (the chunks' execution from the commit
 feedback's GPU timestamps), `wait_ms` (commit to completion minus the GPU
 span), `durable_ms`, `checkpoint_ms` and the remainder `other_ms`; normal
-GPU time next to an exploding total means a host-side stall. `ngram` has the
+GPU time next to an exploding total means a host-side stall. `evictions`
+says what evicting sessions cost at the `acquire` (inside `session_ms`) and
+at the `release` after the decode: sessions `evicted`, of them
+`written_ahead` (dropped) and `spilled` (with `spill_ms`), `waited_ms` for a
+write ahead still running, and `cancelled_writes`; the log line adds an
+`evictions:` group when a spill, a wait or a cancel happened. `ngram` has the
 gathers of the prefill and the decode separately (rows, pages checked, cold
 pages, time). `memory` has the system's paging deltas (`host_statistics64`:
 pageins, pageouts, swapins, swapouts, compressions, decompressions, in 16 KB

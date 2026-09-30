@@ -80,14 +80,79 @@ pub struct DiskEntry {
     pub images: Vec<CachedImage>,
 }
 
-/// What a store call describes about the entry it is about to write.
+/// What a store describes about the entry it writes.
 #[derive(Clone, Copy)]
-struct NewEntry<'a> {
-    tokens: &'a [u32],
-    images: &'a [CachedImage],
-    cache_key: Option<&'a str>,
-    checkpoints: &'a [usize],
-    durable: bool,
+pub struct NewEntry<'a> {
+    pub tokens: &'a [u32],
+    pub images: &'a [CachedImage],
+    pub cache_key: Option<&'a str>,
+    /// Positions with a checkpoint file; must include `tokens.len()`.
+    pub checkpoints: &'a [usize],
+    pub durable: bool,
+}
+
+impl NewEntry<'_> {
+    fn check(&self) -> Result<()> {
+        ensure!(!self.tokens.is_empty(), "empty session");
+        ensure!(
+            self.checkpoints.contains(&self.tokens.len()),
+            "the live end must be a checkpoint"
+        );
+        ensure!(
+            self.images.iter().all(|i| i.end() <= self.tokens.len()),
+            "an image span extends past the session's tokens"
+        );
+        Ok(())
+    }
+}
+
+/// An entry's directory, picked by [`DiskStore::reserve`] and not yet indexed.
+pub struct Reserved {
+    id: String,
+    path: PathBuf,
+}
+
+impl Reserved {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Writes an entry's files into `path` (created): `prefix.bin` from `prefix`
+/// and one `ckpt-<pos>.bin` per position of `checkpoints` from `checkpoint`.
+/// Returns the bytes written. Touches no index, so it may run on any thread;
+/// [`DiskStore::commit`] indexes the result.
+pub fn write_files(
+    path: &Path,
+    checkpoints: &[usize],
+    prefix: &mut dyn FnMut(&mut dyn Write) -> Result<()>,
+    checkpoint: &mut dyn FnMut(usize, &mut dyn Write) -> Result<()>,
+) -> Result<u64> {
+    fs::create_dir_all(path)?;
+    let mut bytes = 0u64;
+    {
+        let mut w = BufWriter::with_capacity(8 << 20, File::create(path.join(PREFIX))?);
+        prefix(&mut w)?;
+        w.flush()?;
+        bytes += w.get_ref().metadata()?.len();
+    }
+    let mut positions: Vec<usize> = checkpoints.to_vec();
+    positions.sort_unstable();
+    positions.dedup();
+    for &pos in &positions {
+        let mut w = BufWriter::with_capacity(
+            8 << 20,
+            File::create(path.join(format!("ckpt-{pos}.bin")))?,
+        );
+        checkpoint(pos, &mut w)?;
+        w.flush()?;
+        bytes += w.get_ref().metadata()?.len();
+    }
+    Ok(bytes)
 }
 
 pub struct DiskStore {
@@ -296,72 +361,77 @@ impl DiskStore {
         prefix: &mut dyn FnMut(&mut dyn Write) -> Result<()>,
         checkpoint: &mut dyn FnMut(usize, &mut dyn Write) -> Result<()>,
     ) -> Result<Option<String>> {
-        ensure!(!tokens.is_empty(), "empty session");
-        ensure!(
-            checkpoints.contains(&tokens.len()),
-            "the live end must be a checkpoint"
-        );
-        ensure!(
-            images.iter().all(|i| i.end() <= tokens.len()),
-            "an image span extends past the session's tokens"
-        );
-        self.expire();
-        let id = format!("s{}", self.next_id);
-        let path = self.dir.join(&id);
         let new = NewEntry { tokens, images, cache_key, checkpoints, durable };
-        let result = self.write_entry(&path, &new, prefix, checkpoint);
-        match result {
-            Ok(Some(entry)) => {
-                self.next_id += 1;
-                self.entries.push(entry);
-                // The cap first, so the new entry (the most recent) is what
-                // stays when the budget trim below has to choose.
-                if durable {
-                    self.trim_durable();
-                }
-                self.trim(0);
-                Ok(Some(id))
-            }
-            Ok(None) => {
-                let _ = fs::remove_dir_all(&path);
-                Ok(None)
-            }
+        new.check()?;
+        let reserved = self.reserve();
+        match write_files(&reserved.path, checkpoints, prefix, checkpoint) {
+            Ok(bytes) => self.commit(reserved, &new, bytes),
             Err(error) => {
-                let _ = fs::remove_dir_all(&path);
+                self.abandon(reserved);
                 Err(error)
             }
         }
     }
 
-    fn write_entry(
+    /// Picks the directory of the next entry (after expiring stale ones), for
+    /// a caller that writes it with [`write_files`], possibly on another
+    /// thread, and then hands it to [`Self::commit`] or [`Self::abandon`].
+    /// Until the commit the entry is not in the index, so nothing can read a
+    /// partly written one; a directory left behind by a crash has no meta
+    /// file and is dropped at the next open.
+    pub fn reserve(&mut self) -> Reserved {
+        self.expire();
+        let id = format!("s{}", self.next_id);
+        self.next_id += 1;
+        Reserved { path: self.dir.join(&id), id }
+    }
+
+    /// Deletes what was written for `reserved`.
+    pub fn abandon(&mut self, reserved: Reserved) {
+        let _ = fs::remove_dir_all(&reserved.path);
+    }
+
+    /// Indexes the files [`write_files`] wrote for `reserved` (`bytes` of
+    /// them) as the entry `new` describes: refused (`None`, files deleted)
+    /// when it exceeds the whole budget or the volume is short of space,
+    /// otherwise room is made by least-recently-used eviction (the durable
+    /// cap first for a durable entry) and the meta file written last.
+    pub fn commit(
         &mut self,
-        path: &Path,
+        reserved: Reserved,
         new: &NewEntry<'_>,
-        prefix: &mut dyn FnMut(&mut dyn Write) -> Result<()>,
-        checkpoint: &mut dyn FnMut(usize, &mut dyn Write) -> Result<()>,
+        bytes: u64,
+    ) -> Result<Option<String>> {
+        match self.index_entry(&reserved, new, bytes) {
+            Ok(Some(entry)) => {
+                self.entries.push(entry);
+                // The cap first, so the new entry (the most recent) is what
+                // stays when the budget trim below has to choose.
+                if new.durable {
+                    self.trim_durable();
+                }
+                self.trim(0);
+                Ok(Some(reserved.id))
+            }
+            Ok(None) => {
+                self.abandon(reserved);
+                Ok(None)
+            }
+            Err(error) => {
+                self.abandon(reserved);
+                Err(error)
+            }
+        }
+    }
+
+    fn index_entry(
+        &mut self,
+        reserved: &Reserved,
+        new: &NewEntry<'_>,
+        bytes: u64,
     ) -> Result<Option<DiskEntry>> {
+        new.check()?;
         let NewEntry { tokens, images, cache_key, checkpoints, durable } = *new;
-        fs::create_dir_all(path)?;
-        let mut bytes = 0u64;
-        {
-            let mut w =
-                BufWriter::with_capacity(8 << 20, File::create(path.join(PREFIX))?);
-            prefix(&mut w)?;
-            w.flush()?;
-            bytes += w.get_ref().metadata()?.len();
-        }
-        let mut positions: Vec<usize> = checkpoints.to_vec();
-        positions.sort_unstable();
-        positions.dedup();
-        for &pos in &positions {
-            let mut w = BufWriter::with_capacity(
-                8 << 20,
-                File::create(path.join(format!("ckpt-{pos}.bin")))?,
-            );
-            checkpoint(pos, &mut w)?;
-            w.flush()?;
-            bytes += w.get_ref().metadata()?.len();
-        }
         if bytes > self.budget {
             return Ok(None);
         }
@@ -376,6 +446,9 @@ impl DiskStore {
             );
             return Ok(None);
         }
+        let mut positions: Vec<usize> = checkpoints.to_vec();
+        positions.sort_unstable();
+        positions.dedup();
         let meta = Meta {
             format: self.format.clone(),
             tokens: tokens.to_vec(),
@@ -386,12 +459,9 @@ impl DiskStore {
             durable,
             images: images.to_vec(),
         };
-        fs::write(path.join(META), serde_json::to_vec(&meta)?)?;
+        fs::write(reserved.path.join(META), serde_json::to_vec(&meta)?)?;
         Ok(Some(DiskEntry {
-            id: path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+            id: reserved.id.clone(),
             tokens: meta.tokens,
             checkpoints: positions,
             bytes,
@@ -400,6 +470,12 @@ impl DiskStore {
             durable,
             images: meta.images,
         }))
+    }
+
+    /// Whether `id` is (still) indexed: the budget and the age limit delete
+    /// entries on their own.
+    pub fn contains(&self, id: &str) -> bool {
+        self.entries.iter().any(|e| e.id == id)
     }
 
     /// Opens the per-token cache file of `id` for reading.

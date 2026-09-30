@@ -129,6 +129,24 @@ fn the_json_shape_is_the_documented_one() {
                 "other_ms": 0.0,
                 "chunks": 0,
             },
+            "evictions": {
+                "acquire": {
+                    "evicted": 0,
+                    "written_ahead": 0,
+                    "spilled": 0,
+                    "spill_ms": 0.0,
+                    "waited_ms": 0.0,
+                    "cancelled_writes": 0,
+                },
+                "release": {
+                    "evicted": 0,
+                    "written_ahead": 0,
+                    "spilled": 0,
+                    "spill_ms": 0.0,
+                    "waited_ms": 0.0,
+                    "cancelled_writes": 0,
+                },
+            },
             "ngram": {
                 "prefill": {
                     "batches": 0,
@@ -457,4 +475,47 @@ fn a_prefill_stalled_on_decompression_shows_its_phases_and_memory() {
     );
     assert!(details.contains("decompressions 3591786"), "{details}");
     assert!(!details.contains("ngram cold"), "{details}");
+}
+
+#[test]
+fn evictions_report_both_steps_and_reach_the_log_only_when_they_cost_time() {
+    use crate::serve::session::Evictions;
+    // Two sessions evicted to make room, both written ahead: drops, nothing
+    // for the log line.
+    let dropped = Evictions { evicted: 2, written_ahead: 2, ..Evictions::default() };
+    let quiet =
+        Timings::measure(1000, 0, 1.0, 5, 0.1, None).with_evictions(EvictionTimings {
+            acquire: EvictionPhase::new(&dropped),
+            ..Default::default()
+        });
+    let json = serde_json::to_value(quiet).unwrap();
+    assert_eq!(json["evictions"]["acquire"]["evicted"], json!(2));
+    assert_eq!(json["evictions"]["acquire"]["written_ahead"], json!(2));
+    assert_eq!(json["evictions"]["release"]["evicted"], json!(0));
+    assert!(!quiet.log_details().contains("evictions"), "{}", quiet.log_details());
+
+    // The fallback: one written ahead, one spilled on the spot after waiting
+    // for the write ahead of another; the release cancelled nothing.
+    let slow = Evictions {
+        evicted: 2,
+        written_ahead: 1,
+        spilled: 1,
+        spill_secs: 0.4913,
+        waited_secs: 0.12,
+        cancelled: 0,
+    };
+    let t =
+        Timings::measure(1000, 0, 1.0, 5, 0.1, None).with_evictions(EvictionTimings {
+            acquire: EvictionPhase::new(&slow),
+            ..Default::default()
+        });
+    assert_eq!(t.evictions.acquire.spill_ms, 491.3);
+    assert_eq!(t.evictions.acquire.waited_ms, 120.0);
+    assert!(
+        t.log_details().contains(
+            "evictions: acquire 2 evicted, 1 written ahead, 1 spilled in 0.49s, waited 0.12s for a write ahead; release 0 evicted"
+        ),
+        "{}",
+        t.log_details()
+    );
 }

@@ -16,7 +16,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::engine::{
-    DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, SnapshotApi,
+    DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, Segment, SnapshotApi,
     VisionMode, VisionTower,
 };
 use crate::kernels::attention::{
@@ -471,25 +471,43 @@ impl SnapshotApi for Snapshot {
             + self.mtp_hidden.as_ref().map_or(0, Tensor::byte_len)
     }
 
-    /// Layout: position (u64 LE); per GDN layer the state then the conv
-    /// window; the PLE hash history (2 x u32 LE) and window; the draft head's
-    /// hidden. Shapes come from the model, so nothing else is written.
-    fn write_to(&self, w: &mut dyn std::io::Write) -> Result<()> {
-        w.write_all(&(self.pos as u64).to_le_bytes())?;
-        for (state, window) in &self.gdn {
-            state.write_to(w)?;
-            window.write_to(w)?;
-        }
-        if let Some((hist, window)) = &self.ple {
-            w.write_all(&hist[0].to_le_bytes())?;
-            w.write_all(&hist[1].to_le_bytes())?;
-            window.write_to(w)?;
-        }
-        if let Some(hidden) = &self.mtp_hidden {
-            hidden.write_to(w)?;
-        }
-        Ok(())
+    fn layout(&self) -> Result<Vec<Segment>> {
+        Ok(recurrent_layout(
+            self.pos,
+            self.gdn.iter().map(|(state, window)| (state, window)),
+            self.ple.as_ref().map(|(hist, window)| (*hist, window)),
+            self.mtp_hidden.as_ref(),
+        ))
     }
+}
+
+/// The persisted recurrent state: position (u64 LE); per GDN layer the state
+/// then the conv window; the PLE hash history (2 x u32 LE) and window; the
+/// draft head's hidden. Shapes come from the model, so nothing else is
+/// written. A [`Snapshot`] and a live [`DecodeState`] (its current conv
+/// slot) lay out the same way, which is what lets a state at rest be written
+/// without taking a snapshot first.
+fn recurrent_layout<'t>(
+    pos: usize,
+    gdn: impl Iterator<Item = (&'t Tensor, &'t Tensor)>,
+    ple: Option<([u32; 2], &'t Tensor)>,
+    mtp_hidden: Option<&'t Tensor>,
+) -> Vec<Segment> {
+    let mut out = vec![Segment::Bytes((pos as u64).to_le_bytes().to_vec())];
+    for (state, window) in gdn {
+        out.push(Segment::tensor(state));
+        out.push(Segment::tensor(window));
+    }
+    if let Some((hist, window)) = ple {
+        let mut bytes = hist[0].to_le_bytes().to_vec();
+        bytes.extend_from_slice(&hist[1].to_le_bytes());
+        out.push(Segment::Bytes(bytes));
+        out.push(Segment::tensor(window));
+    }
+    if let Some(hidden) = mtp_hidden {
+        out.push(Segment::tensor(hidden));
+    }
+    out
 }
 
 /// Visits an attention layer's cache regions holding the first `tokens`
@@ -3647,17 +3665,37 @@ impl DecodeStateApi for DecodeState {
         ctx.blit_copy(&copies)
     }
 
-    fn write_prefix(&self, tokens: usize, w: &mut dyn std::io::Write) -> Result<()> {
+    fn prefix_layout(&self, tokens: usize) -> Result<Vec<Segment>> {
         ensure!(
             tokens <= self.pos,
             "state has fed {} tokens, {tokens} requested",
             self.pos
         );
-        let mut sink = |t: &Tensor, _: usize| t.write_to(w);
+        let mut out = Vec::new();
+        let mut sink = |t: &Tensor, _: usize| {
+            out.push(Segment::tensor(t));
+            Ok(())
+        };
         for lstate in self.layers.iter().chain(self.mtp.as_ref().map(|m| &m.layer)) {
             attn_prefix_regions(lstate, tokens, tokens, self.ratio, &mut sink)?;
         }
-        Ok(())
+        Ok(out)
+    }
+
+    fn live_layout(&self) -> Result<Vec<Segment>> {
+        ensure!(self.spec.is_none(), "a speculative step is still pending");
+        let slot = self.conv_slot;
+        Ok(recurrent_layout(
+            self.pos,
+            self.layers.iter().filter_map(|l| match l {
+                LayerState::Gdn { state, conv_windows } => {
+                    Some((state, &conv_windows[slot]))
+                }
+                LayerState::Attn { .. } => None,
+            }),
+            self.ple.as_ref().map(|p| (p.hist, &p.conv_windows[slot])),
+            self.mtp.as_ref().map(|m| &m.hidden),
+        ))
     }
 
     /// Reads a `tokens`-token prefix out of a layout written for `written`

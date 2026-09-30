@@ -65,8 +65,8 @@ use api::{Defaults, ImagePolicy, Kind, Prepared};
 use session::{CachedImage, SessionStore, boundary_position};
 use stream::{Event, OutputParser, ParserConfig};
 use timings::{
-    MemoryStats, NgramStats, PrefillParts, PrefillPhases, Speculation, Timings,
-    TimingsEntry, TimingsLog,
+    EvictionPhase, EvictionTimings, MemoryStats, NgramStats, PrefillParts,
+    PrefillPhases, Speculation, Timings, TimingsEntry, TimingsLog,
 };
 use tools::ParsedToolCall;
 
@@ -83,6 +83,13 @@ const BUDGET_HEADROOM_BYTES: usize = 8 << 30;
 /// The derived budget never goes below this (two full 131k contexts of the
 /// Qwen3.8 caches), whatever the arithmetic says; `--cache-bytes` overrides.
 const BUDGET_FLOOR_BYTES: usize = 8 << 30;
+/// The write ahead keeps the evictions for a new session of at least this
+/// context free of writes (the size of the last few new sessions raises
+/// it): an agent client's new conversation or subagent starts from a
+/// preamble of 10 000 to 30 000 tokens.
+const WRITE_AHEAD_FLOOR_TOKENS: usize = 32_768;
+/// How often the engine looks whether a write ahead finished.
+const WRITE_AHEAD_POLL: Duration = Duration::from_millis(50);
 
 /// The default session-cache budget: what the device's recommended working
 /// set leaves after the weights already allocated, the paged weights that
@@ -762,6 +769,27 @@ impl<M: LanguageModel> Engine<M> {
                     sessions = sessions
                         .with_disk(disk)
                         .with_durable_min_tokens(options.durable_min_tokens);
+                    // Under the expert cache the budget is exactly the one
+                    // session the plan reserved: every new session evicts the
+                    // last one, and the small machine keeps its behaviour.
+                    if model.expert_cache_stats().is_none()
+                        && model.session_reserve().is_none()
+                    {
+                        let floor = model
+                            .session_bytes(WRITE_AHEAD_FLOOR_TOKENS, 0)
+                            .map_or(1 << 30, |b| b as usize);
+                        sessions = sessions.with_write_ahead(floor);
+                        eprintln!(
+                            "session cache: evictions are written ahead in the background between requests, \
+                             keeping room for a new session of at least {:.1} GB ({WRITE_AHEAD_FLOOR_TOKENS} tokens) \
+                             free of writes",
+                            gb(floor)
+                        );
+                    } else {
+                        eprintln!(
+                            "session cache: no write ahead (the expert cache budgets one session)"
+                        );
+                    }
                 }
                 None => eprintln!(
                     "session cache: {} cannot persist sessions; disk tier off",
@@ -873,6 +901,13 @@ impl<M: LanguageModel> Engine<M> {
             left as f64 / 1e9,
         );
         next_id
+    }
+
+    /// Between requests: lets the session cache write the next evictions
+    /// ahead (see [`SessionStore::write_ahead`]). Returns whether a write is
+    /// in flight, which the engine loop then polls for.
+    fn write_ahead(&mut self) -> bool {
+        self.sessions.write_ahead(&self.ctx)
     }
 
     /// Testing only: makes the context fail its next submission the way a
@@ -1271,7 +1306,7 @@ impl<M: LanguageModel> Engine<M> {
             session.state.pos() == session.tokens.len(),
             "session token/state position mismatch"
         );
-        sessions.release(ctx, session, &images, p.cache_key.as_deref());
+        let released = sessions.release(ctx, session, &images, p.cache_key.as_deref());
 
         if ctx.profiling() {
             print_kernel_profile(&crate::metal::profile::take());
@@ -1299,6 +1334,10 @@ impl<M: LanguageModel> Engine<M> {
         .with_agreement(agreement, durable.map(|(b, _)| b))
         .with_vision(image_tokens, vision_secs)
         .with_pinned(pinned)
+        .with_evictions(EvictionTimings {
+            acquire: EvictionPhase::new(&acquired.evictions),
+            release: EvictionPhase::new(&released),
+        })
         .with_diagnostics(
             queued.as_secs_f64(),
             PrefillPhases::split(
@@ -1576,6 +1615,20 @@ fn warm_up<M: LanguageModel>(
     let decode_secs = decode_started.elapsed().as_secs_f64();
     // Snapshot/restore compile no shaders but exercise the blit path once.
     let snapshot = state.snapshot(ctx)?;
+    // The session cache persists a state at rest from its own buffers
+    // (`live_layout`, what the write ahead and a spill write as the live
+    // end) instead of a snapshot of it; the two must be the same bytes, or a
+    // session read back from disk would resume from another recurrent state.
+    // Checked before the restore, which resets the conv window slot.
+    if model.persistence_format().is_some() {
+        let (live, taken) = (state.live_layout()?, snapshot.layout()?);
+        // SAFETY: the state and the snapshot are borrowed here and the GPU
+        // is idle on both (the snapshot's blit was waited for).
+        ensure!(
+            unsafe { crate::engine::layouts_equal(&live, &taken) },
+            "the live recurrent state does not lay out like its snapshot"
+        );
+    }
     state.restore(ctx, &snapshot)?;
     // The expert cache's plan reserves a session from the shapes alone
     // (`LanguageModel::session_bytes`); a drift from what a real state and
@@ -1893,12 +1946,15 @@ fn engine_loop<M: LanguageModel>(
     while !shutdown.requested() {
         // An unloaded engine has nothing to time out; wait for a request.
         // A loaded one wakes for the idle unload or the end of the pin's hold.
+        // A write ahead in flight is polled for, so its entry is indexed and
+        // the next one started while the engine is still idle.
         let wait = engine.as_ref().and_then(|loaded| {
             let now = Instant::now();
-            match (idle.remaining(now), loaded.pin.hold_remaining(now)) {
-                (Some(idle), Some(hold)) => Some(idle.min(hold)),
-                (idle, hold) => idle.or(hold),
-            }
+            let writing = loaded.sessions.writing().then_some(WRITE_AHEAD_POLL);
+            [idle.remaining(now), loaded.pin.hold_remaining(now), writing]
+                .into_iter()
+                .flatten()
+                .min()
         });
         let cmd = match wait {
             None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
@@ -1938,6 +1994,9 @@ fn engine_loop<M: LanguageModel>(
                 }
                 let fault = engine.as_mut().expect("engine loaded").serve(*job);
                 idle.touch(Instant::now());
+                if fault.is_none() {
+                    engine.as_mut().expect("engine loaded").write_ahead();
+                }
                 if let Some(fault) = fault {
                     let faulted = engine.take().expect("engine loaded");
                     lifecycle.set(State::Recovering);
@@ -1985,6 +2044,7 @@ fn engine_loop<M: LanguageModel>(
             Err(RecvTimeoutError::Timeout) => {
                 if let Some(loaded) = engine.as_mut() {
                     loaded.pin.release_if_held_out(Instant::now());
+                    loaded.write_ahead();
                 }
                 if let Some(loaded) = engine.take_if(|_| idle.expired(Instant::now())) {
                     next_id = loaded.unload(&format!(

@@ -236,3 +236,540 @@ fn resume_rule_with_images_never_reuses_another_images_placeholders() {
     assert_eq!(resume_position(durable, &mine, &[8], true, &served, &mine), Some(8));
     assert_eq!(resume_position(durable, &mine, &[8], true, &served, &theirs), None);
 }
+
+// --- the store, with a model whose state lives in host memory -----------------
+
+mod store {
+    use std::io::Read;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use anyhow::{Result, bail};
+
+    use super::super::{Acquired, DiskCopy, Evictions, SessionStore};
+    use crate::engine::{
+        DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, Segment,
+        SnapshotApi,
+    };
+    use crate::metal::{EncodedPass, MetalContext};
+    use crate::serve::disk::DiskStore;
+    use crate::tensor::Tensor;
+
+    /// Budget bytes per token of capacity: a 300-token session is 300 000.
+    const BYTES_PER_TOKEN: usize = 1000;
+
+    /// A decode state that keeps one byte per fed token (the token id, cut
+    /// to a byte) and a rolling hash of them as its "recurrent" part, so a
+    /// restored session can be checked for exactly what it held.
+    struct State {
+        data: Vec<u8>,
+        recurrent: u64,
+        capacity: usize,
+    }
+
+    struct Snap {
+        pos: usize,
+        recurrent: u64,
+    }
+
+    fn snap_bytes(pos: usize, recurrent: u64) -> Vec<u8> {
+        let mut bytes = (pos as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&recurrent.to_le_bytes());
+        bytes
+    }
+
+    impl SnapshotApi for Snap {
+        fn pos(&self) -> usize {
+            self.pos
+        }
+        fn bytes(&self) -> usize {
+            0
+        }
+        fn layout(&self) -> Result<Vec<Segment>> {
+            Ok(vec![Segment::Bytes(snap_bytes(self.pos, self.recurrent))])
+        }
+    }
+
+    impl State {
+        fn feed(&mut self, tokens: &[u32]) {
+            for &t in tokens {
+                self.data.push(t as u8);
+                self.recurrent = self.recurrent.wrapping_mul(31).wrapping_add(t.into());
+            }
+            self.capacity = self.capacity.max(self.data.len());
+        }
+    }
+
+    impl DecodeStateApi for State {
+        type Snapshot = Snap;
+        fn pos(&self) -> usize {
+            self.data.len()
+        }
+        fn advance(&mut self, _: usize) {}
+        fn reset(&mut self) -> Result<()> {
+            self.data.clear();
+            Ok(())
+        }
+        fn capacity(&self) -> usize {
+            self.capacity
+        }
+        fn ensure_capacity(&mut self, _: &MetalContext, tokens: usize) -> Result<()> {
+            self.capacity = self.capacity.max(tokens);
+            Ok(())
+        }
+        fn bytes(&self) -> usize {
+            self.capacity * BYTES_PER_TOKEN
+        }
+        fn snapshot(&self, _: &MetalContext) -> Result<Snap> {
+            Ok(Snap { pos: self.data.len(), recurrent: self.recurrent })
+        }
+        fn restore(&mut self, _: &MetalContext, snapshot: &Snap) -> Result<()> {
+            self.data.truncate(snapshot.pos);
+            self.recurrent = snapshot.recurrent;
+            Ok(())
+        }
+        fn copy_prefix_from(
+            &mut self,
+            _: &MetalContext,
+            from: &Self,
+            tokens: usize,
+        ) -> Result<()> {
+            self.data = from.data[..tokens].to_vec();
+            Ok(())
+        }
+        fn prefix_layout(&self, tokens: usize) -> Result<Vec<Segment>> {
+            Ok(vec![Segment::host(&self.data[..tokens])])
+        }
+        fn live_layout(&self) -> Result<Vec<Segment>> {
+            Ok(vec![Segment::Bytes(snap_bytes(self.data.len(), self.recurrent))])
+        }
+        fn read_prefix(
+            &mut self,
+            _: &MetalContext,
+            written: usize,
+            tokens: usize,
+            r: &mut dyn Read,
+        ) -> Result<()> {
+            let mut all = vec![0u8; written];
+            r.read_exact(&mut all)?;
+            self.data = all[..tokens].to_vec();
+            self.capacity = self.capacity.max(tokens);
+            Ok(())
+        }
+    }
+
+    struct Scratch;
+
+    impl ScratchApi for Scratch {
+        fn next_token(&self) -> &Tensor {
+            unreachable!("no decoding in these tests")
+        }
+        fn logits(&self) -> &Tensor {
+            unreachable!("no decoding in these tests")
+        }
+        fn begin_request(&self) {}
+    }
+
+    struct Model;
+
+    impl LanguageModel for Model {
+        type State = State;
+        type Scratch = Scratch;
+        const MODEL_ID: &'static str = "fake";
+
+        fn load(_: &MetalContext, _: &Path, _: &LoadOptions) -> Result<Self> {
+            Ok(Self)
+        }
+        fn max_position_embeddings(&self) -> usize {
+            0
+        }
+        fn eos_token_ids(&self) -> Vec<u32> {
+            Vec::new()
+        }
+        fn vocab_size(&self) -> usize {
+            256
+        }
+        fn bytes_per_token(&self) -> usize {
+            BYTES_PER_TOKEN
+        }
+        fn read_snapshot(&self, _: &MetalContext, r: &mut dyn Read) -> Result<Snap> {
+            let mut b = [0u8; 16];
+            r.read_exact(&mut b)?;
+            Ok(Snap {
+                pos: u64::from_le_bytes(b[..8].try_into()?) as usize,
+                recurrent: u64::from_le_bytes(b[8..].try_into()?),
+            })
+        }
+        fn new_state(&self, _: &MetalContext, capacity: usize) -> Result<State> {
+            Ok(State { data: Vec::new(), recurrent: 0, capacity })
+        }
+        fn new_scratch_with_capacity(
+            &self,
+            _: &MetalContext,
+            _: usize,
+        ) -> Result<Scratch> {
+            Ok(Scratch)
+        }
+        fn prefill(
+            &self,
+            _: &MetalContext,
+            _: &mut State,
+            _: &mut Scratch,
+            _: &[u32],
+            _: Option<Draw<'_>>,
+        ) -> Result<()> {
+            bail!("not in these tests")
+        }
+        fn prepare_step_inputs(
+            &self,
+            _: &mut State,
+            _: &Scratch,
+            _: u32,
+        ) -> Result<()> {
+            bail!("not in these tests")
+        }
+        fn encode_decode_step<'a>(
+            &self,
+            _: &'a MetalContext,
+            _: &State,
+            _: &Scratch,
+            _: usize,
+            _: usize,
+            _: Draw<'_>,
+        ) -> Result<EncodedPass<'a>> {
+            bail!("not in these tests")
+        }
+    }
+
+    struct Fixture {
+        ctx: MetalContext,
+        store: SessionStore<Model>,
+        root: PathBuf,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.store.drop_all();
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// A store of `budget` bytes over a fresh disk tier; the write ahead on
+    /// with `floor` bytes when given.
+    fn fixture(tag: &str, budget: usize, floor: Option<usize>) -> Fixture {
+        let root = std::env::temp_dir()
+            .join(format!("lily-session-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let disk = DiskStore::open(&root, "fake", 1 << 30, 0).expect("disk");
+        let mut store = SessionStore::new(budget, 16, 3).with_disk(disk);
+        if let Some(floor) = floor {
+            store = store.with_write_ahead(floor);
+        }
+        Fixture { ctx: MetalContext::new().expect("metal"), store, root }
+    }
+
+    /// A prompt of `len` tokens whose ids start at `seed` (distinct seeds,
+    /// distinct lineages).
+    fn prompt(seed: u32, len: usize) -> Vec<u32> {
+        (0..len as u32).map(|i| seed * 1000 + i).collect()
+    }
+
+    /// What the engine does with a request: acquire, feed the rest of the
+    /// prompt with a checkpoint at `n - 1`, release. Returns the acquire
+    /// and what the release evicted.
+    fn serve(f: &mut Fixture, prompt: &[u32]) -> (Acquired<Model>, Evictions) {
+        let n = prompt.len();
+        let mut acquired =
+            f.store.acquire(&f.ctx, &Model, prompt, &[], None).expect("acquire");
+        let reused = acquired.reused;
+        let mut session = std::mem::replace(
+            &mut acquired.session,
+            super::super::Session::new(State {
+                data: vec![],
+                recurrent: 0,
+                capacity: 0,
+            }),
+        );
+        assert_eq!(session.state.pos(), reused);
+        session.state.feed(&prompt[reused..n - 1]);
+        let snapshot = session.state.snapshot(&f.ctx).expect("snapshot");
+        session.add_checkpoint(snapshot);
+        session.state.feed(&prompt[n - 1..]);
+        session.tokens.truncate(reused);
+        session.tokens.extend_from_slice(&prompt[reused..]);
+        let released = f.store.release(&f.ctx, session, &[], None);
+        (acquired, released)
+    }
+
+    /// Runs the write ahead until nothing is in flight; returns how many
+    /// writes finished.
+    fn settle(f: &mut Fixture) -> usize {
+        let before = f.store.disk().map_or(0, DiskStore::len);
+        while f.store.write_ahead(&f.ctx) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        f.store.disk().map_or(0, DiskStore::len) - before
+    }
+
+    fn copy_of(f: &Fixture, seed: u32) -> Option<DiskCopy> {
+        f.store
+            .entries
+            .iter()
+            .find(|s| s.tokens.first() == Some(&(seed * 1000)))
+            .map(|s| s.disk.clone())
+    }
+
+    fn entry_dirs(f: &Fixture) -> usize {
+        std::fs::read_dir(f.root.join("fake")).map_or(0, |d| d.count())
+    }
+
+    /// The state a resumed session holds must be exactly the one served.
+    fn assert_holds(state: &State, tokens: &[u32]) {
+        let mut expected = State { data: vec![], recurrent: 0, capacity: 0 };
+        expected.feed(tokens);
+        assert_eq!(state.data, expected.data);
+        assert_eq!(state.recurrent, expected.recurrent);
+    }
+
+    #[test]
+    fn a_session_written_ahead_is_evicted_without_a_write_and_resumes_exactly() {
+        // Two 300-token sessions fit a 700 000-byte budget, a third does not.
+        let mut f = fixture("ahead", 700_000, Some(300_000));
+        let a = prompt(1, 300);
+        serve(&mut f, &a);
+        serve(&mut f, &prompt(2, 300));
+        // 100 000 free, a new session needs 300 000: A (least recently used)
+        // is written ahead, B (the one that just ran) is not.
+        assert_eq!(settle(&mut f), 1);
+        assert!(matches!(copy_of(&f, 1), Some(DiskCopy::Written(_))));
+        assert_eq!(copy_of(&f, 2), Some(DiskCopy::None));
+        // Both still resident: the write released nothing.
+        assert_eq!((f.store.len(), f.store.used_bytes()), (2, 600_000));
+        // The room now holds a new session: nothing more to write.
+        assert!(!f.store.write_ahead(&f.ctx));
+        assert_eq!(settle(&mut f), 0);
+
+        let (acquired, _) = serve(&mut f, &prompt(3, 300));
+        let e = acquired.evictions;
+        assert_eq!((e.evicted, e.written_ahead, e.spilled, e.cancelled), (1, 1, 0, 0));
+        assert!(f.store.used_bytes() <= 700_000);
+
+        // A comes back from its copy with exactly what it held.
+        let mut longer = a.clone();
+        longer.extend(prompt(9, 20));
+        let acquired = f.store.acquire(&f.ctx, &Model, &longer, &[], None).expect("a");
+        assert_eq!(acquired.reused, 300);
+        assert!(acquired.from_disk.is_some());
+        assert_holds(&acquired.session.state, &a);
+    }
+
+    #[test]
+    fn a_prompt_that_resumes_the_session_being_written_cancels_the_write() {
+        let mut f = fixture("reclaim", 700_000, Some(300_000));
+        let gate = Arc::new(AtomicBool::new(true));
+        f.store.write_gate = Some(gate.clone());
+        let a = prompt(1, 300);
+        serve(&mut f, &a);
+        serve(&mut f, &prompt(2, 300));
+        assert!(f.store.write_ahead(&f.ctx), "the write of A is held in flight");
+        // Parked: counted in the budget, invisible to lookups, nothing indexed.
+        assert_eq!((f.store.len(), f.store.used_bytes()), (2, 600_000));
+        assert_eq!(f.store.disk().expect("disk").len(), 0);
+
+        let mut longer = a.clone();
+        longer.extend(prompt(9, 20));
+        let (acquired, _) = serve(&mut f, &longer);
+        // The request got A itself, resident, at its live end ...
+        assert_eq!((acquired.reused, acquired.forked), (300, false));
+        assert!(acquired.from_disk.is_none());
+        assert_eq!(acquired.evictions.cancelled, 1);
+        // ... and the partly written entry is gone, never indexed.
+        assert!(!f.store.writing());
+        assert_eq!(f.store.disk().expect("disk").len(), 0);
+        assert_eq!(entry_dirs(&f), 0);
+        gate.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn an_eviction_that_reaches_the_write_in_flight_waits_for_it() {
+        let mut f = fixture("wait", 700_000, Some(300_000));
+        let gate = Arc::new(AtomicBool::new(true));
+        f.store.write_gate = Some(gate.clone());
+        let a = prompt(1, 300);
+        serve(&mut f, &a);
+        serve(&mut f, &prompt(2, 300));
+        assert!(f.store.write_ahead(&f.ctx));
+        let opener = {
+            let gate = gate.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                gate.store(false, Ordering::Release);
+            })
+        };
+        // A new session needs A's room: the eviction waits for A's write and
+        // then drops it, no second write.
+        let acquired = f
+            .store
+            .acquire(&f.ctx, &Model, &prompt(3, 300), &[], None)
+            .expect("acquire");
+        opener.join().expect("opener");
+        let e = acquired.evictions;
+        assert_eq!((e.evicted, e.written_ahead, e.spilled), (1, 1, 0));
+        assert!(e.waited_secs >= 0.02, "{e:?}");
+        // The bound: what stays resident plus the new session fits.
+        assert_eq!(f.store.used_bytes() + acquired.session.bytes(), 600_000);
+        let disk = f.store.disk().expect("disk");
+        assert_eq!(disk.len(), 1);
+        assert_eq!(disk.entries()[0].tokens, a);
+    }
+
+    #[test]
+    fn without_a_copy_on_disk_the_eviction_writes_the_session_on_the_spot() {
+        // The fallback: the write ahead is off, or had no time.
+        let mut f = fixture("fallback", 700_000, None);
+        let a = prompt(1, 300);
+        serve(&mut f, &a);
+        serve(&mut f, &prompt(2, 300));
+        assert!(!f.store.write_ahead(&f.ctx), "off");
+        let (acquired, _) = serve(&mut f, &prompt(3, 300));
+        let e = acquired.evictions;
+        assert_eq!((e.evicted, e.written_ahead, e.spilled), (1, 0, 1));
+        assert!(e.spill_secs > 0.0);
+        let mut longer = a.clone();
+        longer.push(5);
+        let acquired = f.store.acquire(&f.ctx, &Model, &longer, &[], None).expect("a");
+        assert_eq!(acquired.reused, 300);
+        assert_holds(&acquired.session.state, &a);
+    }
+
+    #[test]
+    fn a_copy_the_tier_deleted_is_written_again_or_spilled() {
+        let mut f = fixture("vanished", 700_000, Some(300_000));
+        serve(&mut f, &prompt(1, 300));
+        serve(&mut f, &prompt(2, 300));
+        assert_eq!(settle(&mut f), 1);
+        let Some(DiskCopy::Written(id)) = copy_of(&f, 1) else { panic!("written") };
+        // The budget or the age limit deletes the entry behind the store's back.
+        f.store.disk.as_mut().expect("disk").remove(&id);
+        // An eviction now does not trust the copy: it spills.
+        let (acquired, _) = serve(&mut f, &prompt(3, 300));
+        let e = acquired.evictions;
+        assert_eq!((e.evicted, e.written_ahead, e.spilled), (1, 0, 1));
+        // And between requests the write ahead notices a deleted copy too.
+        assert_eq!(settle(&mut f), 1);
+        let Some(DiskCopy::Written(id)) = copy_of(&f, 2) else {
+            panic!("B written ahead")
+        };
+        f.store.disk.as_mut().expect("disk").remove(&id);
+        assert_eq!(settle(&mut f), 1, "written again");
+    }
+
+    #[test]
+    fn resuming_a_session_that_was_written_ahead_deletes_the_stale_copy() {
+        let mut f = fixture("stale", 700_000, Some(300_000));
+        let a = prompt(1, 300);
+        serve(&mut f, &a);
+        serve(&mut f, &prompt(2, 300));
+        assert_eq!(settle(&mut f), 1);
+        let mut longer = a.clone();
+        longer.extend(prompt(9, 20));
+        let (acquired, _) = serve(&mut f, &longer);
+        // Resumed resident (ties go to the GPU), not from the copy.
+        assert_eq!(acquired.reused, 300);
+        assert!(acquired.from_disk.is_none());
+        // The copy held A as it was; after the request it is stale and gone.
+        assert_eq!(f.store.disk().expect("disk").len(), 0);
+        assert_eq!(copy_of(&f, 1), Some(DiskCopy::None));
+    }
+
+    #[test]
+    fn nothing_is_written_ahead_while_the_room_suffices_nor_the_latest_session() {
+        let mut f = fixture("quiet", 2_000_000, Some(300_000));
+        serve(&mut f, &prompt(1, 300));
+        serve(&mut f, &prompt(2, 300));
+        // 1 400 000 free: room enough.
+        assert_eq!(settle(&mut f), 0);
+        // A lone session filling the budget: it is the one that just ran.
+        let mut g = fixture("lone", 300_000, Some(300_000));
+        serve(&mut g, &prompt(1, 300));
+        assert_eq!(settle(&mut g), 0);
+        // Sessions too short for the disk tier are dropped anyway and never
+        // written.
+        let mut h = fixture("short", 250_000, Some(300_000));
+        serve(&mut h, &prompt(1, 100));
+        serve(&mut h, &prompt(2, 100));
+        assert_eq!(settle(&mut h), 0);
+    }
+
+    #[test]
+    fn the_headroom_follows_the_largest_recent_new_session() {
+        // A 600-token session was created: the next new one is expected to
+        // be as large, so two sessions are written ahead, not one.
+        let mut f = fixture("headroom", 1_300_000, Some(100_000));
+        serve(&mut f, &prompt(1, 300));
+        serve(&mut f, &prompt(2, 300));
+        serve(&mut f, &prompt(3, 600));
+        // 100 000 free; 600 000 wanted: A and B, in eviction order.
+        assert_eq!(settle(&mut f), 2);
+        assert!(matches!(copy_of(&f, 1), Some(DiskCopy::Written(_))));
+        assert!(matches!(copy_of(&f, 2), Some(DiskCopy::Written(_))));
+        assert_eq!(copy_of(&f, 3), Some(DiskCopy::None));
+    }
+
+    #[test]
+    fn a_fault_drops_the_write_in_flight_and_an_unload_finishes_it() {
+        let mut f = fixture("drop", 700_000, Some(300_000));
+        let gate = Arc::new(AtomicBool::new(true));
+        f.store.write_gate = Some(gate.clone());
+        serve(&mut f, &prompt(1, 300));
+        serve(&mut f, &prompt(2, 300));
+        assert!(f.store.write_ahead(&f.ctx));
+        assert_eq!(f.store.drop_all(), 2);
+        assert!(!f.store.writing());
+        assert_eq!(f.store.disk().expect("disk").len(), 0);
+        assert_eq!(entry_dirs(&f), 0);
+
+        // The unload: the write in flight completes, the other session spills.
+        serve(&mut f, &prompt(3, 300));
+        serve(&mut f, &prompt(4, 300));
+        assert!(f.store.write_ahead(&f.ctx));
+        gate.store(false, Ordering::Release);
+        assert_eq!(f.store.spill_all(&f.ctx), (2, 0));
+        assert!(f.store.is_empty());
+        assert_eq!(f.store.disk().expect("disk").len(), 2);
+    }
+
+    #[test]
+    fn a_write_ahead_writes_what_a_synchronous_spill_writes() {
+        let read = |root: &Path, id: &str| -> Vec<Vec<u8>> {
+            let dir = root.join("fake").join(id);
+            let mut files: Vec<_> = std::fs::read_dir(&dir)
+                .expect("dir")
+                .map(|e| e.expect("entry").path())
+                .filter(|p| !p.ends_with("meta.json"))
+                .collect();
+            files.sort();
+            files.iter().map(|p| std::fs::read(p).expect("read")).collect()
+        };
+        let mut ahead = fixture("same-ahead", 700_000, Some(300_000));
+        let mut sync = fixture("same-sync", 700_000, None);
+        for f in [&mut ahead, &mut sync] {
+            serve(f, &prompt(1, 300));
+            serve(f, &prompt(2, 300));
+            settle(f);
+            serve(f, &prompt(3, 300));
+        }
+        let id = |f: &Fixture| f.store.disk().expect("disk").entries()[0].id.clone();
+        assert_eq!(read(&ahead.root, &id(&ahead)), read(&sync.root, &id(&sync)));
+        let mut out = Vec::new();
+        std::fs::File::open(
+            ahead.root.join("fake").join(id(&ahead)).join("prefix.bin"),
+        )
+        .expect("prefix")
+        .read_to_end(&mut out)
+        .expect("read");
+        assert_eq!(out, prompt(1, 300).iter().map(|&t| t as u8).collect::<Vec<_>>());
+    }
+}

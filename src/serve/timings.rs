@@ -97,6 +97,10 @@ pub struct Timings {
     pub pinned: bool,
     /// Where `prefill_ms` went.
     pub prefill_phases: PrefillPhases,
+    /// What evicting sessions cost the request: while acquiring its session
+    /// (part of `prefill_phases.session_ms`) and while returning it to the
+    /// cache after the decode (before the response's last chunk).
+    pub evictions: EvictionTimings,
     /// The paged n-gram table's gathers during the prefill and the decode.
     pub ngram: NgramStats,
     /// The system's memory over the request.
@@ -132,6 +136,76 @@ pub struct PrefillPhases {
     pub other_ms: f64,
     /// Prefill chunks run (at most 4 096 tokens each).
     pub chunks: u64,
+}
+
+/// Sessions evicted from GPU memory during one step of a request, and how
+/// (`docs/architecture.md`, "The session cache"). An eviction written ahead
+/// in the background is a drop; one that was not writes the session on the
+/// spot (`spilled`, `spill_ms`, the fallback); one that reached the session
+/// being written ahead waited for that write (`waited_ms`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct EvictionPhase {
+    /// Sessions evicted.
+    pub evicted: usize,
+    /// Of those, the ones whose copy was written ahead: dropped, no I/O.
+    pub written_ahead: usize,
+    /// Of those, the ones written to the disk tier synchronously.
+    pub spilled: usize,
+    /// Time in the synchronous writes.
+    pub spill_ms: f64,
+    /// Time waiting for a write ahead that had not finished.
+    pub waited_ms: f64,
+    /// Writes ahead cancelled because the request resumed that session.
+    pub cancelled_writes: usize,
+}
+
+impl EvictionPhase {
+    pub fn new(e: &super::session::Evictions) -> Self {
+        Self {
+            evicted: e.evicted,
+            written_ahead: e.written_ahead,
+            spilled: e.spilled,
+            spill_ms: round(e.spill_secs * 1e3, 1e3),
+            waited_ms: round(e.waited_secs * 1e3, 1e3),
+            cancelled_writes: e.cancelled,
+        }
+    }
+
+    /// Whether anything here cost time (a drop costs none).
+    fn notable(&self) -> bool {
+        self.spilled > 0 || self.waited_ms > 0.0 || self.cancelled_writes > 0
+    }
+
+    fn describe(&self) -> String {
+        let mut parts = vec![format!("{} evicted", self.evicted)];
+        if self.written_ahead > 0 {
+            parts.push(format!("{} written ahead", self.written_ahead));
+        }
+        if self.spilled > 0 {
+            parts.push(format!(
+                "{} spilled in {:.2}s",
+                self.spilled,
+                self.spill_ms / 1e3
+            ));
+        }
+        if self.waited_ms > 0.0 {
+            parts
+                .push(format!("waited {:.2}s for a write ahead", self.waited_ms / 1e3));
+        }
+        if self.cancelled_writes > 0 {
+            parts.push(format!("{} write ahead cancelled", self.cancelled_writes));
+        }
+        parts.join(", ")
+    }
+}
+
+/// [`EvictionPhase`] for the two places a request evicts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct EvictionTimings {
+    /// Making room for the request's session (inside `session_ms`).
+    pub acquire: EvictionPhase,
+    /// Trimming the cache back to budget after the decode.
+    pub release: EvictionPhase,
 }
 
 /// The wall-clock pieces [`PrefillPhases::split`] adds to the engine's
@@ -355,6 +429,7 @@ impl Timings {
             queue_ms: 0.0,
             pinned: false,
             prefill_phases: PrefillPhases::default(),
+            evictions: EvictionTimings::default(),
             ngram: NgramStats::default(),
             memory: MemoryStats::default(),
         }
@@ -405,6 +480,14 @@ impl Timings {
             phases.push(format!("other {}", secs(p.other_ms)));
             parts.push(format!("prefill phases: {}", phases.join(", ")));
         }
+        let ev = &self.evictions;
+        if ev.acquire.notable() || ev.release.notable() {
+            parts.push(format!(
+                "evictions: acquire {}; release {}",
+                ev.acquire.describe(),
+                ev.release.describe()
+            ));
+        }
         let (np, nd) = (&self.ngram.prefill, &self.ngram.decode);
         let decode_per_step = nd.gather_ms / nd.batches.max(1) as f64;
         if np.gather_ms >= LOG_PREFILL_GATHER_MS
@@ -450,6 +533,12 @@ impl Timings {
             ));
         }
         parts.iter().map(|part| format!("; {part}")).collect()
+    }
+
+    /// Adds what evicting sessions cost at the acquire and the release.
+    pub fn with_evictions(mut self, evictions: EvictionTimings) -> Self {
+        self.evictions = evictions;
+        self
     }
 
     /// Records whether the weights were pinned when the request started.
