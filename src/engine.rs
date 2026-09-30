@@ -276,6 +276,21 @@ pub trait LanguageModel: Sized {
         0
     }
 
+    /// The GPU buffers that hold the model's weights (the vision tower's and
+    /// the draft head's included), without an expert cache's slab and slot
+    /// tables, weights served from the page cache, or anything allocated
+    /// after the load: what the server's `--pin-weights` locks in memory.
+    /// Empty for models that do not track them, which are then never pinned.
+    fn weight_buffers(&self) -> Vec<crate::metal::Buffer> {
+        Vec::new()
+    }
+
+    /// The memory the load planned for (`LoadOptions::memory_budget`, else
+    /// the machine's physical memory); `None` when unknown.
+    fn planned_memory(&self) -> Option<u64> {
+        None
+    }
+
     /// The vision tower's fate at load; `None` for architectures whose
     /// checkpoints lily reads text-only.
     fn vision_tower(&self) -> Option<VisionTower> {

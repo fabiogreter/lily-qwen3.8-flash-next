@@ -896,10 +896,12 @@ instead of the response.
 
 Next to the headline numbers the object carries the diagnostics that say
 why a request was slow. `queue_ms` is the wait for the engine (a reload
-included), outside `prefill_ms`. `prefill_phases` splits `prefill_ms` so
-the phases plus `vision_ms` add up to it: `session_ms` (cache lookup,
-fork, disk restore, any eviction the lookup caused), `alloc_ms` (growing
-the state and the prefill scratch), `ngram_ms` (hashing and gathering the
+and pinning the weights included), outside `prefill_ms`, and `pinned`
+whether the weights were pinned when the request started. `prefill_phases`
+splits `prefill_ms` so the phases plus `vision_ms` add up to it:
+`session_ms` (cache lookup, fork, disk restore, any eviction the lookup
+caused), `alloc_ms` (growing the state and the prefill scratch), `ngram_ms`
+(hashing and gathering the
 rows), `encode_ms`, `gpu_ms` (the chunks' execution from the commit
 feedback's GPU timestamps), `wait_ms` (commit to completion minus the GPU
 span), `durable_ms`, `checkpoint_ms` and the remainder `other_ms`; normal
@@ -927,6 +929,52 @@ chatcmpl-...: 113489 prompt tokens (113472 cached), 64 generated, prefix 8.06s, 
 ```
 
 About 3.6 million decompressed pages, 55 GB, for 0.08 s of GPU work.
+
+**Pinning the weights.** The weights are anonymous shared-storage buffers,
+so the compressor takes them like any idle memory; the queue's residency set
+does not prevent that, a wired page is never compressed. With
+`--pin-weights auto` (the default) the first request of an active period
+locks the weight buffers with `mlock` before its prefill, inside its
+`queue_ms` (about 2 to 3 s for the ~74 GB of the full model, more when they
+were compressed already; `pinned X GB of weights in Ys`), the pin holds while
+requests keep coming, and it is released `--pin-hold` (default 1m) after the
+last request finished (`released pin after 1m idle`), as soon as the
+memorystatus pressure level reaches warning (a monitor thread polls it every
+second; `released pin: memory pressure warning`, re-pinned at the next
+request only once the level is normal again), and before an idle unload, a
+GPU-fault reload or the shutdown drops the buffers. What is pinned is the
+set of buffers the load read weights into (`MetalContext::record_buffers`
+around `qwen4exp::weights::load`, the vision tower and the draft head
+included), never the expert cache's slab and slot tables, the session
+caches, the scratch or the paged n-gram table. The pin holds its own handles
+on those buffers and unlocks before it lets go of them, so locked memory is
+never freed and freed memory never locked. A failed `mlock` unlocks what it
+had locked, logs `pin failed: <error>` and is not retried before the next
+active period; the request is served unpinned. Every response's `timings`
+say whether the weights were `pinned` when it started.
+
+Whether to pin is a pure function (`serve::pin::decide`) of the planned
+memory (`--memory-gb` when given, else physical, and never more than
+physical), the wire limit (the smaller of `vm.user_wire_limit` and
+`vm.global_user_wire_limit`, 116.8 GB each on 128 GB), the bytes to pin and
+whether the expert cache is active. `auto` skips when the expert cache is
+active (`pin skipped: expert cache active`): the plan (`auto_expert_slots`)
+already spends everything but its reserve on the slab, the 3 GB of resident
+non-expert weights are not where the stalls come from, and wiring them would
+come out of the 12 GB the plan keeps for the OS, other applications and the
+page cache that streams the other experts. Otherwise it pins only when the
+pinned bytes leave the plan's own reserve and scratch allowance free of the
+planned memory (a sixth of it, at least 12 GiB, plus 5 GiB: 28.3 GB on
+128 GB) and, together with anything else the process locks
+(`--ngram-lock`'s 32 GB table, which makes the two exclusive on 128 GB),
+leave an eighth of the wire limit, at least 8 GiB, below it: the global
+part of the limit counts everything the system has wired already, which
+varies. An unreadable limit counts as half the physical memory. `always`
+drops the expert-cache rule and the planned-memory margin but keeps the wire
+limit's (on 64 GB it pins the ~4 GB of non-expert weights and the tower);
+`off` never pins. Pinning acts only on buffers the plan already allocated:
+slot counts, the slab, the budgets and the expert cache's behaviour are the
+same with every mode.
 
 Sampling runs on the GPU, so that only the token id crosses to the host. Two
 kernels per step: a wide one applies the penalties (presence, frequency and

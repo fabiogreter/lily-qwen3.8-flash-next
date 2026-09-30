@@ -89,9 +89,12 @@ pub struct Timings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vision_ms: Option<f64>,
     /// Wall time from the request entering the engine's queue to the engine
-    /// starting it: other requests ahead of it, or a reload after an idle
-    /// unload. Not part of `prefill_ms`.
+    /// starting it: other requests ahead of it, a reload after an idle
+    /// unload, or pinning the weights (`pinned`). Not part of `prefill_ms`.
     pub queue_ms: f64,
+    /// Whether the weights were pinned in memory (`--pin-weights`) when
+    /// the request started; pinning them for it is part of `queue_ms`.
+    pub pinned: bool,
     /// Where `prefill_ms` went.
     pub prefill_phases: PrefillPhases,
     /// The paged n-gram table's gathers during the prefill and the decode.
@@ -350,6 +353,7 @@ impl Timings {
             image_tokens: None,
             vision_ms: None,
             queue_ms: 0.0,
+            pinned: false,
             prefill_phases: PrefillPhases::default(),
             ngram: NgramStats::default(),
             memory: MemoryStats::default(),
@@ -446,6 +450,12 @@ impl Timings {
             ));
         }
         parts.iter().map(|part| format!("; {part}")).collect()
+    }
+
+    /// Records whether the weights were pinned when the request started.
+    pub fn with_pinned(mut self, pinned: bool) -> Self {
+        self.pinned = pinned;
+        self
     }
 
     /// Adds the request's images: how many prompt tokens they take and how

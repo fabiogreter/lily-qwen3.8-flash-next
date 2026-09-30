@@ -76,6 +76,26 @@ struct Cli {
     #[arg(long, default_value = "0")]
     idle_unload: String,
 
+    /// Lock the model's weights in memory (`mlock`) while requests come, so
+    /// macOS does not compress them while an agent runs a tool and the next
+    /// request does not wait seconds for them to come back. The first
+    /// request after a quiet spell pins them before its prefill (about 3 s
+    /// for the full model); `--pin-hold` after the last request, under
+    /// memory pressure (warning or worse) and before an idle unload the pin
+    /// is released. `auto` pins only when the whole model is resident (no
+    /// expert cache) and leaves the plan's reserve and a margin below the
+    /// wire limit free; `always` pins whenever it fits below the wire limit,
+    /// on a small machine too (the expert cache's slab is never pinned);
+    /// `off` never pins. A failed pin is logged and the server serves
+    /// unpinned.
+    #[arg(long, default_value = "auto")]
+    pin_weights: lily::serve::pin::PinMode,
+
+    /// How long the pin is held after the last request finished, e.g. `1m`,
+    /// `30s`; `0` holds it until memory pressure or the unload.
+    #[arg(long, default_value = "1m")]
+    pin_hold: String,
+
     /// Where the Qwen3.8-Flash-Next n-gram table lives: `paged` reads rows
     /// from the checkpoint files through the page cache (32 GB less GPU
     /// memory), `resident` uploads it whole.
@@ -231,6 +251,8 @@ fn run() -> Result<()> {
             repetition_penalty: cli.repetition_penalty,
         },
         idle_unload_secs: parse_duration_secs(&cli.idle_unload)?,
+        pin_weights: cli.pin_weights,
+        pin_hold_secs: parse_duration_secs(&cli.pin_hold)?,
         inject_metal_fault: cli.debug_inject_metal_fault,
     };
     lily::serve::run(&cli.model, options)

@@ -35,7 +35,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ops::Deref;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -219,6 +219,9 @@ pub struct MetalContext {
     build_nanos: AtomicU64,
     /// Per-kernel profile mode; see [`profile`].
     profile: bool,
+    /// The buffers [`Self::new_buffer`] allocated while a
+    /// [`BufferRecording`] is open.
+    recorded: RefCell<Option<Vec<Weak<GpuBuffer>>>>,
 }
 
 impl MetalContext {
@@ -258,6 +261,7 @@ impl MetalContext {
             built: AtomicU64::new(0),
             build_nanos: AtomicU64::new(0),
             profile,
+            recorded: RefCell::new(None),
         };
         // The production GEMM paths use native Metal tensor units.
         let family = ctx.apple_gpu_family();
@@ -355,7 +359,24 @@ impl MetalContext {
     /// Allocates a zero-initialized shared-storage buffer and makes it
     /// resident for the queue.
     pub fn new_buffer(&self, len: usize) -> Result<Buffer> {
-        self.residency.new_buffer(&self.device, len)
+        let buf = self.residency.new_buffer(&self.device, len)?;
+        if let Some(recorded) = self.recorded.borrow_mut().as_mut() {
+            recorded.push(Rc::downgrade(&buf));
+        }
+        Ok(buf)
+    }
+
+    /// Starts recording the buffers [`Self::new_buffer`] allocates (and so
+    /// [`Self::new_buffer_with_bytes`] and every tensor constructor), until
+    /// [`BufferRecording::finish`] returns the ones still alive. Mapped
+    /// buffers are not recorded (their pages belong to a file), nor are the
+    /// pool's own arenas. The model load records its weights this way, for
+    /// the server's `--pin-weights`. One recording at a time.
+    pub fn record_buffers(&self) -> Result<BufferRecording<'_>> {
+        let mut recorded = self.recorded.borrow_mut();
+        ensure!(recorded.is_none(), "a buffer recording is already open");
+        *recorded = Some(Vec::new());
+        Ok(BufferRecording { ctx: self })
     }
 
     /// A read-only buffer over `len` bytes of `path` at `offset`, mapped
@@ -547,6 +568,27 @@ impl MetalContext {
             self.fault.check()?;
         }
         self.fault.check()
+    }
+}
+
+/// An open [`MetalContext::record_buffers`]; dropping it without
+/// [`Self::finish`] (an error path) ends the recording and forgets it.
+pub struct BufferRecording<'a> {
+    ctx: &'a MetalContext,
+}
+
+impl BufferRecording<'_> {
+    /// Ends the recording and returns the recorded buffers that are still
+    /// alive, in allocation order (temporaries dropped meanwhile are gone).
+    pub fn finish(self) -> Vec<Buffer> {
+        let recorded = self.ctx.recorded.borrow_mut().take().unwrap_or_default();
+        recorded.iter().filter_map(Weak::upgrade).collect()
+    }
+}
+
+impl Drop for BufferRecording<'_> {
+    fn drop(&mut self) {
+        self.ctx.recorded.borrow_mut().take();
     }
 }
 

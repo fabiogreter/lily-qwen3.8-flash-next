@@ -201,6 +201,41 @@ pub fn pressure_level() -> Option<u32> {
     (rc == 0 && level >= 0).then_some(level as u32)
 }
 
+/// How much memory this process may lock with `mlock`: the smaller of
+/// `vm.user_wire_limit` (per process) and `vm.global_user_wire_limit` (every
+/// process's user wirings plus what the system has wired already, e.g.
+/// 116.8 GB each on a 128 GB machine). `None` when neither can be read.
+pub fn user_wire_limit() -> Option<u64> {
+    let per_process = sysctl_u64(c"vm.user_wire_limit");
+    let global = sysctl_u64(c"vm.global_user_wire_limit");
+    match (per_process, global) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// A 32- or 64-bit unsigned sysctl, `None` when it cannot be read.
+fn sysctl_u64(name: &std::ffi::CStr) -> Option<u64> {
+    let mut value: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    // SAFETY: a NUL-terminated name and an 8-byte output buffer of `len`.
+    let rc = unsafe {
+        sys::sysctlbyname(
+            name.as_ptr(),
+            (&raw mut value).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    match (rc, len) {
+        (0, 8) => Some(value),
+        // A 32-bit value lands in the low half (little-endian).
+        (0, 4) => Some(value & 0xffff_ffff),
+        _ => None,
+    }
+}
+
 /// The name of a [`pressure_level`].
 pub fn pressure_name(level: u32) -> &'static str {
     match level {

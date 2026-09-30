@@ -270,6 +270,18 @@ impl ExpertCache {
         self.experts
     }
 
+    /// The GPU addresses of the buffers the cache allocated (the slab's
+    /// nine stacks and the slot tables), so the model load can tell them
+    /// from its own weights: `--pin-weights` never pins the slab.
+    pub fn buffer_addresses(&self) -> Vec<u64> {
+        [&self.gate, &self.up, &self.down]
+            .into_iter()
+            .flat_map(|q| [&q.codes, &q.scales, &q.biases])
+            .chain(&self.slot_of)
+            .map(|t| t.binding().0.address())
+            .collect()
+    }
+
     /// The protocol handle the cached layers' `MoeWeights` share.
     pub fn link(&self) -> Rc<ExpertCacheLink> {
         self.link.clone()

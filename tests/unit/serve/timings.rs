@@ -116,6 +116,7 @@ fn the_json_shape_is_the_documented_one() {
             "acceptance_ratio": 0.7857,
             "agreement_tokens": 0,
             "queue_ms": 0.0,
+            "pinned": false,
             "prefill_phases": {
                 "session_ms": 0.0,
                 "alloc_ms": 0.0,

@@ -3732,6 +3732,14 @@ impl LanguageModel for Qwen4ExpModel {
         )
     }
 
+    fn weight_buffers(&self) -> Vec<crate::metal::Buffer> {
+        self.weights.buffers.clone()
+    }
+
+    fn planned_memory(&self) -> Option<u64> {
+        self.weights.planned_memory
+    }
+
     fn vision_tower(&self) -> Option<VisionTower> {
         Some(match (&self.config.vision, &self.weights.vision) {
             (None, _) => VisionTower::Absent,

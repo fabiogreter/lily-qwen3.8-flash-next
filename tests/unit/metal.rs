@@ -466,6 +466,30 @@ fn residency_follows_buffer_lifetimes() {
     assert_eq!(ctx.resident_allocations(), before);
 }
 
+/// A recording returns the buffers allocated while it was open that are
+/// still alive, nothing from before or after it, and only one runs at a time.
+#[test]
+fn buffer_recordings_return_the_live_buffers_allocated_meanwhile() {
+    let ctx = MetalContext::new().expect("metal context");
+    let before = ctx.new_buffer(64).expect("before");
+    let recording = ctx.record_buffers().expect("recording");
+    assert!(ctx.record_buffers().is_err(), "one recording at a time");
+    let kept = Tensor::zeros(&ctx, &[1024], DType::U32).expect("kept");
+    let temporary = ctx.new_buffer(4096).expect("temporary");
+    let bytes = ctx.new_buffer_with_bytes(&[7u8; 100]).expect("bytes");
+    drop(temporary);
+    let recorded = recording.finish();
+    let after = ctx.new_buffer(64).expect("after");
+    let addresses: Vec<u64> = recorded.iter().map(|b| b.address()).collect();
+    assert_eq!(addresses, vec![kept.binding().0.address(), bytes.address()]);
+    assert!(!addresses.contains(&before.address()));
+    assert!(!addresses.contains(&after.address()));
+    // A recording dropped without `finish` (an error path) ends too.
+    drop(ctx.record_buffers().expect("again"));
+    let _unrecorded = ctx.new_buffer(64).expect("unrecorded");
+    assert!(ctx.record_buffers().expect("free again").finish().is_empty());
+}
+
 /// An encoded pass that is never committed (a pre-encoded speculative
 /// variant that lost) returns its command memory without touching the GPU,
 /// and a pending pass dropped without a wait completes first.

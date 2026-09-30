@@ -26,6 +26,7 @@ pub mod api;
 pub mod data_uri;
 pub mod disk;
 pub mod http;
+pub mod pin;
 pub mod session;
 pub mod stream;
 pub mod timings;
@@ -173,6 +174,11 @@ pub struct ServeOptions {
     pub sampling: SamplingOverrides,
     /// Seconds without a request after which the engine is unloaded (0: never).
     pub idle_unload_secs: u64,
+    /// Whether to pin the weights in memory while requests come (`mlock`).
+    pub pin_weights: pin::PinMode,
+    /// Seconds the pin is held after the last request (0: until memory
+    /// pressure or the unload).
+    pub pin_hold_secs: u64,
     /// Testing only: record a Metal fault on the N-th request the engine
     /// serves (1-based, counted across reloads) to exercise the recovery
     /// path; `None` in normal operation.
@@ -528,6 +534,8 @@ struct Engine<M: LanguageModel> {
     timings: Arc<TimingsLog>,
     /// The paged n-gram table's preload while it runs in the background.
     preload: Option<BackgroundPreload>,
+    /// The weights' pin (`--pin-weights`); dropped before the model.
+    pin: pin::WeightPin,
 }
 
 /// Where a request's text ends up when not streaming.
@@ -606,6 +614,44 @@ impl<M: LanguageModel> Engine<M> {
                 }
             );
         }
+        // The weights' pin acts only on the buffers the load allocated, so
+        // it changes nothing in the plan; it pins at the first request.
+        let weight_buffers = model.weight_buffers();
+        let (_, pin_bytes) = pin::page_ranges(&weight_buffers);
+        let decision = pin::decide(&pin::PinInputs {
+            mode: options.pin_weights,
+            planned_memory: model.planned_memory(),
+            physical_memory: crate::qwen4exp::weights::physical_memory(),
+            wire_limit: crate::stats::user_wire_limit(),
+            pin_bytes,
+            locked_elsewhere: match model.paged_table() {
+                Some(table) if options.ngram_lock => table.bytes(),
+                _ => 0,
+            },
+            expert_cache: model.expert_cache_stats().is_some(),
+        });
+        match &decision {
+            pin::PinDecision::Pin => eprintln!(
+                "weights: pinning {:.1} GB in memory from the first request on, released {} or under \
+                 memory pressure",
+                pin_bytes as f64 / 1e9,
+                if options.pin_hold_secs > 0 {
+                    format!(
+                        "after {} without a request",
+                        describe_secs(options.pin_hold_secs)
+                    )
+                } else {
+                    "at the unload".to_owned()
+                }
+            ),
+            pin::PinDecision::Skip(why) => eprintln!("pin skipped: {why}"),
+        }
+        let pin = pin::WeightPin::new(
+            weight_buffers,
+            decision,
+            options.pin_hold_secs,
+            crate::stats::pressure_level,
+        )?;
         let max_seq =
             effective_max_seq(options.max_seq, model.max_position_embeddings());
         ensure!(max_seq > 1, "max_seq must be at least 2");
@@ -746,6 +792,7 @@ impl<M: LanguageModel> Engine<M> {
             shutdown,
             timings,
             preload,
+            pin,
         })
     }
 
@@ -764,8 +811,12 @@ impl<M: LanguageModel> Engine<M> {
             scratch,
             next_id,
             preload,
+            pin,
             ..
         } = self;
+        // Unlocked before any buffer is released: the pin holds handles on
+        // the weights, so they cannot be freed while locked.
+        drop(pin);
         // A preload still running holds the table's mappings; it stops at its
         // next 8 MB piece and logs how far it got.
         if let Some(mut preload) = preload {
@@ -818,8 +869,12 @@ impl<M: LanguageModel> Engine<M> {
         let mut sink = job.sink;
         let stream = job.prepared.stream;
         let kind = job.prepared.kind;
+        // Pinned before the prefill (the first request of an active period
+        // pays for it, inside its queue time).
+        let pinned = self.pin.before_request(Instant::now());
         let queued = job.queued_at.elapsed();
-        let result = self.run(job.prepared, &mut sink, queued);
+        let result = self.run(job.prepared, &mut sink, queued, pinned);
+        self.pin.after_request(Instant::now());
         let fault = self.ctx.fault();
         if let Err(error) = result {
             let (status, message) = match &fault {
@@ -855,8 +910,15 @@ impl<M: LanguageModel> Engine<M> {
     }
 
     /// `queued` is how long the request waited for the engine (a reload
-    /// included), which its timings report next to the prefill.
-    fn run(&mut self, p: Prepared, sink: &mut Sink, queued: Duration) -> Result<()> {
+    /// and the pin included), which its timings report next to the prefill,
+    /// with whether the weights were `pinned`.
+    fn run(
+        &mut self,
+        p: Prepared,
+        sink: &mut Sink,
+        queued: Duration,
+        pinned: bool,
+    ) -> Result<()> {
         // Work on the user's behalf for as long as the request runs.
         let _activity = crate::activity::Activity::begin("lily: serving a request");
         if sink.cancelled() {
@@ -874,6 +936,7 @@ impl<M: LanguageModel> Engine<M> {
             shutdown,
             timings,
             preload: _,
+            pin: _,
         } = self;
         // The HTTP thread validated against the same limit; this only guards
         // the engine's buffers if the two ever disagree.
@@ -1216,6 +1279,7 @@ impl<M: LanguageModel> Engine<M> {
         )
         .with_agreement(agreement, durable.map(|(b, _)| b))
         .with_vision(image_tokens, vision_secs)
+        .with_pinned(pinned)
         .with_diagnostics(
             queued.as_secs_f64(),
             PrefillPhases::split(
@@ -1792,7 +1856,14 @@ fn engine_loop<M: LanguageModel>(
     let mut idle = IdleTimer::new(options.idle_unload_secs, Instant::now());
     while !shutdown.requested() {
         // An unloaded engine has nothing to time out; wait for a request.
-        let wait = engine.as_ref().and_then(|_| idle.remaining(Instant::now()));
+        // A loaded one wakes for the idle unload or the end of the pin's hold.
+        let wait = engine.as_ref().and_then(|loaded| {
+            let now = Instant::now();
+            match (idle.remaining(now), loaded.pin.hold_remaining(now)) {
+                (Some(idle), Some(hold)) => Some(idle.min(hold)),
+                (idle, hold) => idle.or(hold),
+            }
+        });
         let cmd = match wait {
             None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
             Some(wait) => rx.recv_timeout(wait),
@@ -1876,6 +1947,9 @@ fn engine_loop<M: LanguageModel>(
             }
             Ok(Cmd::Wake) => {}
             Err(RecvTimeoutError::Timeout) => {
+                if let Some(loaded) = engine.as_mut() {
+                    loaded.pin.release_if_held_out(Instant::now());
+                }
                 if let Some(loaded) = engine.take_if(|_| idle.expired(Instant::now())) {
                     next_id = loaded.unload(&format!(
                         "idle for {}",

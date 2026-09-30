@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, ensure};
 
-use crate::metal::MetalContext;
+use crate::metal::{Buffer, MetalContext};
 use crate::safetensors::Checkpoint;
 use crate::tensor::Tensor;
 use std::path::PathBuf;
@@ -143,6 +143,15 @@ pub struct ModelWeights {
     /// The expert cache when the experts are served from a slab of slots
     /// (`LoadOptions::expert_slots`); the layers' `MoeWeights` view it.
     pub expert_cache: Option<ExpertCache>,
+    /// Every GPU buffer the load allocated for the weights above (views
+    /// share them), without the expert cache's slab and slot tables and
+    /// without the paged n-gram table, which is a file mapping: what the
+    /// server's `--pin-weights` locks. Handles only; the memory is the same.
+    pub buffers: Vec<Buffer>,
+    /// The memory the load planned for: the budget it was given, else the
+    /// machine's physical memory (`None` when neither is known), exactly
+    /// what `auto_expert_slots` sized the expert cache from.
+    pub planned_memory: Option<u64>,
 }
 
 /// The converter's storage policy: routers, gates and the small mixing
@@ -238,7 +247,7 @@ fn load_mlp(
 }
 
 /// Physical memory of this machine in bytes (`hw.memsize`).
-fn physical_memory() -> Option<u64> {
+pub(crate) fn physical_memory() -> Option<u64> {
     let mut size: u64 = 0;
     let mut len = std::mem::size_of::<u64>();
     let name = c"hw.memsize";
@@ -571,6 +580,9 @@ pub fn load(
     // bench, the probes, the tests with a real checkpoint): one per machine,
     // held until the process exits (`crate::instance`).
     crate::instance::acquire()?;
+    // Every buffer allocated from here on that is still alive at the end is
+    // a weight, or the expert cache's (filtered out below).
+    let recording = ctx.record_buffers()?;
     let ckpt = Checkpoint::open(&dir)?;
     ensure!(
         ckpt.meta(&format!("{PREFIX}embed_tokens.weight")).is_some(),
@@ -721,6 +733,13 @@ pub fn load(
     };
 
     loader.finish()?;
+    let slab =
+        expert_cache.as_ref().map(ExpertCache::buffer_addresses).unwrap_or_default();
+    let buffers = recording
+        .finish()
+        .into_iter()
+        .filter(|b| !slab.contains(&b.address()))
+        .collect();
     Ok(ModelWeights {
         embed_tokens,
         lm_head,
@@ -729,5 +748,7 @@ pub fn load(
         mtp,
         vision,
         expert_cache,
+        buffers,
+        planned_memory: memory_budget.or_else(physical_memory),
     })
 }
