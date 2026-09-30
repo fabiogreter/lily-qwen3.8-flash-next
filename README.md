@@ -32,7 +32,7 @@ The checkpoint is on Hugging Face as
 [fabiogreter/Qwen3.8-Flash-Next-lily-q4](https://huggingface.co/fabiogreter/Qwen3.8-Flash-Next-lily-q4).
 The server answers `/health` with `503 loading` while the model loads and
 serves after about 25 seconds, while the n-gram table keeps loading in the
-background. `tools/service/lily-service.sh install` runs
+background. [`tools/service/lily-service.sh install`](tools/service/README.md) runs
 it as a launchd agent that starts at login and unloads the model after 30
 idle minutes. `--help` lists every flag.
 
