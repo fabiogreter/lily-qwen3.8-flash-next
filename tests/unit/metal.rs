@@ -733,3 +733,190 @@ fn injected_fault_fails_the_next_submission_and_is_reported() {
     assert!(ctx.begin().expect("pass").commit_wait().is_err());
     assert_eq!(ctx.fault().as_deref(), Some("injected for the test"));
 }
+
+/// What the first submission after an idle gap costs, and what of it scales
+/// with the resident set: a model-sized population of resident buffers
+/// (`LILY_IDLE_PROBE_GB`, default 1, zero-filled, `LILY_IDLE_PROBE_MLOCK=1`
+/// locks them like the pinned weights), then per gap in `LILY_IDLE_PROBE_GAPS`
+/// (seconds, default `1,3,10,30`) a sleep and one ~1 ms copy pass, followed at
+/// once by the same pass as the back-to-back reference. Prints the commit to
+/// GPU start delay, the GPU span and the commit-to-return wall time of both.
+/// `LILY_IDLE_PROBE_MODE`: `plain` (default); `wake`, which commits a
+/// one-dispatch pass right after the sleep and the measured pass
+/// `LILY_IDLE_PROBE_LEAD_MS` (default 100) later, the way a request-arrival
+/// wake overlaps host work; `signal`, the same with only a queue-level fence
+/// signal (no command buffer) as the wake; `request`, which calls
+/// `requestResidency` on the set at the end of the sleep, then waits the lead,
+/// then commits; `keepalive` (see the loop). `LILY_IDLE_PROBE_HEAP=1` puts
+/// the population in 1 GiB heaps instead of buffers.
+/// `cargo test --release --lib -- --ignored --nocapture idle_first_submission`.
+#[test]
+#[ignore = "timing probe; run with --ignored --nocapture"]
+fn idle_first_submission_probe() {
+    let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_owned());
+    let gb: usize = env("LILY_IDLE_PROBE_GB", "1").parse().expect("gb");
+    let lock = env("LILY_IDLE_PROBE_MLOCK", "0") == "1";
+    let mode = env("LILY_IDLE_PROBE_MODE", "plain");
+    let lead_ms: u64 = env("LILY_IDLE_PROBE_LEAD_MS", "100").parse().expect("lead");
+    let gaps: Vec<f64> = env("LILY_IDLE_PROBE_GAPS", "1,3,10,30")
+        .split(',')
+        .map(|s| s.trim().parse().expect("gap"))
+        .collect();
+    let ctx = MetalContext::new().expect("metal context");
+    let mut population = Vec::new();
+    // `LILY_IDLE_PROBE_HEAP=1`: the population as 1 GiB heaps in the set
+    // (one buffer placed in each and zero-filled) instead of buffers.
+    let mut heaps = Vec::new();
+    if env("LILY_IDLE_PROBE_HEAP", "0") == "1" {
+        use objc2_metal::{MTLHeap, MTLHeapDescriptor, MTLStorageMode};
+        for _ in 0..gb {
+            let desc = MTLHeapDescriptor::new();
+            desc.setSize(1 << 30);
+            desc.setStorageMode(MTLStorageMode::Shared);
+            let heap = ctx.device.newHeapWithDescriptor(&desc).expect("heap");
+            let buf = heap
+                .newBufferWithLength_options(
+                    1 << 30,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("heap buffer");
+            unsafe {
+                core::ptr::write_bytes(buf.contents().as_ptr().cast::<u8>(), 0, 1 << 30)
+            };
+            ctx.residency
+                .set
+                .addAllocation(ProtocolObject::<dyn MTLAllocation>::from_ref(&*heap));
+            heaps.push((heap, buf));
+        }
+        ctx.residency.dirty.set(true);
+    }
+    for _ in 0..if heaps.is_empty() { gb } else { 0 } {
+        let t = Tensor::zeros(&ctx, &[1usize << 28], DType::U32).expect("1 GiB");
+        if lock {
+            let (buf, _) = t.binding();
+            // SAFETY: the buffer's own mapping, of its length.
+            let rc = unsafe { libc::mlock(buf.contents().as_ptr(), buf.length()) };
+            assert_eq!(rc, 0, "mlock: {}", std::io::Error::last_os_error());
+        }
+        population.push(t);
+    }
+    let words = 64usize << 20; // 256 MiB copy, ~1 ms
+    let src = Tensor::zeros(&ctx, &[words], DType::U32).expect("src");
+    let dst = Tensor::zeros(&ctx, &[words], DType::U32).expect("dst");
+    let tiny_src = Tensor::zeros(&ctx, &[64], DType::U32).expect("tiny");
+    let tiny_dst = Tensor::zeros(&ctx, &[64], DType::U32).expect("tiny");
+    // (start delay, GPU span, wall) in ms of one measured pass.
+    let run = |big: bool| -> (f64, f64, f64) {
+        let pass = ctx.begin_concurrent().expect("pass");
+        if big {
+            copy_words(&ctx, &pass, &src, &dst).expect("copy");
+        } else {
+            copy_words(&ctx, &pass, &tiny_src, &tiny_dst).expect("copy");
+        }
+        let encoded = pass.end().expect("end");
+        let t0 = Instant::now();
+        let committed = mach_secs();
+        let done = encoded.commit().expect("commit").wait_retain().expect("wait");
+        let wall = t0.elapsed().as_secs_f64() * 1e3;
+        let t = done.timing().expect("timing");
+        (
+            (t.gpu_start_secs - committed) * 1e3,
+            (t.gpu_end_secs - t.gpu_start_secs) * 1e3,
+            wall,
+        )
+    };
+    for _ in 0..5 {
+        run(true);
+    }
+    eprintln!(
+        "idle probe: {gb} GiB resident{}, {} allocations, mode {mode}, lead {lead_ms} ms",
+        if lock { " (mlocked)" } else { "" },
+        ctx.resident_allocations()
+    );
+    eprintln!(
+        "gap_s\tmode\tdelay_ms\tgpu_ms\twall_ms\tpre_ms\tref_delay\tref_gpu\tref_wall"
+    );
+    for &gap in &gaps {
+        // `keepalive`: a bare fence signal every `LILY_IDLE_PROBE_TICK_MS`
+        // (default 1000) through the gap, to see whether that alone keeps
+        // the set resident. A measurement only; the server does not do this.
+        if mode == "keepalive" {
+            let tick: u64 =
+                env("LILY_IDLE_PROBE_TICK_MS", "1000").parse().expect("tick");
+            let end = Instant::now() + Duration::from_secs_f64(gap);
+            while Instant::now() < end {
+                ctx.wake().expect("tick");
+                std::thread::sleep(
+                    Duration::from_millis(tick).min(end - Instant::now()),
+                );
+            }
+        } else {
+            std::thread::sleep(Duration::from_secs_f64(gap));
+        }
+        let mut pre = 0.0;
+        let mut pending = None;
+        match mode.as_str() {
+            "wake" => {
+                let t0 = Instant::now();
+                let pass = ctx.begin_concurrent().expect("pass");
+                copy_words(&ctx, &pass, &tiny_src, &tiny_dst).expect("copy");
+                pending = Some(pass.commit().expect("commit"));
+                pre = t0.elapsed().as_secs_f64() * 1e3;
+                std::thread::sleep(Duration::from_millis(lead_ms));
+            }
+            "signal" => {
+                let t0 = Instant::now();
+                let feedback = Feedback::new(0, None);
+                ctx.submit(&[], &feedback).expect("fence signal");
+                pre = t0.elapsed().as_secs_f64() * 1e3;
+                std::thread::sleep(Duration::from_millis(lead_ms));
+            }
+            "request" => {
+                let t0 = Instant::now();
+                ctx.residency.set.requestResidency();
+                pre = t0.elapsed().as_secs_f64() * 1e3;
+                std::thread::sleep(Duration::from_millis(lead_ms));
+            }
+            _ => {}
+        }
+        let (d, g, w) = run(true);
+        if let Some(p) = pending {
+            p.wait().expect("wake pass");
+        }
+        let (rd, rg, rw) = run(true);
+        eprintln!(
+            "{gap}\t{mode}\t{d:.2}\t{g:.3}\t{w:.2}\t{pre:.3}\t{rd:.2}\t{rg:.3}\t{rw:.2}"
+        );
+    }
+    drop(population);
+    for (heap, _) in &heaps {
+        ctx.residency
+            .set
+            .removeAllocation(ProtocolObject::<dyn MTLAllocation>::from_ref(&**heap));
+    }
+    ctx.residency.set.commit();
+}
+
+/// A wake is a bare fence signal nobody waits for: passes before and after
+/// it complete and wait normally, and a faulted context refuses it.
+#[test]
+fn wake_is_a_fence_signal_that_later_passes_wait_past() {
+    let ctx = MetalContext::new().expect("metal context");
+    let n = 4096usize;
+    let data: Vec<u32> = (0..n as u32).collect();
+    let src = Tensor::zeros(&ctx, &[n], DType::U32).expect("src");
+    src.write_bytes(bytemuck::cast_slice(&data)).expect("write");
+    let dst = Tensor::zeros(&ctx, &[n], DType::U32).expect("dst");
+    let pass = ctx.begin_concurrent().expect("pass");
+    copy_words(&ctx, &pass, &src, &dst).expect("copy");
+    let pending = pass.commit().expect("commit");
+    ctx.wake().expect("wake behind a pending pass");
+    ctx.wake().expect("wake twice");
+    pending.wait().expect("the pass before the wakes completes");
+    let pass = ctx.begin_concurrent().expect("pass");
+    copy_words(&ctx, &pass, &src, &dst).expect("copy");
+    pass.commit_wait().expect("the pass after the wakes completes");
+    assert_eq!(dst.to_u32().expect("read"), data);
+    ctx.inject_fault("injected for the test");
+    assert!(ctx.wake().is_err());
+}

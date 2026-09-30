@@ -135,6 +135,24 @@ submission after an allocation costs 0.003 ms with about 4 000 resident
 allocations, a buffer drop 0.002 ms, and a blocking fence wait costs 0.07 ms
 more than polling on a 1 ms pass.
 
+**Residency does not survive an idle second.** After about 1.5 s without
+GPU work (1 s: no effect; 1.5, 2, 3 s: the full cost), the first
+submission waits until the queue's residency set is resident again, and
+the wait scales with the set: about 40 ms with 1 GiB allocated, 110 to
+130 ms with 8, 225 to 260 ms with 40 and 430 to 620 ms with 80, the same
+with the buffers `mlock`ed, and the same for a gap of 3 s or 90 s
+(`tests/unit/metal.rs::idle_first_submission_probe`). The pass that pays
+it runs at normal speed once started; the submission after it pays
+nothing. Apple's documentation says nothing about this; `requestResidency`
+("do as much preparatory work as it can ... to make the set's resource
+allocations resident") blocks the calling thread for the same time and
+residency sets are not thread-safe, so it cannot move to a helper thread.
+What helps is starting early: any submission, even a bare queue-level
+signal with no command buffer, starts the work, and a pass committed
+after it waits only for what is left. `MetalContext::wake` is that
+signal, and the server sends it when a request arrives (see "The
+server").
+
 ### Hiding the host round trip
 
 The n-gram table lives in the page cache, so every decode step needs the host
@@ -890,6 +908,34 @@ rendering run on the connection thread, so they never touch the engine
 thread. Detokenization and the output parser run per token inside the token
 callback, which executes while the parked next step is already running.
 
+**Waking the GPU at arrival.** A generation request that finds the engine
+ready sends it an `Arrival` message as soon as its headers and body are
+read, before the connection thread parses, renders and tokenizes it; the
+engine answers with `MetalContext::wake`, so the residency the first
+submission after an idle second waits for (0.4 to 0.6 s for the full
+model, see "The Metal 4 transport") runs while the host parses,
+tokenizes, pins and acquires the session instead of after. It is one
+signal per request and nothing while idle: no periodic keep-alive, which
+would keep a laptop's GPU awake for nothing. At most one arrival is in the
+channel; `--queue` counts only the jobs waiting in it (`EngineQueue`),
+and the channel has room for one arrival and one stop wake on top, so
+neither control message takes a job's place.
+
+What it recovers depends on how much host work precedes the first GPU
+command. Measured over HTTP on an agent-shaped conversation (600 to 700
+new tokens per turn, interleaved against the build before it, 2 to 4
+turns per cell): after gaps of 3 to 30 s the stall moves from 0.40 to
+0.37 s (parsing and tokenizing take only 25 to 35 ms before the session
+lookup's first copy), inside the noise; after 60 and 90 s, when the pin
+has to be taken again (1.4 to 2.3 s of `mlock` in `queue_ms`), it goes
+from 0.38 s to 0.04 s, 0.4 s of wall time. The stall lands in whichever
+phase submits first: `session_ms` when the lookup forks or restores a
+session, `wait_ms` when it does not, and inside a spill's snapshot before
+spills went to the background. The full cost after short gaps could only
+be avoided by keeping the GPU from going idle between requests (a bare
+signal once a second keeps the set resident, measured), which a laptop
+should not pay for; it is not done.
+
 **Images.** Image parts (`image_url` with a `{url, detail}` object or
 `input_image` with a string) are accepted in user messages only and their
 URL must be a base64 data URI of type `image/png` or `image/jpeg`: the
@@ -1091,7 +1137,10 @@ while the full model was loaded next to it and the machine had 0.5 GB free:
 building 56 pipelines took 0.02 s and the first prefill's submission waited
 about 0.2 s for residency. With 60 GB free it took 0.1 s, the wait 0.02 s,
 and a synthetic test put the first-submission wait at about 10 ms per GB
-allocated. The wait grows with memory pressure. Pipeline builds are cheap
+allocated. The wait grows with memory pressure. It is the same
+residency wait every submission after an idle second pays (see "The
+Metal 4 transport"): the full model's warm-up logs about 0.35 s of it.
+Pipeline builds are cheap
 because Metal keeps compiled libraries in a per-user cache across processes
 and in memory within one: compiling every source cold took 1.5 s, the same
 sources again 0.1 ms each, also in a new context after an idle unload.

@@ -54,6 +54,14 @@ then says what assumption it rests on.
   before a series and record it with the run; the timeline tooling writes a
   `.env.txt` with swap, paging counters and the thermal level before every
   run.
+- **An idle second costs 0.4 s of residency.** After about 1.5 s without
+  GPU work the next submission waits 0.4 to 0.6 s for the model's
+  residency set to become resident again (about 6 ms per GB, pinned or
+  not; architecture.md, "The Metal 4 transport"). A request after a
+  cooldown pays it once, in `session_ms` or `wait_ms`, whatever its
+  length; back to back it is gone. A series with cooldowns and one without
+  are therefore not comparable at short prompts, and a cooldown of a
+  second or less does not reset it.
 - **32K prefill is clock-limited.** Every 32K prefill sags to a busy-clock
   median of 1 340 to 1 560 MHz with dips to about 1 000 MHz, against a full
   1 620 MHz at about 75 W for the 1K and 8K runs. The 32K prefill column is

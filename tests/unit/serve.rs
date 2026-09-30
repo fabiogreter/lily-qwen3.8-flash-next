@@ -413,3 +413,34 @@ fn warm_up_on_load_and_reload() {
         warm_up(&ctx, &model, &mut scratch).expect("second warm-up");
     }
 }
+
+#[test]
+fn engine_queue_limits_jobs_but_not_control_messages() {
+    let queue = EngineQueue::new(2);
+    assert_eq!(queue.capacity(), 4);
+    assert!(queue.admit());
+    assert!(queue.admit());
+    assert!(!queue.admit(), "a third job exceeds --queue 2");
+    queue.left();
+    assert!(queue.admit(), "a received job frees its place");
+    // One arrival at a time, whatever the jobs do.
+    assert!(queue.claim_arrival());
+    assert!(!queue.claim_arrival());
+    queue.arrival_taken();
+    assert!(queue.claim_arrival());
+    assert_eq!(EngineQueue::new(0).limit, 1, "the limit is at least one");
+}
+
+#[test]
+fn a_full_job_queue_still_takes_the_arrival_and_the_stop_wake() {
+    let queue = EngineQueue::new(1);
+    let (tx, rx) = mpsc::sync_channel::<Cmd>(queue.capacity());
+    assert!(queue.claim_arrival());
+    tx.try_send(Cmd::Arrival).expect("arrival fits");
+    assert!(queue.admit());
+    assert!(tx.try_send(Cmd::Wake).is_ok(), "the stop wake fits next to one arrival");
+    assert!(!queue.admit());
+    // Draining skips the control messages and refuses no job here (none sent).
+    assert_eq!(refuse_queued(&rx, &queue, 503, "stopping"), 0);
+    assert!(queue.claim_arrival(), "the drained arrival was released");
+}

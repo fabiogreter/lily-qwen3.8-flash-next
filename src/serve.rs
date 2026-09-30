@@ -480,6 +480,64 @@ enum Cmd {
     Job(Box<Job>),
     /// Wakes the engine so it notices a stop request; carries nothing.
     Wake,
+    /// A generation request has arrived and is being parsed and tokenized:
+    /// the engine wakes the GPU now (`MetalContext::wake`) so the residency
+    /// the first submission after an idle second waits for overlaps that
+    /// host work instead of following it. At most one is in the channel.
+    Arrival,
+}
+
+/// The bookkeeping next to the engine's channel. `--queue` limits the jobs
+/// waiting in it, which the channel's capacity no longer does because it
+/// also carries control messages: its capacity is the limit plus one
+/// arrival plus one stop wake, and this counts the jobs.
+struct EngineQueue {
+    limit: usize,
+    waiting: AtomicUsize,
+    arrival_pending: AtomicBool,
+}
+
+impl EngineQueue {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit: limit.max(1),
+            waiting: AtomicUsize::new(0),
+            arrival_pending: AtomicBool::new(false),
+        }
+    }
+
+    /// The channel's capacity: every job the limit admits plus the two
+    /// control messages, so neither can be refused for lack of room.
+    fn capacity(&self) -> usize {
+        self.limit + 2
+    }
+
+    /// Reserves a place for one job; false when the queue is full. A
+    /// reservation is given back by [`Self::left`] once the job is received,
+    /// or when sending it failed.
+    fn admit(&self) -> bool {
+        if self.waiting.fetch_add(1, Ordering::AcqRel) < self.limit {
+            true
+        } else {
+            self.left();
+            false
+        }
+    }
+
+    fn left(&self) {
+        self.waiting.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Whether the caller should send a [`Cmd::Arrival`]: true unless one
+    /// is already in the channel.
+    fn claim_arrival(&self) -> bool {
+        !self.arrival_pending.swap(true, Ordering::AcqRel)
+    }
+
+    /// The engine took the arrival (or sending it failed).
+    fn arrival_taken(&self) {
+        self.arrival_pending.store(false, Ordering::Release);
+    }
 }
 
 /// Relays one request's output from the engine to the client on the
@@ -561,7 +619,7 @@ impl<M: LanguageModel> Engine<M> {
         shared: &Shared,
         next_id: u64,
     ) -> Result<Self> {
-        let Shared { generator, shutdown, timings } = shared.clone();
+        let Shared { generator, shutdown, timings, queue: _ } = shared.clone();
         // `LILY_KERNEL_PROFILE=1`: per-kernel GPU times per pass, printed
         // after every request (diagnostic; the profile transport serializes
         // dispatches, so throughput under it is not comparable).
@@ -1857,6 +1915,7 @@ struct Shared {
     shutdown: Arc<Shutdown>,
     /// Where each finished request's numbers go for `GET /v1/timings`.
     timings: Arc<TimingsLog>,
+    queue: Arc<EngineQueue>,
 }
 
 /// Everything the HTTP thread needs without the engine.
@@ -1888,7 +1947,7 @@ fn engine_loop<M: LanguageModel>(
     lifecycle: &Lifecycle,
     address: SocketAddr,
 ) {
-    let Shared { shutdown, .. } = &shared;
+    let Shared { shutdown, queue, .. } = &shared;
     // Exits with `code` after logging `what` and refusing the queued
     // requests with `status`/`client_message`.
     let exit_failed = |what: String,
@@ -1899,11 +1958,7 @@ fn engine_loop<M: LanguageModel>(
      -> ! {
         eprintln!("{what}");
         lifecycle.set(State::Stopping);
-        let mut refused = 0usize;
-        while let Ok(Cmd::Job(job)) = rx.try_recv() {
-            job.reject(status, client_message);
-            refused += 1;
-        }
+        let refused = refuse_queued(rx, queue, status, client_message);
         if refused > 0 {
             eprintln!("exiting: refused {refused} queued requests with {status}");
         }
@@ -1962,6 +2017,7 @@ fn engine_loop<M: LanguageModel>(
         };
         match cmd {
             Ok(Cmd::Job(job)) => {
+                queue.left();
                 if shutdown.requested() {
                     job.reject(503, "the server is shutting down");
                     break;
@@ -2041,6 +2097,15 @@ fn engine_loop<M: LanguageModel>(
                 }
             }
             Ok(Cmd::Wake) => {}
+            Ok(Cmd::Arrival) => {
+                queue.arrival_taken();
+                if let Some(loaded) = engine.as_ref()
+                    && let Err(error) = loaded.ctx.wake()
+                {
+                    // A faulted queue; the request that follows reports it.
+                    eprintln!("GPU wake at request arrival failed: {error:#}");
+                }
+            }
             Err(RecvTimeoutError::Timeout) => {
                 if let Some(loaded) = engine.as_mut() {
                     loaded.pin.release_if_held_out(Instant::now());
@@ -2058,17 +2123,36 @@ fn engine_loop<M: LanguageModel>(
         }
     }
     lifecycle.set(State::Stopping);
-    let mut refused = 0usize;
-    while let Ok(Cmd::Job(job)) = rx.try_recv() {
-        job.reject(503, "the server is shutting down");
-        refused += 1;
-    }
+    let refused = refuse_queued(&rx, queue, 503, "the server is shutting down");
     if refused > 0 {
         eprintln!("stopping: refused {refused} queued requests");
     }
     if let Some(loaded) = engine {
         loaded.unload("stopping");
     }
+}
+
+/// Answers every job still in the channel with `status` and skips the
+/// control messages between them; returns how many were refused.
+fn refuse_queued(
+    rx: &Receiver<Cmd>,
+    queue: &EngineQueue,
+    status: u16,
+    message: &str,
+) -> usize {
+    let mut refused = 0usize;
+    while let Ok(cmd) = rx.try_recv() {
+        match cmd {
+            Cmd::Job(job) => {
+                queue.left();
+                job.reject(status, message);
+                refused += 1;
+            }
+            Cmd::Arrival => queue.arrival_taken(),
+            Cmd::Wake => {}
+        }
+    }
+    refused
 }
 
 fn describe_secs(secs: u64) -> String {
@@ -2153,13 +2237,15 @@ fn run_with<M: LanguageModel + 'static>(
 
     let listener = TcpListener::bind(address)
         .with_context(|| format!("binding http://{}", options.bind))?;
-    let (jobs, job_rx) = mpsc::sync_channel::<Cmd>(options.queue.max(1));
+    let queue = Arc::new(EngineQueue::new(options.queue));
+    let (jobs, job_rx) = mpsc::sync_channel::<Cmd>(queue.capacity());
     let lifecycle = Arc::new(Lifecycle::new(State::Loading));
     let shutdown = Arc::new(Shutdown::default());
     let shared = Shared {
         generator,
         shutdown: shutdown.clone(),
         timings: Arc::new(TimingsLog::new(TIMINGS_LOG_CAPACITY)),
+        queue,
     };
     let engine_thread = {
         let model_dir = model_dir.to_path_buf();
@@ -2299,6 +2385,16 @@ fn handle(front: &Front, mut stream: TcpStream) {
             }),
         ),
         ("POST", "/v1/chat/completions" | "/v1/completions") => {
+            // Before parsing and tokenizing, so the GPU's return from idle
+            // runs meanwhile. Only a loaded engine has a GPU to wake; a busy
+            // one takes the message after its request, a no-op then.
+            let queue = &front.shared.queue;
+            if state == State::Ready
+                && queue.claim_arrival()
+                && front.jobs.try_send(Cmd::Arrival).is_err()
+            {
+                queue.arrival_taken();
+            }
             let prepared = if path == "/v1/chat/completions" {
                 serde_json::from_slice::<api::ChatRequest>(&request.body)
                     .context("parsing the chat request")
@@ -2375,9 +2471,20 @@ fn handle(front: &Front, mut stream: TcpStream) {
                 sink: Sink { tx, cancelled: cancelled.clone(), started: false },
                 queued_at: Instant::now(),
             };
+            if !queue.admit() {
+                refuse(
+                    stream,
+                    &what,
+                    503,
+                    "server_error",
+                    "the request queue is full; retry later",
+                );
+                return;
+            }
             match front.jobs.try_send(Cmd::Job(Box::new(job))) {
                 Ok(()) => relay(stream, rx, cancelled),
                 Err(TrySendError::Full(_)) => {
+                    queue.left();
                     refuse(
                         stream,
                         &what,
@@ -2387,6 +2494,7 @@ fn handle(front: &Front, mut stream: TcpStream) {
                     );
                 }
                 Err(TrySendError::Disconnected(_)) => {
+                    queue.left();
                     refuse(stream, &what, 500, "server_error", "engine stopped");
                 }
             }

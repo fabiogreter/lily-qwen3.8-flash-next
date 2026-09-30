@@ -491,6 +491,18 @@ impl MetalContext {
         self.fault.record(message.to_owned());
     }
 
+    /// Starts the GPU's return from idle without waiting for it: submits a
+    /// queue-level signal of the fence and nothing else, so no command memory
+    /// is held and nobody has to wait for it. After about 1.5 s without work
+    /// the first submission waits for the queue's residency set to become
+    /// resident again, about 6 ms per GB (0.4 to 0.6 s for the full model,
+    /// `mlock` or not; `tests/unit/metal.rs::idle_first_submission_probe`);
+    /// a wake issued while the host is still preparing a pass overlaps that
+    /// with the host work, and costs about 0.03 ms when the GPU is awake.
+    pub fn wake(&self) -> Result<()> {
+        self.submit(&[], &Feedback::new(0, None)).map(|_| ())
+    }
+
     /// Copies byte ranges between buffers on the GPU and waits. Used for
     /// session forks and recurrent-state checkpoints, where a few hundred
     /// megabytes move at memory speed instead of through the host.
