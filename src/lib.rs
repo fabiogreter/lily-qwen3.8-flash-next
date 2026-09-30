@@ -92,6 +92,8 @@ pub mod safetensors;
 pub mod serve;
 pub mod sha256;
 #[cfg(target_os = "macos")]
+pub mod stats;
+#[cfg(target_os = "macos")]
 pub mod tensor;
 #[cfg(target_os = "macos")]
 pub mod tokenizer;

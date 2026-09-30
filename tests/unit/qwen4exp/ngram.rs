@@ -311,3 +311,97 @@ fn paged_gather_timing() {
         });
     }
 }
+
+/// Host cost of `gather` on a warm synthetic table (a 2M-row shard written to
+/// the temp directory, so every page is in the page cache): what the
+/// residency checks cost on a decode step, a verify step and a prefill chunk.
+/// Run with `cargo test --lib paged_gather_overhead -- --ignored --nocapture`.
+#[test]
+#[ignore = "timing only"]
+fn paged_gather_overhead() {
+    let dir = std::env::temp_dir()
+        .join(format!("lily-ngram-overhead-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let (rows, words, groups) = (2_000_000usize, 20usize, 5usize);
+    let base =
+        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0";
+    let lens = [rows * words * 4, rows * groups * 2, rows * groups * 2];
+    let mut header = serde_json::Map::new();
+    let mut offset = 0usize;
+    for ((suffix, dtype, width), len) in [
+        ("weight", "U32", words),
+        ("scales", "BF16", groups),
+        ("biases", "BF16", groups),
+    ]
+    .into_iter()
+    .zip(lens)
+    {
+        header.insert(
+            format!("{base}.{suffix}"),
+            serde_json::json!({"dtype": dtype, "shape": [rows, width], "data_offsets": [offset, offset + len]}),
+        );
+        offset += len;
+    }
+    let header = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+    let mut f = std::fs::File::create(dir.join("model.safetensors")).unwrap();
+    f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+    f.write_all(&header).unwrap();
+    let block = vec![0x5au8; 1 << 20];
+    let mut left = offset;
+    while left > 0 {
+        let n = left.min(block.len());
+        f.write_all(&block[..n]).unwrap();
+        left -= n;
+    }
+    drop(f);
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint");
+    let table = PagedTable::open(
+        &ckpt,
+        &shard_bases("model.language_model.layers.1.ple.", 1),
+        32,
+    )
+    .expect("paged table");
+    table.preload(false).expect("preload");
+    let (cb, gb) = (table.codes_bytes(), table.group_bytes());
+    let mut seed = 99u64;
+    let mut ids = |n: usize| -> Vec<u32> {
+        (0..n)
+            .map(|_| {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((seed >> 33) % rows as u64) as u32
+            })
+            .collect()
+    };
+    for (label, n, reps) in [
+        ("decode step, 16 rows", 16, 20_000),
+        ("verify step, 48 rows", 48, 20_000),
+        ("prefill chunk, 65 536 rows", 65_536, 40),
+    ] {
+        let batches: Vec<Vec<u32>> = (0..64).map(|_| ids(n)).collect();
+        let mut codes = vec![0u8; n * cb];
+        let mut scales = vec![0u8; n * gb];
+        let mut biases = vec![0u8; n * gb];
+        let mut samples = Vec::with_capacity(reps);
+        for r in 0..reps {
+            let t = std::time::Instant::now();
+            table
+                .gather(
+                    &batches[r % batches.len()],
+                    &mut codes,
+                    &mut scales,
+                    &mut biases,
+                )
+                .unwrap();
+            samples.push(t.elapsed().as_secs_f64());
+        }
+        samples.sort_by(f64::total_cmp);
+        eprintln!(
+            "{label}: median {:.2} us, p90 {:.2} us",
+            samples[reps / 2] * 1e6,
+            samples[reps * 9 / 10] * 1e6
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}

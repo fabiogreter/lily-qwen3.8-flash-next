@@ -61,7 +61,10 @@ use crate::qwen4exp::{
 use api::{Defaults, ImagePolicy, Kind, Prepared};
 use session::{CachedImage, SessionStore, boundary_position};
 use stream::{Event, OutputParser, ParserConfig};
-use timings::{Speculation, Timings, TimingsEntry, TimingsLog};
+use timings::{
+    MemoryStats, NgramStats, PrefillParts, PrefillPhases, Speculation, Timings,
+    TimingsEntry, TimingsLog,
+};
 use tools::ParsedToolCall;
 
 const MAX_REQUEST_BYTES: usize = 32 << 20;
@@ -781,7 +784,7 @@ impl<M: LanguageModel> Engine<M> {
         let stream = job.prepared.stream;
         let kind = job.prepared.kind;
         let queued = job.queued_at.elapsed();
-        let result = self.run(job.prepared, &mut sink);
+        let result = self.run(job.prepared, &mut sink, queued);
         let fault = self.ctx.fault();
         if let Err(error) = result {
             let (status, message) = match &fault {
@@ -812,11 +815,13 @@ impl<M: LanguageModel> Engine<M> {
             }
         }
         sink.end();
-        let _ = (kind, queued);
+        let _ = kind;
         fault
     }
 
-    fn run(&mut self, p: Prepared, sink: &mut Sink) -> Result<()> {
+    /// `queued` is how long the request waited for the engine (a reload
+    /// included), which its timings report next to the prefill.
+    fn run(&mut self, p: Prepared, sink: &mut Sink, queued: Duration) -> Result<()> {
         // Work on the user's behalf for as long as the request runs.
         let _activity = crate::activity::Activity::begin("lily: serving a request");
         if sink.cancelled() {
@@ -845,9 +850,15 @@ impl<M: LanguageModel> Engine<M> {
         let images: Vec<CachedImage> =
             p.images.iter().map(|i| CachedImage::new(i.span, i.digest)).collect();
         let image_tokens: usize = p.images.iter().map(|i| i.span.len).sum();
+        // The diagnostics' samples: the engine thread's counters and the
+        // system's paging counters, here, at the end of the prefill and at
+        // the end of the decode (a few microseconds each).
+        let counters_start = crate::stats::counters();
+        let vm_start = crate::stats::vm_counters();
         let started = Instant::now();
         let acquired =
             sessions.acquire(ctx, model, &p.prompt, &images, p.cache_key.as_deref())?;
+        let session_secs = started.elapsed().as_secs_f64();
         let mut session = acquired.session;
         let reused = acquired.reused;
         let agreement = acquired.agreement;
@@ -911,6 +922,7 @@ impl<M: LanguageModel> Engine<M> {
             .disk()
             .and_then(|_| boundary_position(agreement, reused, n, min_tokens));
         let mut durable: Option<(usize, f64)> = None;
+        let mut durable_secs = 0.0;
         let mut prefilled = reused;
         if let Some(b) = boundary {
             if prefilled < b {
@@ -944,6 +956,7 @@ impl<M: LanguageModel> Engine<M> {
                 ),
             }
             drop(snapshot);
+            durable_secs = write_started.elapsed().as_secs_f64();
         }
 
         // Prefix up to the last prompt token, then checkpoint there so an
@@ -963,9 +976,13 @@ impl<M: LanguageModel> Engine<M> {
         // places it. The image rows are no longer needed.
         drop(embeds);
         drop(encoded);
+        let checkpoint_started = Instant::now();
         let snapshot = session.state.snapshot(ctx)?;
         session.add_checkpoint(snapshot);
+        let checkpoint_secs = checkpoint_started.elapsed().as_secs_f64();
         let prefix_secs = started.elapsed().as_secs_f64();
+        let counters_prefill = crate::stats::counters();
+        let vm_prefill = crate::stats::vm_counters();
 
         // A long shared prefix that nothing could resume from: show the seam
         // once, as the text either side of it in this prompt and what the
@@ -1108,6 +1125,8 @@ impl<M: LanguageModel> Engine<M> {
         let final_events = parser.finish();
         deliver(final_events, sink);
         let decode_secs = decode_started.elapsed().as_secs_f64();
+        let counters_end = crate::stats::counters();
+        let vm_end = crate::stats::vm_counters();
 
         // Bookkeeping: the state holds the prompt plus the generated tokens
         // that were fed: all but the last (drawn, never fed), or all of them
@@ -1142,8 +1161,46 @@ impl<M: LanguageModel> Engine<M> {
             _ if parser.tool_calls_emitted() > 0 => "tool_calls",
             _ => "stop",
         };
+        // The numbers the line below prints, as JSON: attached to the
+        // response below and kept for `GET /v1/timings`. Recorded before the
+        // cancellation checks so the log and the ring buffer never disagree.
+        let measured = Timings::measure(
+            n,
+            reused,
+            prefix_secs,
+            completion_tokens,
+            decode_secs,
+            (*drafts > 0).then_some(Speculation {
+                drafted: generation.drafted,
+                accepted: generation.accepted,
+            }),
+        )
+        .with_agreement(agreement, durable.map(|(b, _)| b))
+        .with_vision(image_tokens, vision_secs)
+        .with_diagnostics(
+            queued.as_secs_f64(),
+            PrefillPhases::split(
+                prefix_secs,
+                if p.images.is_empty() { 0.0 } else { vision_secs },
+                PrefillParts {
+                    session_secs,
+                    durable_secs,
+                    checkpoint_secs,
+                    counters: counters_prefill.since(counters_start).prefill,
+                },
+            ),
+            NgramStats {
+                prefill: counters_prefill.since(counters_start).gather.into(),
+                decode: counters_end.since(counters_prefill).gather.into(),
+            },
+            MemoryStats::from_samples(
+                [vm_start, vm_prefill, vm_end],
+                crate::stats::pressure_level(),
+                crate::stats::task_memory(),
+            ),
+        );
         eprintln!(
-            "{}: {} prompt tokens ({} cached{}{}{}{}){}, {} generated, prefix {:.2}s, decode {:.2}s ({:.1} tok/s){}, finish={finish_reason}, sessions={} ({:.1}/{:.1} GB){}",
+            "{}: {} prompt tokens ({} cached{}{}{}{}){}, {} generated, prefix {:.2}s, decode {:.2}s ({:.1} tok/s){}, finish={finish_reason}, sessions={} ({:.1}/{:.1} GB){}{}",
             id,
             n,
             reused,
@@ -1196,23 +1253,8 @@ impl<M: LanguageModel> Engine<M> {
                     d.used_bytes() as f64 / 1e9
                 ))
                 .unwrap_or_default(),
+            measured.log_details(),
         );
-        // The same numbers the line above prints, as JSON: attached to the
-        // response below and kept for `GET /v1/timings`. Recorded before the
-        // cancellation checks so the log and the ring buffer never disagree.
-        let measured = Timings::measure(
-            n,
-            reused,
-            prefix_secs,
-            completion_tokens,
-            decode_secs,
-            (*drafts > 0).then_some(Speculation {
-                drafted: generation.drafted,
-                accepted: generation.accepted,
-            }),
-        )
-        .with_agreement(agreement, durable.map(|(b, _)| b))
-        .with_vision(image_tokens, vision_secs);
         timings.record(TimingsEntry {
             id: id.clone(),
             model: M::MODEL_ID,

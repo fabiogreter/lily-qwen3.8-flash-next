@@ -14,11 +14,20 @@
 //! or denominator is zero is `null` instead of a division by zero, and the
 //! speculation fields are `null` when the draft head is off for the request,
 //! so they never read as a 0 % acceptance.
+//!
+//! Next to the headline numbers sit the diagnostics that say why a request
+//! was slow: the time it queued, where `prefill_ms` went ([`PrefillPhases`]),
+//! how the paged n-gram table's gathers fared ([`NgramStats`]) and what the
+//! system's memory did meanwhile ([`MemoryStats`]). `GET /v1/timings` always
+//! carries them; the log line prints them only when something stands out
+//! ([`Timings::log_details`]).
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use serde::Serialize;
+
+use crate::stats::{self, VmCounters};
 
 /// What the draft head did for one request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,7 +88,210 @@ pub struct Timings {
     /// not already hold (part of `prefill_ms`); absent for a text request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vision_ms: Option<f64>,
+    /// Wall time from the request entering the engine's queue to the engine
+    /// starting it: other requests ahead of it, or a reload after an idle
+    /// unload. Not part of `prefill_ms`.
+    pub queue_ms: f64,
+    /// Where `prefill_ms` went.
+    pub prefill_phases: PrefillPhases,
+    /// The paged n-gram table's gathers during the prefill and the decode.
+    pub ngram: NgramStats,
+    /// The system's memory over the request.
+    pub memory: MemoryStats,
 }
+
+/// Where `prefill_ms` went, in milliseconds. These phases plus `vision_ms`
+/// add up to `prefill_ms`; `other_ms` is what none of them measured
+/// (bookkeeping between phases, and anything unexpected). A GPU time that
+/// looks normal next to an exploding total means the stall was on the host.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct PrefillPhases {
+    /// The session cache: finding the prefix to resume, forking or restoring
+    /// a resident session, reading a checkpoint back from the disk tier, and
+    /// any eviction to disk that making room for the request caused.
+    pub session_ms: f64,
+    /// Growing the decode state's caches and the prefill scratch.
+    pub alloc_ms: f64,
+    /// Hashing the n-gram ids and gathering their rows (`ngram.prefill`
+    /// breaks the gathers down).
+    pub ngram_ms: f64,
+    /// Encoding the chunks' passes on the host.
+    pub encode_ms: f64,
+    /// The chunks' GPU execution, from the commit feedback's timestamps.
+    pub gpu_ms: f64,
+    /// Commit to completion minus the GPU execution: submission latency, the
+    /// GPU busy with other work, residency being established.
+    pub wait_ms: f64,
+    /// Writing a durable prefix entry to the disk tier (0 without one).
+    pub durable_ms: f64,
+    /// The recurrent-state checkpoint that ends the prefill.
+    pub checkpoint_ms: f64,
+    pub other_ms: f64,
+    /// Prefill chunks run (at most 4 096 tokens each).
+    pub chunks: u64,
+}
+
+/// The wall-clock pieces [`PrefillPhases::split`] adds to the engine's
+/// counters.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PrefillParts {
+    pub session_secs: f64,
+    pub durable_secs: f64,
+    pub checkpoint_secs: f64,
+    /// What the prefill loop recorded over the request's prefill.
+    pub counters: stats::Prefill,
+}
+
+impl PrefillPhases {
+    /// Splits a prefill of `prefill_secs`, `vision_secs` of which the vision
+    /// tower took, into its phases; the remainder becomes `other_ms` (never
+    /// negative: overlapping clocks round the other way at worst).
+    pub fn split(prefill_secs: f64, vision_secs: f64, parts: PrefillParts) -> Self {
+        let c = parts.counters;
+        let measured = parts.session_secs
+            + c.alloc_secs
+            + c.ngram_secs
+            + c.encode_secs
+            + c.gpu_secs
+            + c.wait_secs
+            + parts.durable_secs
+            + parts.checkpoint_secs
+            + vision_secs;
+        let ms = |secs: f64| round(secs * 1e3, 1e3);
+        Self {
+            session_ms: ms(parts.session_secs),
+            alloc_ms: ms(c.alloc_secs),
+            ngram_ms: ms(c.ngram_secs),
+            encode_ms: ms(c.encode_secs),
+            gpu_ms: ms(c.gpu_secs),
+            wait_ms: ms(c.wait_secs),
+            durable_ms: ms(parts.durable_secs),
+            checkpoint_ms: ms(parts.checkpoint_secs),
+            other_ms: ms((prefill_secs - measured).max(0.0)),
+            chunks: c.chunks,
+        }
+    }
+
+    /// Prefill time spent anywhere but on the GPU, in milliseconds (the
+    /// vision tower, a GPU phase of its own, excluded too).
+    fn host_ms(&self) -> f64 {
+        self.session_ms
+            + self.alloc_ms
+            + self.ngram_ms
+            + self.encode_ms
+            + self.wait_ms
+            + self.durable_ms
+            + self.checkpoint_ms
+            + self.other_ms
+    }
+}
+
+/// One phase's gathers from the paged n-gram table (all zero for a
+/// resident table).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct GatherStats {
+    /// Staged batches: one per prefill chunk, decode step or verify step.
+    pub batches: u64,
+    /// Table rows copied (16 per token).
+    pub rows: u64,
+    /// Rows whose pages were checked for residency right before the copy:
+    /// every row in the decode, every 16th in the prefill.
+    pub checked_rows: u64,
+    /// Pages the checked rows lie on (three to six per row).
+    pub pages: u64,
+    /// Of those, the ones that were not resident, each a read from the SSD.
+    pub cold_pages: u64,
+    /// Wall time in the gathers, the checks included.
+    pub gather_ms: f64,
+}
+
+impl From<stats::Gather> for GatherStats {
+    fn from(g: stats::Gather) -> Self {
+        Self {
+            batches: g.batches,
+            rows: g.rows,
+            checked_rows: g.checked_rows,
+            pages: g.pages,
+            cold_pages: g.cold_pages,
+            gather_ms: round(g.secs * 1e3, 1e3),
+        }
+    }
+}
+
+/// The n-gram table's gathers of the two phases.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct NgramStats {
+    pub prefill: GatherStats,
+    /// The decode loop's gathers, the last prompt token's included.
+    pub decode: GatherStats,
+}
+
+/// The system's memory over the request. The paging counters are
+/// system-wide deltas in pages of 16 KB (`host_statistics64`), sampled when
+/// the engine started the request, when the prefill ended and when the
+/// decode ended; `null` where a sample failed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct MemoryStats {
+    /// The memorystatus pressure level at the end: 1 normal, 2 warning,
+    /// 4 critical.
+    pub pressure_level: Option<u32>,
+    /// The same as a word.
+    pub pressure: Option<&'static str>,
+    /// The process's physical footprint at the end, in bytes: what the
+    /// system charges it with (its GPU buffers included, the page cache it
+    /// maps not).
+    pub phys_footprint_bytes: Option<u64>,
+    /// Bytes of the process's memory in the compressor at the end.
+    pub compressed_bytes: Option<u64>,
+    pub prefill: Option<VmCounters>,
+    pub decode: Option<VmCounters>,
+}
+
+impl MemoryStats {
+    /// Builds the object from three samples of the paging counters (start,
+    /// end of prefill, end of decode) and the end-of-request readings.
+    pub fn from_samples(
+        samples: [Option<VmCounters>; 3],
+        pressure_level: Option<u32>,
+        task: Option<stats::TaskMemory>,
+    ) -> Self {
+        let delta = |a: Option<VmCounters>, b: Option<VmCounters>| {
+            a.zip(b).map(|(a, b)| b.since(a))
+        };
+        Self {
+            pressure_level,
+            pressure: pressure_level.map(stats::pressure_name),
+            phys_footprint_bytes: task.map(|t| t.phys_footprint),
+            compressed_bytes: task.map(|t| t.compressed),
+            prefill: delta(samples[0], samples[1]),
+            decode: delta(samples[1], samples[2]),
+        }
+    }
+
+    /// Whether the request ran under memory pressure worth a log line: a
+    /// raised pressure level, any swap traffic, or the compressor moving
+    /// more than [`LOG_COMPRESSOR_PAGES`] pages.
+    fn notable(&self) -> bool {
+        let busy = |vm: &Option<VmCounters>| {
+            vm.is_some_and(|v| {
+                v.swapins + v.swapouts > 0
+                    || v.compressions + v.decompressions > LOG_COMPRESSOR_PAGES
+            })
+        };
+        self.pressure_level.is_some_and(|l| l > 1)
+            || busy(&self.prefill)
+            || busy(&self.decode)
+    }
+}
+
+/// The log line shows the queue time from this many milliseconds on.
+const LOG_QUEUE_MS: f64 = 1_000.0;
+/// ... the prefill phases once this much of the prefill was spent off the
+/// GPU (a normal prefill spends a few tens of milliseconds there).
+const LOG_HOST_MS: f64 = 500.0;
+/// ... and the memory counters once the compressor moved this many pages
+/// (256 MB) in one phase.
+const LOG_COMPRESSOR_PAGES: u64 = 16_384;
 
 /// Tokens per second, or `None` when either side is zero: a rate over no
 /// tokens is meaningless and a division by a zero duration is worse.
@@ -125,7 +337,98 @@ impl Timings {
             durable_prefix_tokens: None,
             image_tokens: None,
             vision_ms: None,
+            queue_ms: 0.0,
+            prefill_phases: PrefillPhases::default(),
+            ngram: NgramStats::default(),
+            memory: MemoryStats::default(),
         }
+    }
+
+    /// Adds the diagnostics: the time the request queued, where the prefill
+    /// went, the n-gram gathers and the memory samples.
+    pub fn with_diagnostics(
+        mut self,
+        queue_secs: f64,
+        prefill_phases: PrefillPhases,
+        ngram: NgramStats,
+        memory: MemoryStats,
+    ) -> Self {
+        self.queue_ms = round(queue_secs * 1e3, 1e3);
+        self.prefill_phases = prefill_phases;
+        self.ngram = ngram;
+        self.memory = memory;
+        self
+    }
+
+    /// The diagnostics worth appending to the request's log line, each group
+    /// only when it stands out: a long queue, a prefill that spent more than
+    /// [`LOG_HOST_MS`] off the GPU, any cold n-gram page, memory pressure.
+    /// Empty for an ordinary request; `GET /v1/timings` has everything.
+    pub fn log_details(&self) -> String {
+        let secs = |ms: f64| format!("{:.2}s", ms / 1e3);
+        let mut parts = Vec::new();
+        if self.queue_ms >= LOG_QUEUE_MS {
+            parts.push(format!("queued {}", secs(self.queue_ms)));
+        }
+        let p = &self.prefill_phases;
+        if p.host_ms() >= LOG_HOST_MS {
+            let mut phases = vec![
+                format!("session {}", secs(p.session_ms)),
+                format!("alloc {}", secs(p.alloc_ms)),
+                format!("ngram {}", secs(p.ngram_ms)),
+                format!("encode {}", secs(p.encode_ms)),
+                format!("gpu {}", secs(p.gpu_ms)),
+                format!("wait {}", secs(p.wait_ms)),
+            ];
+            if p.durable_ms > 0.0 {
+                phases.push(format!("durable {}", secs(p.durable_ms)));
+            }
+            phases.push(format!("checkpoint {}", secs(p.checkpoint_ms)));
+            phases.push(format!("other {}", secs(p.other_ms)));
+            parts.push(format!("prefill phases: {}", phases.join(", ")));
+        }
+        let (np, nd) = (&self.ngram.prefill, &self.ngram.decode);
+        if np.cold_pages + nd.cold_pages > 0 {
+            parts.push(format!(
+                "ngram cold pages: prefill {}/{} checked (gather {}), decode {}/{} (gather {})",
+                np.cold_pages,
+                np.pages,
+                secs(np.gather_ms),
+                nd.cold_pages,
+                nd.pages,
+                secs(nd.gather_ms),
+            ));
+        }
+        let m = &self.memory;
+        if m.notable() {
+            let vm = |label: &str, v: &Option<VmCounters>| match v {
+                Some(v) => format!(
+                    "{label} pageins {} pageouts {} swapins {} swapouts {} compressions {} decompressions {}",
+                    v.pageins,
+                    v.pageouts,
+                    v.swapins,
+                    v.swapouts,
+                    v.compressions,
+                    v.decompressions
+                ),
+                None => format!("{label} unavailable"),
+            };
+            parts.push(format!(
+                "memory: pressure {}, footprint {}; {}; {}",
+                m.pressure.unwrap_or("unknown"),
+                match (m.phys_footprint_bytes, m.compressed_bytes) {
+                    (Some(f), Some(c)) => format!(
+                        "{:.1} GB ({:.1} GB compressed)",
+                        f as f64 / 1e9,
+                        c as f64 / 1e9
+                    ),
+                    _ => "unknown".to_owned(),
+                },
+                vm("prefill", &m.prefill),
+                vm("decode", &m.decode),
+            ));
+        }
+        parts.iter().map(|part| format!("; {part}")).collect()
     }
 
     /// Adds the request's images: how many prompt tokens they take and how

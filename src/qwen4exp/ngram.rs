@@ -167,6 +167,43 @@ impl Mapping {
         }
     }
 
+    /// Checks which pages of `[offset, offset+len)` are resident and asks
+    /// for read-ahead on the range when any is not. Returns the pages the
+    /// range lies on and how many of them were not resident. A failed
+    /// `mincore` counts every page as cold and hints anyway: the answer is
+    /// diagnostics and a hint, never a reason to fail a gather.
+    fn prefetch(&self, offset: usize, len: usize) -> (u64, u64) {
+        let page = sys::page_size();
+        let start = offset & !(page - 1);
+        let end = (offset + len).min(self.len);
+        let pages = (end - start).div_ceil(page);
+        // A row's slice of one region spans one or two pages; wider ranges
+        // are not gathered row by row and just take the hint.
+        let mut vec = [0u8; 4];
+        let cold = if pages <= vec.len() {
+            // SAFETY: page-aligned range inside the mapping; `vec` has one
+            // byte for each of its pages.
+            let rc = unsafe {
+                sys::mincore(
+                    self.ptr.add(start).cast_mut().cast(),
+                    end - start,
+                    vec.as_mut_ptr().cast(),
+                )
+            };
+            if rc == 0 {
+                vec[..pages].iter().filter(|&&b| b & 1 == 0).count()
+            } else {
+                pages
+            }
+        } else {
+            pages
+        };
+        if cold > 0 {
+            self.will_need(offset, len);
+        }
+        (pages as u64, cold as u64)
+    }
+
     /// Bytes of `[offset, offset+len)` currently resident in memory.
     fn resident(&self, offset: usize, len: usize) -> Result<usize> {
         let page = sys::page_size();
@@ -258,7 +295,7 @@ struct ShardRegion {
 
 /// The table left in the checkpoint files, memory-mapped and read row by
 /// row on demand. Warm rows are memcpys from the page cache; cold rows get a
-/// read-ahead hint for the whole batch first so their faults overlap.
+/// read-ahead hint for their pages first so their faults overlap.
 pub struct PagedTable {
     regions: Vec<ShardRegion>,
     /// `row_starts[i]` is the first global row of region `i`; one extra entry
@@ -270,8 +307,24 @@ pub struct PagedTable {
 }
 
 /// Batches at least this large are copied by several threads (prefill);
-/// smaller ones (decode) are hinted and copied inline.
+/// smaller ones (decode, verify) are copied inline.
 const PARALLEL_ROWS: usize = 256;
+
+/// Prefill batches check the residency of every this-many-th row only. A
+/// `mincore` call costs about 0.4 us and the calls do not scale across the
+/// copy threads, so checking all of a 4 096-token chunk's ~200 000 pages
+/// took 80 ms against the 2 ms of the copy; one row in 16 costs about 5 ms
+/// per chunk (0.2 % of its GPU time) and still counts thousands of pages.
+/// Decode and verify batches check every row.
+const PREFILL_CHECK_EVERY: usize = 16;
+
+/// What the residency checks of one gather saw.
+#[derive(Default)]
+struct Residency {
+    rows: u64,
+    pages: u64,
+    cold: u64,
+}
 
 impl PagedTable {
     pub const BITS: usize = 4;
@@ -401,14 +454,36 @@ impl PagedTable {
         ))
     }
 
-    fn copy_rows(
+    /// Copies the rows `ids` into row-major `codes`, `scales` and `biases`.
+    /// The pages of every `check_every`-th row are checked with `mincore`
+    /// first and the cold ones get a read-ahead hint, so their SSD reads
+    /// overlap instead of faulting one after another during the copy
+    /// (`madvise` on a resident page is a wasted system call, which the
+    /// check saves). Returns the rows checked, their pages and how many of
+    /// those were cold.
+    fn stage_rows(
         &self,
         ids: &[u32],
         codes: &mut [u8],
         scales: &mut [u8],
         biases: &mut [u8],
-    ) -> Result<()> {
+        check_every: usize,
+    ) -> Result<Residency> {
         let (cb, gb) = (self.codes_bytes(), self.group_bytes());
+        let mut seen = Residency::default();
+        for &id in ids.iter().step_by(check_every) {
+            let (region, c, s, b) = self.locate(id as usize)?;
+            seen.rows += 1;
+            for (map, offset, len) in [
+                (&region.codes.map, c, cb),
+                (&region.scales.map, s, gb),
+                (&region.biases.map, b, gb),
+            ] {
+                let (pages, cold) = map.prefetch(offset, len);
+                seen.pages += pages;
+                seen.cold += cold;
+            }
+        }
         for (i, &id) in ids.iter().enumerate() {
             let (region, c, s, b) = self.locate(id as usize)?;
             codes[i * cb..(i + 1) * cb].copy_from_slice(region.codes.map.slice(c, cb));
@@ -417,11 +492,12 @@ impl PagedTable {
             biases[i * gb..(i + 1) * gb]
                 .copy_from_slice(region.biases.map.slice(b, gb));
         }
-        Ok(())
+        Ok(seen)
     }
 
     /// Reads the rows `ids` into row-major `codes`, `scales` and `biases`
-    /// (each exactly `ids.len()` rows wide).
+    /// (each exactly `ids.len()` rows wide), and adds the batch to the
+    /// calling thread's gather counters ([`crate::stats`]).
     pub fn gather(
         &self,
         ids: &[u32],
@@ -429,6 +505,7 @@ impl PagedTable {
         scales: &mut [u8],
         biases: &mut [u8],
     ) -> Result<()> {
+        let started = std::time::Instant::now();
         let (cb, gb) = (self.codes_bytes(), self.group_bytes());
         ensure!(
             codes.len() == ids.len() * cb
@@ -437,17 +514,33 @@ impl PagedTable {
             "staging buffers do not match {} rows",
             ids.len()
         );
-        if ids.len() < PARALLEL_ROWS {
-            // Issue every page's read-ahead first so cold rows overlap their
-            // SSD latency instead of faulting one after another.
-            for &id in ids {
-                let (region, c, s, b) = self.locate(id as usize)?;
-                region.codes.map.will_need(c, cb);
-                region.scales.map.will_need(s, gb);
-                region.biases.map.will_need(b, gb);
-            }
-            return self.copy_rows(ids, codes, scales, biases);
-        }
+        let seen = if ids.len() < PARALLEL_ROWS {
+            self.stage_rows(ids, codes, scales, biases, 1)?
+        } else {
+            self.stage_parallel(ids, codes, scales, biases)?
+        };
+        let secs = started.elapsed().as_secs_f64();
+        crate::stats::record(|c| {
+            c.gather.batches += 1;
+            c.gather.rows += ids.len() as u64;
+            c.gather.checked_rows += seen.rows;
+            c.gather.pages += seen.pages;
+            c.gather.cold_pages += seen.cold;
+            c.gather.secs += secs;
+        });
+        Ok(())
+    }
+
+    /// [`Self::stage_rows`] split over up to 8 threads (prefill batches),
+    /// checking every [`PREFILL_CHECK_EVERY`]-th row.
+    fn stage_parallel(
+        &self,
+        ids: &[u32],
+        codes: &mut [u8],
+        scales: &mut [u8],
+        biases: &mut [u8],
+    ) -> Result<Residency> {
+        let (cb, gb) = (self.codes_bytes(), self.group_bytes());
         let threads = 8usize.min(ids.len() / 64).max(1);
         let per = ids.len().div_ceil(threads);
         std::thread::scope(|scope| {
@@ -463,14 +556,20 @@ impl PagedTable {
                 let (s_a, s_b) = rest.2.split_at_mut(n * gb);
                 let (b_a, b_b) = rest.3.split_at_mut(n * gb);
                 rest = (ids_b, c_b, s_b, b_b);
-                handles.push(scope.spawn(move || self.copy_rows(ids_a, c_a, s_a, b_a)));
+                handles.push(scope.spawn(move || {
+                    self.stage_rows(ids_a, c_a, s_a, b_a, PREFILL_CHECK_EVERY)
+                }));
             }
+            let mut seen = Residency::default();
             for handle in handles {
-                handle
+                let part = handle
                     .join()
                     .map_err(|_| anyhow::anyhow!("n-gram copy thread panicked"))??;
+                seen.rows += part.rows;
+                seen.pages += part.pages;
+                seen.cold += part.cold;
             }
-            Ok(())
+            Ok(seen)
         })
     }
 

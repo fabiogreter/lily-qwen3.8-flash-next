@@ -115,6 +115,45 @@ fn the_json_shape_is_the_documented_one() {
             "accepted_tokens": 11,
             "acceptance_ratio": 0.7857,
             "agreement_tokens": 0,
+            "queue_ms": 0.0,
+            "prefill_phases": {
+                "session_ms": 0.0,
+                "alloc_ms": 0.0,
+                "ngram_ms": 0.0,
+                "encode_ms": 0.0,
+                "gpu_ms": 0.0,
+                "wait_ms": 0.0,
+                "durable_ms": 0.0,
+                "checkpoint_ms": 0.0,
+                "other_ms": 0.0,
+                "chunks": 0,
+            },
+            "ngram": {
+                "prefill": {
+                    "batches": 0,
+                    "rows": 0,
+                    "checked_rows": 0,
+                    "pages": 0,
+                    "cold_pages": 0,
+                    "gather_ms": 0.0,
+                },
+                "decode": {
+                    "batches": 0,
+                    "rows": 0,
+                    "checked_rows": 0,
+                    "pages": 0,
+                    "cold_pages": 0,
+                    "gather_ms": 0.0,
+                },
+            },
+            "memory": {
+                "pressure_level": null,
+                "pressure": null,
+                "phys_footprint_bytes": null,
+                "compressed_bytes": null,
+                "prefill": null,
+                "decode": null,
+            },
         })
     );
 }
@@ -212,5 +251,139 @@ fn the_log_survives_a_poisoned_lock() {
     assert_eq!(
         log.recent().iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
         ["after", "before"]
+    );
+}
+
+fn parts(session: f64, gpu: f64, alloc: f64) -> PrefillParts {
+    PrefillParts {
+        session_secs: session,
+        durable_secs: 0.0,
+        checkpoint_secs: 0.01,
+        counters: stats::Prefill {
+            chunks: 1,
+            alloc_secs: alloc,
+            ngram_secs: 0.002,
+            encode_secs: 0.02,
+            gpu_secs: gpu,
+            wait_secs: 0.003,
+        },
+    }
+}
+
+#[test]
+fn prefill_phases_add_up_to_the_prefill_with_the_rest_as_other() {
+    let phases = PrefillPhases::split(0.5, 0.1, parts(0.05, 0.3, 0.001));
+    assert_eq!(phases.session_ms, 50.0);
+    assert_eq!(phases.gpu_ms, 300.0);
+    assert_eq!(phases.chunks, 1);
+    let sum = phases.session_ms
+        + phases.alloc_ms
+        + phases.ngram_ms
+        + phases.encode_ms
+        + phases.gpu_ms
+        + phases.wait_ms
+        + phases.durable_ms
+        + phases.checkpoint_ms
+        + phases.other_ms
+        + 100.0; // the vision tower
+    assert!((sum - 500.0).abs() < 1e-6, "phases sum to {sum}");
+    assert!((phases.other_ms - 14.0).abs() < 1e-6, "{}", phases.other_ms);
+    // Clocks that overlap never make the remainder negative.
+    assert_eq!(PrefillPhases::split(0.1, 0.0, parts(0.05, 0.3, 0.0)).other_ms, 0.0);
+}
+
+#[test]
+fn diagnostics_are_always_in_the_json() {
+    let t = Timings::measure(100, 0, 1.0, 10, 1.0, None).with_diagnostics(
+        0.25,
+        PrefillPhases::split(1.0, 0.0, parts(0.01, 0.9, 0.0)),
+        NgramStats {
+            prefill: stats::Gather {
+                batches: 1,
+                rows: 1600,
+                checked_rows: 100,
+                pages: 320,
+                cold_pages: 0,
+                secs: 0.001,
+            }
+            .into(),
+            decode: GatherStats::default(),
+        },
+        MemoryStats::from_samples(
+            [Some(VmCounters::default()), Some(VmCounters::default()), None],
+            Some(1),
+            Some(stats::TaskMemory { phys_footprint: 80 << 30, compressed: 0 }),
+        ),
+    );
+    let json = serde_json::to_value(t).unwrap();
+    assert_eq!(json["queue_ms"], 250.0);
+    assert_eq!(json["prefill_phases"]["gpu_ms"], 900.0);
+    assert_eq!(json["ngram"]["prefill"]["rows"], 1600);
+    assert_eq!(json["ngram"]["prefill"]["checked_rows"], 100);
+    assert_eq!(json["ngram"]["decode"]["cold_pages"], 0);
+    assert_eq!(json["memory"]["pressure"], "normal");
+    assert_eq!(json["memory"]["prefill"]["swapins"], 0);
+    assert_eq!(json["memory"]["decode"], Value::Null, "a failed sample is null");
+    // Nothing stands out, so the log line gets nothing.
+    assert_eq!(t.log_details(), "");
+}
+
+#[test]
+fn the_log_line_shows_only_what_stands_out() {
+    let base = Timings::measure(86_201, 85_939, 28.7, 12, 0.2, None);
+    // A prefill that spent 28 s allocating: the phases appear, with the GPU
+    // time next to them to show the stall was on the host.
+    let slow = base.with_diagnostics(
+        2.5,
+        PrefillPhases::split(28.7, 0.0, parts(0.02, 0.21, 28.3)),
+        NgramStats::default(),
+        MemoryStats::default(),
+    );
+    let details = slow.log_details();
+    assert!(
+        details
+            .starts_with("; queued 2.50s; prefill phases: session 0.02s, alloc 28.30s"),
+        "{details}"
+    );
+    assert!(details.contains("gpu 0.21s"), "{details}");
+    assert!(!details.contains("durable"), "no durable entry was written: {details}");
+    assert!(
+        !details.contains("ngram cold") && !details.contains("memory"),
+        "{details}"
+    );
+
+    // Cold pages and swap traffic each bring their own group.
+    let swapping = VmCounters { swapins: 5_000, pageins: 120, ..VmCounters::default() };
+    let cold = base.with_diagnostics(
+        0.0,
+        PrefillPhases::split(0.3, 0.0, parts(0.01, 0.25, 0.0)),
+        NgramStats {
+            prefill: GatherStats {
+                cold_pages: 120,
+                pages: 840,
+                ..GatherStats::default()
+            },
+            decode: GatherStats { pages: 576, ..GatherStats::default() },
+        },
+        MemoryStats::from_samples(
+            [Some(VmCounters::default()), Some(swapping), Some(swapping)],
+            Some(2),
+            Some(stats::TaskMemory { phys_footprint: 80_100_000_000, compressed: 0 }),
+        ),
+    );
+    let details = cold.log_details();
+    assert!(!details.contains("prefill phases"), "{details}");
+    assert!(details.contains("ngram cold pages: prefill 120/840 checked"), "{details}");
+    assert!(
+        details.contains("memory: pressure warning, footprint 80.1 GB"),
+        "{details}"
+    );
+    assert!(
+        details.contains("prefill pageins 120 pageouts 0 swapins 5000"),
+        "{details}"
+    );
+    assert!(
+        details.contains("decode pageins 0"),
+        "the decode delta is its own: {details}"
     );
 }

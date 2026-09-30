@@ -1859,8 +1859,11 @@ impl Qwen4ExpModel {
             }
             state.rope_delta = v.positions.rope_delta;
         }
+        let alloc_started = std::time::Instant::now();
         state.ensure_capacity(ctx, state.pos + tokens.len())?;
         self.ensure_prefill_scratch(ctx, s, tokens.len())?;
+        let alloc_secs = alloc_started.elapsed().as_secs_f64();
+        crate::stats::record(|c| c.prefill.alloc_secs += alloc_secs);
         let s = &*s;
         let capacity = s
             .prefill
@@ -1872,9 +1875,11 @@ impl Qwen4ExpModel {
         let profile = std::env::var_os("LILY_PROFILE").is_some();
         for chunk in tokens.chunks(self.prefill_chunk) {
             let ps = capacity.chunk(chunk)?;
+            let staged = std::time::Instant::now();
             if let (Some(w), Some(p), Some(pst)) = (ple_w, &ps.ple, &state.ple) {
                 self.stage_ngram(w, p, chunk, pst.hist)?;
             }
+            let ngram_secs = staged.elapsed().as_secs_f64();
             remaining -= chunk.len();
             let chunk_vision = match vision {
                 Some(v) => {
@@ -1900,16 +1905,28 @@ impl Qwen4ExpModel {
             let encoded = self.encode_batch(ctx, state, s, &ps, mode)?;
             let encoded_at = std::time::Instant::now();
             let completed = encoded.commit()?.wait_retain()?;
+            // The span from the commit feedback, which arrives a few tens of
+            // microseconds after completion; the request's timings split the
+            // chunk's wall time into host, GPU and waiting with it.
+            let gpu_secs = completed
+                .timing()
+                .map(|t| t.gpu_end_secs - t.gpu_start_secs)
+                .unwrap_or(0.0);
+            let submitted_secs = encoded_at.elapsed().as_secs_f64();
+            let encode_secs = (encoded_at - started).as_secs_f64();
+            crate::stats::record(|c| {
+                c.prefill.chunks += 1;
+                c.prefill.ngram_secs += ngram_secs;
+                c.prefill.encode_secs += encode_secs;
+                c.prefill.gpu_secs += gpu_secs;
+                c.prefill.wait_secs += (submitted_secs - gpu_secs).max(0.0);
+            });
             if profile {
-                let gpu = completed
-                    .timing()
-                    .map(|t| (t.gpu_end_secs - t.gpu_start_secs) * 1e3)
-                    .unwrap_or(-1.0);
                 eprintln!(
                     "profile prefill m={}: encode {:.2} ms, gpu {:.2} ms, total {:.2} ms",
                     chunk.len(),
-                    (encoded_at - started).as_secs_f64() * 1e3,
-                    gpu,
+                    encode_secs * 1e3,
+                    gpu_secs * 1e3,
                     started.elapsed().as_secs_f64() * 1e3
                 );
             }

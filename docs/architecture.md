@@ -671,11 +671,19 @@ table still wants its 32 GB of physical memory as page cache for decode to
 stay fast, so the session cache budget accounts for it.
 
 The table is read once at startup (`--ngram-preload`, 3 to 6 s), residency is
-verified with `mincore`, and `madvise(WILLNEED)` is issued for a step's rows
-before they are copied so any remaining faults overlap. `--ngram-lock` pins
-it. Weights are read with `F_NOCACHE` so a model load does not evict the
-table. Without preload a token with new n-grams costs 0.6 ms of host time
-with 8 reader threads, or 1.8 ms serially, against 0.05 ms warm.
+verified with `mincore`, and `--ngram-lock` pins it. Weights are read with
+`F_NOCACHE` so a model load does not evict the table.
+
+Before a gather copies its rows it checks their pages with `mincore` and
+issues `madvise(WILLNEED)` for the ones that are not resident, so their
+reads overlap instead of faulting one after another; a resident page gets
+no hint. Decode and verify batches check every row, prefill batches every
+16th: `mincore` costs about 0.4 us a call and the calls do not scale across
+the copy threads, so checking all ~200 000 pages of a 4 096-token chunk took
+80 ms against 2 ms for the copy, and one row in 16 costs about 5 ms. The
+cold pages found are counted in the request's timings. Without the preload
+a token with new n-grams costs 0.6 ms of host time with 8 reader threads,
+or 1.8 ms serially, against 0.05 ms warm.
 
 **Session cache budget.** By default it is the device's recommended working
 set minus what is already allocated minus the paged weights minus 8 GiB of
@@ -869,6 +877,34 @@ write or a GPU call. It exists because client libraries drop response fields
 they do not know — the AI SDK's openai-compatible provider does, which is why
 the opencode plugin in `tools/opencode-plugin-timings/` reads the endpoint
 instead of the response.
+
+Next to the headline numbers the object carries the diagnostics that say
+why a request was slow. `queue_ms` is the wait for the engine (a reload
+included), outside `prefill_ms`. `prefill_phases` splits `prefill_ms` so
+the phases plus `vision_ms` add up to it: `session_ms` (cache lookup,
+fork, disk restore, any eviction the lookup caused), `alloc_ms` (growing
+the state and the prefill scratch), `ngram_ms` (hashing and gathering the
+rows), `encode_ms`, `gpu_ms` (the chunks' execution from the commit
+feedback's GPU timestamps), `wait_ms` (commit to completion minus the GPU
+span), `durable_ms`, `checkpoint_ms` and the remainder `other_ms`; normal
+GPU time next to an exploding total means a host-side stall. `ngram` has the
+gathers of the prefill and the decode separately (rows, pages checked, cold
+pages, time). `memory` has the system's paging deltas (`host_statistics64`:
+pageins, pageouts, swapins, swapouts, compressions, decompressions, in 16 KB
+pages) for the prefill and the decode, the memorystatus pressure level and
+the process's physical footprint and compressed bytes at the end. The
+engine side is per-thread counters that the code doing the work adds to and
+the request subtracts (`src/stats.rs`); the system side is sampled three
+times per request, a few microseconds each. The log line appends a group
+only when it stands out: a queue over 1 s, more than 0.5 s of the prefill
+off the GPU, any cold n-gram page, a raised pressure level, swap traffic or
+more than 256 MB through the compressor. For example:
+
+```
+chatcmpl-...: 86201 prompt tokens (85939 cached), 12 generated, prefix 28.70s, decode 0.20s (60.0 tok/s), finish=stop, sessions=2 (6.1/8.6 GB); prefill phases: session 0.02s, alloc 27.91s, ngram 0.01s, encode 0.03s, gpu 0.21s, wait 0.01s, checkpoint 0.05s, other 0.46s; memory: pressure warning, footprint 80.1 GB (2.3 GB compressed); prefill pageins 14 pageouts 0 swapins 51234 swapouts 0 compressions 80211 decompressions 60102; decode pageins 0 pageouts 0 swapins 12 swapouts 0 compressions 0 decompressions 40
+```
+
+(an illustration of the format, not a measured request).
 
 Sampling runs on the GPU, so that only the token id crosses to the host. Two
 kernels per step: a wide one applies the penalties (presence, frequency and
