@@ -1,0 +1,84 @@
+{
+  "source": "transformers 5.17.0 apply_chat_template(messages, tools=tools, add_generation_prompt=True, enable_thinking=True) on the checkpoint's chat_template.jinja",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a coding agent."
+    },
+    {
+      "role": "user",
+      "content": "Find the TODOs & fix <them>."
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "reasoning_content": "Search first.",
+      "tool_calls": [
+        {
+          "type": "function",
+          "function": {
+            "name": "grep",
+            "arguments": {
+              "pattern": "TODO",
+              "path": "src",
+              "options": {
+                "max_count": 5,
+                "ratio": 0.25,
+                "globs": [
+                  "*.rs",
+                  "*.md"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "src/a.rs:1: // TODO: it's <broken> & old"
+    },
+    {
+      "role": "user",
+      "content": "Continue."
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "grep",
+        "description": "Search <files> & 'text' in café",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "pattern": {
+              "type": "string",
+              "description": "regex"
+            },
+            "path": {
+              "type": "string"
+            },
+            "options": {
+              "type": "object",
+              "properties": {
+                "max_count": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "ratio": {
+                  "type": "number",
+                  "default": 0.5
+                }
+              }
+            }
+          },
+          "required": [
+            "pattern"
+          ]
+        }
+      }
+    }
+  ],
+  "rendered_prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"grep\", \"description\": \"Search <files> & 'text' in café\", \"parameters\": {\"type\": \"object\", \"properties\": {\"pattern\": {\"type\": \"string\", \"description\": \"regex\"}, \"path\": {\"type\": \"string\"}, \"options\": {\"type\": \"object\", \"properties\": {\"max_count\": {\"type\": \"integer\", \"minimum\": 1}, \"ratio\": {\"type\": \"number\", \"default\": 0.5}}}}, \"required\": [\"pattern\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a coding agent.<|im_end|>\n<|im_start|>user\nFind the TODOs & fix <them>.<|im_end|>\n<|im_start|>assistant\n<think>\nSearch first.\n</think>\n\n<tool_call>\n<function=grep>\n<parameter=pattern>\nTODO\n</parameter>\n<parameter=path>\nsrc\n</parameter>\n<parameter=options>\n{\"max_count\": 5, \"ratio\": 0.25, \"globs\": [\"*.rs\", \"*.md\"]}\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsrc/a.rs:1: // TODO: it's <broken> & old\n</tool_response><|im_end|>\n<|im_start|>user\nContinue.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+}

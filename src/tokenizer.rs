@@ -14,7 +14,7 @@
 use std::path::Path;
 
 use anyhow::{Context as _, Result, bail};
-use minijinja::value::Value;
+use minijinja::value::{Kwargs, Value, ValueKind};
 use minijinja::{Environment, Error as JinjaError, ErrorKind as JinjaErrorKind};
 
 use crate::chat::{Conversation, Role};
@@ -115,6 +115,12 @@ impl Tokenizer {
                 Err(JinjaError::new(JinjaErrorKind::InvalidOperation, message))
             },
         );
+        // The reference renders through transformers, whose `tojson` is
+        // Python's `json.dumps` (`, ` and `: ` separators, no escaping).
+        // minijinja's own filter emits compact JSON and escapes `<`, `>`, `&`
+        // and `'`, so the tools block and every non-string tool argument
+        // would render differently from the reference.
+        env.add_filter("tojson", py_tojson);
         env.add_template_owned("chat", template)
             .context("compiling the checkpoint's chat template")?;
 
@@ -303,6 +309,229 @@ fn token_text(value: &serde_json::Value) -> Option<String> {
             map.get("content")?.as_str().map(str::to_string)
         }
         _ => None,
+    }
+}
+
+/// transformers' template filter `tojson(x, ensure_ascii=False, indent=None,
+/// separators=None, sort_keys=False)`, which is `json.dumps` with those
+/// arguments, reproduced byte for byte: the separators default to `, ` and
+/// `: ` (`,` between items when indenting), strings escape only what Python
+/// escapes, and floats print as Python's `repr`.
+fn py_tojson(value: &Value, kwargs: Kwargs) -> Result<String, JinjaError> {
+    let ensure_ascii: Option<bool> = kwargs.get("ensure_ascii")?;
+    let indent: Option<usize> = kwargs.get("indent")?;
+    let separators: Option<Vec<String>> = kwargs.get("separators")?;
+    let sort_keys: Option<bool> = kwargs.get("sort_keys")?;
+    kwargs.assert_all_used()?;
+    let (item, key) = match separators.as_deref() {
+        Some([item, key]) => (item.clone(), key.clone()),
+        Some(other) => {
+            return Err(JinjaError::new(
+                JinjaErrorKind::InvalidOperation,
+                format!("tojson: separators must be two strings, got {}", other.len()),
+            ));
+        }
+        None => {
+            let item = if indent.is_some() { "," } else { ", " };
+            (item.to_string(), ": ".to_string())
+        }
+    };
+    let dumper = PyJson {
+        ensure_ascii: ensure_ascii.unwrap_or(false),
+        indent,
+        item,
+        key,
+        sort_keys: sort_keys.unwrap_or(false),
+    };
+    let mut out = String::new();
+    dumper.value(value, 0, &mut out)?;
+    Ok(out)
+}
+
+struct PyJson {
+    ensure_ascii: bool,
+    indent: Option<usize>,
+    item: String,
+    key: String,
+    sort_keys: bool,
+}
+
+impl PyJson {
+    fn value(
+        &self,
+        value: &Value,
+        level: usize,
+        out: &mut String,
+    ) -> Result<(), JinjaError> {
+        match value.kind() {
+            ValueKind::None => out.push_str("null"),
+            ValueKind::Bool => {
+                out.push_str(if value.is_true() { "true" } else { "false" })
+            }
+            ValueKind::Number if value.is_integer() => out.push_str(&value.to_string()),
+            ValueKind::Number => {
+                let x = f64::try_from(value.clone())?;
+                out.push_str(&py_float_repr(x));
+            }
+            ValueKind::String => self.string(value.as_str().unwrap_or_default(), out),
+            ValueKind::Seq | ValueKind::Iterable => {
+                let items: Vec<Value> = value.try_iter()?.collect();
+                self.container(
+                    '[',
+                    ']',
+                    &items,
+                    level,
+                    out,
+                    |this, item, level, out| this.value(item, level, out),
+                )?;
+            }
+            ValueKind::Map => {
+                let mut entries = value
+                    .try_iter()?
+                    .map(|k| Ok((py_key(&k)?, value.get_item(&k)?)))
+                    .collect::<Result<Vec<_>, JinjaError>>()?;
+                if self.sort_keys {
+                    entries.sort_by(|a, b| a.0.cmp(&b.0));
+                }
+                self.container(
+                    '{',
+                    '}',
+                    &entries,
+                    level,
+                    out,
+                    |this, (k, v), level, out| {
+                        this.string(k, out);
+                        out.push_str(&this.key);
+                        this.value(v, level, out)
+                    },
+                )?;
+            }
+            kind => {
+                return Err(JinjaError::new(
+                    JinjaErrorKind::InvalidOperation,
+                    format!("tojson: a {kind} value is not JSON serializable"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `[`/`{` ... `]`/`}` around `items`, one per line at `level + 1` when
+    /// indenting; empty containers stay `[]` and `{}` as in Python.
+    fn container<T>(
+        &self,
+        open: char,
+        close: char,
+        items: &[T],
+        level: usize,
+        out: &mut String,
+        mut each: impl FnMut(&Self, &T, usize, &mut String) -> Result<(), JinjaError>,
+    ) -> Result<(), JinjaError> {
+        out.push(open);
+        if items.is_empty() {
+            out.push(close);
+            return Ok(());
+        }
+        let newline = |out: &mut String, level: usize| {
+            if let Some(width) = self.indent {
+                out.push('\n');
+                out.extend(std::iter::repeat_n(' ', width * level));
+            }
+        };
+        for (i, item) in items.iter().enumerate() {
+            if i > 0 {
+                out.push_str(&self.item);
+            }
+            newline(out, level + 1);
+            each(self, item, level + 1, out)?;
+        }
+        newline(out, level);
+        out.push(close);
+        Ok(())
+    }
+
+    /// A JSON string as `json.dumps` writes it: `"`, `\` and the control
+    /// characters escaped (short forms where JSON has them), and with
+    /// `ensure_ascii` everything outside space..`~` as `\uXXXX`, astral
+    /// characters as surrogate pairs.
+    fn string(&self, s: &str, out: &mut String) {
+        out.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                '\u{8}' => out.push_str("\\b"),
+                '\u{c}' => out.push_str("\\f"),
+                c if (c as u32) < 0x20
+                    || (self.ensure_ascii && !(' '..='~').contains(&c)) =>
+                {
+                    let mut units = [0u16; 2];
+                    for unit in c.encode_utf16(&mut units) {
+                        out.push_str(&format!("\\u{unit:04x}"));
+                    }
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+    }
+}
+
+/// A map key as `json.dumps` coerces it: strings as they are, integers,
+/// floats, booleans and None as their JSON spelling.
+fn py_key(key: &Value) -> Result<String, JinjaError> {
+    Ok(match key.kind() {
+        ValueKind::String => key.as_str().unwrap_or_default().to_string(),
+        ValueKind::None => "null".into(),
+        ValueKind::Bool => (if key.is_true() { "true" } else { "false" }).into(),
+        ValueKind::Number if key.is_integer() => key.to_string(),
+        ValueKind::Number => py_float_repr(f64::try_from(key.clone())?),
+        kind => {
+            return Err(JinjaError::new(
+                JinjaErrorKind::InvalidOperation,
+                format!(
+                    "tojson: keys must be str, int, float, bool or None, not {kind}"
+                ),
+            ));
+        }
+    })
+}
+
+/// Python's `repr(float)` (and so `json.dumps`): the shortest round-trip
+/// digits, positional when the decimal exponent is in -4..16 (with at least
+/// one fractional digit, `1.0`), otherwise `1e-05` / `1.5e+16` style with a
+/// signed exponent of at least two digits. Non-finite values print as
+/// `NaN`, `Infinity` and `-Infinity`, as `json.dumps` allows by default.
+fn py_float_repr(x: f64) -> String {
+    if x.is_nan() {
+        return "NaN".into();
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { "Infinity" } else { "-Infinity" }.into();
+    }
+    let sign = if x.is_sign_negative() { "-" } else { "" };
+    // `{:e}` gives the shortest round-trip digits: `1.5e-5`, `1e2`, `0e0`.
+    let sci = format!("{:e}", x.abs());
+    let (mantissa, exp) = sci.split_once('e').expect("`{:e}` always has an exponent");
+    let exp: i32 = exp.parse().expect("`{:e}` writes an integer exponent");
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    if x == 0.0 || (-4..16).contains(&exp) {
+        let point = exp + 1; // digits before the decimal point
+        let body = if point <= 0 {
+            format!("0.{}{digits}", "0".repeat((-point) as usize))
+        } else if point as usize >= digits.len() {
+            format!("{digits}{}.0", "0".repeat(point as usize - digits.len()))
+        } else {
+            let (int, frac) = digits.split_at(point as usize);
+            format!("{int}.{frac}")
+        };
+        format!("{sign}{body}")
+    } else {
+        let exp_sign = if exp < 0 { '-' } else { '+' };
+        format!("{sign}{mantissa}e{exp_sign}{:02}", exp.abs())
     }
 }
 

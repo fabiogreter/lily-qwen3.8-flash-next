@@ -64,3 +64,35 @@ fn chat_history_is_deterministic_and_cacheable() -> Result<()> {
     );
     Ok(())
 }
+
+#[derive(Deserialize)]
+struct ToolsGolden {
+    messages: Vec<serde_json::Value>,
+    tools: Vec<serde_json::Value>,
+    rendered_prompt: String,
+}
+
+/// Tool schemas and a tool call with a non-string argument go through the
+/// template's `tojson`; lily's must render them byte for byte as
+/// transformers does (Python `json.dumps`: `, ` and `: `, no escaping of
+/// `<`, `>`, `&` or `'`), with keys in the order they arrived.
+#[test]
+#[ignore = "requires LILY_MODEL_DIR_FLASH"]
+fn tools_and_tool_calls_match_the_reference_rendering() -> Result<()> {
+    let generator = generator()?;
+    let golden: ToolsGolden =
+        serde_json::from_slice(include_bytes!("goldens/golden_flash_tools_chat.json"))?;
+    let rendered = generator.tokenizer().render(&lily::tokenizer::ChatRender {
+        messages: &golden.messages,
+        tools: Some(&golden.tools),
+        enable_thinking: true,
+        reasoning_effort: None,
+        preserve_thinking: None,
+    })?;
+    ensure!(
+        rendered == golden.rendered_prompt,
+        "tools rendering drifted from the reference:\n  got {rendered:?}\n  want {:?}",
+        golden.rendered_prompt
+    );
+    Ok(())
+}
