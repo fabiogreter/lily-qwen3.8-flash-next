@@ -32,9 +32,8 @@ The checkpoint is on Hugging Face as
 [fabiogreter/Qwen3.8-Flash-Next-lily-q4](https://huggingface.co/fabiogreter/Qwen3.8-Flash-Next-lily-q4).
 The server answers `/health` with `503 loading` while the model loads and
 serves after about 25 seconds, while the n-gram table keeps loading in the
-background. [`tools/service/lily-service.sh install`](tools/service/README.md) runs
-it as a launchd agent that starts at login and unloads the model after 30
-idle minutes. `--help` lists every flag.
+background. `--help` lists every flag. The server can also be run as a
+launchd service, see here: [tools/service/README.md](tools/service/README.md).
 
 The API is OpenAI-compatible: `POST /v1/chat/completions` (streaming or
 not), `POST /v1/completions` and `GET /v1/models`, with tools,
