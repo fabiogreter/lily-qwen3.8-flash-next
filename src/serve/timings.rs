@@ -269,13 +269,16 @@ impl MemoryStats {
     }
 
     /// Whether the request ran under memory pressure worth a log line: a
-    /// raised pressure level, any swap traffic, or the compressor moving
-    /// more than [`LOG_COMPRESSOR_PAGES`] pages.
+    /// raised pressure level, at least [`LOG_SWAP_PAGES`] swapped, or at
+    /// least [`LOG_COMPRESSOR_PAGES`] through the compressor in one phase.
+    /// A busy machine swaps a few pages and compresses tens of thousands in
+    /// almost every request without any effect on it; what stalls lily is
+    /// its own weights coming back from the compressor, millions of pages.
     fn notable(&self) -> bool {
         let busy = |vm: &Option<VmCounters>| {
             vm.is_some_and(|v| {
-                v.swapins + v.swapouts > 0
-                    || v.compressions + v.decompressions > LOG_COMPRESSOR_PAGES
+                v.swapins + v.swapouts >= LOG_SWAP_PAGES
+                    || v.compressions + v.decompressions >= LOG_COMPRESSOR_PAGES
             })
         };
         self.pressure_level.is_some_and(|l| l > 1)
@@ -289,9 +292,18 @@ const LOG_QUEUE_MS: f64 = 1_000.0;
 /// ... the prefill phases once this much of the prefill was spent off the
 /// GPU (a normal prefill spends a few tens of milliseconds there).
 const LOG_HOST_MS: f64 = 500.0;
-/// ... and the memory counters once the compressor moved this many pages
-/// (256 MB) in one phase.
-const LOG_COMPRESSOR_PAGES: u64 = 16_384;
+/// ... the n-gram gathers once the prefill spent this long in them (they
+/// are on its critical path) ...
+const LOG_PREFILL_GATHER_MS: f64 = 500.0;
+/// ... or a decode step spent this long in them on average, more than the
+/// parked window that hides the host's staging (docs/architecture.md,
+/// "Hiding the host round trip") ...
+const LOG_DECODE_GATHER_MS_PER_STEP: f64 = 1.0;
+/// ... and the memory counters once one phase swapped 256 MB ...
+const LOG_SWAP_PAGES: u64 = 16_384;
+/// ... or moved 4 GB through the compressor. They also appear whenever the
+/// prefill phases do, since a stall on the host is read against them.
+const LOG_COMPRESSOR_PAGES: u64 = 262_144;
 
 /// Tokens per second, or `None` when either side is zero: a rate over no
 /// tokens is meaningless and a division by a zero duration is worse.
@@ -362,7 +374,8 @@ impl Timings {
 
     /// The diagnostics worth appending to the request's log line, each group
     /// only when it stands out: a long queue, a prefill that spent more than
-    /// [`LOG_HOST_MS`] off the GPU, any cold n-gram page, memory pressure.
+    /// [`LOG_HOST_MS`] off the GPU, n-gram gathers that cost noticeable time,
+    /// memory pressure (and the memory state next to every slow prefill).
     /// Empty for an ordinary request; `GET /v1/timings` has everything.
     pub fn log_details(&self) -> String {
         let secs = |ms: f64| format!("{:.2}s", ms / 1e3);
@@ -371,7 +384,8 @@ impl Timings {
             parts.push(format!("queued {}", secs(self.queue_ms)));
         }
         let p = &self.prefill_phases;
-        if p.host_ms() >= LOG_HOST_MS {
+        let slow_prefill = p.host_ms() >= LOG_HOST_MS;
+        if slow_prefill {
             let mut phases = vec![
                 format!("session {}", secs(p.session_ms)),
                 format!("alloc {}", secs(p.alloc_ms)),
@@ -388,7 +402,10 @@ impl Timings {
             parts.push(format!("prefill phases: {}", phases.join(", ")));
         }
         let (np, nd) = (&self.ngram.prefill, &self.ngram.decode);
-        if np.cold_pages + nd.cold_pages > 0 {
+        let decode_per_step = nd.gather_ms / nd.batches.max(1) as f64;
+        if np.gather_ms >= LOG_PREFILL_GATHER_MS
+            || decode_per_step >= LOG_DECODE_GATHER_MS_PER_STEP
+        {
             parts.push(format!(
                 "ngram cold pages: prefill {}/{} checked (gather {}), decode {}/{} (gather {})",
                 np.cold_pages,
@@ -400,7 +417,7 @@ impl Timings {
             ));
         }
         let m = &self.memory;
-        if m.notable() {
+        if (slow_prefill && m.prefill.is_some()) || m.notable() {
             let vm = |label: &str, v: &Option<VmCounters>| match v {
                 Some(v) => format!(
                     "{label} pageins {} pageouts {} swapins {} swapouts {} compressions {} decompressions {}",

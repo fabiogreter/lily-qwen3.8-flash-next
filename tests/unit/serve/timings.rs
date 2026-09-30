@@ -352,8 +352,9 @@ fn the_log_line_shows_only_what_stands_out() {
         "{details}"
     );
 
-    // Cold pages and swap traffic each bring their own group.
-    let swapping = VmCounters { swapins: 5_000, pageins: 120, ..VmCounters::default() };
+    // Gathers that cost time and heavy swapping each bring their own group.
+    let swapping =
+        VmCounters { swapins: 20_000, pageins: 120, ..VmCounters::default() };
     let cold = base.with_diagnostics(
         0.0,
         PrefillPhases::split(0.3, 0.0, parts(0.01, 0.25, 0.0)),
@@ -361,6 +362,7 @@ fn the_log_line_shows_only_what_stands_out() {
             prefill: GatherStats {
                 cold_pages: 120,
                 pages: 840,
+                gather_ms: 620.0,
                 ..GatherStats::default()
             },
             decode: GatherStats { pages: 576, ..GatherStats::default() },
@@ -379,11 +381,79 @@ fn the_log_line_shows_only_what_stands_out() {
         "{details}"
     );
     assert!(
-        details.contains("prefill pageins 120 pageouts 0 swapins 5000"),
+        details.contains("prefill pageins 120 pageouts 0 swapins 20000"),
         "{details}"
     );
     assert!(
         details.contains("decode pageins 0"),
         "the decode delta is its own: {details}"
     );
+}
+
+#[test]
+fn an_ordinary_request_on_a_busy_machine_logs_nothing_extra() {
+    // Measured on a real agent turn: some cold pages that cost nothing, a
+    // few swapped pages and tens of thousands through the compressor.
+    let busy = VmCounters {
+        swapins: 88,
+        compressions: 67_598,
+        decompressions: 1_873,
+        ..VmCounters::default()
+    };
+    let t = Timings::measure(85_930, 78_877, 5.77, 2630, 25.17, None).with_diagnostics(
+        0.0,
+        PrefillPhases::split(5.77, 0.0, parts(0.0, 5.5, 0.0)),
+        NgramStats {
+            prefill: GatherStats {
+                batches: 2,
+                cold_pages: 2_207,
+                pages: 21_207,
+                gather_ms: 65.0,
+                ..GatherStats::default()
+            },
+            decode: GatherStats {
+                batches: 1_300,
+                cold_pages: 16_009,
+                pages: 151_406,
+                gather_ms: 520.0,
+                ..GatherStats::default()
+            },
+        },
+        MemoryStats::from_samples(
+            [Some(VmCounters::default()), Some(busy), Some(busy)],
+            Some(1),
+            Some(stats::TaskMemory { phys_footprint: 81 << 30, compressed: 0 }),
+        ),
+    );
+    assert_eq!(t.log_details(), "");
+}
+
+#[test]
+fn a_prefill_stalled_on_decompression_shows_its_phases_and_memory() {
+    // Measured: 64 new tokens, 0.08 s on the GPU, 7.95 s waiting while the
+    // weights came back from the compressor.
+    let storm = VmCounters {
+        compressions: 1_392_823,
+        decompressions: 3_591_786,
+        ..VmCounters::default()
+    };
+    let mut stalled = parts(0.0, 0.08, 0.0);
+    stalled.counters.wait_secs = 7.95;
+    let t = Timings::measure(113_489, 113_472, 8.06, 64, 0.55, None).with_diagnostics(
+        0.0,
+        PrefillPhases::split(8.06, 0.0, stalled),
+        NgramStats::default(),
+        MemoryStats::from_samples(
+            [Some(VmCounters::default()), Some(storm), Some(storm)],
+            Some(1),
+            Some(stats::TaskMemory { phys_footprint: 85 << 30, compressed: 76 << 30 }),
+        ),
+    );
+    let details = t.log_details();
+    assert!(
+        details.contains("prefill phases:") && details.contains("wait 7.95s"),
+        "{details}"
+    );
+    assert!(details.contains("decompressions 3591786"), "{details}");
+    assert!(!details.contains("ngram cold"), "{details}");
 }

@@ -912,15 +912,21 @@ the process's physical footprint and compressed bytes at the end. The
 engine side is per-thread counters that the code doing the work adds to and
 the request subtracts (`src/stats.rs`); the system side is sampled three
 times per request, a few microseconds each. The log line appends a group
-only when it stands out: a queue over 1 s, more than 0.5 s of the prefill
-off the GPU, any cold n-gram page, a raised pressure level, swap traffic or
-more than 256 MB through the compressor. For example:
+only when it stands out: a queue over 1 s; more than 0.5 s of the prefill
+off the GPU, which also brings the memory group; n-gram gathers that took
+0.5 s of a prefill or 1 ms per decode step on average; a raised pressure
+level, 256 MB swapped or 4 GB through the compressor in one phase. A busy
+machine has some cold n-gram pages, a few swapped pages and tens of
+thousands of compressor pages in almost every request, none of which moves
+its timing, so those alone print nothing. This request waited for its
+weights to come back from the compressor after 35 idle seconds while the
+agent ran a tool:
 
 ```
-chatcmpl-...: 86201 prompt tokens (85939 cached), 12 generated, prefix 28.70s, decode 0.20s (60.0 tok/s), finish=stop, sessions=2 (6.1/8.6 GB); prefill phases: session 0.02s, alloc 27.91s, ngram 0.01s, encode 0.03s, gpu 0.21s, wait 0.01s, checkpoint 0.05s, other 0.46s; memory: pressure warning, footprint 80.1 GB (2.3 GB compressed); prefill pageins 14 pageouts 0 swapins 51234 swapouts 0 compressions 80211 decompressions 60102; decode pageins 0 pageouts 0 swapins 12 swapouts 0 compressions 0 decompressions 40
+chatcmpl-...: 113489 prompt tokens (113472 cached), 64 generated, prefix 8.06s, decode 0.55s (116.6 tok/s), drafts 40/46 accepted, finish=tool_calls, sessions=2 (7.8/8.6 GB), disk 35 (90.4 GB); prefill phases: session 0.00s, alloc 0.00s, ngram 0.01s, encode 0.00s, gpu 0.08s, wait 7.95s, checkpoint 0.02s, other 0.00s; memory: pressure normal, footprint 85.6 GB (76.9 GB compressed); prefill pageins 318 pageouts 1 swapins 380 swapouts 16 compressions 1392823 decompressions 3591786; decode pageins 104 pageouts 0 swapins 4 swapouts 0 compressions 0 decompressions 1030
 ```
 
-(an illustration of the format, not a measured request).
+About 3.6 million decompressed pages, 55 GB, for 0.08 s of GPU work.
 
 Sampling runs on the GPU, so that only the token id crosses to the host. Two
 kernels per step: a wide one applies the penalties (presence, frequency and
