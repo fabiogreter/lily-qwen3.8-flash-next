@@ -1680,6 +1680,11 @@ fn sampling_defaults(
 
 /// Serves the checkpoint at `model_dir` with the engine its `model_type` names.
 pub fn run(model_dir: &Path, options: ServeOptions) -> Result<()> {
+    // One lily per machine, taken before the port is bound so a second
+    // server is refused with the holder's pid rather than "address in use",
+    // and held for the process's life: the idle unload and the reloads keep
+    // it (`crate::instance`).
+    crate::instance::acquire()?;
     // Before any other thread exists, so they all inherit the mask and the
     // stop signals only ever reach the thread that waits for them.
     let signals = signal::Signals::block()?;
@@ -1719,8 +1724,9 @@ struct Front {
 
 /// The engine thread's body: the first load, then requests until a stop is
 /// requested, with the idle unload and reload in between. Exits the process
-/// with status 1 when a load fails, so a supervisor restarts it (with its
-/// backoff) instead of leaving a server up that can never answer.
+/// with status 1 when a load fails (75 when another instance refused it), so
+/// a supervisor restarts it (with its backoff) instead of leaving a server up
+/// that can never answer.
 fn engine_loop<M: LanguageModel>(
     model_dir: &Path,
     options: &ServeOptions,
@@ -1730,24 +1736,37 @@ fn engine_loop<M: LanguageModel>(
     address: SocketAddr,
 ) {
     let Shared { shutdown, .. } = &shared;
-    // Exits with status 1 after logging `what` and refusing the queued
+    // Exits with `code` after logging `what` and refusing the queued
     // requests with `status`/`client_message`.
-    let exit_failed =
-        |what: String, status: u16, client_message: &str, rx: &Receiver<Cmd>| -> ! {
-            eprintln!("{what}");
-            lifecycle.set(State::Stopping);
-            let mut refused = 0usize;
-            while let Ok(Cmd::Job(job)) = rx.try_recv() {
-                job.reject(status, client_message);
-                refused += 1;
-            }
-            if refused > 0 {
-                eprintln!("exiting: refused {refused} queued requests with {status}");
-            }
-            std::process::exit(1)
-        };
+    let exit_failed = |what: String,
+                       status: u16,
+                       client_message: &str,
+                       rx: &Receiver<Cmd>,
+                       code: u8|
+     -> ! {
+        eprintln!("{what}");
+        lifecycle.set(State::Stopping);
+        let mut refused = 0usize;
+        while let Ok(Cmd::Job(job)) = rx.try_recv() {
+            job.reject(status, client_message);
+            refused += 1;
+        }
+        if refused > 0 {
+            eprintln!("exiting: refused {refused} queued requests with {status}");
+        }
+        std::process::exit(code.into())
+    };
+    // A load that another instance refused exits 75 like a refused start
+    // (`crate::instance`); every other failure 1.
     let fatal = |what: &str, error: anyhow::Error, rx: &Receiver<Cmd>| -> ! {
-        exit_failed(format!("{what}: {error:#}"), 500, "the model failed to load", rx)
+        let code = crate::instance::exit_status(&error);
+        exit_failed(
+            format!("{what}: {error:#}"),
+            500,
+            "the model failed to load",
+            rx,
+            code,
+        )
     };
     let mut engine = match Engine::<M>::load(model_dir, options, &shared, 1) {
         Ok(engine) => Some(engine),
@@ -1826,6 +1845,7 @@ fn engine_loop<M: LanguageModel>(
                             503,
                             "the server is restarting after repeated GPU faults",
                             &rx,
+                            1,
                         );
                     };
                     eprintln!(

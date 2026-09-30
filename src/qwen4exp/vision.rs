@@ -154,6 +154,8 @@ impl VisionTower {
     /// consumption check is not run, since the text tensors are left on disk
     /// on purpose.
     pub fn load_from_dir(ctx: &MetalContext, dir: impl AsRef<Path>) -> Result<Self> {
+        // Weights of the model: one process per machine (`crate::instance`).
+        crate::instance::acquire()?;
         let dir = dir.as_ref();
         let config = Qwen4ExpConfig::from_model_dir(dir)?;
         let vision = config.vision.clone().with_context(|| {

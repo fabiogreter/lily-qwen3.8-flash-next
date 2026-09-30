@@ -9,7 +9,14 @@ use lily::qwen4exp::NgramStorage;
 use lily::serve::{SamplingOverrides, ServeOptions, parse_duration_secs};
 
 #[derive(Parser)]
-#[command(name = "lily", about = "Qwen3.8-Flash-Next inference server")]
+#[command(
+    name = "lily",
+    about = "Qwen3.8-Flash-Next inference server",
+    after_help = "Only one lily instance runs at a time: a server, lily-bench or lily-probe started \
+                  while another one holds ~/Library/Caches/lily/instance.lock refuses to start \
+                  and exits with status 75 (EX_TEMPFAIL). Stop the background service first \
+                  with tools/service/lily-service.sh stop."
+)]
 struct Cli {
     /// Checkpoint directory: a Qwen3.8-Flash-Next conversion from
     /// `tools/convert`.
@@ -185,7 +192,13 @@ fn default_disk_cache_dir() -> PathBuf {
     home.join("Library").join("Caches").join("lily").join("sessions")
 }
 
-fn main() -> Result<()> {
+/// Exits 75 when another lily instance holds the lock (`lily::instance`), 1
+/// on any other error.
+fn main() -> std::process::ExitCode {
+    lily::instance::exit_code(run())
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     let options = ServeOptions {
         bind: cli.bind,

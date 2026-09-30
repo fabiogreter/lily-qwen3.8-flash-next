@@ -13,6 +13,8 @@ pub mod engine;
 #[cfg(target_os = "macos")]
 pub mod generate;
 #[cfg(target_os = "macos")]
+pub mod instance;
+#[cfg(target_os = "macos")]
 pub mod kernels;
 #[cfg(target_os = "macos")]
 pub mod metal;

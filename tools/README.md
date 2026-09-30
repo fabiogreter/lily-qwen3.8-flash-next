@@ -230,5 +230,6 @@ tools/bench/timeline.sh --dry-run --commit HEAD                       # print th
 
 Not Python: a bash script and a launchd plist template that run the server as
 a per-user agent (start at login, restart after a crash or a failed load,
+retry every 30 s while another lily instance holds the instance lock,
 `--idle-unload 30m`). `install`, `uninstall`, `start`, `stop`, `restart`,
 `status`, `logs`; see `service/README.md`.

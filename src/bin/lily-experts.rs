@@ -31,7 +31,12 @@ struct Cli {
     json_out: PathBuf,
 }
 
-fn main() -> Result<()> {
+/// Exits 75 when another lily instance holds the lock (`lily::instance`).
+fn main() -> std::process::ExitCode {
+    lily::instance::exit_code(run())
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     let text = std::fs::read_to_string(&cli.text)?;
     let started = Instant::now();

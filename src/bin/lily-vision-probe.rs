@@ -626,7 +626,12 @@ fn forward(cli: &Cli, model_dir: &Path, golden_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
+/// Exits 75 when another lily instance holds the lock (`lily::instance`).
+fn main() -> std::process::ExitCode {
+    lily::instance::exit_code(run())
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     ensure!(
         cli.image.is_some() || cli.model.is_some(),

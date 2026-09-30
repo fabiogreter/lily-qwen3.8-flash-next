@@ -20,9 +20,10 @@
 @EXTRA_ARGS@    </array>
 
     <!-- Start at login and keep running, but only restart when the server
-         did not exit cleanly: a crash or a failed load (exit 1) brings it
-         back; a stop through SIGTERM (exit 0) stays down until the next
-         `start` or login. -->
+         did not exit cleanly: a crash, a failed load (exit 1) or a start
+         refused because another lily instance holds the instance lock
+         (exit 75) brings it back; a stop through SIGTERM (exit 0) stays
+         down until the next `start` or login. -->
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>

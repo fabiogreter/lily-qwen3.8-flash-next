@@ -28,13 +28,24 @@ Environment for `install`: `LILY_MODEL` (checkpoint directory), `LILY_BIN`,
 `LILY_EXTRA_ARGS` (e.g. `"--mtp-drafts 0 --reasoning-effort low"`),
 `LILY_LABEL`.
 
+Only one lily instance runs at a time. Every process that loads the model
+(this service, a server started by hand, `lily-bench`, `lily-probe`) takes an
+exclusive lock on `~/Library/Caches/lily/instance.lock` first; the kernel
+drops it when the process exits, however it exits. While another process
+holds it the service's start is refused with exit status 75 (`EX_TEMPFAIL`),
+launchd tries again every 30 s, and the service comes up by itself once the
+other process has exited. For development, `stop` the service first (it stays
+down) and `start` it afterwards; `start`, `restart`, `install` and `status`
+say when another instance holds the lock. `restart` waits for the old
+process to exit, which releases the lock, before it starts the new one.
+
 ## What the plist says, and why
 
 | key | value | reason |
 |-----|-------|--------|
 | `RunAtLoad` | true | up after login without a request |
-| `KeepAlive` | `{SuccessfulExit: false}` | restart after a crash or a failed load (exit 1), but a clean stop (SIGTERM, exit 0) stays down until `start` or the next login |
-| `ThrottleInterval` | 30 s | launchd never respawns faster than this (default 10 s); a load that keeps failing then costs one attempt per half minute instead of spinning |
+| `KeepAlive` | `{SuccessfulExit: false}` | restart after a crash, a failed load (exit 1) or a start refused by the instance lock (exit 75), but a clean stop (SIGTERM, exit 0) stays down until `start` or the next login |
+| `ThrottleInterval` | 30 s | launchd never respawns faster than this (default 10 s); a load that keeps failing then costs one attempt per half minute instead of spinning, and a refused start polls for the other instance at that rate |
 | `ExitTimeOut` | 90 s | time between launchd's SIGTERM and its SIGKILL; the server needs up to 10 s for the running request plus the session spill |
 | `ProcessType` | `Interactive` | `launchd.plist(5)`: jobs without a type get "light resource limits", throttling CPU and I/O; Interactive runs like an app |
 | `WorkingDirectory` | the repository | the server itself does not use the working directory |

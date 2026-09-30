@@ -567,6 +567,10 @@ pub fn load(
     memory_budget: Option<u64>,
     expert_usage_out: Option<PathBuf>,
 ) -> Result<ModelWeights> {
+    // Every process that loads the model passes here (the server, the
+    // bench, the probes, the tests with a real checkpoint): one per machine,
+    // held until the process exits (`crate::instance`).
+    crate::instance::acquire()?;
     let ckpt = Checkpoint::open(&dir)?;
     ensure!(
         ckpt.meta(&format!("{PREFIX}embed_tokens.weight")).is_some(),

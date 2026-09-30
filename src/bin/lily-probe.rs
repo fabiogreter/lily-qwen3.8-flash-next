@@ -222,7 +222,12 @@ fn probe<M: LanguageModel>(cli: &Cli) -> Result<Record> {
     })
 }
 
-fn main() -> Result<()> {
+/// Exits 75 when another lily instance holds the lock (`lily::instance`).
+fn main() -> std::process::ExitCode {
+    lily::instance::exit_code(run())
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     let record = match checkpoint_model_type(&cli.model)?.as_str() {
         "qwen4_exp" => probe::<Qwen4ExpModel>(&cli)?,

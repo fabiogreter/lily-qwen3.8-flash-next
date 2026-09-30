@@ -11,6 +11,12 @@
 #   tools/service/lily-service.sh status     launchd state, pid, exit code, /health, memory
 #   tools/service/lily-service.sh logs [N]   the last N (default 40) log lines, then follow
 #
+# Only one lily instance runs at a time (~/Library/Caches/lily/instance.lock):
+# while another lily process (a development server, lily-bench, lily-probe)
+# holds the lock the service's start exits 75, and launchd retries every 30 s
+# until that process has exited. `install`, `start`, `restart` and `status`
+# say when that is the case.
+#
 # Environment for `install` (all optional except the model):
 #   LILY_MODEL        checkpoint directory (default: ~/models/Qwen3.8-Flash-Next-lily-q4)
 #   LILY_BIN          server binary (default: <repo>/target/release/lily)
@@ -29,6 +35,7 @@ target="gui/$uid/$label"
 agents="$HOME/Library/LaunchAgents"
 plist="$agents/$label.plist"
 log_dir="$HOME/Library/Logs/lily"
+lock_file="$HOME/Library/Caches/lily/instance.lock"
 
 die() { echo "lily-service: $*" >&2; exit 1; }
 
@@ -83,11 +90,24 @@ cmd_install() {
     render
     if loaded; then
         echo "re-bootstrapping $target (it was loaded)"
+        local old
+        old=$(service_pid)
         launchctl bootout "$target"
         # bootout is asynchronous; wait for the old instance to leave.
         local i
         for i in $(seq 1 100); do loaded || break; sleep 0.1; done
+        # And for its process, which spills the sessions before it exits
+        # (launchd kills it after the plist's 90 s ExitTimeOut): a new
+        # instance started before that is refused by the instance lock and
+        # only comes up on launchd's next retry.
+        if [ -n "$old" ]; then
+            for i in $(seq 1 60); do kill -0 "$old" 2>/dev/null || break; sleep 2; done
+            if kill -0 "$old" 2>/dev/null; then
+                echo "pid $old is still exiting; the new instance starts once it is gone"
+            fi
+        fi
     fi
+    warn_other_instance
     launchctl bootstrap "gui/$uid" "$plist"
     echo "bootstrapped $target; log: $log_dir/server.log"
 }
@@ -107,6 +127,7 @@ cmd_uninstall() {
 
 cmd_start() {
     loaded || die "$target is not loaded; run install first"
+    warn_other_instance
     launchctl kickstart "$target"
     echo "kickstarted $target"
 }
@@ -117,6 +138,13 @@ cmd_stop() {
         echo "sent SIGTERM to $target (a running request has 10 s; sessions are spilled to disk)"
     else
         echo "$target is not running"
+        # Between two refused starts (exit 75) or failed loads there is no
+        # process to signal, and launchd starts the next attempt within 30 s.
+        local code
+        code=$(launchctl print "$target" 2>/dev/null | awk -F' = ' '/^\tlast exit code = /{print $2; exit}')
+        if [ -n "$code" ] && [ "$code" != 0 ] && [ "$code" != "(never exited)" ]; then
+            echo "  its last exit was $code, so launchd starts it again within 30 s; uninstall keeps it down"
+        fi
     fi
 }
 
@@ -143,10 +171,43 @@ wait_for_exit() {
     return 0
 }
 
+# The live process the instance lock file names, as "pid command", or
+# nothing. The lock itself is an flock its holder keeps until it exits; the
+# pid and binary written into the file are informational, so a pid that is
+# gone or now runs something else is a stale record, not a holder.
+lock_holder() {
+    [ -f "$lock_file" ] || return 0
+    local pid binary command
+    pid=$(awk '/^pid /{print $2; exit}' "$lock_file")
+    binary=$(sed -n 2p "$lock_file")
+    { [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; } || return 0
+    command=$(ps -o command= -p "$pid" 2>/dev/null) || return 0
+    case "$command" in
+        *"${binary##*/}"*) printf '%s %s\n' "$pid" "$command" ;;
+    esac
+    return 0
+}
+
+# Says so when a lily process other than the service holds the instance
+# lock: the service would exit 75 and launchd retry every 30 s until that
+# process is gone.
+warn_other_instance() {
+    local holder
+    holder=$(lock_holder)
+    [ -n "$holder" ] || return 0
+    [ "${holder%% *}" = "$(service_pid)" ] && return 0
+    echo "lily-service: another lily instance holds $lock_file: pid $holder" >&2
+    echo "lily-service: the service refuses to start (exit 75); launchd retries every 30 s until that process exits" >&2
+}
+
 cmd_restart() {
     loaded || die "$target is not loaded; run install first"
     cmd_stop
+    # The lock is released when the old process exits, which is before
+    # launchd stops reporting its pid, so the kickstart below never races
+    # into a refusal by its own predecessor.
     wait_for_exit
+    warn_other_instance
     launchctl kickstart "$target"
     echo "restarted $target"
 }
@@ -167,6 +228,14 @@ cmd_status() {
     code=$(printf '%s\n' "$info" | awk -F' = ' '/^\tlast exit code = /{print $2}' | head -1)
     bind=$(plutil -extract ProgramArguments json -o - "$plist" | python3 -c 'import json,sys; a=json.load(sys.stdin); print(a[a.index("--bind")+1])')
     echo "$target: state ${state:-?}, pid ${pid:-none}, last exit code ${code:-none}"
+    if [ "${code:-}" = 75 ] && [ -z "${pid:-}" ]; then
+        echo "  exit 75: refused to start while another lily instance held the lock; launchd retries every 30 s"
+    fi
+    local holder
+    holder=$(lock_holder)
+    if [ -n "$holder" ] && [ "${holder%% *}" != "${pid:-}" ]; then
+        echo "lock  held by another lily instance: pid $holder"
+    fi
     echo "plist $plist"
     echo "log   $log_dir/server.log"
     if [ -n "${pid:-}" ]; then
@@ -194,5 +263,5 @@ case "${1:-}" in
     restart)   cmd_restart ;;
     status)    cmd_status ;;
     logs)      cmd_logs "${2:-40}" ;;
-    *) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    *) sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

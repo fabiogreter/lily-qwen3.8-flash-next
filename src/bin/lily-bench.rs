@@ -104,7 +104,12 @@ fn fnv1a(tokens: &[u32]) -> u64 {
     })
 }
 
-fn main() -> Result<()> {
+/// Exits 75 when another lily instance holds the lock (`lily::instance`).
+fn main() -> std::process::ExitCode {
+    lily::instance::exit_code(run())
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     let _activity = lily::activity::Activity::begin("lily-bench");
     let params =
