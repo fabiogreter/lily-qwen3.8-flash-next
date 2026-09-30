@@ -52,6 +52,9 @@ pub struct OutputParser<D: FnMut(&[u32]) -> Result<String>> {
     /// leading whitespace of a phase exactly once).
     phase_started: bool,
     tool_calls_emitted: usize,
+    /// Tokens pushed while the reasoning block was open, the closing
+    /// `</think>` included: what `reasoning_content` was generated from.
+    reasoning_tokens: usize,
 }
 
 impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
@@ -72,6 +75,7 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
             stopped: false,
             phase_started: false,
             tool_calls_emitted: 0,
+            reasoning_tokens: 0,
         }
     }
 
@@ -79,11 +83,22 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
         self.tool_calls_emitted
     }
 
+    /// How many of the pushed tokens belong to the reasoning block (see
+    /// the field); 0 when the prompt did not open one.
+    pub fn reasoning_tokens(&self) -> usize {
+        self.reasoning_tokens
+    }
+
     /// Feeds one drawn token (never a stop token) and returns the events it
     /// completes.
     pub fn push(&mut self, token: u32) -> Result<Vec<Event>> {
         if self.stopped {
             return Ok(Vec::new());
+        }
+        // Counted by the phase the token arrives in, so the tokens of a
+        // `</think>` split across several all count as reasoning.
+        if self.phase == Phase::Reasoning {
+            self.reasoning_tokens += 1;
         }
         self.pending.push(token);
         let text = (self.detokenize)(&self.pending)?;

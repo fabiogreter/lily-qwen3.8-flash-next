@@ -16,6 +16,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::data_uri::parse_image_data_uri;
+use super::timings::Speculation;
 use super::tools::{ToolSchema, template_tool_calls};
 use crate::kernels::sample::SamplingParams;
 use crate::qwen4exp::ImageSpan;
@@ -758,3 +759,41 @@ pub(super) fn resolve_budget_for_test(
 ) -> Result<Budget> {
     resolve_budget(prompt, requested, max_seq)
 }
+
+/// The response's `usage` object. `reasoning_tokens` is `Some` wherever a
+/// reasoning block is possible (chat completions), 0 when none was
+/// generated, and lands in `completion_tokens_details` next to the draft
+/// head's accepted and rejected counts, which appear only when drafts ran.
+pub(super) fn usage(
+    prompt_tokens: usize,
+    cached_tokens: usize,
+    completion_tokens: usize,
+    reasoning_tokens: Option<usize>,
+    speculation: Option<Speculation>,
+) -> Value {
+    let mut usage = serde_json::json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "prompt_tokens_details": {"cached_tokens": cached_tokens},
+    });
+    let mut details = serde_json::Map::new();
+    if let Some(reasoning) = reasoning_tokens {
+        details.insert("reasoning_tokens".into(), reasoning.into());
+    }
+    if let Some(s) = speculation {
+        details.insert("accepted_prediction_tokens".into(), s.accepted.into());
+        details.insert(
+            "rejected_prediction_tokens".into(),
+            (s.drafted - s.accepted).into(),
+        );
+    }
+    if !details.is_empty() {
+        usage["completion_tokens_details"] = Value::Object(details);
+    }
+    usage
+}
+
+#[cfg(test)]
+#[path = "../../tests/unit/serve/api.rs"]
+mod tests;

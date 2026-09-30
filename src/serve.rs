@@ -1234,18 +1234,16 @@ impl<M: LanguageModel> Engine<M> {
             }
             return Ok(());
         }
-        let mut usage = json!({
-            "prompt_tokens": n,
-            "completion_tokens": completion_tokens,
-            "total_tokens": n + completion_tokens,
-            "prompt_tokens_details": {"cached_tokens": reused},
-        });
-        if generation.drafted > 0 {
-            usage["completion_tokens_details"] = json!({
-                "accepted_prediction_tokens": generation.accepted,
-                "rejected_prediction_tokens": generation.drafted - generation.accepted,
-            });
-        }
+        let usage = api::usage(
+            n,
+            reused,
+            completion_tokens,
+            (p.kind == Kind::Chat).then(|| parser.reasoning_tokens()),
+            (generation.drafted > 0).then_some(Speculation {
+                drafted: generation.drafted,
+                accepted: generation.accepted,
+            }),
+        );
         let timings_json = serde_json::to_value(measured)?;
         if p.stream {
             // `timings` rides the last chunk the stream already sends: the

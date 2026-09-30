@@ -236,3 +236,30 @@ fn raw_mode_ignores_markers() {
     assert_eq!(reasoning, "");
     assert_eq!(content, "Hello</think><tool_call>");
 }
+
+#[test]
+fn reasoning_tokens_count_the_block_and_its_closing_tag() {
+    let config = |thinking_open| ParserConfig {
+        thinking_open,
+        tools: None,
+        stop_strings: vec![],
+        raw: false,
+    };
+    // "Hello world\n</think>\n\nThe answer": four tokens up to and
+    // including `</think>`, two after it.
+    let mut p = OutputParser::new(detok(TABLE), config(true));
+    run(&mut p, &[0, 1, 2, 3, 4, 16]);
+    assert_eq!(p.reasoning_tokens(), 4);
+    // A `</think>` split over three tokens counts all three.
+    let mut p = OutputParser::new(detok(TABLE), config(true));
+    run(&mut p, &[0, 11, 12, 13, 1]);
+    assert_eq!(p.reasoning_tokens(), 4);
+    // Cut off before the block closed: everything was reasoning.
+    let mut p = OutputParser::new(detok(TABLE), config(true));
+    run(&mut p, &[0, 1, 0]);
+    assert_eq!(p.reasoning_tokens(), 3);
+    // No open block (thinking off): none.
+    let mut p = OutputParser::new(detok(TABLE), config(false));
+    run(&mut p, &[0, 3, 16]);
+    assert_eq!(p.reasoning_tokens(), 0);
+}
