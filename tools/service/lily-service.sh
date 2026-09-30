@@ -226,7 +226,18 @@ cmd_status() {
     state=$(printf '%s\n' "$info" | awk -F' = ' '/^\tstate = /{print $2}' | head -1)
     pid=$(printf '%s\n' "$info" | awk -F' = ' '/^\tpid = /{print $2}' | head -1)
     code=$(printf '%s\n' "$info" | awk -F' = ' '/^\tlast exit code = /{print $2}' | head -1)
-    bind=$(plutil -extract ProgramArguments json -o - "$plist" | python3 -c 'import json,sys; a=json.load(sys.stdin); print(a[a.index("--bind")+1])')
+    # The argument after --bind, read with plutil alone: a python3 here
+    # resolves through the repo's .tool-versions and fails when that
+    # interpreter is not installed.
+    bind=
+    local i=0 arg
+    while arg=$(plutil -extract "ProgramArguments.$i" raw -o - "$plist" 2>/dev/null); do
+        if [ "$arg" = --bind ]; then
+            bind=$(plutil -extract "ProgramArguments.$((i + 1))" raw -o - "$plist" 2>/dev/null)
+            break
+        fi
+        i=$((i + 1))
+    done
     echo "$target: state ${state:-?}, pid ${pid:-none}, last exit code ${code:-none}"
     if [ "${code:-}" = 75 ] && [ -z "${pid:-}" ]; then
         echo "  exit 75: refused to start while another lily instance held the lock; launchd retries every 30 s"
