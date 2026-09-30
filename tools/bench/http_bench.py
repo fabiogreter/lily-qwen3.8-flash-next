@@ -50,10 +50,26 @@ Only the engines' own counters are compared: llama.cpp's `timings` object
 (`prompt_n`, `prompt_ms`, `predicted_n`, `predicted_ms`, `cache_n`,
 `draft_n`, `draft_n_accepted`) and lily's `timings` object (`prefill_tokens`,
 `prefill_ms`, `generated_tokens`, `decode_ms`, `cached_tokens`,
-`drafted_tokens`, `accepted_tokens`). Wall time per request is recorded too.
-Every record carries swap usage and the time, because repeated large model
-loads with swap in use distort everything (docs/performance.md)."""
+`drafted_tokens`, `accepted_tokens`). Wall time per request is recorded too, and each record keeps the engine's whole
+`timings` object as `timings`: for lily that is where `prefill_ms` went
+(`prefill_phases`: session, alloc, ngram, encode, gpu, wait, durable,
+checkpoint, other, chunks), the n-gram gathers (`ngram`), the memory deltas
+(`memory`) and `queue_ms`. Every record carries swap usage and the time,
+because repeated large model loads with swap in use distort everything
+(docs/performance.md).
+
+`matrix --resend` follows every fresh run with the same prompt again, a fresh
+nonce prepended to the user message: the prompt cache matches nothing past the
+template's first tokens, so the whole prompt is prefilled again, but the n-gram
+rows it gathers are the ones the fresh run just paged in (only the nonce's few
+n-grams are new). The pair separates what a cold region of the n-gram table
+and other first-touch costs add from the prefill itself. Records carry
+`variant` `fresh` or `resend`."""
 import argparse, glob, json, os, statistics, subprocess, sys, time, urllib.error, urllib.request
+
+# A run counts as a prefill measurement when the prompt cache supplied no more
+# than this many tokens (a nonce resend still shares the template's first few).
+MAX_CACHED_FOR_PREFILL = 64
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
@@ -140,6 +156,7 @@ def normalise(engine, r, secs):
                    prefill_ms=t.get("prefill_ms"), generated_tokens=t.get("generated_tokens"), decode_ms=t.get("decode_ms"),
                    drafted_tokens=t.get("drafted_tokens"), accepted_tokens=t.get("accepted_tokens"))
     out["wall_s"] = secs
+    out["timings"] = t
     out["prefill_per_second"] = rate(out["prefill_tokens"], out["prefill_ms"])
     out["decode_per_second"] = rate(out["generated_tokens"], out["decode_ms"])
     out["content"] = (r.get("choices") or [{}])[0].get("message", {}).get("content")
@@ -175,15 +192,31 @@ def cmd_matrix(args):
             for spec in specs:
                 run += 1
                 offset = (run * 104729 + rep * 7919) % len(corpus.ids)  # a fresh region every run
-                messages = [{"role": "user", "content": prompt_of(corpus, n, offset)}]
-                res = chat(args.engine, args.url, messages, args.decode_tokens, spec)
-                rec = dict(kind="matrix", label=args.label, engine=args.engine, spec=spec, target_tokens=n, repeat=rep + 1, **res)
-                record(args.out, rec)
-                acc = "" if res["drafted_tokens"] is None else f", drafts {res['accepted_tokens']}/{res['drafted_tokens']}"
-                print(f"  rep {rep + 1} {n:>6} {spec:>6}: prompt {res['prompt_tokens']} (cached {res['cached_tokens']}), "
-                      f"prefill {res['prefill_per_second'] or 0:7.1f} tok/s ({(res['prefill_ms'] or 0) / 1e3:5.1f} s), "
-                      f"decode {res['decode_per_second'] or 0:6.1f} tok/s over {res['generated_tokens']}{acc}, wall {res['wall_s']:.1f} s")
-                time.sleep(args.cooldown)
+                content = prompt_of(corpus, n, offset)
+                for variant in ("fresh", "resend") if args.resend else ("fresh",):
+                    text = content if variant == "fresh" else f"[{os.urandom(4).hex()}]\n" + content
+                    res = chat(args.engine, args.url, [{"role": "user", "content": text}], args.decode_tokens, spec)
+                    rec = dict(kind="matrix", label=args.label, engine=args.engine, spec=spec, variant=variant, target_tokens=n,
+                               repeat=rep + 1, **res)
+                    record(args.out, rec)
+                    acc = "" if res["drafted_tokens"] is None else f", drafts {res['accepted_tokens']}/{res['drafted_tokens']}"
+                    print(f"  rep {rep + 1} {n:>6} {spec:>6} {variant:>6}: prompt {res['prompt_tokens']} (cached {res['cached_tokens']}), "
+                          f"prefill {res['prefill_per_second'] or 0:7.1f} tok/s ({(res['prefill_ms'] or 0) / 1e3:5.1f} s{phases_of(res)}), "
+                          f"decode {res['decode_per_second'] or 0:6.1f} tok/s over {res['generated_tokens']}{acc}, wall {res['wall_s']:.1f} s")
+                    time.sleep(args.cooldown)
+
+
+def phases_of(res):
+    """lily's prefill phases as `; gpu 1.70, wait 0.01, ... s, N chunks, C cold pages`."""
+    ph = (res.get("timings") or {}).get("prefill_phases")
+    if not ph:
+        return ""
+    cold = ((res["timings"].get("ngram") or {}).get("prefill") or {}).get("cold_pages")
+    parts = ", ".join(f"{k[:-3]} {ph[k] / 1e3:.2f}" for k in PHASES if ph.get(k))
+    return f"; {parts} s, {ph.get('chunks')} chunks, {cold} cold pages"
+
+
+PHASES = ("session_ms", "alloc_ms", "ngram_ms", "encode_ms", "gpu_ms", "wait_ms", "durable_ms", "checkpoint_ms", "other_ms")
 
 
 # --- cache -------------------------------------------------------------------
@@ -251,9 +284,13 @@ def cmd_report(args):
     recs = load(args.files)
     matrix = [r for r in recs if r["kind"] == "matrix"]
     if matrix:
+        for r in matrix:
+            r.setdefault("variant", "fresh")
+            r["spec"] = f"{r['spec']} {r['variant']}" if r["variant"] != "fresh" else r["spec"]
         labels = sorted({(r["label"], r["spec"]) for r in matrix})
         lengths = sorted({r["target_tokens"] for r in matrix})
-        cold = [r for r in matrix if not r["cached_tokens"]]  # a cache hit is not a prefill measurement
+        # A cache hit is not a prefill measurement.
+        cold = [r for r in matrix if (r["cached_tokens"] or 0) <= MAX_CACHED_FOR_PREFILL]
         skipped = len(matrix) - len(cold)
         print(f"Prefill, tok/s (median, min–max over repeats; every run a fresh prompt"
               f"{f'; {skipped} runs with a cache hit left out' if skipped else ''})\n")
@@ -262,6 +299,22 @@ def cmd_report(args):
         for n in lengths:
             cells = [fmt(med([r["prefill_per_second"] for r in cold if (r["label"], r["spec"]) == ls and r["target_tokens"] == n])) for ls in labels]
             print(f"| {n} | " + " | ".join(cells) + " |")
+        phased = [r for r in cold if (r.get("timings") or {}).get("prefill_phases")]
+        if phased:
+            print("\nPrefill phases, lily: median ms over repeats (chunks, n-gram cold pages)\n")
+            cols = ("prefill_ms",) + PHASES
+            print("| run | context | " + " | ".join(c[:-3] for c in cols) + " | chunks | cold pages |")
+            print("|---|---|" + "---|" * (len(cols) + 2))
+            for ls in labels:
+                for n in lengths:
+                    rs = [r for r in phased if (r["label"], r["spec"]) == ls and r["target_tokens"] == n]
+                    if not rs:
+                        continue
+                    ph = lambda r, c: r["prefill_ms"] if c == "prefill_ms" else r["timings"]["prefill_phases"][c]
+                    cells = [f"{statistics.median(ph(r, c) for r in rs):.0f}" for c in cols]
+                    chunks = statistics.median(r["timings"]["prefill_phases"]["chunks"] for r in rs)
+                    cold_pages = statistics.median(r["timings"]["ngram"]["prefill"]["cold_pages"] for r in rs)
+                    print(f"| {ls[0]} {ls[1]} | {n} | " + " | ".join(cells) + f" | {chunks:.0f} | {cold_pages:.0f} |")
         print("\nDecode, tok/s\n")
         print("| context | " + " | ".join(f"{l} {s}" for l, s in labels) + " |")
         print("|---|" + "---|" * len(labels))
@@ -308,6 +361,7 @@ def main():
     m.add_argument("--decode-tokens", type=int, default=256)
     m.add_argument("--repeats", type=int, default=3)
     m.add_argument("--cooldown", type=float, default=10, help="seconds between runs")
+    m.add_argument("--resend", action="store_true", help="follow every fresh run with the same prompt behind a fresh nonce")
     m.add_argument("--spec", default="none", help="llama only: comma-separated `none` (plain) and `default` (the server's speculative configuration)")
     r = sub.add_parser("report")
     r.add_argument("files", nargs="+")
