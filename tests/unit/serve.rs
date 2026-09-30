@@ -382,3 +382,33 @@ fn the_image_digest_covers_the_rows_and_the_grid() {
     bytes.extend(2u64.to_le_bytes());
     assert_eq!(a, crate::sha256::sha256(&bytes));
 }
+
+/// Warm-up's cost on a load and on a reload in the same process (what an idle
+/// unload leads to), printed as the server's own warm-up lines. Needs a
+/// checkpoint; the four-layer one is enough and keeps it to a few GB:
+/// `LILY_MODEL_DIR_FLASH=<ckpt> cargo test --lib warm_up_on_load_and_reload -- --ignored --nocapture`.
+#[test]
+#[ignore = "timing only; needs LILY_MODEL_DIR_FLASH"]
+fn warm_up_on_load_and_reload() {
+    let Ok(dir) = std::env::var("LILY_MODEL_DIR_FLASH") else { return };
+    let options = LoadOptions {
+        ngram_storage: NgramStorage::Paged,
+        mtp_drafts: 2,
+        vision: VisionMode::Off,
+        expert_slots: None,
+        expert_usage: None,
+        memory_budget: None,
+        expert_usage_out: None,
+    };
+    for round in ["load", "reload"] {
+        let ctx = MetalContext::new().expect("metal");
+        let model =
+            <Qwen4ExpModel as LanguageModel>::load(&ctx, Path::new(&dir), &options)
+                .expect("model");
+        let mut scratch = model.new_scratch_with_capacity(&ctx, 8192).expect("scratch");
+        eprintln!("{round}, {:.1} GB allocated:", ctx.current_allocated() as f64 / 1e9);
+        warm_up(&ctx, &model, &mut scratch).expect("warm-up");
+        eprintln!("{round}, once more:");
+        warm_up(&ctx, &model, &mut scratch).expect("second warm-up");
+    }
+}

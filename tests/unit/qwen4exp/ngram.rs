@@ -220,7 +220,15 @@ fn paged_table_gathers_rows_from_shard_files() {
             )
             .is_err()
     );
-    assert!(table.preload(false).expect("preload") >= table.bytes());
+    let never = std::sync::atomic::AtomicBool::new(false);
+    let done = table.preload(false, &never).expect("preload");
+    assert!(done.resident >= table.bytes() && !done.stopped);
+    // Just written, so already resident: the preload only checks.
+    assert_eq!(done.read, 0);
+    // A stop raised before the first piece ends it there.
+    let stop = std::sync::atomic::AtomicBool::new(true);
+    let stopped = table.preload(true, &stop).expect("stopped preload");
+    assert!(stopped.stopped && stopped.read == 0);
     assert_eq!(table.bytes() as usize, (rows0 + rows1) * (words * 4 + groups * 4));
 
     // The same rows through the staging buffers on the GPU side.
@@ -240,6 +248,22 @@ fn paged_table_gathers_rows_from_shard_files() {
         stage.seq_ids(n).expect("ids").to_u32().expect("ids"),
         (0..n as u32).collect::<Vec<_>>()
     );
+    // The same preload on its own thread reports through its callback; the
+    // handle joins the thread when it goes, finished or not.
+    let table = Arc::new(table);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = table
+        .preload_in_background(true, move |outcome, secs| {
+            tx.send((outcome.map_err(|e| e.to_string()), secs)).unwrap();
+        })
+        .expect("background preload");
+    let (outcome, secs) =
+        rx.recv_timeout(std::time::Duration::from_secs(30)).expect("preload reported");
+    let outcome = outcome.expect("background preload succeeded");
+    assert!(outcome.resident >= table.bytes() && !outcome.stopped && secs >= 0.0);
+    drop(handle);
+    // Once the handle is gone, nothing but this test holds the table.
+    assert_eq!(Arc::strong_count(&table), 1);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -299,7 +323,10 @@ fn paged_gather_timing() {
     });
     if std::env::var_os("LILY_PRELOAD").is_some() {
         let t = std::time::Instant::now();
-        let resident = table.preload(false).unwrap();
+        let resident = table
+            .preload(false, &std::sync::atomic::AtomicBool::new(false))
+            .unwrap()
+            .resident;
         eprintln!(
             "preload: {:.2} GB resident after {:.1}s",
             resident as f64 / 1e9,
@@ -361,7 +388,7 @@ fn paged_gather_overhead() {
         32,
     )
     .expect("paged table");
-    table.preload(false).expect("preload");
+    table.preload(false, &std::sync::atomic::AtomicBool::new(false)).expect("preload");
     let (cb, gb) = (table.codes_bytes(), table.group_bytes());
     let mut seed = 99u64;
     let mut ids = |n: usize| -> Vec<u32> {
@@ -401,6 +428,87 @@ fn paged_gather_overhead() {
             "{label}: median {:.2} us, p90 {:.2} us",
             samples[reps / 2] * 1e6,
             samples[reps * 9 / 10] * 1e6
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The preload reads a table that is not in the page cache: a shard written
+/// with `F_NOCACHE` (so its pages bypass the cache) is read back through the
+/// files, ends up resident, and gathers the bytes that were written.
+#[test]
+fn preload_reads_cold_shards_into_the_page_cache() {
+    use std::os::fd::AsRawFd as _;
+    let dir =
+        std::env::temp_dir().join(format!("lily-ngram-cold-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let (rows, words, groups) = (400_000usize, 20usize, 5usize);
+    let base =
+        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0";
+    let lens = [rows * words * 4, rows * groups * 2, rows * groups * 2];
+    let mut header = serde_json::Map::new();
+    let mut offset = 0usize;
+    for ((suffix, dtype, width), len) in [
+        ("weight", "U32", words),
+        ("scales", "BF16", groups),
+        ("biases", "BF16", groups),
+    ]
+    .into_iter()
+    .zip(lens)
+    {
+        header.insert(
+            format!("{base}.{suffix}"),
+            serde_json::json!({"dtype": dtype, "shape": [rows, width], "data_offsets": [offset, offset + len]}),
+        );
+        offset += len;
+    }
+    let header = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+    let data: Vec<u8> = (0..offset).map(|i| (i % 251) as u8).collect();
+    let mut f = std::fs::File::create(dir.join("model.safetensors")).unwrap();
+    // SAFETY: an fcntl on a file this test owns.
+    unsafe { libc::fcntl(f.as_raw_fd(), libc::F_NOCACHE, 1) };
+    f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+    f.write_all(&header).unwrap();
+    f.write_all(&data).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint");
+    let table = PagedTable::open(
+        &ckpt,
+        &shard_bases("model.language_model.layers.1.ple.", 1),
+        32,
+    )
+    .expect("paged table");
+    let before = table.resident_bytes().expect("mincore");
+    let done = table
+        .preload(false, &std::sync::atomic::AtomicBool::new(false))
+        .expect("preload");
+    assert!(done.resident >= table.bytes() && !done.stopped);
+    // The write left (nearly) nothing in the cache, so pieces were read (not
+    // all of them: the kernel's read-ahead behind one read can make the next
+    // piece resident before the preload checks it).
+    if before < table.bytes() / 2 {
+        assert!(done.read > 0, "{before} bytes were resident before");
+    }
+    let ids = [0u32, 123_456, 399_999];
+    let mut codes = vec![0u8; ids.len() * words * 4];
+    let mut scales = vec![0u8; ids.len() * groups * 2];
+    let mut biases = vec![0u8; ids.len() * groups * 2];
+    table.gather(&ids, &mut codes, &mut scales, &mut biases).expect("gather");
+    for (i, &id) in ids.iter().enumerate() {
+        let r = id as usize;
+        let c = r * words * 4;
+        assert_eq!(&codes[i * words * 4..(i + 1) * words * 4], &data[c..c + words * 4]);
+        let s = lens[0] + r * groups * 2;
+        assert_eq!(
+            &scales[i * groups * 2..(i + 1) * groups * 2],
+            &data[s..s + groups * 2]
+        );
+        let b = lens[0] + lens[1] + r * groups * 2;
+        assert_eq!(
+            &biases[i * groups * 2..(i + 1) * groups * 2],
+            &data[b..b + groups * 2]
         );
     }
     std::fs::remove_dir_all(&dir).ok();

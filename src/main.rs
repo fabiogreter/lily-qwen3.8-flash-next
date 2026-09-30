@@ -63,8 +63,9 @@ struct Cli {
 
     /// Unload the model (weights, caches, the n-gram table) after this long
     /// without a request, e.g. `30m`, `2h`; resident sessions go to the disk
-    /// tier first and the next request reloads it while it waits. `0` keeps
-    /// the model loaded.
+    /// tier first, a preload still running stops, and the next request
+    /// reloads the model while it waits (weights and warm-up; the table's
+    /// preload runs in the background again). `0` keeps the model loaded.
     #[arg(long, default_value = "0")]
     idle_unload: String,
 
@@ -74,13 +75,18 @@ struct Cli {
     #[arg(long, default_value = "paged")]
     ngram_table: NgramStorage,
 
-    /// Read the whole paged n-gram table at startup so the first requests do
-    /// not pay cold reads (32 GB of evictable page cache).
+    /// Read the whole paged n-gram table into the page cache after every load
+    /// (32 GB, evictable), in a background thread at low CPU and I/O priority
+    /// while the server already answers requests; rows a request needs
+    /// before the preload reaches them are read on demand. Parts already
+    /// resident are skipped.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     ngram_preload: bool,
 
     /// Pin the preloaded table in memory with mlock so it never goes cold
-    /// (32 GB that other applications can no longer reclaim).
+    /// (32 GB that other applications can no longer reclaim). Each part is
+    /// locked right after the background preload has read it; implies the
+    /// preload.
     #[arg(long)]
     ngram_lock: bool,
 

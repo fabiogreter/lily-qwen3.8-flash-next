@@ -3841,8 +3841,17 @@ impl LanguageModel for Qwen4ExpModel {
 
     fn warm_storage(&self, lock: bool) -> Result<u64> {
         match self.ple_table() {
-            Some(NgramTable::Paged(table)) => table.preload(lock),
+            Some(NgramTable::Paged(table)) => Ok(table
+                .preload(lock, &std::sync::atomic::AtomicBool::new(false))?
+                .resident),
             _ => Ok(0),
+        }
+    }
+
+    fn paged_table(&self) -> Option<std::sync::Arc<super::ngram::PagedTable>> {
+        match self.ple_table() {
+            Some(NgramTable::Paged(table)) => Some(table.clone()),
+            _ => None,
         }
     }
 

@@ -213,6 +213,10 @@ pub struct MetalContext {
     fault: Arc<Fault>,
     /// Keyed by function name and MSL version.
     pipelines: Mutex<HashMap<(&'static str, MslVersion), Pipeline>>,
+    /// Pipelines built so far and the nanoseconds it took (library compile
+    /// plus pipeline creation), for the warm-up log line.
+    built: AtomicU64,
+    build_nanos: AtomicU64,
     /// Per-kernel profile mode; see [`profile`].
     profile: bool,
 }
@@ -251,6 +255,8 @@ impl MetalContext {
             submit: Mutex::new(()),
             fault: Arc::new(Fault::default()),
             pipelines: Mutex::new(HashMap::new()),
+            built: AtomicU64::new(0),
+            build_nanos: AtomicU64::new(0),
             profile,
         };
         // The production GEMM paths use native Metal tensor units.
@@ -322,12 +328,28 @@ impl MetalContext {
             return Ok(Kernel { pipeline: p.clone(), name: fn_name });
         }
 
+        let started = Instant::now();
         let library = self
             .compile_library(source, version)
             .with_context(|| format!("for {fn_name}"))?;
         let pipeline = self.pipeline_from_library(&library, fn_name)?;
+        self.built.fetch_add(1, Ordering::Relaxed);
+        self.build_nanos
+            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         cache.insert((fn_name, version), pipeline.clone());
         Ok(Kernel { pipeline, name: fn_name })
+    }
+
+    /// Pipelines [`Self::pipeline`] has built on this context and the
+    /// seconds that took. Metal keeps compiled libraries in a per-user
+    /// cache across processes and in memory within one, so after the first
+    /// run a build costs well under a millisecond; a cold one (a changed
+    /// source, a new OS) up to about 150 ms per source file.
+    pub fn build_stats(&self) -> (u64, f64) {
+        (
+            self.built.load(Ordering::Relaxed),
+            self.build_nanos.load(Ordering::Relaxed) as f64 * 1e-9,
+        )
     }
 
     /// Allocates a zero-initialized shared-storage buffer and makes it

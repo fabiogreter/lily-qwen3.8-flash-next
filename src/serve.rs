@@ -55,6 +55,7 @@ use crate::kernels::attention::MAX_SEQ;
 use crate::kernels::sample::SamplingParams;
 use crate::metal::MetalContext;
 use crate::qwen4exp::image::ImageLimits;
+use crate::qwen4exp::ngram::BackgroundPreload;
 use crate::qwen4exp::{
     ImageEmbeds, NgramStorage, Qwen4ExpModel, VisionInput, positions_for_prompt,
 };
@@ -525,6 +526,8 @@ struct Engine<M: LanguageModel> {
     shutdown: Arc<Shutdown>,
     /// Where each finished request's numbers go for `GET /v1/timings`.
     timings: Arc<TimingsLog>,
+    /// The paged n-gram table's preload while it runs in the background.
+    preload: Option<BackgroundPreload>,
 }
 
 /// Where a request's text ends up when not streaming.
@@ -602,18 +605,6 @@ impl<M: LanguageModel> Engine<M> {
                     VisionTower::Off => "off".to_string(),
                 }
             );
-        }
-        if options.ngram_preload || options.ngram_lock {
-            let started = Instant::now();
-            let bytes = model.warm_storage(options.ngram_lock)?;
-            if bytes > 0 {
-                eprintln!(
-                    "paged weights: {:.1} GB resident after preload in {:.1}s{}",
-                    bytes as f64 / 1e9,
-                    started.elapsed().as_secs_f64(),
-                    if options.ngram_lock { " (locked)" } else { "" }
-                );
-            }
         }
         let max_seq =
             effective_max_seq(options.max_seq, model.max_position_embeddings());
@@ -713,6 +704,36 @@ impl<M: LanguageModel> Engine<M> {
                 ),
             }
         }
+        // The table's preload starts last, once the weights are resident and
+        // warm-up is done, and runs while the engine serves: the first
+        // requests do not wait for 32 GB of reads, and a row they need before
+        // the preload reaches it is read on demand.
+        let preload = match model.paged_table() {
+            Some(table) if options.ngram_preload || options.ngram_lock => {
+                let lock = options.ngram_lock;
+                eprintln!(
+                    "paged weights: preloading {:.1} GB in the background{}",
+                    table.bytes() as f64 / 1e9,
+                    if lock { ", locking it" } else { "" }
+                );
+                Some(table.preload_in_background(lock, move |outcome, secs| {
+                    match outcome {
+                        Ok(done) => eprintln!(
+                            "paged weights: {:.1} GB resident after the background preload {} in {secs:.1}s \
+                             ({:.1} GB read){}",
+                            done.resident as f64 / 1e9,
+                            if done.stopped { "stopped" } else { "finished" },
+                            done.read as f64 / 1e9,
+                            if lock && !done.stopped { ", locked" } else { "" }
+                        ),
+                        Err(error) => eprintln!(
+                            "paged weights: the background preload failed after {secs:.1}s: {error:#}"
+                        ),
+                    }
+                })?)
+            }
+            _ => None,
+        };
         Ok(Self {
             ctx,
             model,
@@ -724,6 +745,7 @@ impl<M: LanguageModel> Engine<M> {
             next_id,
             shutdown,
             timings,
+            preload,
         })
     }
 
@@ -734,8 +756,21 @@ impl<M: LanguageModel> Engine<M> {
     /// ids stay unique across a reload.
     fn unload(self, reason: &str) -> u64 {
         let started = Instant::now();
-        let Engine { ctx, model, generator: _, mut sessions, scratch, next_id, .. } =
-            self;
+        let Engine {
+            ctx,
+            model,
+            generator: _,
+            mut sessions,
+            scratch,
+            next_id,
+            preload,
+            ..
+        } = self;
+        // A preload still running holds the table's mappings; it stops at its
+        // next 8 MB piece and logs how far it got.
+        if let Some(mut preload) = preload {
+            preload.stop();
+        }
         let resident = ctx.current_allocated();
         // A faulted queue cannot run the snapshot blits, and what its last
         // command buffers left in the caches is not trustworthy either: the
@@ -838,6 +873,7 @@ impl<M: LanguageModel> Engine<M> {
             next_id,
             shutdown,
             timings,
+            preload: _,
         } = self;
         // The HTTP thread validated against the same limit; this only guards
         // the engine's buffers if the two ever disagree.
@@ -1404,16 +1440,25 @@ fn text_chunk(
     })
 }
 
-/// Compiles the Metal pipelines a short request needs by running a throwaway
-/// two-token prompt and two decode steps, so the first real request does not
-/// pay the shader compile (tens of seconds on the 48-layer model). Kernels
-/// only long contexts reach (sparse attention) still compile on first use.
+/// Runs a throwaway two-token prompt and two decode steps, so the first real
+/// request does not pay the first-use costs: building the pipelines a short
+/// request needs (kernels only long contexts reach, sparse attention, still
+/// build on first use) and the first submissions after the weights were
+/// allocated, which wait while their residency is established. Building is
+/// cheap once Metal's shader cache holds the libraries (56 pipelines in
+/// 20 ms on the four-layer checkpoint; about 1.5 s for every source cold);
+/// the first submission is the larger part (about 10 ms per GB allocated
+/// on an idle machine). The log line splits the time up to tell which
+/// dominates on this machine, with the system's paging over it.
 fn warm_up<M: LanguageModel>(
     ctx: &MetalContext,
     model: &M,
     scratch: &mut M::Scratch,
 ) -> Result<()> {
     let started = Instant::now();
+    let (built_before, build_secs_before) = ctx.build_stats();
+    let counters_before = crate::stats::counters();
+    let vm_before = crate::stats::vm_counters();
     let greedy = SamplingParams::greedy();
     let mut state = model.new_state(ctx, 4)?;
     scratch.begin_request();
@@ -1426,6 +1471,7 @@ fn warm_up<M: LanguageModel>(
         &[1, 2],
         Some(Draw { params: &greedy, step: 0 }),
     )?;
+    let decode_started = Instant::now();
     for (step, (slot_in, slot_out)) in [(0, 1), (1, 0)].into_iter().enumerate() {
         let token = scratch.next_token().view(slot_in, &[1])?.to_u32()?[0];
         let encoded = model.encode_decode_step(
@@ -1441,10 +1487,31 @@ fn warm_up<M: LanguageModel>(
         state.advance(1);
         pending.wait()?;
     }
+    let decode_secs = decode_started.elapsed().as_secs_f64();
     // Snapshot/restore compile no shaders but exercise the blit path once.
     let snapshot = state.snapshot(ctx)?;
     state.restore(ctx, &snapshot)?;
-    eprintln!("warm-up done in {:.1}s", started.elapsed().as_secs_f64());
+    let (built, build_secs) = ctx.build_stats();
+    let prefill = crate::stats::counters().since(counters_before).prefill;
+    let vm = crate::stats::vm_counters()
+        .zip(vm_before)
+        .map(|(after, before)| after.since(before));
+    eprintln!(
+        "warm-up done in {:.1}s: {} pipelines built in {:.2}s; prefill encode {:.2}s, GPU {:.2}s, \
+         waiting {:.2}s; two decode steps {:.2}s{}",
+        started.elapsed().as_secs_f64(),
+        built - built_before,
+        build_secs - build_secs_before,
+        prefill.encode_secs,
+        prefill.gpu_secs,
+        prefill.wait_secs,
+        decode_secs,
+        vm.map(|v| format!(
+            "; system paging meanwhile: pageins {} swapins {} swapouts {} compressions {} decompressions {}",
+            v.pageins, v.swapins, v.swapouts, v.compressions, v.decompressions
+        ))
+        .unwrap_or_default(),
+    );
     Ok(())
 }
 

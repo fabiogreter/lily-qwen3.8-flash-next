@@ -670,9 +670,24 @@ raising `iogpu.wired_limit_mb`: 71 GB fits under the 96 GiB default. The
 table still wants its 32 GB of physical memory as page cache for decode to
 stay fast, so the session cache budget accounts for it.
 
-The table is read once at startup (`--ngram-preload`, 3 to 6 s), residency is
-verified with `mincore`, and `--ngram-lock` pins it. Weights are read with
-`F_NOCACHE` so a model load does not evict the table.
+The table is read into the page cache after every load (`--ngram-preload`),
+on a background thread at background QoS with throttled disk I/O, while the
+server already answers requests; a row a request needs before the preload
+reaches it is read on demand, which only costs time (the table is
+read-only). The preload reads each tensor with `pread` in 8 MB pieces,
+skipping pieces `mincore` finds resident, so a warm table costs only the
+checks. Touching the mapping page by page, as it did before, is
+fault-bound: on freshly written, uncached 2 and 4 GB files one thread
+touching pages read 4 to 5 GB/s against 10 to 12 GB/s for 8 MB reads, and
+the background preload measured 6.2 GB/s on a 4 GB table, which would put
+the 32 GB table at about 5 s on an idle machine (fresh files may sit in the
+SSD's fast cache, so the real table can be slower). The server logged 28 to
+32 s for the old foreground preload after a reload; how much of that was
+the I/O method and how much memory pressure (the weights had just taken
+71 GB) those logs do not say. An idle unload or a shutdown stops a
+preload that is still running at its next piece. `--ngram-lock` pins each
+tensor right after the preload read it. Weights are read with `F_NOCACHE`
+so a model load does not evict the table.
 
 Before a gather copies its rows it checks their pages with `mincore` and
 issues `madvise(WILLNEED)` for the ones that are not resident, so their
@@ -948,6 +963,30 @@ inherits the mask, and one thread `sigwait`s for them. The inherited
 disposition is reset to default first, because a non-interactive shell starts
 background jobs with SIGINT ignored and an ignored signal is discarded before
 `sigwait` could take it.
+
+**Loading.** A load reads the weights, allocates the scratch, runs a
+warm-up (a two-token prefill and two decode steps), derives the session
+cache budget, opens the disk tier and then starts the n-gram table's
+background preload; the engine serves as soon as that returns. The warm-up
+log line splits its time into pipeline builds, the prefill's encode, GPU
+and waiting time, the two decode steps and the system's paging meanwhile.
+On the four-layer checkpoint (8.2 GB allocated) the warm-up took 0.24 s
+while the full model was loaded next to it and the machine had 0.5 GB free:
+building 56 pipelines took 0.02 s and the first prefill's submission waited
+about 0.2 s for residency. With 60 GB free it took 0.1 s, the wait 0.02 s,
+and a synthetic test put the first-submission wait at about 10 ms per GB
+allocated. The wait grows with memory pressure. Pipeline builds are cheap
+because Metal keeps compiled libraries in a per-user cache across processes
+and in memory within one: compiling every source cold took 1.5 s, the same
+sources again 0.1 ms each, also in a new context after an idle unload.
+Keeping pipelines across an idle unload would therefore save milliseconds,
+and the context (with its pipeline cache) is dropped with the engine as
+before. The 8 to 9 s the full model's warm-up logged after a reload came
+right after the old foreground preload had filled 32 GB of page cache next
+to 71 GB of fresh weights; these numbers suggest residency under that
+pressure rather than compilation, but that is not measured, and the
+breakdown in the log line is there to show it. With the preload now
+starting after the warm-up, the warm-up no longer runs behind it.
 
 A Metal command-queue error is treated as a transport failure rather than a
 request failure, because the queue's state after one is unknown: the context

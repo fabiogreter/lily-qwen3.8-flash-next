@@ -11,8 +11,10 @@
 //!   for KV and session caches at no quality cost. A warm row is a memcpy.
 
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use anyhow::{Context as _, Result, ensure};
 
@@ -111,6 +113,9 @@ impl NgramHasher {
 struct Mapping {
     ptr: *const u8,
     len: usize,
+    /// The file, which the preload reads through the page cache the mapping
+    /// shares.
+    path: PathBuf,
 }
 
 // SAFETY: the mapping is immutable file-backed memory; concurrent reads from
@@ -142,7 +147,7 @@ impl Mapping {
             path.display(),
             std::io::Error::last_os_error()
         );
-        Ok(Self { ptr: ptr.cast::<u8>().cast_const(), len })
+        Ok(Self { ptr: ptr.cast::<u8>().cast_const(), len, path: path.to_path_buf() })
     }
 
     fn slice(&self, offset: usize, len: usize) -> &[u8] {
@@ -204,6 +209,16 @@ impl Mapping {
         (pages as u64, cold as u64)
     }
 
+    /// Whether every page of `[offset, offset+len)` is resident; `false`
+    /// when `mincore` fails.
+    fn all_resident(&self, offset: usize, len: usize) -> bool {
+        self.resident(offset, len).is_ok_and(|bytes| {
+            let page = sys::page_size();
+            let start = offset & !(page - 1);
+            bytes >= (offset + len).min(self.len) - start
+        })
+    }
+
     /// Bytes of `[offset, offset+len)` currently resident in memory.
     fn resident(&self, offset: usize, len: usize) -> Result<usize> {
         let page = sys::page_size();
@@ -255,6 +270,10 @@ mod sys {
     pub const MAP_SHARED: c_int = 1;
     pub const MADV_WILLNEED: c_int = 3;
     pub const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
+    const QOS_CLASS_BACKGROUND: u32 = 0x09;
+    const IOPOL_TYPE_DISK: c_int = 0;
+    const IOPOL_SCOPE_THREAD: c_int = 1;
+    const IOPOL_THROTTLE: c_int = 3;
 
     unsafe extern "C" {
         pub fn mmap(
@@ -270,6 +289,21 @@ mod sys {
         pub fn mincore(addr: *mut c_void, len: usize, vec: *mut u8) -> c_int;
         pub fn mlock(addr: *mut c_void, len: usize) -> c_int;
         fn getpagesize() -> c_int;
+        fn pthread_set_qos_class_self_np(qos: u32, relative_priority: c_int) -> c_int;
+        fn setiopolicy_np(iotype: c_int, scope: c_int, policy: c_int) -> c_int;
+    }
+
+    /// Puts the calling thread at background QoS (efficiency cores, lowest
+    /// scheduling priority) and throttles its disk I/O, which then yields
+    /// to any other I/O on the device. Best effort; returns whether both
+    /// took.
+    pub fn lower_thread_priority() -> bool {
+        // SAFETY: both calls only change the calling thread's own policy.
+        unsafe {
+            pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0) == 0
+                && setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_THROTTLE)
+                    == 0
+        }
     }
 
     pub fn page_size() -> usize {
@@ -574,33 +608,79 @@ impl PagedTable {
     }
 
     /// Reads the whole table once so its pages are resident, and pins them
-    /// with `mlock` when `lock` is set. Returns the bytes found resident
+    /// with `mlock` when `lock` is set (each tensor right after it was
+    /// read). Reads go through `pread` in [`PRELOAD_CHUNK`] pieces, which
+    /// fills the page cache the mapping shares at the SSD's sequential rate;
+    /// touching the mapping page by page was fault-bound (on a cold 4 GB
+    /// file 4 GB/s from one thread against 12 GB/s for the reads, and at
+    /// background QoS 1.9 to 4 GB/s). A piece that `mincore` finds resident
+    /// already is skipped, so a warm table costs only the checks. `stop`
+    /// ends it between pieces. Returns what was read and what is resident
     /// afterwards (from `mincore`), which is what the log should show.
-    pub fn preload(&self, lock: bool) -> Result<u64> {
+    pub fn preload(&self, lock: bool, stop: &AtomicBool) -> Result<Preloaded> {
+        use std::os::unix::fs::FileExt as _;
         let (cb, gb) = (self.codes_bytes(), self.group_bytes());
-        let mut sink = 0u64;
-        for region in &self.regions {
+        let mut buf = vec![0u8; PRELOAD_CHUNK];
+        let mut read = 0u64;
+        let mut stopped = false;
+        'parts: for region in &self.regions {
             for (part, len) in [
                 (&region.codes, region.rows * cb),
                 (&region.scales, region.rows * gb),
                 (&region.biases, region.rows * gb),
             ] {
-                part.map.will_need(part.start, len);
-                let bytes = part.map.slice(part.start, len);
-                // Touch one word per page; the sum keeps the loads alive.
-                let page = sys::page_size();
-                let mut off = 0;
-                while off < len {
-                    sink = sink.wrapping_add(bytes[off] as u64);
-                    off += page;
+                let file = File::open(&part.map.path).with_context(|| {
+                    format!("opening {} for the preload", part.map.path.display())
+                })?;
+                let mut offset = part.start;
+                let end = part.start + len;
+                while offset < end {
+                    if stop.load(Ordering::Relaxed) {
+                        stopped = true;
+                        break 'parts;
+                    }
+                    let n = PRELOAD_CHUNK.min(end - offset);
+                    if !part.map.all_resident(offset, n) {
+                        file.read_exact_at(&mut buf[..n], offset as u64).with_context(
+                            || format!("reading {}", part.map.path.display()),
+                        )?;
+                        read += n as u64;
+                    }
+                    offset += n;
                 }
                 if lock {
                     part.map.lock(part.start, len)?;
                 }
             }
         }
-        std::hint::black_box(sink);
-        self.resident_bytes()
+        Ok(Preloaded { read, resident: self.resident_bytes()?, stopped })
+    }
+
+    /// Runs [`Self::preload`] on a thread of its own at background QoS with
+    /// throttled I/O, so it does not compete with the requests being served
+    /// meanwhile; a row they need before the preload reaches it just faults
+    /// in (the table is read-only). `done` gets the outcome and the seconds
+    /// it took, on that thread. The handle stops the preload when dropped.
+    pub fn preload_in_background(
+        self: &Arc<Self>,
+        lock: bool,
+        done: impl FnOnce(Result<Preloaded>, f64) + Send + 'static,
+    ) -> Result<BackgroundPreload> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let table = self.clone();
+        let flag = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("lily-ngram-preload".into())
+            .spawn(move || {
+                let started = Instant::now();
+                if !sys::lower_thread_priority() {
+                    eprintln!("n-gram preload: could not lower its thread priority");
+                }
+                let outcome = table.preload(lock, &flag);
+                done(outcome, started.elapsed().as_secs_f64());
+            })
+            .context("spawning the n-gram preload thread")?;
+        Ok(BackgroundPreload { stop, thread: Some(thread) })
     }
 
     /// Bytes of the table currently resident in memory.
@@ -617,6 +697,44 @@ impl PagedTable {
             }
         }
         Ok(total)
+    }
+}
+
+/// Bytes one preload read request covers (see [`PagedTable::preload`]).
+const PRELOAD_CHUNK: usize = 8 << 20;
+
+/// What [`PagedTable::preload`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Preloaded {
+    /// Bytes read from the files (pieces not already resident).
+    pub read: u64,
+    /// Bytes of the table resident when it ended.
+    pub resident: u64,
+    /// Whether it was stopped before reaching the end.
+    pub stopped: bool,
+}
+
+/// A preload running on its own thread ([`PagedTable::preload_in_background`]).
+/// The thread holds the table, and with it the mappings, until it ends.
+pub struct BackgroundPreload {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl BackgroundPreload {
+    /// Asks the preload to stop at its next piece and waits for the thread,
+    /// so the table's mappings are released with the model that owns them.
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for BackgroundPreload {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 

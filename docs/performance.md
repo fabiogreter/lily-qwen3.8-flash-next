@@ -10,7 +10,10 @@ then says what assumption it rests on.
 - **Hardware.** MacBook Pro, M5 Max, 40-core GPU, 128 GB unified memory, on
   mains power, GPU otherwise idle. The benchmark refuses to start on battery.
 - **Model.** The full 48-layer Qwen3.8-Flash-Next conversion, 103.1 GB, with
-  the draft head, `--ngram-preload` on.
+  the draft head, `--ngram-preload` on. `lily-bench` preloads the table
+  before it measures; the server preloads it in the background after it is
+  ready, so an HTTP run starts after the log's `background preload
+  finished` line, or its first cells pay cold rows.
 - **Prompts.** Real text: the first 1 024, 8 192 or 32 768 tokens of a file
   cut from this repository's documentation and source and two sibling
   repositories (`lily-bench --prompt-text`, `tools/bench/corpus.py`). The

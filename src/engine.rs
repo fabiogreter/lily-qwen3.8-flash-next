@@ -249,12 +249,23 @@ pub trait LanguageModel: Sized {
         anyhow::bail!("this model does not persist sessions")
     }
 
-    /// Warms weights served from disk (the paged n-gram table), pinning them
-    /// in memory when `lock` is set, and returns the bytes found resident;
-    /// models without such weights return 0.
+    /// Warms weights served from disk (the paged n-gram table) before
+    /// returning, pinning them in memory when `lock` is set, and returns the
+    /// bytes found resident; models without such weights return 0. The
+    /// server preloads in the background instead ([`Self::paged_table`]);
+    /// the bench wants the table warm before it measures.
     fn warm_storage(&self, lock: bool) -> Result<u64> {
         let _ = lock;
         Ok(0)
+    }
+
+    /// The table served from disk, for a preload that runs while the engine
+    /// serves ([`crate::qwen4exp::ngram::PagedTable::preload_in_background`]);
+    /// `None` for models without one.
+    fn paged_table(
+        &self,
+    ) -> Option<std::sync::Arc<crate::qwen4exp::ngram::PagedTable>> {
+        None
     }
 
     /// Bytes of weights served from the page cache instead of GPU memory
