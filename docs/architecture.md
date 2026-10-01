@@ -282,6 +282,23 @@ the MoE row gather, the intermediates) gives a bandwidth floor of about
 (2.95 s when the sparse attention still ran per query). **Prefill is
 compute- and efficiency-bound, not bandwidth-bound.**
 
+**Why 4 096 and not 8 192.** `LILY_PREFILL_CHUNK=8192` was measured on the
+resident path on 2026-10-01 and left opt-in. Fresh real-text prompts over
+HTTP, four server launches per arm, gave (8 192 against 4 096, median
+tok/s) 2 554 / 2 503 at 4K, 2 255 / 2 207 at 6K, 2 334 / 2 338 at 8K,
+2 464 / 2 459 at 16K and 2 391 / 2 374 at 64K, with GPU time per prompt
+equal to within 1% at every size: all inside the noise band. More rows per expert make the expert GEMM faster (231
+ms less per 16K prompt in the per-kernel profile), but the dense bf16 GEMM
+gets slower by 160 ms at 8 192 rows and a few smaller kernels by 40, so the
+kernel sum moves 1.4%. The costs are real: the larger scratch adds 2.4 GB of
+GPU memory on top of the memory plan from the first prompt segment longer
+than 4 096 tokens until the unload, and the first chunk's n-gram staging, the
+one that cannot overlap, doubles, which with a partly cold table (60% of its
+blocks evicted) took an 8K prompt from 2 500 to 2 410 tok/s. The two sizes
+give bit-identical logits (lily-bench digests at 8K, 16K and 64K; lily-probe
+top-64 logits on 12 345, 16 384 and 61 000-token prompts). The expert cache
+keeps 4 096 for its own reason (docs/low-ram-experts.md).
+
 Where a 4 096-token chunk goes at an 8K prompt, per pass in the per-kernel
 profile:
 
@@ -721,7 +738,7 @@ On a 128 GB machine with the full checkpoint:
 | draft head                          | 1.5 GB   | in the 71.1 GB above when converted |
 | per-token cache, all layers         | 28 416 B | session cache                      |
 | GDN recurrent checkpoint            | 113 MB   | session cache, up to 3 per session |
-| prefill scratch                     | ~1.5 GB  | grown on demand to the 4 096-token chunk |
+| prefill scratch                     | ~2.4 GB  | grown on demand to the 4 096-token chunk |
 
 Moving the n-gram table off the GPU is what makes the model fit without
 raising `iogpu.wired_limit_mb`: 71 GB fits under the 96 GiB default. The

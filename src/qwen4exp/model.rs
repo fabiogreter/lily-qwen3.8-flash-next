@@ -338,7 +338,9 @@ pub struct Qwen4ExpModel {
     /// Prompt tokens per batched prefill pass: `PREFILL_CHUNK`, or what
     /// `LILY_PREFILL_CHUNK` says (up to twice that; under an expert cache
     /// the larger chunk streams the cold experts half as often per token,
-    /// see docs/low-ram-experts.md for why it is not the default).
+    /// see docs/low-ram-experts.md for why it is not the default; resident,
+    /// 8 192 measured no faster for 2.4 GB more scratch, see
+    /// docs/architecture.md, "Prefill").
     prefill_chunk: usize,
     /// Whether a multi-chunk prefill stages chunk k+1's n-gram rows while
     /// the GPU runs chunk k (paged table only; on by default, off for the
