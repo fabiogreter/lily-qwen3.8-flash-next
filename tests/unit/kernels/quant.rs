@@ -8,6 +8,13 @@ use crate::cpu_ref;
 
 const GROUP_SIZE: usize = 64;
 
+/// The shipped source plus the test-only reference kernels.
+const TEST_SOURCE: &str = concat!(
+    include_str!("../../../src/kernels/metal/quant.metal"),
+    "\n",
+    include_str!("../../metal/quant_test.metal")
+);
+
 const FIXTURE: &[u8] = include_bytes!("../../goldens/quant_fixture.json");
 
 #[derive(Deserialize)]
@@ -548,4 +555,281 @@ fn gemv_q4_bandwidth_probe() {
         best * 1e3,
         per_matrix * mats as f64 / 1e9
     );
+}
+
+/// Dispatches the grouped kernel as it shipped before the 128-deep K step
+/// (`tests/metal/quant_test.metal`): the reference the shipped kernel is
+/// asserted bit-identical against.
+#[allow(clippy::too_many_arguments)]
+fn gemm_q4_grouped_nt_previous(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    a: &Tensor,
+    w: &QuantWeights,
+    c: &Tensor,
+    blocks: &Tensor,
+    n_blocks: usize,
+    tile: MoeTile,
+) -> Result<()> {
+    let (_, k) = check_quant(w)?;
+    let n = c.shape()[1];
+    let name = match tile {
+        MoeTile::T32Sg4 => "gemm_q4_nt_nax_grouped_ref_t32x4",
+        MoeTile::T64Sg4 => "gemm_q4_nt_nax_grouped_ref_t64x4",
+    };
+    let pipeline = ctx.pipeline(name, TEST_SOURCE, MslVersion::V4_0)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            w.codes.binding(),
+            w.scales.binding(),
+            w.biases.binding(),
+            a.binding(),
+            c.binding(),
+            blocks.binding(),
+        ],
+        &[&u32_bytes(k), &u32_bytes(n), &u32_bytes(w.group_size)],
+        Grid::Threadgroups {
+            groups: (n_blocks, 1, 1),
+            threadgroup: (32 * tile.simdgroups(), 1, 1),
+        },
+    )
+}
+
+/// A random Q4 stack without its dequantized image (for shapes where the
+/// CPU reference is not computed): codes from the generator, scales and
+/// biases in the checkpoint's ranges.
+fn random_q4_weights(
+    ctx: &MetalContext,
+    rng: &mut StdRng,
+    rows: usize,
+    k: usize,
+) -> QuantWeights {
+    let words = k / 8;
+    let groups = k / GROUP_SIZE;
+    let mut codes = vec![0u32; rows * words];
+    rng.fill(&mut codes[..]);
+    let mut params = |lo: f32, hi: f32| -> Vec<bf16> {
+        (0..rows * groups).map(|_| bf16::from_f32(rng.gen_range(lo..hi))).collect()
+    };
+    let scales = params(0.002, 0.02);
+    let biases = params(-0.15, 0.0);
+    let upload = |v: &[u8], shape: &[usize], dtype| {
+        Tensor::from_bytes(ctx, v, shape, dtype).expect("weight upload")
+    };
+    QuantWeights {
+        codes: upload(bytemuck::cast_slice(&codes), &[rows, words], DType::U32),
+        scales: upload(bytemuck::cast_slice(&scales), &[rows, groups], DType::BF16),
+        biases: upload(bytemuck::cast_slice(&biases), &[rows, groups], DType::BF16),
+        group_size: GROUP_SIZE,
+        bits: 4,
+    }
+}
+
+fn output_bits(t: &Tensor) -> Vec<u32> {
+    t.to_f32().expect("read").iter().map(|v| v.to_bits()).collect()
+}
+
+/// The shipped grouped kernel (128-deep K steps with a 64-deep tail, run
+/// loads, padded B tile) reproduces the previous kernel bit for bit: the
+/// model's gate/up (2560 -> 640) and down (640 -> 2560) shapes, K at and on
+/// both sides of the tail route (64, 128, 192), both tile heights, over a
+/// skewed expert split with empty experts, single rows, and runs on every
+/// edge of the 16/32/64-row heights and of two and three tiles.
+#[test]
+fn gemm_q4_grouped_bit_identical_to_previous_kernel() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(31);
+    let counts = [
+        0usize, 1, 7, 15, 16, 17, 31, 32, 33, 47, 63, 64, 65, 96, 127, 128, 129, 200,
+        0, 3, 450, 0, 81, 79,
+    ];
+    let e = counts.len();
+    let s: usize = counts.iter().sum();
+    for (k, n_per) in
+        [(2560usize, 640usize), (640, 2560), (64, 64), (128, 128), (192, 64)]
+    {
+        let w = random_q4_weights(&ctx, &mut rng, e * n_per, k);
+        let a: Vec<f32> = (0..s * k).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+        let ta = Tensor::from_f32_as_bf16(&ctx, &a, &[s, k]).expect("a");
+        for tile in [MoeTile::T32Sg4, MoeTile::T64Sg4] {
+            let blocks = tiled_block_map(&counts, n_per, tile.rows());
+            let tblocks = Tensor::from_bytes(
+                &ctx,
+                bytemuck::cast_slice(&blocks),
+                &[blocks.len()],
+                DType::U32,
+            )
+            .expect("blocks");
+            let nb = blocks.len() / 4;
+            let shipped = Tensor::zeros(&ctx, &[s, n_per], DType::BF16).expect("c");
+            let previous = Tensor::zeros(&ctx, &[s, n_per], DType::BF16).expect("c");
+            let pass = ctx.begin().expect("pass");
+            gemm_q4_grouped_nt(&ctx, &pass, &ta, &w, &shipped, &tblocks, nb, tile)
+                .expect("shipped");
+            gemm_q4_grouped_nt_previous(
+                &ctx, &pass, &ta, &w, &previous, &tblocks, nb, tile,
+            )
+            .expect("previous");
+            pass.commit_wait().expect("commit");
+            let (got, want) = (output_bits(&shipped), output_bits(&previous));
+            let differ = got.iter().zip(&want).filter(|(g, w)| g != w).count();
+            assert_eq!(
+                differ,
+                0,
+                "K={k} N={n_per} tile {}: {differ} of {} outputs differ from the previous kernel",
+                tile.label(),
+                got.len()
+            );
+            assert!(want.iter().any(|&b| b != 0), "K={k} N={n_per}: empty output");
+        }
+    }
+}
+
+/// Per-expert routed-row counts of `s` slots for `layer` from the measured
+/// usage profile (`tools/bench/expert-usage-qwen38-flash-next.json`),
+/// scaled by largest remainder.
+fn usage_counts(layer: usize, s: usize) -> Vec<usize> {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tools/bench/expert-usage-qwen38-flash-next.json"
+    );
+    let v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).expect("usage profile"))
+            .expect("json");
+    let row: Vec<f64> = v["counts"][layer]
+        .as_array()
+        .expect("counts")
+        .iter()
+        .map(|x| x.as_f64().expect("count"))
+        .collect();
+    let total: f64 = row.iter().sum();
+    let exact: Vec<f64> = row.iter().map(|x| x * s as f64 / total).collect();
+    let mut counts: Vec<usize> = exact.iter().map(|x| x.floor() as usize).collect();
+    let mut rest: Vec<(f64, usize)> =
+        exact.iter().enumerate().map(|(i, x)| (x - x.floor(), i)).collect();
+    rest.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let short = s - counts.iter().sum::<usize>();
+    for &(_, i) in rest.iter().take(short) {
+        counts[i] += 1;
+    }
+    counts
+}
+
+/// The grouped expert GEMMs at the model's shapes (512 experts, gate and up
+/// 2560 -> 640, down 640 -> 2560) over four layers' measured routing
+/// profiles (`LILY_GROUPED_M` tokens per chunk, default 4096; 8192 is 160
+/// rows per expert), shipped against the previous kernel, interleaved.
+/// Prints ms per layer and TFLOP/s for gate + up and for down, and checks
+/// the two bit for bit. `cargo test --release --lib -- --ignored
+/// --nocapture grouped_expert_gemm_timing`.
+#[test]
+#[ignore = "timing only"]
+fn grouped_expert_gemm_timing() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(77);
+    let (e, inter, h, top_k) = (512usize, 640usize, 2560usize, 10usize);
+    let m: usize = std::env::var("LILY_GROUPED_M")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4096);
+    let s = m * top_k;
+    let gate = random_q4_weights(&ctx, &mut rng, e * inter, h);
+    let up = random_q4_weights(&ctx, &mut rng, e * inter, h);
+    let down = random_q4_weights(&ctx, &mut rng, e * h, inter);
+    let mut random_act = |rows: usize, k: usize| {
+        let v: Vec<f32> = (0..rows * k).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+        Tensor::from_f32_as_bf16(&ctx, &v, &[rows, k]).expect("activations")
+    };
+    let gx = random_act(s, h);
+    let ea = random_act(s, inter);
+    let zeros = |k: usize| Tensor::zeros(&ctx, &[s, k], DType::BF16).expect("out");
+    let (eg, eu, ed) = (zeros(inter), zeros(inter), zeros(h));
+    let tile = MoeTile::T64Sg4;
+    let layers = [0usize, 12, 24, 47];
+    let upload = |v: &[u32]| {
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(v), &[v.len()], DType::U32)
+            .expect("map")
+    };
+    let maps: Vec<(Tensor, usize, Tensor, usize)> = layers
+        .iter()
+        .map(|&l| {
+            let counts = usage_counts(l, s);
+            let gu = tiled_block_map(&counts, inter, tile.rows());
+            let dn = tiled_block_map(&counts, h, tile.rows());
+            (upload(&gu), gu.len() / 4, upload(&dn), dn.len() / 4)
+        })
+        .collect();
+    type Gemm = fn(
+        &MetalContext,
+        &ComputePass<'_>,
+        &Tensor,
+        &QuantWeights,
+        &Tensor,
+        &Tensor,
+        usize,
+        MoeTile,
+    ) -> Result<()>;
+    let arms: [(&str, Gemm); 2] =
+        [("previous", gemm_q4_grouped_nt_previous), ("shipped", gemm_q4_grouped_nt)];
+
+    let mut bits = Vec::new();
+    for (_, gemm) in arms {
+        let (bgu, nbgu, bdn, nbdn) = &maps[0];
+        let pass = ctx.begin().expect("pass");
+        gemm(&ctx, &pass, &gx, &gate, &eg, bgu, *nbgu, tile).expect("gate");
+        gemm(&ctx, &pass, &ea, &down, &ed, bdn, *nbdn, tile).expect("down");
+        pass.commit_wait().expect("commit");
+        bits.push((output_bits(&eg), output_bits(&ed)));
+    }
+    assert!(bits[0] == bits[1], "shipped and previous kernels differ");
+
+    let mut times = vec![[Vec::new(), Vec::new()]; arms.len()];
+    let warm = crate::kernels::qsa::tests::chain_warmup();
+    let mut round = 0usize;
+    loop {
+        let timed = warm.elapsed() >= crate::kernels::qsa::tests::chain_warmup_ms();
+        for j in 0..arms.len() {
+            let which = (round + j) % arms.len();
+            let gemm = arms[which].1;
+            for (op, out) in times[which].iter_mut().enumerate() {
+                let pass = ctx.begin().expect("pass");
+                for (bgu, nbgu, bdn, nbdn) in &maps {
+                    if op == 0 {
+                        gemm(&ctx, &pass, &gx, &gate, &eg, bgu, *nbgu, tile)
+                            .expect("gate");
+                        gemm(&ctx, &pass, &gx, &up, &eu, bgu, *nbgu, tile).expect("up");
+                    } else {
+                        gemm(&ctx, &pass, &ea, &down, &ed, bdn, *nbdn, tile)
+                            .expect("down");
+                    }
+                }
+                let done = pass.commit().expect("commit").wait_retain().expect("wait");
+                let t = done.timing().expect("timing");
+                if timed {
+                    out.push((t.gpu_end_secs - t.gpu_start_secs) / layers.len() as f64);
+                }
+            }
+        }
+        if timed {
+            round += 1;
+            if round == 7 {
+                break;
+            }
+        }
+    }
+    let flop = [4.0 * (s * h * inter) as f64, 2.0 * (s * h * inter) as f64];
+    for ((name, _), t) in arms.iter().zip(&mut times) {
+        let mut line = format!("{name:9} m={m}:");
+        for (op, label) in ["gate+up", "down"].iter().enumerate() {
+            t[op].sort_by(f64::total_cmp);
+            let med = t[op][t[op].len() / 2];
+            line += &format!(
+                " {label} {:.3} ms ({:.1} TFLOP/s)",
+                med * 1e3,
+                flop[op] / med / 1e12
+            );
+        }
+        eprintln!("{line}");
+    }
 }

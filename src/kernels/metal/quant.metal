@@ -270,18 +270,102 @@ static inline void store_word_q4_tg(uint word, float s, float b,
 #include <metal_tensor>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 
-// Grouped Q4 GEMM dequantizes B tiles to BF16 and accumulates in FP32.
-constant constexpr uint QNAX_BN = 64;
-constant constexpr uint QNAX_BK = 64;
 
-// One block of the grouped GEMM at row-tile height BM: the B tile is
-// dequantized per K step and the product accumulated over the block's rows.
-template <uint BM, int SG, typename AT, typename BT>
+// Grouped Q4 GEMM: per K step the threadgroup dequantizes its expert's
+// 64-row B tile into threadgroup memory and accumulates the product of the
+// block's A rows with it in FP32.
+//
+// - K steps are 128 deep (one 64-deep step closes a K that is an odd
+//   multiple of 64): each weight row is read 64 contiguous bytes per step.
+// - Each thread reads whole 32-code runs (one uint4) of a row with one
+//   scale and one bias, instead of single code words.
+// - The B tile's rows are padded by 8 elements (144 / 272 bytes instead of
+//   128 / 256), so a column of the tile does not fall on one bank.
+//
+// The dequantization (`store_word_q4_tg`) and the tensor-op product per
+// output element are those of the 64-deep, word-per-thread kernel this
+// replaced, and the results are bit-identical to it (asserted in the
+// tests against the previous kernel, kept in tests/metal/quant_test.metal).
+constant constexpr uint QNAX_BN = 64;
+constant constexpr uint QNAX_BK = 128;
+constant constexpr uint QNAX_PAD = 8;
+constant constexpr uint QNAX_LDT = QNAX_BK + QNAX_PAD;
+
+// Loads BK-deep runs of a 64-row B tile (32 codes per uint4, one scale and
+// bias each; GS must be a multiple of 32) and dequantizes them into the
+// padded threadgroup tile.
+template <uint BK, uint SG>
+struct Q4TileLoader {
+    static constant constexpr uint RUNS = BK / 32;  // uint4 runs per row
+    static constant constexpr uint PER_THREAD = QNAX_BN * RUNS / (32 * SG);
+    static_assert(PER_THREAD * 32 * SG == QNAX_BN * RUNS, "loader split");
+    uint4 w[PER_THREAD];
+    float s[PER_THREAD];
+    float b[PER_THREAD];
+
+    inline void load(device const uint* codes, device const bfloat* scales,
+                     device const bfloat* biases, uint words, uint groups, uint GS,
+                     uint b_row0, uint k0, uint tid) {
+        for (uint j = 0; j < PER_THREAD; ++j) {
+            const uint i = tid + j * 32 * SG;
+            const uint r = i / RUNS, u = i % RUNS;
+            const uint k = k0 + u * 32;
+            const ulong row = b_row0 + r;
+            w[j] = *(device const uint4*)(codes + row * words + k / 8);
+            const uint g = k / GS;
+            s[j] = float(scales[row * groups + g]);
+            b[j] = float(biases[row * groups + g]);
+        }
+    }
+
+    inline void store(threadgroup bfloat* tile, uint tid) {
+        for (uint j = 0; j < PER_THREAD; ++j) {
+            const uint i = tid + j * 32 * SG;
+            const uint r = i / RUNS, u = i % RUNS;
+            threadgroup bfloat4* out =
+                (threadgroup bfloat4*)(tile + r * QNAX_LDT + u * 32);
+            for (uint q = 0; q < 4; ++q) {
+                store_word_q4_tg(w[j][q], s[j], b[j], out, q);
+            }
+        }
+    }
+};
+
+using QnaxTile =
+    metal::tensor<threadgroup bfloat, metal::dextents<int32_t, 2>, metal::tensor_inline>;
+
+// One K step of BK: dequantize the B tile, then accumulate its product.
+template <uint BM, int SG, uint BK, typename AT, typename ACC>
+static inline void gemm_q4_grouped_step(device const uint* codes,
+                                        device const bfloat* scales,
+                                        device const bfloat* biases,
+                                        thread AT& ta, thread ACC& acc,
+                                        uint words, uint groups, uint GS,
+                                        uint m0, uint b_row0, uint k0,
+                                        threadgroup bfloat* b_tile, uint tid) {
+    using namespace mpp::tensor_ops;
+    constexpr auto desc = matmul2d_descriptor(
+        BM, QNAX_BN, BK, /*transpose_left=*/false,
+        /*transpose_right=*/true, /*relaxed_precision=*/false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, metal::execution_simdgroups<SG>> op;
+    Q4TileLoader<BK, SG> loader;
+    loader.load(codes, scales, biases, words, groups, GS, b_row0, k0, tid);
+    loader.store(b_tile, tid);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    QnaxTile tb(b_tile, metal::dextents<int32_t, 2>(BK, QNAX_BN),
+                metal::array<int32_t, 2>{1, int(QNAX_LDT)});
+    auto a_slice = ta.slice(int(k0), int(m0));
+    op.run(a_slice, tb, acc);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// One block of the grouped GEMM at row-tile height BM.
+template <uint BM, int SG, typename AT>
 static void gemm_q4_nt_nax_grouped_rows(device const uint* codes,
                                         device const bfloat* scales,
                                         device const bfloat* biases,
                                         thread AT& ta,
-                                        thread BT& tb,
                                         device bfloat* c,
                                         uint K, uint N, uint GS,
                                         uint m0, uint b_row0, uint n0, uint m_end,
@@ -297,31 +381,22 @@ static void gemm_q4_nt_nax_grouped_rows(device const uint* codes,
     matmul2d<desc, metal::execution_simdgroups<SG>> op;
 
     using ASlice = decltype(ta.slice(0, 0));
-    auto acc = op.template get_destination_cooperative_tensor<ASlice, BT, float>();
+    auto acc = op.template get_destination_cooperative_tensor<ASlice, QnaxTile, float>();
     for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
         if (acc.is_valid_element(i)) {
             acc[i] = 0.0f;
         }
     }
 
-    for (uint k0 = 0; k0 < K; k0 += QNAX_BK) {
-        // Dequantize one 64x64 B tile across 32*SG threads.
-        for (uint i = tid; i < QNAX_BN * QNAX_BK / 8; i += 32 * SG) {
-            uint r = i / (QNAX_BK / 8);
-            uint wcol = i % (QNAX_BK / 8);
-            uint k = k0 + wcol * 8;
-            ulong row = b_row0 + r;
-            uint word = codes[row * words + k / 8];
-            uint g = k / GS;
-            float s = float(scales[row * groups + g]);
-            float b = float(biases[row * groups + g]);
-            store_word_q4_tg(word, s, b,
-                             (threadgroup bfloat4*)(b_tile + r * QNAX_BK), wcol);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        auto a_slice = ta.slice(int(k0), int(m0));
-        op.run(a_slice, tb, acc);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint k_full = K - K % QNAX_BK;
+    for (uint k0 = 0; k0 < k_full; k0 += QNAX_BK) {
+        gemm_q4_grouped_step<BM, SG, QNAX_BK>(codes, scales, biases, ta, acc, words,
+                                              groups, GS, m0, b_row0, k0, b_tile, tid);
+    }
+    if (k_full < K) {
+        gemm_q4_grouped_step<BM, SG, QNAX_BK / 2>(codes, scales, biases, ta, acc,
+                                                  words, groups, GS, m0, b_row0,
+                                                  k_full, b_tile, tid);
     }
 
     for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
@@ -359,15 +434,14 @@ static void gemm_q4_nt_nax_grouped_body(device const uint* codes,
     const uint rows = m_end - m0;
 
     auto ta = metal::tensor(a, metal::dextents<int32_t, 2>(K, int(m_end)));
-    auto tb = metal::tensor(b_tile, metal::dextents<int32_t, 2>(QNAX_BK, QNAX_BN));
     if (rows <= BM / 4) {
-        gemm_q4_nt_nax_grouped_rows<BM / 4, SG>(codes, scales, biases, ta, tb, c, K, N, GS,
+        gemm_q4_nt_nax_grouped_rows<BM / 4, SG>(codes, scales, biases, ta, c, K, N, GS,
                                                 m0, b_row0, n0, m_end, b_tile, tid);
     } else if (rows <= BM / 2) {
-        gemm_q4_nt_nax_grouped_rows<BM / 2, SG>(codes, scales, biases, ta, tb, c, K, N, GS,
+        gemm_q4_nt_nax_grouped_rows<BM / 2, SG>(codes, scales, biases, ta, c, K, N, GS,
                                                 m0, b_row0, n0, m_end, b_tile, tid);
     } else {
-        gemm_q4_nt_nax_grouped_rows<BM, SG>(codes, scales, biases, ta, tb, c, K, N, GS,
+        gemm_q4_nt_nax_grouped_rows<BM, SG>(codes, scales, biases, ta, c, K, N, GS,
                                             m0, b_row0, n0, m_end, b_tile, tid);
     }
 }
@@ -384,7 +458,7 @@ static void gemm_q4_nt_nax_grouped_body(device const uint* codes,
                      constant uint&       GS     [[buffer(8)]],                \
                      uint bid [[threadgroup_position_in_grid]],                \
                      uint tid [[thread_index_in_threadgroup]]) {               \
-        threadgroup bfloat b_tile[QNAX_BN * QNAX_BK];                          \
+        threadgroup bfloat b_tile[QNAX_BN * QNAX_LDT];                         \
         gemm_q4_nt_nax_grouped_body<BM, SG>(codes, scales, biases, a, c,       \
                                             blocks, K, N, GS, b_tile, bid,     \
                                             tid);                              \
