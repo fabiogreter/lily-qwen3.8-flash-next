@@ -563,7 +563,8 @@ pub fn moe_sort_slots(
         &scan,
         &[counts.binding(), offsets.binding(), tile_offsets.binding()],
         &[&u32_bytes(num_experts), &u32_bytes(tile_m)],
-        Grid::Threads { grid: (1, 1, 1), threadgroup: (1, 1, 1) },
+        // One threadgroup; the kernel's MOE_SCAN_THREADS.
+        Grid::Threadgroups { groups: (1, 1, 1), threadgroup: (256, 1, 1) },
     )?;
     pass.level_barrier(&[b.offsets, b.tile_offsets, b.cursors])?;
     let scatter = ctx.pipeline("moe_scatter_slots", SOURCE, MslVersion::V3_1)?;

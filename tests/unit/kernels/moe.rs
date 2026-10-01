@@ -592,6 +592,8 @@ fn router_pipeline_matches_host() {
                 (33, 8, 2, "all_to_one"),
                 (5, 64, 4, "ties"),
                 (3, 16, 8, "e_gt_s"),
+                // The model's expert count: two experts per scan thread.
+                (40, 512, 10, "random"),
             ]
             .into_iter()
             .map(move |case| (t, case))

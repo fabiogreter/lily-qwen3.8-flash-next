@@ -772,24 +772,50 @@ kernel void moe_histogram(device const uint*   indices [[buffer(0)]],  // [m*K]
 }
 
 // Scans slot and row-tile offsets; T must match the grouped GEMM tile height.
+// One threadgroup of MOE_SCAN_THREADS: each thread sums a contiguous run of
+// experts, the runs' totals are scanned across the threadgroup, then each
+// thread writes its run's exclusive prefixes (integer sums: the order does
+// not matter).
+#define MOE_SCAN_THREADS 256
 kernel void moe_scan_offsets(device const uint* counts       [[buffer(0)]],  // [E]
                              device uint*       offsets      [[buffer(1)]],  // [E+1]
                              device uint*       tile_offsets [[buffer(2)]],  // [E+1]
                              constant uint&     E            [[buffer(3)]],
                              constant uint&     T            [[buffer(4)]],
-                             uint tid [[thread_position_in_grid]]) {
-    if (tid != 0) {
-        return;
+                             uint tid  [[thread_index_in_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]],
+                             uint sg   [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint sg_rows[MOE_SCAN_THREADS / 32];
+    threadgroup uint sg_tiles[MOE_SCAN_THREADS / 32];
+    const uint per = (E + MOE_SCAN_THREADS - 1) / MOE_SCAN_THREADS;
+    const uint e0 = min(tid * per, E), e1 = min(e0 + per, E);
+    uint rows = 0, tiles = 0;
+    for (uint e = e0; e < e1; ++e) {
+        rows += counts[e];
+        tiles += (counts[e] + T - 1) / T;
     }
-    uint acc = 0, tacc = 0;
-    for (uint e = 0; e < E; ++e) {
+    uint rows_before = simd_prefix_exclusive_sum(rows);
+    uint tiles_before = simd_prefix_exclusive_sum(tiles);
+    if (lane == 31) {
+        sg_rows[sg] = rows_before + rows;
+        sg_tiles[sg] = tiles_before + tiles;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint g = 0; g < sg; ++g) {
+        rows_before += sg_rows[g];
+        tiles_before += sg_tiles[g];
+    }
+    uint acc = rows_before, tacc = tiles_before;
+    for (uint e = e0; e < e1; ++e) {
         offsets[e] = acc;
         tile_offsets[e] = tacc;
         acc += counts[e];
         tacc += (counts[e] + T - 1) / T;
     }
-    offsets[E] = acc;
-    tile_offsets[E] = tacc;
+    if (tid == MOE_SCAN_THREADS - 1) {
+        offsets[E] = acc;
+        tile_offsets[E] = tacc;
+    }
 }
 
 // Scatters slots into expert-major order; within-expert order is unspecified.
