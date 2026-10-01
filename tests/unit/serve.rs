@@ -444,3 +444,182 @@ fn a_full_job_queue_still_takes_the_arrival_and_the_stop_wake() {
     assert_eq!(refuse_queued(&rx, &queue, 503, "stopping"), 0);
     assert!(queue.claim_arrival(), "the drained arrival was released");
 }
+
+#[test]
+fn keep_alive_ticks_once_an_interval_and_only_inside_the_window() {
+    let t0 = Instant::now();
+    let s = Duration::from_secs;
+    let mut keep_alive = KeepAlive::new(s(1), t0);
+    // A closed window (no pin, or the hold is over) never ticks.
+    assert_eq!(keep_alive.next_tick(t0, None), None);
+    assert_eq!(keep_alive.next_tick(t0, Some(Duration::ZERO)), None);
+    // Inside the window: an interval after the last submission.
+    assert_eq!(keep_alive.next_tick(t0, Some(s(60))), Some(t0 + s(1)));
+    // A submission moves it.
+    keep_alive.touch(t0 + s(5));
+    assert_eq!(keep_alive.next_tick(t0 + s(5), Some(s(55))), Some(t0 + s(6)));
+    // A tick at or after the window's end is not due at all.
+    assert_eq!(keep_alive.next_tick(t0 + s(5), Some(s(1))), None);
+    assert_eq!(
+        keep_alive.next_tick(t0 + s(5), Some(Duration::from_millis(1001))),
+        Some(t0 + s(6))
+    );
+    // A failed tick stops them until the engine submits again.
+    keep_alive.stop();
+    assert_eq!(keep_alive.next_tick(t0 + s(5), Some(s(55))), None);
+    keep_alive.touch(t0 + s(7));
+    assert_eq!(keep_alive.next_tick(t0 + s(7), Some(s(53))), Some(t0 + s(8)));
+}
+
+const TICK: Duration = Duration::from_millis(50);
+
+/// Runs `recv_keeping_warm` with a 50 ms interval and records the ticks.
+fn wait_recording<T>(
+    rx: &Receiver<T>,
+    deadline: Option<Instant>,
+    window: impl Fn(Instant) -> Option<Duration>,
+) -> (std::result::Result<T, RecvTimeoutError>, Vec<Instant>) {
+    let mut keep_alive = KeepAlive::new(TICK, Instant::now());
+    let mut ticks = Vec::new();
+    let received = recv_keeping_warm(rx, deadline, &mut keep_alive, window, || {
+        ticks.push(Instant::now());
+        Ok(())
+    });
+    (received, ticks)
+}
+
+#[test]
+fn the_idle_wait_ticks_while_the_window_is_open_and_returns_at_its_deadline() {
+    let (_tx, rx) = mpsc::channel::<()>();
+    let start = Instant::now();
+    let window_end = start + Duration::from_millis(225);
+    let deadline = start + Duration::from_millis(400);
+    let (received, ticks) = wait_recording(&rx, Some(deadline), |now| {
+        Some(window_end.saturating_duration_since(now))
+    });
+    let returned = Instant::now();
+    assert!(matches!(received, Err(RecvTimeoutError::Timeout)));
+    assert!(returned >= deadline && returned < deadline + TICK, "on time");
+    assert!((3..=4).contains(&ticks.len()), "{} ticks", ticks.len());
+    assert!(ticks.iter().all(|&at| at < window_end), "none after the window");
+    for pair in ticks.windows(2) {
+        assert!(pair[1] - pair[0] >= TICK, "one per interval");
+    }
+}
+
+#[test]
+fn a_request_ends_the_idle_wait_at_once_between_ticks() {
+    let (tx, rx) = mpsc::channel::<Instant>();
+    let sender = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(130));
+        tx.send(Instant::now()).expect("send");
+        // Keep the channel open: only the message may end the wait.
+        std::thread::sleep(Duration::from_millis(300));
+    });
+    let (received, ticks) =
+        wait_recording(&rx, None, |_| Some(Duration::from_secs(60)));
+    let returned = Instant::now();
+    let sent = received.expect("the request");
+    assert!(returned - sent < Duration::from_millis(20), "{:?}", returned - sent);
+    assert!(!ticks.is_empty(), "it ticked before the request");
+    assert!(ticks.iter().all(|&at| at <= sent), "and not after it");
+    sender.join().expect("sender");
+}
+
+#[test]
+fn a_stop_wake_ends_the_idle_wait_at_once() {
+    let (tx, rx) = mpsc::sync_channel::<Cmd>(2);
+    let sent = Instant::now() + Duration::from_millis(80);
+    let sender = std::thread::spawn(move || {
+        std::thread::sleep(sent.saturating_duration_since(Instant::now()));
+        tx.send(Cmd::Wake).expect("send");
+        std::thread::sleep(Duration::from_millis(300));
+    });
+    let (received, _) = wait_recording(&rx, None, |_| Some(Duration::from_secs(60)));
+    assert!(matches!(received, Ok(Cmd::Wake)));
+    assert!(Instant::now() - sent < Duration::from_millis(20));
+    sender.join().expect("sender");
+}
+
+#[test]
+fn a_released_pin_stops_the_ticks_at_once() {
+    let (tx, rx) = mpsc::channel::<()>();
+    let pinned = Arc::new(AtomicBool::new(true));
+    let released_at = Arc::new(std::sync::Mutex::new(None::<Instant>));
+    let sender = {
+        let (pinned, released_at) = (pinned.clone(), released_at.clone());
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            // The monitor thread's pressure release, or the hold's end.
+            pinned.store(false, Ordering::SeqCst);
+            *released_at.lock().expect("lock") = Some(Instant::now());
+            std::thread::sleep(Duration::from_millis(300));
+            tx.send(()).expect("send");
+        })
+    };
+    let (received, ticks) = wait_recording(&rx, None, |_| {
+        pinned.load(Ordering::SeqCst).then_some(Duration::from_secs(60))
+    });
+    received.expect("the request");
+    let released = released_at.lock().expect("lock").expect("released");
+    assert!(!ticks.is_empty(), "it ticked while pinned");
+    assert!(
+        ticks.iter().all(|&at| at < released + Duration::from_millis(5)),
+        "no tick after the release"
+    );
+    sender.join().expect("sender");
+}
+
+#[test]
+fn without_a_held_pin_the_idle_wait_submits_nothing() {
+    // An unpinned engine (`--pin-weights off`, the expert cache's `auto`,
+    // a released pin) or an unloaded one: no window, no tick.
+    let (_tx, rx) = mpsc::channel::<()>();
+    let deadline = Instant::now() + Duration::from_millis(200);
+    let (received, ticks) = wait_recording(&rx, Some(deadline), |_| None);
+    assert!(matches!(received, Err(RecvTimeoutError::Timeout)));
+    assert!(ticks.is_empty());
+    assert!(Instant::now() < deadline + TICK);
+}
+
+#[test]
+fn the_idle_wait_deadline_is_never_delayed_by_ticks() {
+    // The idle unload, the pin's release and the write-ahead poll are the
+    // deadline; a tick due at or after it yields.
+    let (_tx, rx) = mpsc::channel::<()>();
+    for after in [TICK, TICK + Duration::from_millis(5), Duration::from_millis(120)] {
+        let deadline = Instant::now() + after;
+        let (received, ticks) =
+            wait_recording(&rx, Some(deadline), |_| Some(Duration::from_secs(60)));
+        let returned = Instant::now();
+        assert!(matches!(received, Err(RecvTimeoutError::Timeout)));
+        assert!(
+            returned >= deadline && returned < deadline + Duration::from_millis(20)
+        );
+        assert!(ticks.iter().all(|&at| at < deadline));
+    }
+}
+
+#[test]
+fn a_failed_tick_is_not_retried_until_the_engine_submits_again() {
+    let (_tx, rx) = mpsc::channel::<()>();
+    let mut keep_alive = KeepAlive::new(TICK, Instant::now());
+    let mut calls = 0;
+    let deadline = Instant::now() + Duration::from_millis(300);
+    let received = recv_keeping_warm(
+        &rx,
+        Some(deadline),
+        &mut keep_alive,
+        |_| Some(Duration::from_secs(60)),
+        || {
+            calls += 1;
+            Err(anyhow::anyhow!("faulted queue"))
+        },
+    );
+    assert!(matches!(received, Err(RecvTimeoutError::Timeout)));
+    assert_eq!(calls, 1);
+    assert_eq!(
+        keep_alive.next_tick(Instant::now(), Some(Duration::from_secs(60))),
+        None
+    );
+}

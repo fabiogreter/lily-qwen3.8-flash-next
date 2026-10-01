@@ -92,6 +92,10 @@ const BUDGET_FLOOR_BYTES: usize = 8 << 30;
 const WRITE_AHEAD_FLOOR_TOKENS: usize = 32_768;
 /// How often the engine looks whether a write ahead finished.
 const WRITE_AHEAD_POLL: Duration = Duration::from_millis(50);
+/// How long the GPU may go without a submission while the pin is held
+/// before the engine sends it a bare fence signal ([`KeepAlive`]): well
+/// under the ~1.5 s after which the queue's residency set is dropped.
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The default session-cache budget: what the device's recommended working
 /// set leaves after the weights already allocated, the paged weights that
@@ -340,6 +344,95 @@ impl IdleTimer {
 
     pub fn expired(&self, now: Instant) -> bool {
         self.remaining(now) == Some(Duration::ZERO)
+    }
+}
+
+/// The GPU keep-alive: when the engine's last submission was, and when the
+/// next bare fence signal is due so the queue's residency set is never
+/// dropped (docs/architecture.md, "The Metal 4 transport"). It ticks only
+/// inside a window the caller passes, the pin's hold
+/// ([`pin::WeightPin::keep_warm_remaining`]), so an idle server without a
+/// held pin submits nothing.
+pub struct KeepAlive {
+    interval: Duration,
+    /// The engine's last GPU submission; `None` after a failed tick, which
+    /// stops the ticks until the engine submits again.
+    last_gpu: Option<Instant>,
+}
+
+impl KeepAlive {
+    pub fn new(interval: Duration, now: Instant) -> Self {
+        Self { interval, last_gpu: Some(now) }
+    }
+
+    /// Records a GPU submission (a request served, a wake, a tick, a load).
+    pub fn touch(&mut self, now: Instant) {
+        self.last_gpu = Some(now);
+    }
+
+    /// Stops the ticks until the next [`Self::touch`].
+    pub fn stop(&mut self) {
+        self.last_gpu = None;
+    }
+
+    /// When the next tick is due, given what is left of the window at
+    /// `now`: `None` when the window is closed (`None` or zero), when the
+    /// tick would fall at or after its end, or after a failed tick.
+    pub fn next_tick(&self, now: Instant, window: Option<Duration>) -> Option<Instant> {
+        let ends = now + window.filter(|left| !left.is_zero())?;
+        let at = self.last_gpu? + self.interval;
+        (at < ends).then_some(at)
+    }
+}
+
+/// Waits for the engine's next command until `deadline` (`None`: for as
+/// long as it takes), and meanwhile calls `tick` whenever `keep_alive` says
+/// one is due inside `window` (read again before every tick, so a pin
+/// released by another thread stops the ticks at once). Returns what
+/// `recv_timeout` would have for `deadline`: a command the moment it
+/// arrives, even between ticks, a timeout once the deadline passed. A tick
+/// due together with the deadline yields to it. A failed tick is logged
+/// once and stops the ticks until the engine touches `keep_alive` again.
+/// The ticks run on the engine thread itself, so they never overlap the
+/// engine's own GPU work.
+fn recv_keeping_warm<T>(
+    rx: &Receiver<T>,
+    deadline: Option<Instant>,
+    keep_alive: &mut KeepAlive,
+    window: impl Fn(Instant) -> Option<Duration>,
+    mut tick: impl FnMut() -> Result<()>,
+) -> std::result::Result<T, RecvTimeoutError> {
+    loop {
+        let now = Instant::now();
+        let next_tick = keep_alive
+            .next_tick(now, window(now))
+            .filter(|&at| deadline.is_none_or(|end| at < end));
+        let received = match next_tick.or(deadline) {
+            None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            Some(at) => rx.recv_timeout(at.saturating_duration_since(now)),
+        };
+        match received {
+            Err(RecvTimeoutError::Timeout) if next_tick.is_some() => {
+                let now = Instant::now();
+                if deadline.is_some_and(|end| now >= end) {
+                    // Woken late, past the deadline: it goes first.
+                    return Err(RecvTimeoutError::Timeout);
+                }
+                if keep_alive.next_tick(now, window(now)).is_none_or(|at| at > now) {
+                    // The window closed (or moved) while waiting.
+                    continue;
+                }
+                match tick() {
+                    Ok(()) => keep_alive.touch(Instant::now()),
+                    Err(error) => {
+                        // A faulted queue; the next request reports it.
+                        eprintln!("GPU keep-alive failed: {error:#}");
+                        keep_alive.stop();
+                    }
+                }
+            }
+            other => return other,
+        }
     }
 }
 
@@ -2130,22 +2223,32 @@ fn engine_loop<M: LanguageModel>(
         }
     );
     let mut idle = IdleTimer::new(options.idle_unload_secs, Instant::now());
+    let mut keep_alive = KeepAlive::new(KEEP_ALIVE_INTERVAL, Instant::now());
     while !shutdown.requested() {
         // An unloaded engine has nothing to time out; wait for a request.
         // A loaded one wakes for the idle unload or the end of the pin's hold.
         // A write ahead in flight is polled for, so its entry is indexed and
-        // the next one started while the engine is still idle.
-        let wait = engine.as_ref().and_then(|loaded| {
-            let now = Instant::now();
-            let writing = loaded.sessions.writing().then_some(WRITE_AHEAD_POLL);
-            [idle.remaining(now), loaded.pin.hold_remaining(now), writing]
-                .into_iter()
-                .flatten()
-                .min()
-        });
-        let cmd = match wait {
-            None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
-            Some(wait) => rx.recv_timeout(wait),
+        // the next one started while the engine is still idle. While the
+        // pin is held, the wait also keeps the GPU's residency warm.
+        let now = Instant::now();
+        let cmd = match engine.as_ref() {
+            None => recv_keeping_warm(&rx, None, &mut keep_alive, |_| None, || Ok(())),
+            Some(loaded) => {
+                let writing = loaded.sessions.writing().then_some(WRITE_AHEAD_POLL);
+                let deadline =
+                    [idle.remaining(now), loaded.pin.hold_remaining(now), writing]
+                        .into_iter()
+                        .flatten()
+                        .min()
+                        .map(|wait| now + wait);
+                recv_keeping_warm(
+                    &rx,
+                    deadline,
+                    &mut keep_alive,
+                    |now| loaded.pin.keep_warm_remaining(now),
+                    || loaded.ctx.wake(),
+                )
+            }
         };
         match cmd {
             Ok(Cmd::Job(job)) => {
@@ -2182,6 +2285,7 @@ fn engine_loop<M: LanguageModel>(
                 }
                 let fault = engine.as_mut().expect("engine loaded").serve(*job);
                 idle.touch(Instant::now());
+                keep_alive.touch(Instant::now());
                 if fault.is_none() {
                     engine.as_mut().expect("engine loaded").write_ahead();
                 }
@@ -2219,6 +2323,7 @@ fn engine_loop<M: LanguageModel>(
                             engine = Some(loaded);
                             lifecycle.set(State::Ready);
                             idle.touch(Instant::now());
+                            keep_alive.touch(Instant::now());
                         }
                         Err(error) => fatal(
                             "engine failed to reload after a GPU fault",
@@ -2231,11 +2336,14 @@ fn engine_loop<M: LanguageModel>(
             Ok(Cmd::Wake) => {}
             Ok(Cmd::Arrival) => {
                 queue.arrival_taken();
-                if let Some(loaded) = engine.as_ref()
-                    && let Err(error) = loaded.ctx.wake()
-                {
-                    // A faulted queue; the request that follows reports it.
-                    eprintln!("GPU wake at request arrival failed: {error:#}");
+                if let Some(loaded) = engine.as_ref() {
+                    match loaded.ctx.wake() {
+                        Ok(()) => keep_alive.touch(Instant::now()),
+                        // A faulted queue; the request that follows reports it.
+                        Err(error) => {
+                            eprintln!("GPU wake at request arrival failed: {error:#}")
+                        }
+                    }
                 }
             }
             Err(RecvTimeoutError::Timeout) => {

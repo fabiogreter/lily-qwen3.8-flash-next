@@ -150,8 +150,9 @@ residency sets are not thread-safe, so it cannot move to a helper thread.
 What helps is starting early: any submission, even a bare queue-level
 signal with no command buffer, starts the work, and a pass committed
 after it waits only for what is left. `MetalContext::wake` is that
-signal, and the server sends it when a request arrives (see "The
-server").
+signal, and the server sends it when a request arrives and, while the
+weights' pin is held, once a second in between requests so the set is
+never dropped (see "The server").
 
 ### Hiding the host round trip
 
@@ -993,12 +994,10 @@ read, before the connection thread parses, renders and tokenizes it; the
 engine answers with `MetalContext::wake`, so the residency the first
 submission after an idle second waits for (0.4 to 0.6 s for the full
 model, see "The Metal 4 transport") runs while the host parses,
-tokenizes, pins and acquires the session instead of after. It is one
-signal per request and nothing while idle: no periodic keep-alive, which
-would keep a laptop's GPU awake for nothing. At most one arrival is in the
-channel; `--queue` counts only the jobs waiting in it (`EngineQueue`),
-and the channel has room for one arrival and one stop wake on top, so
-neither control message takes a job's place.
+tokenizes, pins and acquires the session instead of after. At most one
+arrival is in the channel; `--queue` counts only the jobs waiting in it
+(`EngineQueue`), and the channel has room for one arrival and one stop
+wake on top, so neither control message takes a job's place.
 
 What it recovers depends on how much host work precedes the first GPU
 command. Measured over HTTP on an agent-shaped conversation (600 to 700
@@ -1010,10 +1009,34 @@ has to be taken again (1.4 to 2.3 s of `mlock` in `queue_ms`), it goes
 from 0.38 s to 0.04 s, 0.4 s of wall time. The stall lands in whichever
 phase submits first: `session_ms` when the lookup forks or restores a
 session, `wait_ms` when it does not, and inside a spill's snapshot before
-spills went to the background. The full cost after short gaps could only
-be avoided by keeping the GPU from going idle between requests (a bare
-signal once a second keeps the set resident, measured), which a laptop
-should not pay for; it is not done.
+spills went to the background.
+
+**Keeping the residency warm while the pin is held.** The wake cannot
+recover the stall after the common 3 to 30 s agent pause, so the engine
+keeps the GPU from going idle for exactly as long as the weights are
+pinned: while it waits for the next command with the pin held and its
+hold (`--pin-hold`, default 1m) still running, it sends
+`MetalContext::wake` whenever the GPU has gone a second without a
+submission (`KEEP_ALIVE_INTERVAL`, well under the ~1.5 s threshold). It
+runs on the engine thread's own idle wait (`recv_keeping_warm`, a
+`recv_timeout` loop), not on a thread of its own: a tick can never
+overlap or race the engine's GPU work, a command ends the wait the moment
+it arrives (the ticks are 0.03 ms submissions that wait for nothing), and
+the wait's own deadlines (the idle unload, the end of the hold, the
+write-ahead poll) go first. The window is
+`WeightPin::keep_warm_remaining`, read again before every tick: the hold
+after the last request while pinned, a minute after it with an unlimited
+hold (`--pin-hold 0`), and closed the moment the pin is released by its
+hold, by memory pressure (the monitor thread) or by an unload, or when it
+was never taken (`--pin-weights off`, `auto` with the expert cache, a
+failed `mlock`). Without a held pin an idle server submits nothing. There
+is no flag: measured on a 24 GiB set, 60 ticks at 1 Hz stayed at about
+1 ms each where 60 s of plain idle cost 144 to 160 ms on the next signal,
+and the GPU power of the ticks was not distinguishable from background
+(bounded at tens of mW). Nothing is logged per tick; a failed tick (a
+faulted queue) is logged once and stops the ticks until the next request.
+The requests inside the window should then show no post-idle stall in
+`session_ms` or `wait_ms`; that has not been measured live over HTTP yet.
 
 **Images.** Image parts (`image_url` with a `{url, detail}` object or
 `input_image` with a string) are accepted in user messages only and their
@@ -1197,7 +1220,10 @@ on those buffers and unlocks before it lets go of them, so locked memory is
 never freed and freed memory never locked. A failed `mlock` unlocks what it
 had locked, logs `pin failed: <error>` and is not retried before the next
 active period; the request is served unpinned. Every response's `timings`
-say whether the weights were `pinned` when it started.
+say whether the weights were `pinned` when it started. The hold is also the
+window of the GPU keep-alive ("Keeping the residency warm while the pin is
+held" above): the idle engine signals the GPU once a second while the pin
+is held and stops when it is released.
 
 Whether to pin is a pure function (`serve::pin::decide`) of the planned
 memory (`--memory-gb` when given, else physical, and never more than

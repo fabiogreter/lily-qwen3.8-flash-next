@@ -244,12 +244,17 @@ fn pins_at_the_first_request_holds_then_releases_after_the_hold() {
         .expect("pin");
     assert!(!pin.pinned());
     assert_eq!(wired(&bufs), vec![false; bufs.len()]);
+    assert_eq!(pin.keep_warm_remaining(Instant::now()), None, "no request yet");
 
     let t0 = Instant::now();
     assert!(pin.before_request(t0), "pins at the first request");
     assert_eq!(wired(&bufs), vec![true; bufs.len()]);
     pin.after_request(t0);
     assert_eq!(pin.hold_remaining(t0), Some(Duration::from_secs(60)));
+    // The keep-alive's window is the hold.
+    assert_eq!(pin.keep_warm_remaining(t0), Some(Duration::from_secs(60)));
+    let t = t0 + Duration::from_secs(25);
+    assert_eq!(pin.keep_warm_remaining(t), Some(Duration::from_secs(35)));
 
     // A request inside the hold finds it pinned; the hold restarts.
     let t1 = t0 + Duration::from_secs(30);
@@ -260,10 +265,12 @@ fn pins_at_the_first_request_holds_then_releases_after_the_hold() {
 
     let t2 = t1 + Duration::from_secs(60);
     assert_eq!(pin.hold_remaining(t2), Some(Duration::ZERO));
+    assert_eq!(pin.keep_warm_remaining(t2), Some(Duration::ZERO), "window over");
     pin.release_if_held_out(t2);
     assert!(!pin.pinned());
     assert_eq!(wired(&bufs), vec![false; bufs.len()]);
     assert_eq!(pin.hold_remaining(t2), None, "nothing to hold");
+    assert_eq!(pin.keep_warm_remaining(t2), None, "released: no keep-alive");
 
     // The next active period pins again.
     assert!(pin.before_request(t2 + Duration::from_secs(600)));
@@ -281,8 +288,17 @@ fn the_pin_keeps_its_buffers_alive_and_unlocks_before_releasing_them() {
     let handles: Vec<_> = bufs.iter().map(std::rc::Rc::downgrade).collect();
     let mut pin =
         WeightPin::new(bufs, PinDecision::Pin, 0, normal_pressure).expect("pin");
-    assert!(pin.before_request(Instant::now()));
+    let t0 = Instant::now();
+    assert!(pin.before_request(t0));
     assert_eq!(pin.hold_remaining(Instant::now()), None, "a hold of 0 never ends");
+    // The keep-alive still ends: a minute after the last request.
+    pin.after_request(t0);
+    assert_eq!(pin.keep_warm_remaining(t0), Some(Duration::from_secs(60)));
+    assert_eq!(
+        pin.keep_warm_remaining(t0 + Duration::from_secs(90)),
+        Some(Duration::ZERO)
+    );
+    assert!(pin.pinned(), "while the pin itself holds");
     // The engine drops its model (the other handles) while the pin lives:
     // the memory stays allocated, and locked.
     assert!(handles.iter().all(|h| h.upgrade().is_some()));
@@ -314,6 +330,7 @@ fn memory_pressure_releases_the_pin_and_blocks_repinning_until_normal() {
     }
     assert!(!pin.pinned(), "released under warning");
     assert_eq!(wired(&bufs), vec![false; bufs.len()]);
+    assert_eq!(pin.keep_warm_remaining(t0), None, "the release ends the keep-alive");
     // No re-pin while the pressure is raised, even in the same period...
     assert!(!pin.before_request(t0 + Duration::from_secs(1)));
     assert!(!pin.pinned());
@@ -335,9 +352,13 @@ fn a_skipped_decision_never_pins() {
         normal_pressure,
     )
     .expect("pin");
-    assert!(!pin.before_request(Instant::now()));
+    let t0 = Instant::now();
+    assert!(!pin.before_request(t0));
+    pin.after_request(t0);
     assert_eq!(wired(&bufs), vec![false; bufs.len()]);
     assert!(pin.monitor.is_none(), "no monitor thread without a pin");
+    // `--pin-weights off`, the expert cache under `auto`: no keep-alive.
+    assert_eq!(pin.keep_warm_remaining(t0), None);
 }
 
 #[test]
@@ -358,6 +379,7 @@ fn a_failed_lock_unlocks_what_it_locked_and_waits_for_the_next_period() {
         "the earlier ranges were unlocked"
     );
     pin.after_request(t0);
+    assert_eq!(pin.keep_warm_remaining(t0), None, "unpinned: no keep-alive");
     // Not retried within the period...
     pin.shared.lock().ranges.pop();
     assert!(!pin.before_request(t0 + Duration::from_secs(30)));

@@ -61,7 +61,10 @@ then says what assumption it rests on.
   cooldown pays it once, in `session_ms` or `wait_ms`, whatever its
   length; back to back it is gone. A series with cooldowns and one without
   are therefore not comparable at short prompts, and a cooldown of a
-  second or less does not reset it.
+  second or less does not reset it. The server keeps the set warm with a
+  signal a second while the weights' pin is held (architecture.md, "The
+  server"), so an HTTP request within `--pin-hold` of the last one does
+  not pay it; `lily-bench` has no such keep-alive.
 - **32K prefill is clock-limited.** Every 32K prefill sags to a busy-clock
   median of 1 340 to 1 560 MHz with dips to about 1 000 MHz, against a full
   1 620 MHz at about 75 W for the 1K and 8K runs. The 32K prefill column is

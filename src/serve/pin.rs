@@ -19,6 +19,12 @@
 //! unlocks what it had locked, is logged, and is not retried before the
 //! next active period; the server serves unpinned meanwhile.
 //!
+//! The hold is also the GPU keep-alive's window
+//! ([`WeightPin::keep_warm_remaining`]): while the weights are pinned and
+//! the hold runs, the idle engine signals the GPU once a second so the
+//! queue's residency set is not dropped; once the pin is released, for
+//! whatever reason, it submits nothing.
+//!
 //! What is pinned: [`LanguageModel::weight_buffers`], the buffers the load
 //! read the weights into, the vision tower included. Never the expert
 //! cache's slab, the session caches, the scratch or the paged n-gram table.
@@ -201,6 +207,9 @@ pub fn decide(i: &PinInputs) -> PinDecision {
 const WARNING: u32 = 2;
 /// How often the monitor thread reads the pressure level while pinned.
 const PRESSURE_POLL: Duration = Duration::from_secs(1);
+/// The GPU keep-alive's window after the last request when the hold is
+/// unlimited: the default `--pin-hold`.
+const UNLIMITED_HOLD_KEEP_WARM: Duration = Duration::from_secs(60);
 
 /// `buffers`' memory as page-aligned `(start, len)` ranges, sorted and with
 /// overlapping or touching ones merged (a page two small buffers share is
@@ -452,6 +461,19 @@ impl WeightPin {
     pub fn hold_remaining(&self, now: Instant) -> Option<Duration> {
         let (last, hold) = (self.last_request?, self.hold?);
         self.pinned().then(|| hold.saturating_sub(now.saturating_duration_since(last)))
+    }
+
+    /// What is left of the GPU keep-alive's window ([`super::KeepAlive`]):
+    /// the hold after the last request while the weights are pinned, and
+    /// with an unlimited hold (`--pin-hold 0`) the default hold's minute,
+    /// so the ticks always end. `None` when nothing is pinned (never pinned,
+    /// a skipped decision, a failed `mlock`, released after the hold or
+    /// under memory pressure), zero when the window is over.
+    pub fn keep_warm_remaining(&self, now: Instant) -> Option<Duration> {
+        let last = self.last_request?;
+        let window = self.hold.unwrap_or(UNLIMITED_HOLD_KEEP_WARM);
+        self.pinned()
+            .then(|| window.saturating_sub(now.saturating_duration_since(last)))
     }
 
     /// Releases the pin once its hold is over.
