@@ -508,6 +508,27 @@ pub trait LanguageModel: Sized {
         }
     }
 
+    /// [`Self::prefill_with_vision`] without a draw (it fills a cache
+    /// prefix), stopping at the first chunk boundary at which `stop` returns
+    /// true, before that chunk is committed. Returns how many of `tokens`
+    /// were fed. A stopped state sits at a chunk boundary exactly as if the
+    /// prefix fed so far had been the whole call, so it can be kept and
+    /// extended later. Architectures that do not implement it never stop
+    /// early.
+    fn prefill_until(
+        &self,
+        ctx: &MetalContext,
+        state: &mut Self::State,
+        scratch: &mut Self::Scratch,
+        tokens: &[u32],
+        vision: Option<&crate::qwen4exp::VisionInput<'_>>,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<usize> {
+        let _ = stop;
+        self.prefill_with_vision(ctx, state, scratch, tokens, None, vision)?;
+        Ok(tokens.len())
+    }
+
     /// Runs the vision tower over one preprocessed image
     /// (`[grid_h * grid_w, patch_dim]` f32 rows in block-major patch order,
     /// [`crate::qwen4exp::image::preprocess`]) and returns its merged rows

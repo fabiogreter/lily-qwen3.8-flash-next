@@ -278,6 +278,24 @@ impl<M: LanguageModel> Session<M> {
         self.checkpoints.insert(at, Arc::new(snapshot));
     }
 
+    /// The lineage after a prefill that stopped early: the request resumed
+    /// at `reused` and fed `prompt[reused..at]`, which the state holds, so
+    /// the session is the prompt's first `at` tokens and its live end is
+    /// resumable there like any other. Nothing else changes: its
+    /// checkpoints are the ones it was acquired with, all at or below
+    /// `reused`, since a request adds its own only after the prefill.
+    pub fn stop_at(&mut self, prompt: &[u32], reused: usize, at: usize) -> Result<()> {
+        ensure!(
+            reused <= at && at <= prompt.len() && self.state.pos() == at,
+            "a prefill stopped at {at} (resumed at {reused}, {} prompt tokens) left the state at {}",
+            prompt.len(),
+            self.state.pos()
+        );
+        self.tokens.truncate(reused);
+        self.tokens.extend_from_slice(&prompt[reused..at]);
+        Ok(())
+    }
+
     /// GPU bytes the session holds.
     pub fn bytes(&self) -> usize {
         self.state.bytes() + self.checkpoints.iter().map(|c| c.bytes()).sum::<usize>()

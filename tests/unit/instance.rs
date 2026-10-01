@@ -7,6 +7,16 @@ use super::*;
 /// lock file it takes.
 const CHILD_ENV: &str = "LILY_TEST_INSTANCE_LOCK_CHILD";
 
+/// Held by every test that takes a lock. A child spawned by one test can
+/// inherit another test's lock descriptor between its fork and its exec
+/// (close-on-exec only closes it at the exec), which holds that lock for a
+/// moment and failed "dropping frees it" now and then under a parallel run.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn temp_lock(name: &str) -> PathBuf {
     let dir = std::env::temp_dir()
         .join(format!("lily-instance-{name}-{}", std::process::id()));
@@ -69,6 +79,7 @@ fn refusal(path: &Path) -> AlreadyRunning {
 
 #[test]
 fn a_second_process_is_refused_with_the_holders_pid_until_the_holder_is_killed() {
+    let _serial = serial();
     let path = temp_lock("killed");
     let mut child = spawn_holder(&path);
     let refused = refusal(&path);
@@ -92,6 +103,7 @@ fn a_second_process_is_refused_with_the_holders_pid_until_the_holder_is_killed()
 
 #[test]
 fn the_lock_is_free_again_after_the_holder_exits() {
+    let _serial = serial();
     let path = temp_lock("exited");
     let mut child = spawn_holder(&path);
     assert_eq!(refusal(&path).holder.map(|h| h.pid), Some(child.id()));
@@ -102,6 +114,7 @@ fn the_lock_is_free_again_after_the_holder_exits() {
 
 #[test]
 fn a_second_handle_in_the_same_process_is_refused_and_dropping_frees_it() {
+    let _serial = serial();
     let path = temp_lock("handles");
     let first = InstanceLock::acquire_at(&path).expect("first");
     let refused = refusal(&path);

@@ -88,6 +88,18 @@ pub struct Timings {
     /// not already hold (part of `prefill_ms`); absent for a text request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vision_ms: Option<f64>,
+    /// What stopped the request before it finished: `"client"` (its
+    /// connection closed, see `http::Watched`) or `"shutdown"` (the stop
+    /// signal's grace ran out); absent for a request that ran to its end.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancelled_by: Option<&'static str>,
+    /// The prompt position at which a cancellation stopped the prefill, a
+    /// chunk boundary where the session cache kept the state for a retry;
+    /// `prefill_tokens` are then the tokens run up to it. Absent when the
+    /// prefill completed (a cancellation during the decode has only
+    /// `cancelled_by`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancelled_at: Option<usize>,
     /// Wall time from the request entering the engine's queue to the engine
     /// starting it: other requests ahead of it, a reload after an idle
     /// unload, or pinning the weights (`pinned`). Not part of `prefill_ms`.
@@ -438,6 +450,8 @@ impl Timings {
             durable_prefix_tokens: None,
             image_tokens: None,
             vision_ms: None,
+            cancelled_by: None,
+            cancelled_at: None,
             queue_ms: 0.0,
             pinned: false,
             prefill_phases: PrefillPhases::default(),
@@ -551,6 +565,20 @@ impl Timings {
     /// Adds what evicting sessions cost at the acquire and the release.
     pub fn with_evictions(mut self, evictions: EvictionTimings) -> Self {
         self.evictions = evictions;
+        self
+    }
+
+    /// Records a cancellation: who stopped the request and, when it was
+    /// stopped during the prefill, the position it got to, which is also
+    /// what `prefill_tokens` and the prefill rate then count.
+    pub fn with_cancel(mut self, by: Option<&'static str>, at: Option<usize>) -> Self {
+        self.cancelled_by = by;
+        self.cancelled_at = at;
+        if let Some(at) = at {
+            self.prefill_tokens =
+                at.clamp(self.cached_tokens, self.prompt_tokens) - self.cached_tokens;
+            self.prefill_per_second = rate(self.prefill_tokens, self.prefill_ms / 1e3);
+        }
         self
     }
 

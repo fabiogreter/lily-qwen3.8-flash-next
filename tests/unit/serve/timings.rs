@@ -545,3 +545,29 @@ fn evictions_report_both_steps_and_reach_the_log_only_when_they_cost_time() {
         t.log_details()
     );
 }
+
+#[test]
+fn a_cancelled_prefill_reports_where_it_stopped_and_counts_only_what_ran() {
+    // 65 536 prompt tokens, 4 096 cached, stopped at 12 288 after 3.2 s.
+    let t = Timings::measure(65_536, 4_096, 3.2, 0, 0.0, None)
+        .with_cancel(Some("client"), Some(12_288));
+    assert_eq!((t.cancelled_by, t.cancelled_at), (Some("client"), Some(12_288)));
+    assert_eq!(t.prefill_tokens, 8_192);
+    assert_eq!(t.prefill_per_second, Some(2_560.0));
+    let json = serde_json::to_value(t).unwrap();
+    assert_eq!(json["cancelled_by"], json!("client"));
+    assert_eq!(json["cancelled_at"], json!(12_288));
+    // Stopped before the first chunk: nothing ran, no rate.
+    let early = Timings::measure(100, 40, 0.1, 0, 0.0, None)
+        .with_cancel(Some("shutdown"), Some(40));
+    assert_eq!((early.prefill_tokens, early.prefill_per_second), (0, None));
+    // A decode cancel names who stopped it and leaves the prefill alone.
+    let decode =
+        Timings::measure(100, 0, 1.0, 5, 0.1, None).with_cancel(Some("client"), None);
+    assert_eq!((decode.cancelled_at, decode.prefill_tokens), (None, 100));
+    assert!(serde_json::to_value(decode).unwrap().get("cancelled_at").is_none());
+    // A request that ran to its end carries neither field.
+    let json =
+        serde_json::to_value(Timings::measure(10, 0, 1.0, 5, 1.0, None)).unwrap();
+    assert!(json.get("cancelled_by").is_none() && json.get("cancelled_at").is_none());
+}

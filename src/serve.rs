@@ -4,8 +4,10 @@
 //! from a bounded queue. The HTTP thread parses and validates requests (400s
 //! never touch the engine), and a small responder thread per request relays
 //! the engine's output to the socket, so a slow or vanished client never
-//! stalls the decode loop; its write failure cancels the generation at the
-//! next token.
+//! stalls the decode loop. The connection is watched from the moment the
+//! request is queued; a client that left cancels it before it starts, at the
+//! next prefill chunk or at the next token, and a prefill stopped that way
+//! keeps its prefix as a session for the retry.
 //!
 //! The engine thread also owns the model's lifetime: with `--idle-unload`
 //! it spills the resident sessions to the disk tier and drops the whole
@@ -107,7 +109,7 @@ fn derive_cache_budget(
     (derived.max(BUDGET_FLOOR_BYTES), derived < BUDGET_FLOOR_BYTES)
 }
 /// How long a running request may keep going after a stop signal before it
-/// is cancelled at its next token.
+/// is cancelled at its next token or prefill chunk.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 /// How long the listener waits for connection threads to finish writing
 /// their responses after the engine stopped.
@@ -343,7 +345,8 @@ impl IdleTimer {
 
 /// Stop coordination: `requested` closes the door (no new requests, the
 /// engine winds down after the running one); `cancel` is raised once the
-/// grace period is over and stops the running request at its next token.
+/// grace period is over and stops the running request at its next token or
+/// prefill chunk.
 #[derive(Default)]
 struct Shutdown {
     requested: AtomicBool,
@@ -541,22 +544,34 @@ impl EngineQueue {
 }
 
 /// Relays one request's output from the engine to the client on the
-/// connection's own thread; a failed write or the client's EOF flags
-/// cancellation for the engine.
-fn relay(stream: TcpStream, rx: Receiver<Out>, cancelled: Arc<AtomicBool>) {
+/// connection's own thread. The connection is watched from here on, while
+/// the request waits in the queue and the engine prefills it, not only once
+/// the response has started: a failed write, a reset or a confirmed EOF
+/// flags cancellation for the engine, which stops at the next prefill chunk
+/// or decoded token.
+fn relay(
+    stream: TcpStream,
+    http11: bool,
+    rx: Receiver<Out>,
+    cancelled: Arc<AtomicBool>,
+) {
+    let watched = http::Watched::new(stream, http11, cancelled.clone());
     let (status, content_type) = match rx.recv() {
         Ok(Out::Start { status, content_type }) => (status, content_type),
+        // The engine ended the request without a response: the client is
+        // gone (nothing to say) or something failed before it started.
         _ => {
-            send_error(stream, 500, "server_error", "internal server error");
+            if !cancelled.load(Ordering::Relaxed) {
+                let body = error_json("server_error", "internal server error");
+                if let Err(error) = watched.respond(500, "application/json", &body) {
+                    eprintln!("response error: {error:#}");
+                }
+            }
             return;
         }
     };
-    let mut response = match http::ChunkedResponse::start(
-        stream,
-        status,
-        content_type,
-        cancelled.clone(),
-    ) {
+    let mut response = match http::ChunkedResponse::start(watched, status, content_type)
+    {
         Ok(response) => response,
         Err(_) => {
             cancelled.store(true, Ordering::Relaxed);
@@ -1132,55 +1147,153 @@ impl<M: LanguageModel> Engine<M> {
         let boundary = sessions
             .disk()
             .and_then(|_| boundary_position(agreement, reused, n, min_tokens));
+        // A client that went away (or the stop signal's grace running out)
+        // stops the prefill at the next chunk boundary, before that chunk is
+        // committed, instead of holding the engine for the rest of it.
+        let stop = || sink.cancelled() || shutdown.cancel();
+        let mut cancelled_at: Option<usize> = None;
         let mut durable: Option<(usize, f64)> = None;
         let mut durable_secs = 0.0;
         let mut prefilled = reused;
         if let Some(b) = boundary {
             if prefilled < b {
-                model.prefill_with_vision(
+                prefilled += model.prefill_until(
                     ctx,
                     &mut session.state,
                     scratch,
                     &p.prompt[prefilled..b],
-                    None,
                     vision.as_ref(),
+                    &stop,
                 )?;
-                prefilled = b;
             }
-            let write_started = Instant::now();
-            let snapshot = session.state.snapshot(ctx)?;
-            match sessions.store_durable(
-                &p.prompt[..b],
-                &images,
-                p.cache_key.as_deref(),
-                &session.state,
-                &snapshot,
-            ) {
-                Ok(Some(_)) => {
-                    durable = Some((b, write_started.elapsed().as_secs_f64()))
+            // A stopped request writes no durable entry: one it never wrote
+            // is one fewer than a finished request would have, never more.
+            if prefilled < b || stop() {
+                cancelled_at = Some(prefilled);
+            } else {
+                let write_started = Instant::now();
+                let snapshot = session.state.snapshot(ctx)?;
+                match sessions.store_durable(
+                    &p.prompt[..b],
+                    &images,
+                    p.cache_key.as_deref(),
+                    &session.state,
+                    &snapshot,
+                ) {
+                    Ok(Some(_)) => {
+                        durable = Some((b, write_started.elapsed().as_secs_f64()))
+                    }
+                    Ok(None) => eprintln!(
+                        "session cache: the disk tier did not keep the durable prefix at {b}"
+                    ),
+                    Err(error) => eprintln!(
+                        "session cache: writing the durable prefix at {b} failed: {error:#}"
+                    ),
                 }
-                Ok(None) => eprintln!(
-                    "session cache: the disk tier did not keep the durable prefix at {b}"
-                ),
-                Err(error) => eprintln!(
-                    "session cache: writing the durable prefix at {b} failed: {error:#}"
-                ),
+                drop(snapshot);
+                durable_secs = write_started.elapsed().as_secs_f64();
             }
-            drop(snapshot);
-            durable_secs = write_started.elapsed().as_secs_f64();
         }
 
         // Prefix up to the last prompt token, then checkpoint there so an
         // identical or extended prompt can resume without re-feeding it.
-        if prefilled < n - 1 {
-            model.prefill_with_vision(
-                ctx,
-                &mut session.state,
-                scratch,
-                &p.prompt[prefilled..n - 1],
-                None,
-                vision.as_ref(),
-            )?;
+        if cancelled_at.is_none() {
+            if prefilled < n - 1 {
+                prefilled += model.prefill_until(
+                    ctx,
+                    &mut session.state,
+                    scratch,
+                    &p.prompt[prefilled..n - 1],
+                    vision.as_ref(),
+                    &stop,
+                )?;
+            }
+            if prefilled < n - 1 || stop() {
+                cancelled_at = Some(prefilled);
+            }
+        }
+        if let Some(at) = cancelled_at {
+            let prefix_secs = started.elapsed().as_secs_f64();
+            // The prefix fed so far stays an ordinary session whose live end
+            // is the chunk boundary, so a retry of the prompt resumes there.
+            // It is released like any request's session: under the budget
+            // (evictions write ahead or spill as usual), never written ahead
+            // itself while it is the latest, its checkpoints those it had,
+            // all at or below the position it was acquired at (the live end
+            // needs none). An image the stop cut through is left out of the
+            // lineage's spans, so no prompt resumes inside it.
+            session.stop_at(&p.prompt, reused, at)?;
+            let released =
+                sessions.release(ctx, session, &images, p.cache_key.as_deref());
+            let counters_end = crate::stats::counters();
+            let vm_end = crate::stats::vm_counters();
+            let created = now();
+            let id = response_id(p.kind, created, next_id);
+            let by = if sink.cancelled() { "client" } else { "shutdown" };
+            let measured = Timings::measure(n, reused, prefix_secs, 0, 0.0, None)
+                .with_agreement(agreement, durable.map(|(b, _)| b))
+                .with_vision(image_tokens, vision_secs)
+                .with_pinned(pinned)
+                .with_cancel(Some(by), Some(at))
+                .with_evictions(EvictionTimings {
+                    acquire: EvictionPhase::new(&acquired.evictions),
+                    release: EvictionPhase::new(&released),
+                })
+                .with_diagnostics(
+                    queued.as_secs_f64(),
+                    PrefillPhases::split(
+                        prefix_secs,
+                        if p.images.is_empty() { 0.0 } else { vision_secs },
+                        PrefillParts {
+                            session_secs,
+                            durable_secs,
+                            checkpoint_secs: 0.0,
+                            counters: counters_end.since(counters_start).prefill,
+                        },
+                    ),
+                    NgramStats {
+                        prefill: counters_end.since(counters_start).gather.into(),
+                        decode: counters_end.since(counters_end).gather.into(),
+                    },
+                    MemoryStats::from_samples(
+                        [vm_start, vm_end, vm_end],
+                        crate::stats::pressure_level(),
+                        crate::stats::task_memory(),
+                    ),
+                );
+            eprintln!(
+                "{id}: {n} prompt tokens ({reused} cached{}{}), cancelled by the {by} at {at} after {} prefilled in {prefix_secs:.2}s, kept {at} tokens as a session, sessions={} ({:.1}/{:.1} GB){}{}",
+                if acquired.forked { ", forked" } else { "" },
+                acquired
+                    .from_disk
+                    .map(|d| format!(", from disk in {:.2}s", d.as_secs_f64()))
+                    .unwrap_or_default(),
+                at - reused,
+                sessions.len(),
+                sessions.used_bytes() as f64 / 1e9,
+                sessions.budget_bytes() as f64 / 1e9,
+                sessions
+                    .disk()
+                    .map(|d| format!(
+                        ", disk {} ({:.1} GB)",
+                        d.len(),
+                        d.used_bytes() as f64 / 1e9
+                    ))
+                    .unwrap_or_default(),
+                measured.log_details(),
+            );
+            timings.record(TimingsEntry {
+                id,
+                model: M::MODEL_ID,
+                created,
+                timings: measured,
+            });
+            if !sink.cancelled() {
+                // Stopped by the server: the client is still there to hear it.
+                sink.start(503, "application/json");
+                sink.send(error_json("server_error", "the server is shutting down"));
+            }
+            return Ok(());
         }
         // The last prompt token is fed by the generator through the text
         // prefill: it is text after every image, and the state's rope delta
@@ -1228,13 +1341,7 @@ impl<M: LanguageModel> Engine<M> {
         }
 
         let created = now();
-        let id = format!(
-            "{}-{}-{}",
-            if p.kind == Kind::Chat { "chatcmpl" } else { "cmpl" },
-            created,
-            *next_id
-        );
-        *next_id += 1;
+        let id = response_id(p.kind, created, next_id);
         let tokenizer = generator.tokenizer();
         let mut parser = OutputParser::new(
             |ids: &[u32]| tokenizer.decode(ids, false),
@@ -1378,6 +1485,15 @@ impl<M: LanguageModel> Engine<M> {
         // The numbers the line below prints, as JSON: attached to the
         // response below and kept for `GET /v1/timings`. Recorded before the
         // cancellation checks so the log and the ring buffer never disagree.
+        // A request whose client left (or the server stopped) during the
+        // decode is marked; its answer goes nowhere, or is a 503 below.
+        let cancelled_by = if sink.cancelled() {
+            Some("client")
+        } else if shutdown.cancel() {
+            Some("shutdown")
+        } else {
+            None
+        };
         let measured = Timings::measure(
             n,
             reused,
@@ -1392,6 +1508,7 @@ impl<M: LanguageModel> Engine<M> {
         .with_agreement(agreement, durable.map(|(b, _)| b))
         .with_vision(image_tokens, vision_secs)
         .with_pinned(pinned)
+        .with_cancel(cancelled_by, None)
         .with_evictions(EvictionTimings {
             acquire: EvictionPhase::new(&acquired.evictions),
             release: EvictionPhase::new(&released),
@@ -1419,7 +1536,7 @@ impl<M: LanguageModel> Engine<M> {
             ),
         );
         eprintln!(
-            "{}: {} prompt tokens ({} cached{}{}{}{}){}, {} generated, prefix {:.2}s, decode {:.2}s ({:.1} tok/s){}, finish={finish_reason}, sessions={} ({:.1}/{:.1} GB){}{}",
+            "{}: {} prompt tokens ({} cached{}{}{}{}){}, {} generated, prefix {:.2}s, decode {:.2}s ({:.1} tok/s){}, finish={finish_reason}{}, sessions={} ({:.1}/{:.1} GB){}{}",
             id,
             n,
             reused,
@@ -1461,6 +1578,9 @@ impl<M: LanguageModel> Engine<M> {
             } else {
                 String::new()
             },
+            cancelled_by
+                .map(|by| format!(" (cancelled by the {by} during the decode)"))
+                .unwrap_or_default(),
             sessions.len(),
             sessions.used_bytes() as f64 / 1e9,
             sessions.budget_bytes() as f64 / 1e9,
@@ -1582,6 +1702,18 @@ impl<M: LanguageModel> Engine<M> {
         }
         Ok(())
     }
+}
+
+/// A response id, `chatcmpl-<created>-<n>` or `cmpl-…`, unique within the
+/// process; advances the counter.
+fn response_id(kind: Kind, created: u64, next_id: &mut u64) -> String {
+    let id = format!(
+        "{}-{created}-{}",
+        if kind == Kind::Chat { "chatcmpl" } else { "cmpl" },
+        *next_id
+    );
+    *next_id += 1;
+    id
 }
 
 fn call_id(request_id: &str, index: usize) -> String {
@@ -2482,7 +2614,7 @@ fn handle(front: &Front, mut stream: TcpStream) {
                 return;
             }
             match front.jobs.try_send(Cmd::Job(Box::new(job))) {
-                Ok(()) => relay(stream, rx, cancelled),
+                Ok(()) => relay(stream, request.http11, rx, cancelled),
                 Err(TrySendError::Full(_)) => {
                     queue.left();
                     refuse(

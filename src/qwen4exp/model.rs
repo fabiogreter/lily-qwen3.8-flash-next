@@ -1859,6 +1859,39 @@ impl Qwen4ExpModel {
         draw: Option<Draw<'_>>,
         vision: Option<&VisionInput<'_>>,
     ) -> Result<()> {
+        self.prefill_chunks(ctx, state, s, tokens, draw, vision, None).map(drop)
+    }
+
+    /// [`Self::prefill_with_vision`] without a draw that stops before the
+    /// first chunk at which `stop` returns true (checked before every chunk,
+    /// the first included). Returns the tokens fed, a whole number of chunks
+    /// unless all of them. The state is then at rest at that position, as
+    /// after a prefill of exactly those tokens: positions, n-gram history
+    /// and convolution slot advance per completed chunk, and a staged-ahead
+    /// next chunk only wrote scratch.
+    pub fn prefill_until(
+        &self,
+        ctx: &MetalContext,
+        state: &mut DecodeState,
+        s: &mut Scratch,
+        tokens: &[u32],
+        vision: Option<&VisionInput<'_>>,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<usize> {
+        self.prefill_chunks(ctx, state, s, tokens, None, vision, Some(stop))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_chunks(
+        &self,
+        ctx: &MetalContext,
+        state: &mut DecodeState,
+        s: &mut Scratch,
+        tokens: &[u32],
+        draw: Option<Draw<'_>>,
+        vision: Option<&VisionInput<'_>>,
+        stop: Option<&dyn Fn() -> bool>,
+    ) -> Result<usize> {
         ensure!(!tokens.is_empty(), "empty prompt");
         ensure!(state.spec.is_none(), "prefill during a pending speculative step");
         let h = self.config.hidden_size;
@@ -1917,7 +1950,11 @@ impl Qwen4ExpModel {
             && capacity.ple.as_ref().is_some_and(|p| p.stage_alt.is_some());
         let buffer = |k: usize| if ahead { k % 2 } else { 0 };
         let mut staged_ahead = false;
+        let mut fed = 0;
         for (k, &chunk) in chunks.iter().enumerate() {
+            if stop.is_some_and(|stop| stop()) {
+                return Ok(fed);
+            }
             let mut ps = capacity.chunk(chunk)?;
             ps.ple = capacity
                 .ple
@@ -2013,13 +2050,14 @@ impl Qwen4ExpModel {
                 );
             }
             state.pos += chunk.len();
+            fed += chunk.len();
             if let Some(pst) = &mut state.ple {
                 pst.hist = NgramHasher::advance(pst.hist, chunk);
             }
             // The chunk's recurrent kernels wrote the other window buffers.
             state.conv_slot = 1 - state.conv_slot;
         }
-        Ok(())
+        Ok(fed)
     }
 
     /// Whether a multi-chunk prefill stages the next chunk's n-gram rows
@@ -4048,6 +4086,18 @@ impl LanguageModel for Qwen4ExpModel {
         Qwen4ExpModel::prefill_with_vision(
             self, ctx, state, scratch, tokens, draw, vision,
         )
+    }
+
+    fn prefill_until(
+        &self,
+        ctx: &MetalContext,
+        state: &mut DecodeState,
+        scratch: &mut Scratch,
+        tokens: &[u32],
+        vision: Option<&VisionInput<'_>>,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<usize> {
+        Qwen4ExpModel::prefill_until(self, ctx, state, scratch, tokens, vision, stop)
     }
 
     fn encode_image(

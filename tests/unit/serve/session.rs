@@ -772,4 +772,83 @@ mod store {
         .expect("read");
         assert_eq!(out, prompt(1, 300).iter().map(|&t| t as u8).collect::<Vec<_>>());
     }
+
+    /// What the engine does with a request whose prefill a cancellation
+    /// stopped at `at`: acquire, feed up to there, keep that prefix, release.
+    fn serve_stopped(f: &mut Fixture, prompt: &[u32], at: usize) -> Acquired<Model> {
+        let mut acquired =
+            f.store.acquire(&f.ctx, &Model, prompt, &[], None).expect("acquire");
+        let reused = acquired.reused;
+        let mut session = std::mem::replace(
+            &mut acquired.session,
+            super::super::Session::new(State {
+                data: vec![],
+                recurrent: 0,
+                capacity: 0,
+            }),
+        );
+        session.state.feed(&prompt[reused..at]);
+        // The position must be the state's: anything else is refused.
+        assert!(session.stop_at(prompt, reused, at + 1).is_err());
+        session.stop_at(prompt, reused, at).expect("stop");
+        f.store.release(&f.ctx, session, &[], None);
+        acquired
+    }
+
+    #[test]
+    fn a_prefill_stopped_at_a_chunk_boundary_is_kept_and_its_retry_resumes_there() {
+        // 1 000 bytes a token; the write ahead keeps room for a new
+        // 300-token session free of writes.
+        let mut f = fixture("stopped", 900_000, Some(300_000));
+        let a = prompt(1, 300);
+        serve(&mut f, &a);
+        // The next turn extends A in place, and its client leaves after the
+        // prefill reached 400 of 700 tokens.
+        let mut turn = a.clone();
+        turn.extend(prompt(2, 400));
+        let acquired = serve_stopped(&mut f, &turn, 400);
+        assert_eq!((acquired.reused, acquired.forked), (300, false));
+        assert_eq!(f.store.len(), 1);
+        // Kept like any request's session: it just ran, so it is not
+        // written ahead (nothing else is resident to write either).
+        assert_eq!(settle(&mut f), 0);
+
+        // A different conversation fills the budget; the stopped session is
+        // now the least recently used and is written ahead like any other.
+        serve(&mut f, &prompt(3, 300));
+        assert!(f.store.used_bytes() <= 900_000);
+        assert_eq!(settle(&mut f), 1);
+        let kept = f.store.entries.iter().find(|s| s.tokens.first() == Some(&1000));
+        let kept = kept.expect("the stopped session is still resident");
+        assert_eq!(kept.tokens, turn[..400]);
+        assert!(matches!(kept.disk, DiskCopy::Written(_)));
+
+        // The retry resumes in place at the boundary with exactly the state
+        // the stopped prefill left, and carries on to the end as usual.
+        let (retry, _) = serve(&mut f, &turn);
+        assert_eq!((retry.reused, retry.forked, retry.from_disk), (400, false, None));
+        let resumed = f.store.entries.iter().find(|s| s.tokens.first() == Some(&1000));
+        assert_holds(&resumed.expect("resumed").state, &turn);
+
+        // The checkpoint of the first turn still serves a rollback below the
+        // stopped position: a regenerated first answer forks from 299.
+        let mut regenerate = a.clone();
+        regenerate.push(4242);
+        let (fork, _) = serve(&mut f, &regenerate);
+        assert_eq!((fork.reused, fork.forked), (299, true));
+    }
+
+    #[test]
+    fn a_prefill_stopped_before_its_first_chunk_keeps_what_it_was_acquired_with() {
+        let mut f = fixture("stopped-early", 1_000_000, None);
+        let a = prompt(1, 300);
+        serve(&mut f, &a);
+        let mut turn = a.clone();
+        turn.extend(prompt(2, 100));
+        let acquired = serve_stopped(&mut f, &turn, 300);
+        assert_eq!(acquired.reused, 300);
+        assert_eq!(f.store.len(), 1);
+        let (retry, _) = serve(&mut f, &turn);
+        assert_eq!((retry.reused, retry.forked), (300, false));
+    }
 }

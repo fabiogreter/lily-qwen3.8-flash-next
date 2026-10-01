@@ -1062,6 +1062,62 @@ disconnect detection needs the socket: a general-purpose crate buffered
 writes and swallowed the errors, so a departed client kept the GPU busy to
 `max_tokens`.
 
+**A client that leaves.** An agent client abandons requests all the time:
+the user presses Esc, opencode aborts and retries, a subagent is cancelled.
+Each request's connection is watched from the moment its job is queued, not
+only once the response has started (`http::Watched`): a helper thread
+blocks in `read` on the socket, and with `Connection: close` the client
+sends nothing more, so a read that completes means it left. A reset flags
+the request at once. An EOF alone does not, because a client may half-close
+its sending side after the request and still wait for the answer; on macOS
+`poll` reports `POLLHUP` for both cases, so the watcher writes a probe that
+the client has to accept anyway and looks for the reset a closed peer
+answers it with (`SO_ERROR`, up to 250 ms): an interim `HTTP/1.1 102
+Processing` before the head (RFC 9110 lets a client receive 1xx responses it
+did not ask for; never to an HTTP/1.0 client), an SSE comment chunk `:` in
+an event stream, nothing inside a JSON body, whose bytes follow at once. A
+half-closed client that is still there is answered normally and no longer
+watched. A failing write flags the request too, as before. The flag is the
+job's `cancelled`, which the engine reads before the request starts, at
+every decoded token and, now, before every prefill chunk:
+`LanguageModel::prefill_until` stops before committing the next chunk, so a
+departed client holds the GPU for at most the chunk in flight (about 1.6 s
+at 4 096 tokens) instead of the rest of the prefill. Before, a 64K request
+abandoned after 3 s kept the next request queued 25.5 to 26 s; now 0.2 s,
+streaming or not. The same check stops a prefill once the stop signal's
+grace has run out (the 503 then goes to the client, which is still there).
+Non-streaming requests gain detection during the decode as well, which
+previously only a stream's writes provided.
+
+The partial prefill is kept. The state at a chunk boundary is at rest and as
+consistent as after a prefill of exactly that prefix (positions, the n-gram
+hash history and the convolution slot advance per completed chunk; the rows
+staged ahead for the skipped chunk only wrote scratch), so the session is
+released as the prompt's first `cancelled_at` tokens (`Session::stop_at`)
+with its live end there, like any request's session: under the budget, with
+its evictions written ahead or spilled as usual, never written ahead itself
+while it is the latest, and with the checkpoints it was acquired with (all
+at or below where it resumed; the live end needs none). A retry of the same
+prompt, which is what opencode sends, extends the live end in place and
+prefills the rest on the same chunk grid, so its answer is the answer of an
+uncancelled run (bit-identical in the 4-layer test, the same greedy text on
+the full model). Dropping the work instead would have thrown away a resumed
+session's whole lineage, since a request extends its session in place. A
+stopped request writes no durable entry, not even when it stopped exactly
+at the boundary, so it never creates one a finished request would not. An
+image the stop cut through is left out of the lineage's spans, which makes
+every prompt carrying that image share at most the text before it, so
+nothing resumes inside an image. The kept state keeps the capacity it was
+grown to for the whole prompt, so until the retry it is counted in the
+budget at the full prompt's size. The expert-cache mode keeps it the same
+way; its one-session budget then evicts it synchronously for the next
+different prompt, as it would a finished request's session. The log line
+says `cancelled by the client at N after M prefilled in Ts, kept N tokens
+as a session`, and the `timings` carry `cancelled_by` (`client` or
+`shutdown`) and `cancelled_at`, with `prefill_tokens` counting what ran; a
+cancellation during the decode adds `cancelled_by` and `(cancelled by the
+client during the decode)` after `finish=`.
+
 Each request's own numbers leave the engine twice. The `timings` object goes
 into the response (next to `usage`, and on the last chunk of a stream) from
 values the request already measured for its log line, so the addition is a
