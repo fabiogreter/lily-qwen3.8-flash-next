@@ -144,12 +144,16 @@ then says what assumption it rests on.
 
 ## The numbers
 
-Measured 2026-09-18 at commit `38d2642` against the commit before that
-day's kernel work (`37cc34c`), interleaved per repeat, median of three,
-range in parentheses, on the first tokens of one real-text prompt
-(`docs/bench/prompts/p0.txt`). The README's table is the headline: fresh
-real prompts over HTTP at 4K to 64K; this is the fixed `lily-bench`
-matrix.
+The README's table is the headline: fresh real prompts over HTTP at 4K to
+64K, last measured 2026-10-01 at commit `c096b75` (below, "The README
+series"): prefill 2 387 to 2 534 tok/s, decode 97 to 110 tok/s with two
+drafts and 77 to 85 without.
+
+The fixed `lily-bench` matrix that follows was measured 2026-09-18 at
+commit `38d2642` against the commit before that day's kernel work
+(`37cc34c`), interleaved per repeat, median of three, range in
+parentheses, on the first tokens of one real-text prompt
+(`docs/bench/prompts/p0.txt`).
 
 ### Prefill, tok/s
 
@@ -246,6 +250,58 @@ bounds, and the 32K cells of the synthetic matrices were trajectory artifacts
 falling into a run of a repeated special token that the head predicts
 poorly). The kernels involved do not depend on position, and the 4-layer
 differential test of the speculative step at position 33 000 passes.
+
+### The README series, 2026-10-01 (`c096b75`)
+
+The README's method rerun on the server that ships on 2026-10-01 (commit
+`c096b75`): `tools/bench/http_bench.py matrix`, fresh real-text prompts
+cut from this repository (591 693 corpus tokens that day) at 4K, 16K, 32K
+and 64K tokens, 256 greedy tokens of new text, three repeats interleaved
+per repeat, medians, range in parentheses. One server with the draft head
+as shipped (`--mtp-drafts 2`) gives the prefill and 2-draft rows, a second
+started with `--mtp-drafts 0` the plain rows; `--max-seq 262144`, disk tier
+off (`--disk-cache-bytes 0`) so no run could hit a cache, each series after
+the n-gram preload had finished. On AC, swap 1.78 GB of 3 GB before and
+after. Differences from the `38d2642` series: 20 s between runs instead of
+10, `--max-seq` 262144 instead of 131072, a corpus grown with the
+repository, and the `38d2642` plain rows came from a series before the
+activity assertion.
+
+| context | prefill, draft head loaded | prefill, `--mtp-drafts 0` | decode, 2 drafts | decode, no drafts |
+|--------:|---------------------------:|--------------------------:|-----------------:|------------------:|
+| 4 096   | 2 387 (2 379 to 2 426) | 2 582 (2 568 to 2 587) | 110.0 (108.0 to 110.2) | 85.4 (84.8 to 85.9) |
+| 16 384  | 2 534 (2 533 to 2 574) | 2 647 (2 617 to 2 649) | 105.0 (99.6 to 106.1)  | 84.3 (84.1 to 86.7) |
+| 32 768  | 2 495 (2 480 to 2 503) | 2 582 (2 579 to 2 598) | 105.2 (104.3 to 106.5) | 83.4 (83.3 to 83.9) |
+| 65 536  | 2 335 (2 310 to 2 367) | 2 448 (2 376 to 2 479) | 97.1 (96.5 to 102.9)   | 77.1 (76.4 to 79.7) |
+
+Against `38d2642` (the next section's lily rows):
+
+| context | prefill | decode, 2 drafts | decode, no drafts |
+|--------:|--------:|-----------------:|------------------:|
+| 4 096   | 2 387 against 1 435 (+66%) | 110.0 against 98.1 (+12%)  | 85.4 against 86.7 (-1%) |
+| 16 384  | 2 534 against 1 756 (+44%) | 105.0 against 97.2 (+8%)   | 84.3 against 85.4 (-1%) |
+| 32 768  | 2 495 against 1 864 (+34%) | 105.2 against 102.0 (+3%)  | 83.4 against 84.8 (-2%) |
+| 65 536  | 2 335 against 1 651 (+41%) | 97.1 against 92.4 (+5%)    | 77.1 against 81.7 (-6%) |
+
+- **Prefill**: the gain is the prefill work since 2026-09-18 ("What was
+  done", "Prefill"; this series does not attribute it). The GPU phase is
+  90 to 99% of `prefill_ms` (1.55 s of 1.72 s at 4K, 27.7 of 28.1 s at
+  64K), the n-gram gather 95 to 110 ms with 0.6 to 4.7 K cold pages per
+  run, `wait` 7 to 35 ms. The draft head, caught up during prefill, costs
+  3 to 8% of it.
+- **Decode with two drafts** accepted 1 717 of 2 686 drafts (64%), the same
+  rate as the `38d2642` series, so the gain is shorter steps or a smaller
+  clock sag, not more accepted drafts; the longer cooldown may account for
+  part of it, which this series does not separate.
+- **Plain decode** is within the noise band at 4K to 32K. **The 64K cell is
+  6% below `38d2642`'s** (76.4 to 79.7 against 81.7), outside the band; not
+  investigated here, and the two series differ in `--max-seq` and corpus
+  as listed above. An A/B at 64K against `38d2642` would settle whether the
+  engine moved.
+
+Records: `docs/bench/2026-10-01-readme-series/` (not published):
+`lily-d2.jsonl`, `lily-d0.jsonl`, `run.log`, `server-d*.log`, `report.txt`,
+swap before and after each series.
 
 ### Against llama.cpp
 
@@ -402,11 +458,21 @@ had no counterpart, and it peaked at 105 GB of memory on the 128 GB machine.
 Several third-party MLX engines ship their own `qwen4_exp` and publish
 figures for an M5 Max: MTPLX (Apache-2.0) reports 79 tok/s at 9K and 61 at
 109K with its MTP path under the model's default sampling, 44 plain, and
-810 tok/s prefill at 131K; oMLX reports 58 to 70 tok/s with its speculative
-path in its 0.7.0 development builds. None of these were measured with this
-harness, so they are cited, not compared; lily's plain decode of 82 to 87
-exceeds their speculative figures, and its 2-draft rate is measured greedily,
-which is worth about 10% over sampled drafting.
+810 tok/s prefill at 131K. oMLX 0.7.0 (released 2026-09-30) publishes for
+Qwen3.8-Flash-Next oQ4e on an M5 Max 128 GB, in the chart of its release
+notes, prefill 2 768 / 2 844 / 2 366 tok/s at 4K / 16K / 64K and generation
+93.0 / 87.1 / 75.9 tok/s, sampling settings not stated (the benchmarks in
+its pull requests used temperature 1.0). lily's 2026-10-01 series at the
+same lengths: prefill 2 387 / 2 534 / 2 335 with the draft head (2 582 /
+2 647 / 2 448 without), decode 110.0 / 105.0 / 97.1 with two drafts and
+85.4 / 84.3 / 77.1 plain, all greedy. None of the third-party figures were
+measured with this harness, and the quantizations differ, so they are
+cited, not compared: on these numbers oMLX's prefill is ahead by 12 to 16%
+at 4K and 16K (7% against lily without the draft head) and level at 64K;
+its generation figures are above lily's plain rate at 4K and 16K, just
+below it at 64K, and below the 2-draft rate at all three. lily's 2-draft
+rate is measured greedily, which is worth about 10% over sampled
+drafting.
 
 ### Smaller machines
 

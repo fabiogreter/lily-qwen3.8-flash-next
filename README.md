@@ -12,7 +12,7 @@ requests and restarts, and an expert cache that runs the model on half the
 memory it needs.
 
 Against Unsloth's llama.cpp fork on the same machine and prompts, prefill is
-1.6 to 3 times faster and decode 1.9 to 3.4 times faster, more so at longer
+2.7 to 4.2 times faster and decode 2.1 to 3.6 times faster, more so at longer
 context.
 
 ## Running it
@@ -57,21 +57,23 @@ opencode. The differences:
 
 M5 Max, 40-core GPU, 128 GB. Both engines over HTTP with the same real-text
 prompts, 256 greedy tokens, medians of three interleaved repeats. This fork
-at commit `38d2642` (2026-09-18), llama.cpp on 2026-09-17.
+at commit `c096b75` (2026-10-01); the llama.cpp rows are from 2026-09-17 and
+were not re-measured.
 
 | tokens per second | 4K context | 16K | 32K | 64K |
 |---|---:|---:|---:|---:|
-| **prefill** this fork | 1 435 | 1 756 | 1 864 | 1 651 |
+| **prefill** this fork | 2 387 | 2 534 | 2 495 | 2 335 |
 | prefill llama.cpp | 887 | 882 | 713 | 550 |
-| **decode** this fork, 2 drafts | 98 | 97 | 102 | 92 |
+| **decode** this fork, 2 drafts | 110 | 105 | 105 | 97 |
 | decode llama.cpp, MTP 2 drafts | 52 | 44 | 37 | 27 |
-| decode this fork, no drafts | 87 | 85 | 85 | 82 |
+| decode this fork, no drafts | 85 | 84 | 83 | 77 |
 | decode llama.cpp, no drafts | 39 | 31 | 25 | 17 |
 
-Decode stays nearly flat up to 64K because the sparse-attention kernels
-keep the cost of context at a few percent of a step. Three drafts per step
-were slower than two on both engines. Under sustained load the GPU clock
-sags a few percent, which slows the speculative and prefill rows slightly.
+Decode loses about a tenth from 4K to 64K, where llama.cpp loses half,
+because the sparse-attention kernels keep the cost of context to a small
+part of a step. Three drafts per step were slower than two on both
+engines. Under sustained load the GPU clock sags a few percent, which slows
+the speculative and prefill rows slightly.
 
 During actual use with opencode, prefill is often quite a bit slower, due to
 most turns being short, so that fixed per-request costs dominate.
@@ -125,10 +127,24 @@ engines with their own implementation publish M5 Max numbers:
 
 - [MTPLX](https://mtplx.com/benchmarks/) 79 tok/s at 9K and 61 at 109K with
 its speculative path (44 without)
-- [oMLX](https://github.com/jundot/omlx/releases)
-58 to 70 tok/s with its speculative path in its 0.7.0 development builds.
+- [oMLX 0.7.0](https://github.com/jundot/omlx/releases/tag/v0.7.0) (released
+2026-09-30), Qwen3.8-Flash-Next oQ4e on an M5 Max 128 GB, from the chart in
+its release notes:
 
-We have not re-measured them, and their quantizations and settings differ.
+| tokens per second | 4K context | 16K | 64K |
+|---|---:|---:|---:|
+| prefill oMLX 0.7.0, published | 2 768 | 2 844 | 2 366 |
+| prefill this fork | 2 387 | 2 534 | 2 335 |
+| generation oMLX 0.7.0, published | 93.0 | 87.1 | 75.9 |
+| decode this fork, 2 drafts | 110 | 105 | 97 |
+| decode this fork, no drafts | 85 | 84 | 77 |
+
+The oMLX rows are its own published numbers, not measured by us, with a
+different quantization (oQ4e) and sampling the chart does not state (the
+benchmarks in its pull requests used temperature 1.0; ours are greedy).
+This fork's rows are the table above, prefill with the draft head loaded as
+shipped; without it (`--mtp-drafts 0`) prefill measured 2 582 / 2 647 /
+2 448. We have not run MTPLX or oMLX ourselves.
 
 ## The model
 
