@@ -443,8 +443,33 @@ against `38d2642` in one clock state (the dense GEMM, untouched, reads
 | kernel sum per pass | 1 998 | 1 702 | |
 
 The dense GEMM runs at 54 TFLOP/s, the ceiling this GPU reached on any
-shape; the expert GEMM at about 34 by the same accounting. The kept work,
-in order of size:
+shape; the expert GEMM at about 34 by the same accounting in that table,
+about 38 since item 0. The kept work, in order of size:
+
+0. **The expert GEMM's B-tile staging** (2026-10-01). In a harness at the
+   model's shapes (512 experts, four layers' measured routing profiles,
+   `grouped_expert_gemm_timing`) ablations put the cost in the weight
+   loads, not the dequantization: filling the tile with the loaded words
+   undequantized kept 96% of the kernel's time, dequantizing register
+   values without loading them cost 8%, and no tile refresh at all ran at
+   51 TFLOP/s. Three changes, each 0 to 9% alone: 128-deep K steps (64
+   contiguous bytes of each weight row per step, half the barriers; a
+   64-deep step closes a K that is an odd multiple of 64), one uint4 run
+   of 32 codes per thread with one scale and bias instead of single code
+   words, and the B tile's rows padded by 8 elements (bank spread for the
+   tile's columns). Together, bit-identical to the previous kernel
+   (kept test-only in `tests/metal/quant_test.metal`), harness ms per
+   layer at 4 096-token chunks: gate+up 7.92 to 6.79 (33.9 to 39.5
+   TFLOP/s), down 4.17 to 3.60 (32.2 to 37.3); at 8 192 (160 rows per
+   expert) 39.0 to 45.1 and 36.1 to 41.2. In the model's profile at a 16K
+   real-text prompt per chunk: gate+up 397 to 338 ms (32.4 to 38.1
+   TFLOP/s), down 208 to 179 (31.0 to 36.0). lily-bench, ABBA x3: +5.4%
+   at 4K, +6.0% at 16K; HTTP with the two items below, fresh prompts, a
+   fresh server per session, 3 per build: 4K 2 394 to 2 538 tok/s, 16K
+   2 327 to 2 463, 64K 2 249 to 2 395 (+6.0 / +5.8 / +6.5%). In the same
+   change set, bit-identical: the MoE
+   combine and the gated shared-expert add in one pass (32.7 to 23.6 ms per
+   chunk) and the expert offset scan over a threadgroup (2.4 to 0.27 ms).
 
 1. **Sparse attention and indexer scores per query on the tensor ops**
    (2026-10-01). Past 16K the tiled route of item 2 was what grew with
@@ -659,7 +684,13 @@ none is kept behind a knob. The reason is what the measurement said.
 
 | tried | measured | why it lost |
 |---|---|---|
-| grouped expert GEMM with a 128-deep K step (half the B-tile barriers per FLOP) | within 2% of the 64-deep one | the barriers were not the cost |
+| grouped expert GEMM with a 128-deep K step alone (half the B-tile barriers per FLOP) | within 2% of the 64-deep one | kept since 2026-10-01 together with run loads and a padded tile, which is where it pays |
+| expert GEMM B tile double-buffered (next step's weights loaded into registers across the product), with one or two tiles | 8.1 to 11.9 against 7.5 to 7.9 ms gate+up per layer; with one tile on the shipped kernel 6.93 against 6.82 | registers held across the product; the product does not overlap the loads |
+| expert GEMM warp-specialized: 4 consumer simdgroups on single-simdgroup products, 2 or 4 producer simdgroups streaming the next tile | 11.0 / 8.0 against 7.9 ms (bit-identical) | two producers cannot keep up; four equal the plain kernel |
+| expert GEMM grid with a row tile's column blocks on one grid x (oMLX's tile-on-x), or expert-major block order | 4 to 5% slower; equal | not this GPU's lever at 40 cores |
+| expert GEMM 128-row tiles with 16/32/64/96/128 heights, 4 or 8 simdgroups; a 48-row height | equal; 48 rows 55% slower | re-reads of an expert's weights already hit the cache |
+| gate and up in one kernel with the SwiGLU epilogue (two accumulators on 4 simdgroups, or gate and up on 8 simdgroups exchanging through threadgroup memory; bit-identical) | 8.4 to 8.8 against 7.1 ms for both GEMMs plus `silu_mul` | twice the accumulator registers per thread, or half the threadgroups per core |
+| the gate/up GEMM reading token rows through the sorted row map, A staged in threadgroup memory 64 K at a time (bit-identical) | 10.1 against 7.3 ms for gather plus both GEMMs | a 128-deep A tile and the B tile do not fit 32 KB together; staging A costs more than the 27 ms gather per chunk |
 | grouped expert GEMM row tiles of 32, 96 and 128 rows | 645 / 659 / 698 to 759 ms against 593 to 622 per chunk | tensor work on padded rows; solved instead by the last-tile heights |
 | a 32-query tile for the staged attention kernel | 4.68 against 3.89 ms per 256-query dispatch at 8K, 13.1 against 7.6 at 32K | the union grows faster than the reuse; the kernel was bound per slice, not per gather |
 | the staged attention kernel with 8 simdgroups, 16-row slices, two staged slices, two heads per pass | all slower | same: a serial chain of gathered fetches, dependent tensor ops and barriers per slice |
@@ -869,11 +900,14 @@ server:
   step) for a server that serves one agent at a time by design.
 
 **Prefill has two levers left, both against ceilings already measured.**
-The grouped expert GEMM runs at about 34 TFLOP/s against the dense GEMM's
-54 on the same GPU, 34% of the chunk; with padding at 10% and the K step and
-tile heights swept, what separates them is the per-tile dequantization and
-the expert-grouped B tiles, and closing the gap would be a new kernel with
-no measured design to point at. The gathered-row attention runs at the dense
+The grouped expert GEMM runs at about 38 TFLOP/s against the dense GEMM's
+54 on the same GPU, about 32% of the chunk. The ablations of 2026-10-01
+say what separates them: with no B-tile refresh the same kernel runs at 51
+to 54, so it is the weight stream, whose loads the tensor-op product does
+not overlap (double buffering, register prefetch and producer simdgroups
+all measured equal or slower). A kernel that hides them would need either
+more resident threadgroups per core or loads that bypass the registers;
+neither has a measured design here. The gathered-row attention runs at the dense
 kernel's rate and its gather is at bandwidth, so the only lever there is
 gathering less, which the tile union already sets. The GDN scan streams
 rows at the level ceiling. The elementwise glue is 9% of a chunk in about

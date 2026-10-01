@@ -287,12 +287,29 @@ profile:
 
 | kernel                                       | ms    | share | achieved   |
 |----------------------------------------------|------:|------:|------------|
-| grouped Q4 expert GEMM                       | 572   | 34%   | about 34 TFLOP/s |
+| grouped Q4 expert GEMM                       | 572   | 34%   | about 34 TFLOP/s (38 since 2026-10-01, below) |
 | dense bf16 GEMM (tensor ops)                 | 554   | 33%   | 54 TFLOP/s |
 | sparse attention over gathered rows + gather | 134 + 29 | 10% | about 25 TFLOP/s; the gather at 400 to 460 GB/s |
 | GDN prefill scan, chunked (scan + WY pass)   | 72 + 31 | 6%  | bound by streaming each chunk's rows |
 | hyper-connection mix and inject              | 79    | 5%    |            |
 | norms, MoE row gather and combine, convolutions, gates, indexer | 233 | 14% | |
+
+The MoE feed-forward of a chunk runs on the GPU end to end: the router
+GEMM and a per-row top-k, a counting sort of the routed (row, expert) pairs
+by expert (histogram, an offset scan over one threadgroup, an atomic
+scatter), a copy of each pair's input row into expert-sorted order
+(`gather_rows_bf16`, 27 ms per chunk), a block map of (first row, expert's
+weight row, column, end row) per 64-row tile and 64-column block, the
+grouped gate and up GEMMs, `silu_mul`, the grouped down GEMM, and one pass
+that combines each row's ten expert outputs in slot order and adds the
+gated shared expert. The grouped GEMM's threadgroup dequantizes its
+expert's 64 x 128 B tile per K step into threadgroup memory (one uint4 run
+of 32 codes, one scale and one bias per thread; rows padded by 8 elements)
+and accumulates its rows' product with the A rows read from device memory
+by the tensor op; an expert's last, partial tile runs at the smallest of
+64, 32 and 16 rows that covers it. At a 16K real-text prompt the gate and
+up GEMMs take 338 ms per chunk (38 TFLOP/s), the down GEMM 179 (36). What
+it still loses to the dense GEMM is the weight stream (performance.md).
 
 (That table is from before the per-query sparse attention described below.
 At a 16K real-text prompt the per-kernel profile now reads 118 ms per chunk
