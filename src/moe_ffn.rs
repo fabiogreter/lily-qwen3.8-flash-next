@@ -303,7 +303,7 @@ pub(crate) struct PrefillMoeIo<'a> {
 /// softmax/top-k → then either (grouped route, m > 8) counting sort
 /// (histogram, serial scans, atomic scatter) → GPU-built block map
 /// (sentinel-padded to a readback-free capacity bound) → grouped expert GEMMs
-/// → per-row combine → gated shared-expert add, or (small-m route, m <= 8)
+/// → per-row combine with the gated shared-expert add, or (small-m route, m <= 8)
 /// the two fused small-batch expert kernels (gate + up + SwiGLU over the
 /// union of the routed experts; down + combine + shared add per row), the
 /// batched shape of the decode gathers. No host round-trip and no per-layer
@@ -516,13 +516,20 @@ pub(crate) fn prefill_moe(
         nb_dn,
         tile,
     )?;
-    pass.level_barrier(&[&ms.ed])?;
-    moe::moe_combine_rows(ctx, pass, &ms.ed, &ms.slot_of, &ms.scores, io.out, top_k)?;
-
-    // Both chains are complete: the routed sum is in `out`, the shared
-    // expert in `shared_out`.
-    pass.level_barrier(&[io.out, &ms.shared_out])?;
-    moe::moe_row_gate_add(ctx, pass, &ms.shared_out, &ms.shared_gate, io.out)
+    // Both chains are complete: the routed rows are in `ed`, the shared
+    // expert in `shared_out`; one pass combines and adds them.
+    pass.level_barrier(&[&ms.ed, &ms.shared_out])?;
+    moe::moe_combine_rows_gate_add(
+        ctx,
+        pass,
+        &ms.ed,
+        &ms.slot_of,
+        &ms.scores,
+        &ms.shared_out,
+        &ms.shared_gate,
+        io.out,
+        top_k,
+    )
 }
 
 /// With a served expert cache: has the routed ids in `indices` (`count`

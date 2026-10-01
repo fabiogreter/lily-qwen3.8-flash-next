@@ -694,6 +694,61 @@ pub fn moe_combine_rows(
     )
 }
 
+/// [`moe_combine_rows`] then [`moe_row_gate_add`] in one dispatch:
+/// `out[row] = bf16(bf16(Σ_k scores[row,k] * ed[slots[row,k]]) +
+/// sigmoid(gate[row]) * shared[row])`, bit-identical to the two passes.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_combine_rows_gate_add(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    ed: &Tensor,
+    slots: &Tensor,
+    scores: &Tensor,
+    shared: &Tensor,
+    gate: &Tensor,
+    out: &Tensor,
+    top_k: usize,
+) -> Result<()> {
+    ensure!(out.shape().len() == 2, "out must be [m, h]");
+    let (m, h) = (out.shape()[0], out.shape()[1]);
+    ensure!(h.is_multiple_of(4), "combine needs h % 4 == 0 (got {h})");
+    ensure!(
+        ed.dtype() == DType::BF16 && ed.numel().is_multiple_of(h),
+        "ed must be [S, h]"
+    );
+    ensure!(
+        slots.dtype() == DType::U32 && slots.numel() == m * top_k,
+        "slots must be U32 [m, top_k]"
+    );
+    ensure!(
+        scores.dtype() == DType::F32 && scores.numel() == m * top_k,
+        "scores must be F32 [m, top_k]"
+    );
+    ensure!(
+        shared.numel() == m * h && shared.dtype() == DType::BF16,
+        "shared must be BF16 [m, h]"
+    );
+    ensure!(
+        gate.numel() == m && gate.dtype() == DType::BF16,
+        "gate logits must be BF16 [m]"
+    );
+    let pipeline =
+        ctx.pipeline("moe_combine_rows_gate_add", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            ed.binding(),
+            slots.binding(),
+            scores.binding(),
+            shared.binding(),
+            gate.binding(),
+            out.binding(),
+        ],
+        &[&u32_bytes(h), &u32_bytes(top_k)],
+        Grid::Threads { grid: (h / 4, m, 1), threadgroup: (32, 1, 1) },
+    )
+}
+
 /// `dst[r, :] += sigmoid(gate[r]) * src[r, :]` (prefill shared-expert add).
 pub fn moe_row_gate_add(
     ctx: &MetalContext,

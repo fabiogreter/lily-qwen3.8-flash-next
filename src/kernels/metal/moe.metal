@@ -725,6 +725,35 @@ kernel void moe_combine_rows(device const bfloat* ed     [[buffer(0)]],  // [S, 
     ((device bfloat4*)(out + (ulong)row * H))[c4] = bfloat4(acc);
 }
 
+// moe_combine_rows followed by moe_row_gate_add in one pass: the combined
+// row is rounded to bf16 as moe_combine_rows stores it, then the gated
+// shared expert is added and rounded as moe_row_gate_add does.
+kernel void moe_combine_rows_gate_add(device const bfloat* ed     [[buffer(0)]],  // [S, H]
+                                      device const uint*   slots  [[buffer(1)]],  // [m, K]
+                                      device const float*  scores [[buffer(2)]],  // [m, K]
+                                      device const bfloat* shared [[buffer(3)]],  // [m, H]
+                                      device const bfloat* gate   [[buffer(4)]],  // [m]
+                                      device bfloat*       out    [[buffer(5)]],  // [m, H]
+                                      constant uint&       H      [[buffer(6)]],
+                                      constant uint&       TOPK   [[buffer(7)]],
+                                      uint2 gid [[thread_position_in_grid]]) {
+    const uint c4 = gid.x;
+    const uint row = gid.y;
+    if (c4 * 4 >= H) {
+        return;
+    }
+    float4 acc = float4(0.0f);
+    for (uint k = 0; k < TOPK; ++k) {
+        uint slot = slots[row * TOPK + k];
+        float s = scores[row * TOPK + k];
+        acc += s * float4(((device const bfloat4*)(ed + (ulong)slot * H))[c4]);
+    }
+    const float g = 1.0f / (1.0f + exp(-float(gate[row])));
+    const float4 src = float4(((device const bfloat4*)(shared + (ulong)row * H))[c4]);
+    ((device bfloat4*)(out + (ulong)row * H))[c4] =
+        bfloat4(float4(bfloat4(acc)) + g * src);
+}
+
 kernel void fill_zero_u32(device uint* dst [[buffer(0)]],
                           constant uint& N [[buffer(1)]],
                           uint i [[thread_position_in_grid]]) {

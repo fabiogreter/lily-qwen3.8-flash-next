@@ -313,6 +313,67 @@ fn combine_rows_matches_cpu() {
     cpu_ref::assert_close(&t_out.to_f32().expect("read"), &expected, 1e-2, 1e-2);
 }
 
+/// The prefill combine fused with the gated shared-expert add reproduces
+/// `moe_combine_rows` followed by `moe_row_gate_add` bit for bit at the
+/// model's width and top-k (slots shared and repeated across rows, gate
+/// logits on both sides of zero and in sigmoid's flat tails), and the CPU
+/// definition within bf16 rounding.
+#[test]
+fn combine_rows_gate_add_matches_the_two_passes() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(43);
+    let (m, h, k) = (37usize, 2560usize, 10usize);
+    let s = m * k;
+    let ed = random_vec(&mut rng, s * h, -1.0, 1.0);
+    let slots: Vec<u32> = (0..m * k).map(|_| rng.gen_range(0..s as u32)).collect();
+    let scores = random_vec(&mut rng, m * k, 0.0, 0.3);
+    let shared = random_vec(&mut rng, m * h, -2.0, 2.0);
+    let gate = random_vec(&mut rng, m, -12.0, 12.0);
+
+    let t_ed = Tensor::from_f32_as_bf16(&ctx, &ed, &[s, h]).expect("ed");
+    let t_slots =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&slots), &[m, k], DType::U32)
+            .expect("slots");
+    let t_scores = Tensor::from_f32(&ctx, &scores, &[m, k]).expect("scores");
+    let t_shared = Tensor::from_f32_as_bf16(&ctx, &shared, &[m, h]).expect("shared");
+    let t_gate = Tensor::from_f32_as_bf16(&ctx, &gate, &[m]).expect("gate");
+    let two = Tensor::zeros(&ctx, &[m, h], DType::BF16).expect("out");
+    let fused = Tensor::zeros(&ctx, &[m, h], DType::BF16).expect("out");
+
+    let pass = ctx.begin().expect("pass");
+    moe_combine_rows(&ctx, &pass, &t_ed, &t_slots, &t_scores, &two, k)
+        .expect("combine");
+    moe_row_gate_add(&ctx, &pass, &t_shared, &t_gate, &two).expect("gate add");
+    moe_combine_rows_gate_add(
+        &ctx, &pass, &t_ed, &t_slots, &t_scores, &t_shared, &t_gate, &fused, k,
+    )
+    .expect("fused");
+    pass.commit_wait().expect("commit");
+
+    let bits = |t: &Tensor| -> Vec<u32> {
+        t.to_f32().expect("read").iter().map(|v| v.to_bits()).collect()
+    };
+    assert_eq!(bits(&fused), bits(&two), "fused combine differs from the two passes");
+
+    let red = cpu_ref::round_bf16(&ed);
+    let rsh = cpu_ref::round_bf16(&shared);
+    let rg = cpu_ref::round_bf16(&gate);
+    let mut expected = vec![0.0f32; m * h];
+    for row in 0..m {
+        let g = 1.0 / (1.0 + (-rg[row]).exp());
+        for c in 0..h {
+            let mut acc = 0.0f32;
+            for kk in 0..k {
+                let slot = slots[row * k + kk] as usize;
+                acc += scores[row * k + kk] * red[slot * h + c];
+            }
+            expected[row * h + c] =
+                cpu_ref::round_bf16(&[acc])[0] + g * rsh[row * h + c];
+        }
+    }
+    cpu_ref::assert_close(&fused.to_f32().expect("read"), &expected, 2e-2, 2e-2);
+}
+
 /// Builds a random 4-bit stacked expert weight (`[e * n, k]`, gs 64 when
 /// `gs` is 0) plus its exact dequantized f32 image.
 fn random_quant_stack(
