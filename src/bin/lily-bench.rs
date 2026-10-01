@@ -200,9 +200,35 @@ fn kernel_profile_report(passes: &[PassProfile]) -> serde_json::Value {
             span_secs / count * 1e3,
             (span_secs - kernel_secs) / count * 1e3
         );
+        // Per pass (a prefill label has one pass per chunk, in completion
+        // order): the kernels' GPU ms, so growth with context depth shows.
+        let per_pass: Vec<serde_json::Value> = group
+            .iter()
+            .map(|pass| {
+                let mut ms: HashMap<&'static str, f64> = HashMap::new();
+                for sample in &pass.kernels {
+                    *ms.entry(sample.name).or_insert(0.0) += sample.gpu_secs * 1e3;
+                }
+                serde_json::json!(ms)
+            })
+            .collect();
+        if group.len() > 1 {
+            let (first, last) = (&per_pass[0], &per_pass[group.len() - 1]);
+            let ms = |pass: &serde_json::Value, name: &str| {
+                pass.get(name).and_then(serde_json::Value::as_f64).unwrap_or(0.0)
+            };
+            eprintln!("  first vs last pass, ms (kernels over 1 ms in either):");
+            for (name, _, _) in &rows {
+                let (a, b) = (ms(first, name), ms(last, name));
+                if a.max(b) >= 1.0 {
+                    eprintln!("  {a:>9.3}  {b:>9.3}  {:>+8.3}  {name}", b - a);
+                }
+            }
+        }
         tables.push(serde_json::json!({
             "label": label,
             "passes": group.len(),
+            "per_pass_ms": per_pass,
             "dispatches_per_pass": dispatches as f64 / count,
             "kernel_sum_ms_per_pass": kernel_secs / count * 1e3,
             "pass_span_ms_per_pass": span_secs / count * 1e3,
