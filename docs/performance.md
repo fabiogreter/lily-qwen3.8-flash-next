@@ -446,7 +446,68 @@ The dense GEMM runs at 54 TFLOP/s, the ceiling this GPU reached on any
 shape; the expert GEMM at about 34 by the same accounting. The kept work,
 in order of size:
 
-1. **Tiled sparse attention over gathered rows.** Past the dense limit the
+1. **Sparse attention and indexer scores per query on the tensor ops**
+   (2026-10-01). Past 16K the tiled route of item 2 was what grew with
+   depth: its union of 16 queries' selections, all masked work beyond one
+   query's own blocks, and the copy of the union's rows. At a 64K real-text
+   prompt the chunk from 60K to 64K spent 505 + 150 ms in the tiled
+   attention and its gather, and 216 ms in the scalar indexer scores, of a
+   2 653 ms kernel sum (1 795 for the first chunk). `qsa_attn_gqa_nax` runs
+   one threadgroup per (query, KV head) over the query's own blocks and
+   tail, the GQA group's 12 heads as the rows of a 16-row tensor-op tile, K
+   and V read from the cache into the register operands, no scratch
+   (architecture.md, "Prefill"); `qsa_scores_nax` scores a sub-batch as a
+   GEMM with the ReLU and head sum in the epilogue. In the same profile the
+   last chunk's attention takes 176 ms and its scores 39, the mean
+   attention per chunk 161 ms against 480, the mean scores 21 against 114;
+   the kernel sum of the last chunk is 2 133 ms, of which only 175 is QSA
+   growth over the first chunk (815 before). In the harness (256 queries,
+   2 KV heads, 512-block budget) the attention takes 0.67 / 0.69 / 0.71 ms
+   at 8K / 32K / 64K against 0.55 + 1.95, 1.19 + 3.30 and 1.51 + 3.67 for
+   the tiled gather + attention: flat in depth, about 18 useful TFLOP/s.
+   lily-bench, real text (a cargo-registry corpus), interleaved ABBA, three
+   repeats, against `3cfdd49`; the 64-step plain decode of each run is the
+   clock canary (about 80 tok/s in the full clock state, 64 in the
+   sustained-load sag, the code path is unchanged), so pairs are read
+   within a state:
+
+   | prompt | before, tok/s | after | change, same clock state |
+   |---|---:|---:|---:|
+   | 4K | 2 269 / 2 342 | 2 588 / 2 590 | +12% |
+   | 16K | 2 212 to 2 224 | 2 399 to 2 422 | +8% (all three pairs) |
+   | 32K | 1 879 to 1 963 | 2 252 | +15 to 19% (the other two runs sagged: 1 650 / 1 681) |
+   | 64K | 1 812 (full clock), 1 420 / 1 443 (sagged) | 2 110, 1 721 / 1 741 | +16%, +21% |
+
+   Over HTTP (`tools/bench/http_bench.py matrix`, fresh prompts from
+   cargo-registry regions no earlier run used, a fresh server per session
+   with no disk tier and the n-gram preload awaited, three sessions per
+   build alternating, 20 s apart), median (min to max) prefill tok/s and
+   GPU s:
+
+   | prompt | before | after | GPU s before / after |
+   |---|---:|---:|---:|
+   | 4K (one chunk plus a 7-token tail) | 2 236 (2 062 to 2 277) | 2 225 (2 176 to 2 357) | 1.77 / 1.76 |
+   | 16K | 2 070 (2 038 to 2 078) | 2 207 (2 145 to 2 290), +7% | 7.53 / 7.04 |
+   | 64K | 1 785 (1 757 to 1 825) | 2 255 (2 246 to 2 258), +26% | 36.3 / 28.7 |
+
+   Decode is not changed: batches under 16 rows (decode, verify, the draft
+   head's steps) keep the scalar scores and the split kernel.
+
+   Numerics: the attention's online softmax now steps over a query's own
+   keys 32 at a time (the tiled route stepped over union rows 128 at a
+   time), and the scores accumulate in another order, so a block near the
+   512th score can change sides. lily-probe top-64 logits on six real
+   prompts (three corpora, 16K and 64K), teacher-forced on `3cfdd49`'s
+   greedy path for 9 steps, against the band `3cfdd49`'s own variants span
+   (`LILY_QSA_ROUTE=split`, `LILY_PREFILL_CHUNK=8192`): the last prefill
+   row's max |dlogit| 1.90 / 0.70 / 1.34 / 1.86 / 0.86 / 1.12 against the
+   variants' 1.83 / 0.76 / 2.15 / 2.52 / 1.63 / 1.86; argmax changes only
+   at near-ties (reference margins 0.40 and 0.57, and one decode step of the
+   mixed 64K prompt), as the split variant's do on two of the six prompts.
+   With the scalar scores kept (`LILY_QSA_SCORES=scalar`) the attention
+   alone stays at 0.66 to 1.57.
+2. **Tiled sparse attention over gathered rows** (replaced by item 1 on
+   2026-10-01; kept here for its measurements). Past the dense limit the
    per-query kernel attended to each query's 512 selected blocks with no
    reuse and no tensor operations, 40% of the chunk at 2.1 TFLOP/s. The
    tiled route merges 16 consecutive queries' selections into one block list
@@ -465,7 +526,7 @@ in order of size:
    online softmax's order); the 4-layer tile-against-split comparison stays
    within 0.011 on a logit scale of 2.93. The rows of a chunk whose causal
    window fits the budget take the dense kernel, which is exact for them.
-2. **The expert GEMM's last tiles.** With about 80 routed rows per expert per
+3. **The expert GEMM's last tiles.** With about 80 routed rows per expert per
    chunk, 64-row tiles padded the rows by 47% and the tensor work on the
    padding was what the kernel paid for (a row-tile sweep, 32 / 64 / 96 /
    128 rows, had put every other height further behind). An expert's last
@@ -474,7 +535,7 @@ in order of size:
    grouped GEMMs per 8K prefill 573 to 583 ms against 666 to 677 in paired
    profiles (14% off the kernel), 628 against 710 per 32K prefill, 229 to
    232 against 246 per 1K prefill.
-3. **The GDN prefill scan in chunked form on the tensor ops.** The scan over
+4. **The GDN prefill scan in chunked form on the tensor ops.** The scan over
    a chunk's rows was a token-serial recurrence, one simdgroup per head; it
    first gained four value columns per simdgroup (384 to 281 ms per 8K chunk
    in the profile), and then left the serial form for batches of 128 rows or
@@ -491,13 +552,13 @@ in order of size:
    inside the band the serial variants already span (above). A batch's
    ragged tail continues through the serial scan, which also serves the
    verify passes and records the per-row states the rollback needs.
-4. **The block selection without serial steps**: a radix select over the
+5. **The block selection without serial steps**: a radix select over the
    block scores with scan-picked digits and one compaction scan, 15.6 to
    2.6 ms per 8K prefill and 30.1 to 13.1 per 32K; then 512 threads per
    query. **The MoE input gather** moving eight bf16 elements per thread on
    its aligned rows, 1.07 to 0.52 ms per call, about 26 ms per 8K chunk.
    **The dense rows below the limit** through the dense kernel.
-5. **The n-gram staging off the critical path** (host side, bit-identical;
+6. **The n-gram staging off the critical path** (host side, bit-identical;
    `docs/architecture.md`, "Memory layout"). With the table partly cold, the
    state the service is in under interactive use (18 of 32 GB resident),
    staging a fresh prompt's rows cost 0.6 / 1.7 / 3.4 s at 4K / 16K / 64K.
@@ -607,6 +668,10 @@ none is kept behind a knob. The reason is what the measurement said.
 | the gather double-buffered (each group's gather on the previous group's level) | 3.14 against 2.76 and 5.78 against 5.06 ms by the clock | the two groups' rows compete for the cache that the single group fits |
 | the gather split over eight threadgroups per tile | no change | bandwidth-bound either way |
 | a row scratch of 1.1 GB (every tile at once) or 256 MB (three tiles) instead of 512 MB | equal at 32K and 7% slower at 8K; 60 to 70% slower | a group's rows fitting the cache matters more than dispatch width |
+| the per-query attention with 64 keys per step (two score fragments per barrier) | 1.95 against 0.75 ms per 256-query dispatch at 64K | register pressure: the tensor ops take register operands only at 16 or 32 per side, and two steps' operands spill |
+| the per-query attention with 16-byte K/V/Q loads (the head dims permuted within each 32-dim chunk) | 1.03 to 1.05 against 0.69 to 0.72 ms (medians, 8K to 64K) | slower despite half the load instructions |
+| the per-query attention with the step's V rows requested before the score exchange; Q held in registers across steps | 0.75 to 0.78 and 0.77 to 0.81 against 0.69 to 0.72 ms | registers held across the step cost more occupancy than the latency they hide |
+| the per-query attention over 1 024- or 4 096-query sub-batches (fewer dispatches) | 2.6 to 2.8 us per query at every size | a 256-query dispatch already fills the GPU for its duration |
 | the chunked GDN scan with 8, 32, 64 or 128 state columns per threadgroup | 3.8 / 2.2 / 2.8 / 3.2 ms against 1.9 (16 columns) | narrower doubles the row bytes, wider runs too few threadgroups to hide the dependent-product latency |
 | the chunked GDN scan with eight simdgroups, pre-transposed keys, next-chunk prefetch touches, fp16 operand copies | no gain | the pass streams rows; none of these change the bytes |
 | the four-column serial scan kept for batches over 128 rows | 171 to 190 against 99 to 109 ms per 8K prefill | the serial recurrence |
@@ -875,10 +940,11 @@ target/release/lily-bench \
 results are garbage, the step time without a group is its marginal cost in
 the level chain. `LILY_GDN_SCAN_KERNEL=gdn_prefill_regscan` routes every
 prefill through the token-serial scan, `LILY_QSA_ROUTE=split` through the
-per-query attention kernel, for comparisons against the shipped kernels.
+decode-style split attention kernel, `LILY_QSA_SCORES=scalar` through the
+scalar indexer scores, for comparisons against the shipped kernels.
 The timing harnesses (`cargo test --release --lib -- --ignored <name>`):
 `level_size_bandwidth_probe`, the `*_chain_timing` tests per kernel family,
-`tiled_attention_timing`, `gdn_prefill_scan_timing`; each takes an env
+`query_attention_timing`, `gdn_prefill_scan_timing`; each takes an env
 variable listing the kernel variants to rotate, named in its source.
 
 ### The matrix

@@ -38,9 +38,7 @@ use crate::kernels::hc::{
 };
 use crate::kernels::norm::rmsnorm_bf16;
 use crate::kernels::ple;
-use crate::kernels::qsa::{
-    self, INDEXER_D, SparseAttnRoute, SparseSplitScratch, SparseTileScratch,
-};
+use crate::kernels::qsa::{self, INDEXER_D, SparseAttnRoute, SparseSplitScratch};
 use crate::kernels::sample::{
     DraftDists, SamplerScratch, SamplingParams, sample_f32, sample_spec_f32,
 };
@@ -342,8 +340,6 @@ pub struct Qwen4ExpModel {
     /// the larger chunk streams the cold experts half as often per token,
     /// see docs/low-ram-experts.md for why it is not the default).
     prefill_chunk: usize,
-    /// Bytes the gathered-row scratch of the tiled sparse attention may take.
-    tile_row_budget: usize,
     /// Whether a multi-chunk prefill stages chunk k+1's n-gram rows while
     /// the GPU runs chunk k (paged table only; on by default, off for the
     /// bit-identity test of the staging pipeline).
@@ -738,8 +734,6 @@ struct QsaScratch {
     partials: Tensor,
     /// F32 `[slots * NQ, 2]`.
     stats: Tensor,
-    /// Per-tile unions for the tiled route.
-    tiles: SparseTileScratch,
     /// How sub-batches past the dense limit attend (`LILY_QSA_ROUTE`).
     route: SparseAttnRoute,
 }
@@ -750,7 +744,6 @@ impl QsaScratch {
         cfg: &Qwen4ExpConfig,
         max_seq: usize,
         qb: usize,
-        row_budget: usize,
     ) -> Result<Self> {
         let idx = &cfg.indexer;
         let max_blocks = (max_seq / idx.compress_ratio).max(1);
@@ -763,15 +756,6 @@ impl QsaScratch {
             n_sel: Tensor::zeros(ctx, &[qb], DType::U32)?,
             partials: Tensor::zeros(ctx, &[slots * nq, cfg.head_dim], DType::F32)?,
             stats: Tensor::zeros(ctx, &[slots * nq, 2], DType::F32)?,
-            tiles: SparseTileScratch::new(
-                ctx,
-                qb,
-                max_blocks,
-                k_max,
-                cfg.num_key_value_heads,
-                idx.compress_ratio,
-                row_budget,
-            )?,
             route: SparseAttnRoute::from_env(),
         })
     }
@@ -1202,7 +1186,6 @@ impl PrefillScratch {
         max_seq: usize,
         table: Option<&NgramTable>,
         with_mtp: bool,
-        row_budget: usize,
     ) -> Result<Self> {
         ensure!(capacity > 0, "prefill scratch capacity must be nonzero");
         let m = capacity;
@@ -1252,13 +1235,7 @@ impl PrefillScratch {
                 Tensor::zeros(ctx, &[rows, width], bf)?
             },
             moe: PrefillMoeScratch::new(ctx, &moe_dims(cfg), m)?,
-            qsa: QsaScratch::new(
-                ctx,
-                cfg,
-                max_seq,
-                QSA_QUERY_BATCH.min(m),
-                row_budget,
-            )?,
+            qsa: QsaScratch::new(ctx, cfg, max_seq, QSA_QUERY_BATCH.min(m))?,
             ple: table.map(|t| PleScratch::new(ctx, cfg, m, t, true)).transpose()?,
             mtp_hyper: with_mtp
                 .then(|| Tensor::zeros(ctx, &[m, cfg.hc_width()], bf))
@@ -1324,7 +1301,6 @@ impl PrefillScratch {
                 n_sel: self.qsa.n_sel.view(0, self.qsa.n_sel.shape())?,
                 partials: self.qsa.partials.view(0, self.qsa.partials.shape())?,
                 stats: self.qsa.stats.view(0, self.qsa.stats.shape())?,
-                tiles: self.qsa.tiles.share()?,
                 route: self.qsa.route,
             },
             ple: self.ple.as_ref().map(|p| p.rows(m)).transpose()?,
@@ -1431,7 +1407,6 @@ impl Qwen4ExpModel {
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|c| c.is_power_of_two() && (256..=PREFILL_CHUNK * 2).contains(c))
             .unwrap_or(PREFILL_CHUNK);
-        let tile_row_budget = qsa::tile_row_budget();
         Ok(Self {
             config,
             weights,
@@ -1440,7 +1415,6 @@ impl Qwen4ExpModel {
             gdn_gate,
             hasher,
             prefill_chunk,
-            tile_row_budget,
             ngram_ahead: true,
         })
     }
@@ -1757,7 +1731,7 @@ impl Qwen4ExpModel {
             attn_gated: Tensor::zeros(ctx, &[nq * hd], bf)?,
             idx_qk: Tensor::zeros(ctx, &[(nh + 1) * INDEXER_D], bf)?,
             idx_q: Tensor::zeros(ctx, &[nh, INDEXER_D], bf)?,
-            qsa: QsaScratch::new(ctx, cfg, capacity_tokens, 1, 0)?,
+            qsa: QsaScratch::new(ctx, cfg, capacity_tokens, 1)?,
             ple: self
                 .ple_table()
                 .map(|t| PleScratch::new(ctx, cfg, 1, t, false))
@@ -1803,7 +1777,6 @@ impl Qwen4ExpModel {
                 MAX_SEQ,
                 self.ple_table(),
                 self.weights.mtp.is_some(),
-                self.tile_row_budget,
             )?);
         }
         Ok(())
@@ -2871,41 +2844,23 @@ impl Qwen4ExpModel {
                         base,
                         self.attn_scale,
                     )?,
-                    SparseAttnRoute::Tiled => {
-                        let tiles = &ps.qsa.tiles;
-                        qsa::qsa_tile_union(
-                            ctx,
-                            pass,
-                            &ps.qsa.sel,
-                            &ps.qsa.n_sel,
-                            tiles,
-                            qb,
-                            idx.block_topk(),
-                            idx.compress_ratio,
-                            base,
-                        )?;
-                        pass.level_barrier(&[
-                            &tiles.union_blk,
-                            &tiles.union_mask,
-                            &tiles.n_union,
-                            &tiles.tail_mask,
-                        ])?;
-                        qsa::qsa_attention_tiled(
-                            ctx,
-                            pass,
-                            &q,
-                            k_cache,
-                            v_cache,
-                            tiles,
-                            &out,
-                            qb,
-                            idx.compress_ratio,
-                            base,
-                            self.attn_scale,
-                        )?;
-                    }
+                    SparseAttnRoute::Query => qsa::qsa_attention_query(
+                        ctx,
+                        pass,
+                        &q,
+                        k_cache,
+                        v_cache,
+                        &ps.qsa.sel,
+                        &ps.qsa.n_sel,
+                        &out,
+                        qb,
+                        idx.block_topk(),
+                        idx.compress_ratio,
+                        base,
+                        self.attn_scale,
+                    )?,
                 }
-                // The next sub-batch reuses the score/selection/union scratch.
+                // The next sub-batch reuses the score and selection scratch.
                 pass.level_barrier(&[&out])?;
             }
         }
@@ -4225,8 +4180,8 @@ impl LanguageModel for Qwen4ExpModel {
 }
 
 #[cfg(test)]
-#[path = "../../tests/unit/qwen4exp/qsa_tiles.rs"]
-mod qsa_tile_tests;
+#[path = "../../tests/unit/qwen4exp/qsa_routes.rs"]
+mod qsa_route_tests;
 
 #[cfg(test)]
 #[path = "../../tests/unit/qwen4exp/prefill.rs"]

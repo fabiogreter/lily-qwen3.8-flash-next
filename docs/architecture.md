@@ -294,6 +294,12 @@ profile:
 | hyper-connection mix and inject              | 79    | 5%    |            |
 | norms, MoE row gather and combine, convolutions, gates, indexer | 233 | 14% | |
 
+(That table is from before the per-query sparse attention described below.
+At a 16K real-text prompt the per-kernel profile now reads 118 ms per chunk
+for the sparse attention, 6.8 for the indexer scores and 5.6 for the
+selection, against 213 + 49 (attention + gather), 25 and 5.9 for the tiled
+route: 131 against 294 ms of a 1 703 against 1 849 ms kernel sum.)
+
 At a 1K prompt, where attention is dense, the grouped expert GEMM and the
 dense GEMM dominate alike. The per-query sparse-attention kernel had been the
 outlier: past the dense limit the whole chunk ran through the decode-style
@@ -305,29 +311,46 @@ at 29 on the same head shapes.
 Two things addressed it. The rows of a chunk whose causal window still fits
 the budget (the prefix up to the dense limit) take the dense kernel, which
 is exact for them, and only the rest goes through the indexer. And the
-default route past the limit is now **tiled**: `qsa_tile_union` merges the
-selections of 16 consecutive queries into one ascending block list with a
-query mask per block, `qsa_tile_gather` copies the union's K and V rows
-(and each row's query mask) once per KV head into a contiguous device
-scratch, and `qsa_attn_rows_nax_h1` runs the dense kernel's tensor-op
-flash loop over that scratch, one query head per threadgroup, 128 keys per
-slice read straight from device memory, each query masked to its own
-selection. The gain rests on how much neighbouring queries' selections
-overlap, which the union kernel measures: on real text (this repository's
-documentation) a tile's union is 1.9 times one query's 512 blocks at 8K
-and 3.2 times at 32K, against 16 for disjoint selections. The first tiled
-kernel staged the union's rows into threadgroup memory 32 at a time
-instead; taken apart in the harness it was a serial chain of gathered
-fetches, dependent tensor ops and barriers per slice, and the gathered-row
-kernel halves its time (`docs/performance.md`, item 1). The scratch is
-512 MB (`LILY_QSA_ROWS_MB`): at 32K contexts and beyond a 256-query batch
-is gathered and attended in groups of six tiles, which measured no
-slower than every tile at once and faster at 8K. Measured on
-the full model in the per-kernel profile: the sparse attention of a pass
-past the dense limit takes 153 + 35 ms (attention + gather) at 8K and
-about 300 + 78 at 32K, against 1 200 and 1 480 for the per-query kernel.
-`LILY_QSA_ROUTE=split` restores the per-query kernel. Sub-batches under 16 rows (the verify
-pass) keep the split kernel.
+route past the limit runs on the tensor ops, **one query at a time**:
+`qsa_attn_gqa_nax` takes one threadgroup per (query, KV head), with the 12
+query heads of the KV head's group as the rows of one 16-row tensor-op
+tile, and walks that query's own ascending block list and then its tail,
+32 keys per step. Every K and V row is read from the cache straight into
+the right operand of the product (a register-resident cooperative tensor,
+filled by the lanes that own its elements), so there is no gathered copy
+and no masked work: the two simdgroups each own half of the head
+dimension, sum their partial scores through threadgroup memory (the one
+barrier of a step), and run the online softmax on the score fragment in
+registers. The products are 16 x 32 x 32, which is what the tensor ops
+allow when both operands are in registers. The element layouts of those
+operands are implementation defined; the kernel relies on the ones
+measured on the M5, and the CPU reference test fails if they move.
+
+This replaced a **tiled** route, which merged 16 consecutive queries'
+selections into a union, copied the union's K and V rows into a 512 MB
+scratch and ran the dense kernel's loop over them with each query masked
+to its own selection. Its cost followed the union, not the selection: 1.9
+times one query's 512 blocks at 8K, 3.2 at 32K and more beyond, all of it
+masked work, plus the copy. Past 32K it was the part of a chunk that grew
+with depth. In the full model's per-kernel profile at a 64K real-text
+prompt, the attention of the last chunk (60K to 64K) went from 505 + 150
+ms (tiled attention + gather) to 176, and the mean over the prompt's 16
+chunks from 480 to 161 ms per chunk. The scratch is gone with it.
+
+The indexer's scores moved to the tensor ops in the same change:
+`qsa_scores_nax` treats a sub-batch's indexer queries (`[QB, 4, 128]`, a
+row per query and head) and the block keys as a GEMM, sixteen rows (four
+queries' four heads) by 32 blocks per product with fp32 accumulation, and
+applies the ReLU and the head sum in the epilogue. The scalar kernel it
+replaces for prefill cost 5.7 ms in the first chunk and 216 in the last
+at 64K (every query scores every visible block: linear in depth); the
+tensor-op kernel 3.5 and 39. bf16 products are exact in fp32, so only the
+accumulation order differs from the scalar kernel, and the reference
+computes these scores with a matmul of its own order; a block near the
+512th score can still change sides (see performance.md for what that does
+to the logits). Batches under 16 rows (decode, the verify pass) keep the
+scalar scores and the split attention kernel, unchanged. `LILY_QSA_ROUTE=split`
+and `LILY_QSA_SCORES=scalar` restore the older kernels for prefill.
 
 ## The vision tower
 
