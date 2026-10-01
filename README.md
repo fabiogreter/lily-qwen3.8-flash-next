@@ -76,10 +76,23 @@ sags a few percent, which slows the speculative and prefill rows slightly.
 During actual use with opencode, prefill is often quite a bit slower, due to
 most turns being short, so that fixed per-request costs dominate.
 
-Decode in practice is typically faster, probably because the speculative
-decoding gets more hits than in the synthetic tests, usually still >100tok/s
-at 220-230K context. This is most likely task-dependent, as the draft head may
-be better at some tasks than others.
+Decode in practice is typically faster, because the speculative decoding gets
+more hits than in the synthetic tests: usually still >100 tok/s at 220-230K
+context. One day of opencode sessions on a single project (339 requests,
+2026-09-30, server log) accepted 74 to 82% of the drafts at every context
+length, against 59 to 64% on the synthetic prompts:
+
+| context | requests | decode tok/s | drafts accepted | ms per step |
+|---|---:|---:|---:|---:|
+| 32-64K | 72 | 113 | 82% | 23.6 |
+| 64-128K | 148 | 101 | 74% | 24.8 |
+| 128-192K | 89 | 103 | 80% | 25.4 |
+| 192-270K | 29 | 106 | 80% | 24.7 |
+
+Acceptance does not grow with context; decode stays flat because a step is
+only about 5% slower at 250K than at 50K. Agent output (tool calls, paths,
+code repeated from the context) is easy for the draft head to predict. Other
+projects and tasks will accept more or fewer drafts.
 
 The quantizations for the tests differ slightly (affine 4-bit, group 64, against
 UD-IQ4_XS), and the llama.cpp MTP rows use a one-line fix the shipped build
