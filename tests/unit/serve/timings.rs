@@ -573,3 +573,34 @@ fn a_cancelled_prefill_reports_where_it_stopped_and_counts_only_what_ran() {
         serde_json::to_value(Timings::measure(10, 0, 1.0, 5, 1.0, None)).unwrap();
     assert!(json.get("cancelled_by").is_none() && json.get("cancelled_at").is_none());
 }
+
+#[test]
+fn the_batch_object_is_there_only_with_batching_and_rounded() {
+    // Batching off: the object is absent, so the JSON is what it was.
+    let off = serde_json::to_value(Timings::measure(10, 0, 1.0, 5, 1.0, None)).unwrap();
+    assert!(off.get("batch").is_none());
+    let t = Timings::measure(10, 0, 1.0, 5, 1.0, None).with_batch(BatchTimings {
+        batched_tokens: 3,
+        solo_tokens: 2,
+        mean_rows: Some(7.0 / 3.0),
+        max_rows: 3,
+        shared_with: 2,
+        preemptions: 1,
+        prefill_interleaved_steps: 8,
+        prefill_interleaved_ms: 120.123_456_7,
+    });
+    let json = serde_json::to_value(t).unwrap();
+    assert_eq!(json["batch"]["batched_tokens"], json!(3));
+    assert_eq!(json["batch"]["solo_tokens"], json!(2));
+    assert_eq!(json["batch"]["mean_rows"], json!(2.333));
+    assert_eq!(json["batch"]["shared_with"], json!(2));
+    assert_eq!(json["batch"]["prefill_interleaved_ms"], json!(120.123));
+    // A request that never met another: the object, with nothing shared.
+    let lone = serde_json::to_value(
+        Timings::measure(10, 0, 1.0, 5, 1.0, None)
+            .with_batch(BatchTimings { solo_tokens: 5, ..Default::default() }),
+    )
+    .unwrap();
+    assert_eq!(lone["batch"]["mean_rows"], Value::Null);
+    assert_eq!(lone["batch"]["batched_tokens"], json!(0));
+}

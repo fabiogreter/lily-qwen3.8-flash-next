@@ -35,8 +35,8 @@ use super::api::{self, Kind, Prepared};
 use super::session::{CachedImage, Evictions, Session, boundary_position};
 use super::stream::{Event, OutputParser, ParserConfig};
 use super::timings::{
-    EvictionPhase, EvictionTimings, MemoryStats, NgramStats, PrefillParts,
-    PrefillPhases, Speculation, Timings, TimingsEntry,
+    BatchTimings, EvictionPhase, EvictionTimings, MemoryStats, NgramStats,
+    PrefillParts, PrefillPhases, Speculation, Timings, TimingsEntry,
 };
 use super::{
     Cmd, Collected, Engine, EngineQueue, Job, Sink, call_id, chunk, error_json, now,
@@ -160,6 +160,20 @@ impl BatchStats {
             if m != own && !self.peers.contains(&m) {
                 self.peers.push(m);
             }
+        }
+    }
+
+    /// The `batch` object of the request's timings.
+    pub(super) fn timings(&self) -> BatchTimings {
+        BatchTimings {
+            batched_tokens: self.batched_tokens,
+            solo_tokens: self.solo_tokens,
+            mean_rows: self.mean_rows(),
+            max_rows: self.max_rows,
+            shared_with: self.peers.len(),
+            preemptions: self.preemptions,
+            prefill_interleaved_steps: self.interleaved_steps,
+            prefill_interleaved_ms: self.interleaved_secs * 1e3,
         }
     }
 
@@ -908,6 +922,7 @@ impl<M: LanguageModel> Engine<M> {
                 .with_agreement(agreement, durable.map(|(b, _)| b))
                 .with_vision(image_tokens, vision_secs)
                 .with_pinned(pinned)
+                .with_batch(stats.timings())
                 .with_cancel(Some(by), Some(at))
                 .with_evictions(EvictionTimings {
                     acquire: EvictionPhase::new(&acquired.evictions),
@@ -1269,6 +1284,7 @@ impl<M: LanguageModel> Engine<M> {
         .with_agreement(f.agreement, f.durable.map(|(b, _)| b))
         .with_vision(f.image_tokens, f.vision_secs)
         .with_pinned(f.pinned)
+        .with_batch(row.stats.timings())
         .with_cancel(cancelled_by, None)
         .with_evictions(EvictionTimings {
             acquire: EvictionPhase::new(&f.acquire_evictions),

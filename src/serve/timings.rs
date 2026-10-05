@@ -122,6 +122,45 @@ pub struct Timings {
     pub ngram: NgramStats,
     /// The system's memory over the request.
     pub memory: MemoryStats,
+    /// How the request shared the GPU with other requests (continuous
+    /// batching, `--max-batch` above 1); absent with batching off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch: Option<BatchTimings>,
+}
+
+/// What continuous batching did for one request: how many of its tokens
+/// came from steps shared with other requests and how full those steps
+/// were, how often its lone decode was stopped to admit a newcomer, and
+/// how long other requests' decode steps ran between its prefill chunks
+/// (part of `prefill_ms`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct BatchTimings {
+    /// Tokens drawn in steps shared with at least one other request.
+    pub batched_tokens: usize,
+    /// Tokens drawn while decoding alone (speculation included).
+    pub solo_tokens: usize,
+    /// Mean rows of the shared steps, this request included; `null`
+    /// without one.
+    pub mean_rows: Option<f64>,
+    /// The most rows one of its steps had (0 without a shared step).
+    pub max_rows: usize,
+    /// Distinct other requests it shared a step with.
+    pub shared_with: usize,
+    /// Times its lone decode was stopped at a token to admit a request.
+    pub preemptions: usize,
+    /// Other requests' decode steps run between its prefill chunks, and
+    /// their wall time.
+    pub prefill_interleaved_steps: usize,
+    pub prefill_interleaved_ms: f64,
+}
+
+impl BatchTimings {
+    /// Rounds the derived figures like the rest of the object.
+    pub fn rounded(mut self) -> Self {
+        self.mean_rows = self.mean_rows.map(|m| round(m, 1e3));
+        self.prefill_interleaved_ms = round(self.prefill_interleaved_ms, 1e3);
+        self
+    }
 }
 
 /// Where `prefill_ms` went, in milliseconds. These phases plus `vision_ms`
@@ -465,6 +504,7 @@ impl Timings {
             evictions: EvictionTimings::default(),
             ngram: NgramStats::default(),
             memory: MemoryStats::default(),
+            batch: None,
         }
     }
 
@@ -573,6 +613,12 @@ impl Timings {
     pub fn with_decode_checkpoints(mut self, taken: usize, secs: f64) -> Self {
         self.decode_checkpoints = taken;
         self.decode_checkpoint_ms = round(secs * 1e3, 1e3);
+        self
+    }
+
+    /// Adds what continuous batching did for the request.
+    pub fn with_batch(mut self, batch: BatchTimings) -> Self {
+        self.batch = Some(batch.rounded());
         self
     }
 
