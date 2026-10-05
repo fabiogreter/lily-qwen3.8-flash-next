@@ -1036,8 +1036,8 @@ write-ahead poll) go first. The window is
 `WeightPin::keep_warm_remaining`, read again before every tick: the hold
 after the last request while pinned, a minute after it with an unlimited
 hold (`--pin-hold 0`), and closed the moment the pin is released by its
-hold, by memory pressure (the monitor thread) or by an unload, or when it
-was never taken (`--pin-weights off`, `auto` with the expert cache, a
+hold, by memory pressure (the monitor thread, or the end of the request a
+warning was deferred to) or by an unload, or when it was never taken (`--pin-weights off`, `auto` with the expert cache, a
 failed `mlock`). Without a held pin an idle server submits nothing. There
 is no flag: measured on a 24 GiB set, 60 ticks at 1 Hz stayed at about
 1 ms each where 60 s of plain idle cost 144 to 160 ms on the next signal,
@@ -1233,11 +1233,25 @@ locks the weight buffers with `mlock` before its prefill, inside its
 `queue_ms` (about 2 to 3 s for the ~74 GB of the full model, more when they
 were compressed already; `pinned X GB of weights in Ys`), the pin holds while
 requests keep coming, and it is released `--pin-hold` (default 1m) after the
-last request finished (`released pin after 1m idle`), as soon as the
-memorystatus pressure level reaches warning (a monitor thread polls it every
-second; `released pin: memory pressure warning`, re-pinned at the next
-request only once the level is normal again), and before an idle unload, a
-GPU-fault reload or the shutdown drops the buffers. What is pinned is the
+last request finished (`released pin after 1m idle`), under memory
+pressure (below), and before an idle unload, a GPU-fault reload or the
+shutdown drops the buffers. A monitor thread polls the memorystatus
+pressure level every second while pinned. Warning releases the pin at once
+between requests (`released pin: memory pressure warning`), also when the
+next request finds it before the monitor did, but not under a running
+request: then the release waits for the request's end (`pin release
+deferred to the end of the request: memory pressure warning`, then the
+release line), and happens there even if the level fell back to normal
+meanwhile, since the system did ask for memory. Critical, or any level
+above warning, releases at once, mid-request too (`munlock` only makes the
+pages pageable again). Requests in flight are counted by a guard the engine
+holds for the whole request (`serve::pin::InFlight`, dropped on every exit
+path after the response's end), so with several at once the deferred
+release waits for the last, and the guard that ends it unlocks as it drops,
+without waiting for a poll. A request does not pin while the level is
+warning or above (`pin skipped: memory pressure warning`); the next one
+once it is normal pins again. Before 2026-10-05 warning released the pin
+mid-request too. What is pinned is the
 set of buffers the load read weights into (`MetalContext::record_buffers`
 around `qwen4exp::weights::load`, the vision tower and the draft head
 included), never the expert cache's slab and slot tables, the session
