@@ -155,9 +155,10 @@ fn speculate_checkpointed<M: LanguageModel>(
         *tokens.last().ok_or_else(|| anyhow::anyhow!("speculation without a draw"))?;
     // The state holds the prompt and every draw but the last, here and at
     // every later point of rest: `base` is where the prompt ends.
-    let base = state.pos().checked_sub(tokens.len() - 1).ok_or_else(|| {
-        anyhow::anyhow!("speculation from a state behind its draws")
-    })?;
+    let base = state
+        .pos()
+        .checked_sub(tokens.len() - 1)
+        .ok_or_else(|| anyhow::anyhow!("speculation from a state behind its draws"))?;
     let (mut drafted, mut accepted) = (0usize, 0usize);
     let mut proposals =
         model.draft_initial(ctx, state, scratch, last, k, params, tokens.len())?;

@@ -32,18 +32,22 @@ use anyhow::{Context as _, Result, ensure};
 use serde_json::{Value, json};
 
 use super::api::{self, Kind, Prepared};
-use super::session::{CachedImage, Evictions, Session, boundary_position};
+use super::pin::InFlight;
+use super::session::{
+    CachedImage, DecodeCheckpoints, Evictions, Session, boundary_position,
+    last_user_turn,
+};
 use super::stream::{Event, OutputParser, ParserConfig};
 use super::timings::{
     BatchTimings, EvictionPhase, EvictionTimings, MemoryStats, NgramStats,
     PrefillParts, PrefillPhases, Speculation, Timings, TimingsEntry,
 };
 use super::{
-    Cmd, Collected, Engine, EngineQueue, Job, Sink, call_id, chunk, error_json, now,
-    response_id, text_chunk,
+    Cmd, Collected, Engine, EngineQueue, Job, Sink, call_id, chunk, describe_reuse,
+    error_json, now, response_id, text_chunk, user_turn_opener,
 };
 use crate::engine::{BatchRow, CountsSlot, DecodeStateApi, Draw, LanguageModel};
-use crate::generate::{FinishReason, GenerateOptions, Generator};
+use crate::generate::{DecodeCheckpointer, FinishReason, GenerateOptions, Generator};
 use crate::qwen4exp::{ImageEmbeds, VisionInput, positions_for_prompt};
 use crate::stats::{Counters, VmCounters};
 
@@ -295,6 +299,7 @@ struct Facts {
     n: usize,
     reused: usize,
     agreement: usize,
+    cut_back: Option<usize>,
     forked: bool,
     from_disk: Option<Duration>,
     durable: Option<(usize, f64)>,
@@ -320,9 +325,15 @@ struct Row<'g, M: LanguageModel> {
     seq: u64,
     p: Prepared,
     sink: Sink,
+    /// The request is in flight for the weight pin until this drops, after
+    /// its response's end (see `Engine::serve`); taken by whoever ends it.
+    request: Option<InFlight>,
     session: Session<M>,
     images: Vec<CachedImage>,
     facts: Facts,
+    /// Its decode checkpoints, taken in the single-session loop and between
+    /// batched steps alike, counted from the prefill's checkpoint.
+    decode_checkpoints: DecodeCheckpoints<M::State>,
     parser: Parser<'g>,
     out: Output,
     /// Every token drawn so far; the last one is not fed into the state yet
@@ -559,7 +570,9 @@ impl<M: LanguageModel> Engine<M> {
         let before = row.generated.len();
         let mut preempted = false;
         let resumed = {
-            let Row { parser, out, sink, session, generated, .. } = row;
+            let Row {
+                parser, out, sink, session, generated, decode_checkpoints, ..
+            } = row;
             let mut on_token = |token: u32| -> Result<bool> {
                 let events = parser.push(token)?;
                 out.deliver(events, sink);
@@ -579,7 +592,7 @@ impl<M: LanguageModel> Engine<M> {
                 scratch,
                 generated,
                 &options,
-                None,
+                Some(decode_checkpoints as &mut dyn DecodeCheckpointer<M::State>),
                 &mut on_token,
             )?
         };
@@ -687,6 +700,13 @@ impl<M: LanguageModel> Engine<M> {
         for (row, token) in rows.iter_mut().zip(draws) {
             row.stats.record_step(row.seq, &members);
             row.take_draw(token, generator, cancel)?;
+            // At rest between steps, holding every draw but the last: a
+            // decode checkpoint due here is taken as the single-session loop
+            // takes one, only for a row that goes on.
+            let pos = row.session.state.pos();
+            if row.finish.is_none() && row.decode_checkpoints.due(pos) {
+                row.decode_checkpoints.take(&self.ctx, &row.session.state)?;
+            }
         }
         Ok(())
     }
@@ -700,10 +720,11 @@ impl<M: LanguageModel> Engine<M> {
         fault: Option<&str>,
         error: &anyhow::Error,
     ) {
-        let Row { mut sink, p, slot, .. } = row;
+        let Row { mut sink, p, slot, request, .. } = row;
         slots.give(slot);
         self.pin.after_request(Instant::now());
         answer_failure(&mut sink, p.stream, fault, error);
+        drop(request);
     }
 
     // --- admission ----------------------------------------------------------
@@ -722,17 +743,29 @@ impl<M: LanguageModel> Engine<M> {
     ) {
         let Job { prepared, mut sink, queued_at } = job;
         let stream = prepared.stream;
-        let pinned = self.pin.before_request(Instant::now());
+        // In flight for the pin until the response's end, as in
+        // `Engine::serve`: a row takes the guard, and drops it after its
+        // sink's end; every other path drops it here, after the sink's.
+        let mut request = Some(self.pin.before_request(Instant::now()));
         let queued = queued_at.elapsed();
         if sink.cancelled() {
             self.pin.after_request(Instant::now());
             sink.end();
+            drop(request);
             return;
         }
-        match self
-            .try_admit(prepared, &mut sink, queued, pinned, seq, generator, rows, slots)
-        {
-            // The row holds the request's sink now; `sink` is detached.
+        match self.try_admit(
+            prepared,
+            &mut sink,
+            queued,
+            &mut request,
+            seq,
+            generator,
+            rows,
+            slots,
+        ) {
+            // The row holds the request's sink and guard now; `sink` is
+            // detached.
             Ok(Some(row)) => match row.finish {
                 Some(_) => {
                     let others = Self::in_flight(rows);
@@ -751,17 +784,19 @@ impl<M: LanguageModel> Engine<M> {
                 answer_failure(&mut sink, stream, fault.as_deref(), &error);
             }
         }
+        drop(request);
     }
 
     /// `Engine::run` up to its first draw. A returned row has taken over
-    /// `sink` (a detached one is left behind); `None` and errors leave it.
+    /// `sink` (a detached one is left behind) and `request`; `None` and
+    /// errors leave both.
     #[allow(clippy::too_many_arguments)]
     fn try_admit<'g>(
         &mut self,
         p: Prepared,
         sink: &mut Sink,
         queued: Duration,
-        pinned: bool,
+        request: &mut Option<InFlight>,
         seq: u64,
         generator: &'g Generator,
         rows: &mut Vec<Row<'g, M>>,
@@ -773,6 +808,7 @@ impl<M: LanguageModel> Engine<M> {
             p.prompt.len(),
             self.max_seq
         );
+        let pinned = request.as_ref().is_some_and(InFlight::pinned);
         let n = p.prompt.len();
         let images: Vec<CachedImage> =
             p.images.iter().map(|i| CachedImage::new(i.span, i.digest)).collect();
@@ -841,10 +877,24 @@ impl<M: LanguageModel> Engine<M> {
 
         let mut stats = BatchStats::default();
         let min_tokens = self.sessions.durable_min_tokens();
-        let boundary = self
-            .sessions
-            .disk()
-            .and_then(|_| boundary_position(agreement, reused, n, min_tokens));
+        // As in `Engine::run`: snapped back to the last user message opened
+        // before the agreement.
+        let boundary = self.sessions.disk().and_then(|_| {
+            let user_turn = (min_tokens > 0 && agreement > reused)
+                .then(|| {
+                    let opener = user_turn_opener(generator.tokenizer());
+                    last_user_turn(&p.prompt[..agreement.min(n)], &opener)
+                })
+                .flatten();
+            boundary_position(
+                agreement,
+                reused,
+                n,
+                min_tokens,
+                acquired.cut_back.is_some(),
+                user_turn,
+            )
+        });
         let shutdown = self.shutdown.clone();
         let cancelled = sink.cancelled.clone();
         let stop = || {
@@ -960,7 +1010,7 @@ impl<M: LanguageModel> Engine<M> {
                 );
             eprintln!(
                 "{id}: {n} prompt tokens ({reused} cached{}{}), cancelled by the {by} at {at} after {} prefilled in {prefix_secs:.2}s, kept {at} tokens as a session, sessions={} ({:.1}/{:.1} GB){}{}",
-                if acquired.forked { ", forked" } else { "" },
+                describe_reuse(acquired.cut_back, acquired.forked),
                 acquired
                     .from_disk
                     .map(|d| format!(", from disk in {:.2}s", d.as_secs_f64()))
@@ -1079,6 +1129,7 @@ impl<M: LanguageModel> Engine<M> {
             n,
             reused,
             agreement,
+            cut_back: acquired.cut_back,
             forked: acquired.forked,
             from_disk: acquired.from_disk,
             durable,
@@ -1097,15 +1148,18 @@ impl<M: LanguageModel> Engine<M> {
             vm_start,
             vm_prefill,
         };
-        // The row takes the request's sink; the caller keeps a detached one,
-        // and gets the real one back if the first draw fails.
+        // The row takes the request's sink and guard; the caller keeps a
+        // detached sink, and gets both back if the first draw fails.
         let mut row = Row {
             seq,
             p,
             sink: std::mem::replace(sink, detached_sink()),
+            request: request.take(),
             session,
             images,
             facts,
+            // Counted from the checkpoint the prefill just took.
+            decode_checkpoints: self.sessions.decode_checkpoints(n - 1),
             parser,
             out,
             generated: Vec::with_capacity(256),
@@ -1128,6 +1182,7 @@ impl<M: LanguageModel> Engine<M> {
         if let Err(error) = taken {
             slots.give(slot);
             *sink = std::mem::replace(&mut row.sink, detached_sink());
+            *request = row.request.take();
             return Err(error);
         }
         Ok(Some(row))
@@ -1211,6 +1266,7 @@ impl<M: LanguageModel> Engine<M> {
         slots.give(row.slot);
         let stream = row.p.stream;
         let mut sink = std::mem::replace(&mut row.sink, detached_sink());
+        let request = row.request.take();
         let result = self.try_finish(row, &mut sink, in_flight_others);
         self.pin.after_request(Instant::now());
         match result {
@@ -1220,6 +1276,8 @@ impl<M: LanguageModel> Engine<M> {
                 answer_failure(&mut sink, stream, fault.as_deref(), &error);
             }
         }
+        // After the response's end, as in `Engine::serve`.
+        drop(request);
     }
 
     fn try_finish(
@@ -1258,6 +1316,14 @@ impl<M: LanguageModel> Engine<M> {
             session.state.pos() == session.tokens.len(),
             "session token/state position mismatch"
         );
+        // Every decode checkpoint sits at a point the state passed: a prefix
+        // of the tokens just recorded.
+        let decode_checkpoints_taken = row.decode_checkpoints.taken();
+        let decode_checkpoint_secs = row.decode_checkpoints.secs();
+        session.add_decode_checkpoints(
+            row.decode_checkpoints.into_snapshots(),
+            &row.images,
+        )?;
         self.sessions.set_in_flight_bytes(in_flight_others);
         let released = self.sessions.release(
             &self.ctx,
@@ -1291,6 +1357,7 @@ impl<M: LanguageModel> Engine<M> {
         )
         .with_agreement(f.agreement, f.durable.map(|(b, _)| b))
         .with_vision(f.image_tokens, f.vision_secs)
+        .with_decode_checkpoints(decode_checkpoints_taken, decode_checkpoint_secs)
         .with_pinned(f.pinned)
         .with_batch(row.stats.timings())
         .with_cancel(cancelled_by, None)
@@ -1327,7 +1394,7 @@ impl<M: LanguageModel> Engine<M> {
             id,
             n,
             f.reused,
-            if f.forked { ", forked" } else { "" },
+            describe_reuse(f.cut_back, f.forked),
             f.from_disk
                 .map(|d| format!(", from disk in {:.2}s", d.as_secs_f64()))
                 .unwrap_or_default(),
@@ -1364,11 +1431,21 @@ impl<M: LanguageModel> Engine<M> {
             f.prefix_secs,
             decode_secs,
             completion_tokens as f64 / decode_secs.max(1e-9),
-            if row.drafted > 0 {
-                format!(", drafts {}/{} accepted", row.accepted, row.drafted)
-            } else {
-                String::new()
-            },
+            format_args!(
+                "{}{}",
+                if row.drafted > 0 {
+                    format!(", drafts {}/{} accepted", row.accepted, row.drafted)
+                } else {
+                    String::new()
+                },
+                if decode_checkpoints_taken > 0 {
+                    format!(
+                        ", {decode_checkpoints_taken} decode checkpoints in {decode_checkpoint_secs:.2}s"
+                    )
+                } else {
+                    String::new()
+                }
+            ),
             cancelled_by
                 .map(|by| format!(" (cancelled by the {by} during the decode)"))
                 .unwrap_or_default(),
