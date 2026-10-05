@@ -171,6 +171,31 @@ fn penalties_suppress_repeated_ids_and_update_counts() {
     assert_eq!(adjusted[20], 4.0);
 }
 
+/// A request's penalty counts move between the engine's sampler and a batch
+/// slot's whole, and the copy is a copy: the source keeps its counts and
+/// later changes to one side do not reach the other.
+#[test]
+fn penalty_counts_move_between_samplers_whole() {
+    let ctx = MetalContext::new().expect("metal context");
+    let v = 3000;
+    let engine = SamplerScratch::new(&ctx, v).expect("scratch");
+    let slot = SamplerScratch::new(&ctx, v).expect("scratch");
+    let mut counts = vec![0u32; v];
+    counts[7] = 2;
+    counts[v - 1] = 5;
+    engine.counts.write_bytes(bytemuck::cast_slice(&counts)).expect("counts");
+    slot.counts.write_bytes(bytemuck::cast_slice(&vec![9u32; v])).expect("stale");
+    slot.copy_counts_from(&engine).expect("copy");
+    assert_eq!(slot.counts.to_u32().expect("read"), counts, "stale counts replaced");
+    engine.reset_counts();
+    assert_eq!(slot.counts.to_u32().expect("read")[v - 1], 5, "an independent copy");
+    slot.uncount(7);
+    engine.copy_counts_from(&slot).expect("copy back");
+    assert_eq!(engine.counts.to_u32().expect("read")[7], 1);
+    let other = SamplerScratch::new(&ctx, v + 1).expect("scratch");
+    assert!(other.copy_counts_from(&engine).is_err(), "vocabularies must match");
+}
+
 /// Kernel time per draw at the real vocabulary size; run with
 /// `cargo test --release --lib sampler_timing -- --ignored --nocapture`.
 #[test]

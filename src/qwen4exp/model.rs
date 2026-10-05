@@ -16,8 +16,8 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::engine::{
-    DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, Segment, SnapshotApi,
-    VisionMode, VisionTower,
+    BatchRow, CountsSlot, DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi,
+    Segment, SnapshotApi, VisionMode, VisionTower,
 };
 use crate::kernels::attention::{
     MAX_SEQ, k_norm_rope_scatter_decode, q_norm_rope_split_decode, rope_neox,
@@ -975,6 +975,9 @@ pub struct Scratch {
     /// `U32 [layers, capacity, top_k]`, the experts each prefilled position
     /// was routed to, per MoE layer.
     pub(super) expert_log: Option<Tensor>,
+    /// Batched decode across sessions (`batch`): per-slot samplers and
+    /// per-row attention scratch, allocated by the first batched step.
+    pub(super) batch: Option<batch::BatchScratch>,
 }
 
 impl Scratch {
@@ -1751,6 +1754,7 @@ impl Qwen4ExpModel {
             prefill: None,
             vision: None,
             expert_log: None,
+            batch: None,
             spec: self
                 .weights
                 .mtp
@@ -4170,6 +4174,29 @@ impl LanguageModel for Qwen4ExpModel {
         }
     }
 
+    fn max_batch_rows(&self) -> usize {
+        self.batch_rows()
+    }
+
+    fn decode_rows(
+        &self,
+        ctx: &MetalContext,
+        scratch: &mut Scratch,
+        rows: &mut [BatchRow<'_, DecodeState>],
+    ) -> Result<Vec<u32>> {
+        self.decode_session_rows(ctx, scratch, rows)
+    }
+
+    fn move_sampler_counts(
+        &self,
+        ctx: &MetalContext,
+        scratch: &mut Scratch,
+        from: CountsSlot,
+        to: CountsSlot,
+    ) -> Result<()> {
+        self.move_counts(ctx, scratch, from, to)
+    }
+
     fn release_parked(&self, scratch: &Scratch) -> Result<()> {
         scratch.sync.release()
     }
@@ -4233,6 +4260,11 @@ impl LanguageModel for Qwen4ExpModel {
         )
     }
 }
+
+// Batched decode across sessions; a child module for the graph's private
+// helpers and scratch.
+#[path = "batch.rs"]
+mod batch;
 
 #[cfg(test)]
 #[path = "../../tests/unit/qwen4exp/qsa_routes.rs"]
