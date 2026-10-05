@@ -532,6 +532,9 @@ impl DiskStore {
             else {
                 break;
             };
+            if let Some(entry) = self.entries.iter().find(|e| e.id == victim) {
+                eprintln!("{}", eviction_line(entry, "over the durable entry limit"));
+            }
             self.remove(&victim);
         }
     }
@@ -556,10 +559,23 @@ impl DiskStore {
             else {
                 break;
             };
-            let id = self.entries.swap_remove(victim).id;
-            let _ = fs::remove_dir_all(self.dir.join(&id));
+            let entry = self.entries.swap_remove(victim);
+            eprintln!("{}", eviction_line(&entry, "to make room"));
+            let _ = fs::remove_dir_all(self.dir.join(&entry.id));
         }
     }
+}
+
+/// The log line for an entry the disk tier deletes on its own (the budget or
+/// the durable limit), so a later miss on that prefix can be traced to it.
+fn eviction_line(entry: &DiskEntry, why: &str) -> String {
+    format!(
+        "session cache: evicted {} ({} tokens{}, {:.1} GB) from disk {why}",
+        entry.id,
+        entry.tokens.len(),
+        if entry.durable { ", durable" } else { "" },
+        entry.bytes as f64 / 1e9,
+    )
 }
 
 /// Bytes available to this user on the volume holding `path`.

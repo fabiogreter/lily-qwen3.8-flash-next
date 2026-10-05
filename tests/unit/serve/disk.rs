@@ -384,3 +384,25 @@ fn a_reserved_entry_is_invisible_until_committed_and_a_crash_leaves_nothing_read
     assert_eq!(ids(&store), vec![id]);
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn an_eviction_names_the_entry_its_size_and_whether_it_was_durable() {
+    let entry = |durable| DiskEntry {
+        id: "s84".into(),
+        tokens: vec![0; 15_689],
+        checkpoints: vec![15_689],
+        bytes: 480_000_000,
+        last_used: 0,
+        cache_key: None,
+        durable,
+        images: vec![],
+    };
+    assert_eq!(
+        eviction_line(&entry(true), "to make room"),
+        "session cache: evicted s84 (15689 tokens, durable, 0.5 GB) from disk to make room"
+    );
+    assert_eq!(
+        eviction_line(&entry(false), "to make room"),
+        "session cache: evicted s84 (15689 tokens, 0.5 GB) from disk to make room"
+    );
+}
