@@ -528,6 +528,11 @@ def write_config(
         "vision": vision_block(vision) if vision is not None else None,
         "dropped": ([] if vision is not None else [VISION_PREFIX]) + ([] if mtp else [MTP_PREFIX]),
     }
+    # Not read by lily (it uses `lily.quantization`): the Hugging Face Hub only
+    # unpacks u32 codes into a parameter count when it finds the MLX-style
+    # top-level block, and otherwise reports ~30B for this 180B model. The
+    # few 8-bit tensors are counted as 4-bit, about 0.4% high.
+    cfg["quantization"] = {"group_size": Q4.group_size, "bits": Q4.bits, "mode": "affine"}
     (dst / "config.json").write_text(json.dumps(cfg, indent=2))
 
 

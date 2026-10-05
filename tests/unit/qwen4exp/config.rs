@@ -87,6 +87,16 @@ fn a_config_without_the_lily_vision_block_has_no_tower() {
 }
 
 #[test]
+fn the_top_level_quantization_block_is_ignored() {
+    // The converter writes an MLX-style block for the Hugging Face Hub's
+    // parameter count; only lily.quantization drives the loader.
+    let mut v = fixture();
+    v["quantization"] = json!({"group_size": 32, "bits": 8, "mode": "affine"});
+    let cfg = parse(&v).expect("parses");
+    assert_eq!((cfg.quantization.bits, cfg.quantization.group_size), (4, 64));
+}
+
+#[test]
 fn a_config_that_declares_and_drops_the_tower_is_rejected() {
     let mut v = fixture();
     v["lily"]["dropped"] = json!(["model.visual."]);
