@@ -1093,10 +1093,12 @@ impl<M: LanguageModel> Engine<M> {
         let stream = job.prepared.stream;
         let kind = job.prepared.kind;
         // Pinned before the prefill (the first request of an active period
-        // pays for it, inside its queue time).
-        let pinned = self.pin.before_request(Instant::now());
+        // pays for it, inside its queue time). The request is in flight for
+        // the pin until `request` drops: a memory pressure warning meanwhile
+        // releases the pin then, not under the prefill or the decode.
+        let request = self.pin.before_request(Instant::now());
         let queued = job.queued_at.elapsed();
-        let result = self.run(job.prepared, &mut sink, queued, pinned);
+        let result = self.run(job.prepared, &mut sink, queued, request.pinned());
         self.pin.after_request(Instant::now());
         let fault = self.ctx.fault();
         if let Err(error) = result {
@@ -1128,6 +1130,9 @@ impl<M: LanguageModel> Engine<M> {
             }
         }
         sink.end();
+        // After the response's end, so a deferred release's `munlock` does
+        // not hold up the client; before the caller can drop the engine.
+        drop(request);
         let _ = kind;
         fault
     }

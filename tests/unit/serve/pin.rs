@@ -247,7 +247,7 @@ fn pins_at_the_first_request_holds_then_releases_after_the_hold() {
     assert_eq!(pin.keep_warm_remaining(Instant::now()), None, "no request yet");
 
     let t0 = Instant::now();
-    assert!(pin.before_request(t0), "pins at the first request");
+    assert!(pin.before_request(t0).pinned(), "pins at the first request");
     assert_eq!(wired(&bufs), vec![true; bufs.len()]);
     pin.after_request(t0);
     assert_eq!(pin.hold_remaining(t0), Some(Duration::from_secs(60)));
@@ -258,7 +258,7 @@ fn pins_at_the_first_request_holds_then_releases_after_the_hold() {
 
     // A request inside the hold finds it pinned; the hold restarts.
     let t1 = t0 + Duration::from_secs(30);
-    assert!(pin.before_request(t1));
+    assert!(pin.before_request(t1).pinned());
     pin.after_request(t1);
     pin.release_if_held_out(t1 + Duration::from_secs(59));
     assert!(pin.pinned(), "still inside the hold");
@@ -273,7 +273,7 @@ fn pins_at_the_first_request_holds_then_releases_after_the_hold() {
     assert_eq!(pin.keep_warm_remaining(t2), None, "released: no keep-alive");
 
     // The next active period pins again.
-    assert!(pin.before_request(t2 + Duration::from_secs(600)));
+    assert!(pin.before_request(t2 + Duration::from_secs(600)).pinned());
     assert_eq!(wired(&bufs), vec![true; bufs.len()]);
     drop(pin);
     assert_eq!(wired(&bufs), vec![false; bufs.len()], "dropping the pin unlocks");
@@ -289,7 +289,7 @@ fn the_pin_keeps_its_buffers_alive_and_unlocks_before_releasing_them() {
     let mut pin =
         WeightPin::new(bufs, PinDecision::Pin, 0, normal_pressure).expect("pin");
     let t0 = Instant::now();
-    assert!(pin.before_request(t0));
+    assert!(pin.before_request(t0).pinned());
     assert_eq!(pin.hold_remaining(Instant::now()), None, "a hold of 0 never ends");
     // The keep-alive still ends: a minute after the last request.
     pin.after_request(t0);
@@ -312,7 +312,7 @@ fn the_pin_keeps_its_buffers_alive_and_unlocks_before_releasing_them() {
 }
 
 #[test]
-fn memory_pressure_releases_the_pin_and_blocks_repinning_until_normal() {
+fn a_warning_between_requests_releases_the_pin_and_blocks_repinning_until_normal() {
     let _serial = serial();
     let ctx = MetalContext::new().expect("metal");
     let bufs = buffers(&ctx);
@@ -320,7 +320,7 @@ fn memory_pressure_releases_the_pin_and_blocks_repinning_until_normal() {
     let mut pin =
         WeightPin::new(bufs.clone(), PinDecision::Pin, 60, fake_pressure).expect("pin");
     let t0 = Instant::now();
-    assert!(pin.before_request(t0));
+    assert!(pin.before_request(t0).pinned());
     pin.after_request(t0);
     PRESSURE.store(2, Ordering::SeqCst);
     // The monitor polls every second.
@@ -332,12 +332,165 @@ fn memory_pressure_releases_the_pin_and_blocks_repinning_until_normal() {
     assert_eq!(wired(&bufs), vec![false; bufs.len()]);
     assert_eq!(pin.keep_warm_remaining(t0), None, "the release ends the keep-alive");
     // No re-pin while the pressure is raised, even in the same period...
-    assert!(!pin.before_request(t0 + Duration::from_secs(1)));
+    assert!(!pin.before_request(t0 + Duration::from_secs(1)).pinned());
     assert!(!pin.pinned());
     // ...and back at the next request once it is normal.
     PRESSURE.store(1, Ordering::SeqCst);
-    assert!(pin.before_request(t0 + Duration::from_secs(2)));
+    assert!(pin.before_request(t0 + Duration::from_secs(2)).pinned());
     assert_eq!(wired(&bufs), vec![true; bufs.len()]);
+}
+
+/// Polls `done` every 50 ms for up to 5 s (the monitor reads the pressure
+/// once a second).
+fn wait_for(done: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !done() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_warning_during_a_request_releases_the_pin_when_the_request_ends() {
+    let _serial = serial();
+    let ctx = MetalContext::new().expect("metal");
+    let bufs = buffers(&ctx);
+    PRESSURE.store(1, Ordering::SeqCst);
+    let mut pin =
+        WeightPin::new(bufs.clone(), PinDecision::Pin, 60, fake_pressure).expect("pin");
+    let request = pin.before_request(Instant::now());
+    assert!(request.pinned());
+    PRESSURE.store(2, Ordering::SeqCst);
+    wait_for(|| pin.shared.lock().deferred.is_some());
+    assert_eq!(pin.shared.lock().deferred, Some(WARNING), "the monitor deferred");
+    assert!(pin.pinned(), "not released under the running request");
+    assert_eq!(wired(&bufs), vec![true; bufs.len()]);
+    // The request's end releases, at once rather than at the next poll.
+    drop(request);
+    assert!(!pin.pinned(), "released at the request's end");
+    assert_eq!(wired(&bufs), vec![false; bufs.len()]);
+    let t = Instant::now();
+    pin.after_request(t);
+    assert_eq!(pin.keep_warm_remaining(t), None, "the release ends the keep-alive");
+    // No re-pin while the warning lasts, then back once it is normal.
+    assert!(!pin.before_request(t).pinned());
+    PRESSURE.store(1, Ordering::SeqCst);
+    assert!(pin.before_request(t).pinned());
+}
+
+#[test]
+fn critical_releases_the_pin_mid_request() {
+    let _serial = serial();
+    let ctx = MetalContext::new().expect("metal");
+    let bufs = buffers(&ctx);
+    PRESSURE.store(1, Ordering::SeqCst);
+    let mut pin =
+        WeightPin::new(bufs.clone(), PinDecision::Pin, 60, fake_pressure).expect("pin");
+    let request = pin.before_request(Instant::now());
+    assert!(request.pinned());
+    PRESSURE.store(4, Ordering::SeqCst);
+    wait_for(|| !pin.pinned());
+    assert!(!pin.pinned(), "released with the request in flight");
+    assert_eq!(wired(&bufs), vec![false; bufs.len()]);
+    drop(request);
+    assert!(!pin.pinned());
+    PRESSURE.store(1, Ordering::SeqCst);
+}
+
+#[test]
+fn a_warning_found_at_the_start_of_a_request_releases_before_it_runs() {
+    let _serial = serial();
+    let ctx = MetalContext::new().expect("metal");
+    let bufs = buffers(&ctx);
+    PRESSURE.store(1, Ordering::SeqCst);
+    let mut pin =
+        WeightPin::new(bufs.clone(), PinDecision::Pin, 60, fake_pressure).expect("pin");
+    let t0 = Instant::now();
+    assert!(pin.before_request(t0).pinned());
+    pin.after_request(t0);
+    PRESSURE.store(2, Ordering::SeqCst);
+    // Whether the monitor read the warning first or the request does, the
+    // request starts unpinned instead of deferring the release past itself.
+    let request = pin.before_request(t0 + Duration::from_secs(1));
+    assert!(!request.pinned());
+    assert!(!pin.pinned());
+    assert_eq!(wired(&bufs), vec![false; bufs.len()]);
+    drop(request);
+    PRESSURE.store(1, Ordering::SeqCst);
+}
+
+// --- the pressure policy, without Metal ---------------------------------
+
+#[test]
+fn warning_waits_for_the_requests_in_flight_and_anything_above_it_does_not() {
+    use super::PressureAction::{Defer, Keep, Release};
+    for running in [0, 1, 2] {
+        assert_eq!(pressure_action(None, running), Keep, "unreadable");
+        assert_eq!(pressure_action(Some(1), running), Keep, "normal");
+        assert_eq!(pressure_action(Some(4), running), Release(4), "critical");
+        // A level without a name above warning counts as above it.
+        assert_eq!(pressure_action(Some(3), running), Release(3));
+    }
+    assert_eq!(pressure_action(Some(WARNING), 0), Release(WARNING));
+    assert_eq!(pressure_action(Some(WARNING), 1), Defer(WARNING));
+    assert_eq!(pressure_action(Some(WARNING), 2), Defer(WARNING));
+}
+
+/// A pinned state over no memory (unlocking nothing): the policy's state
+/// machine without Metal or `mlock`.
+fn pinned_state(in_flight: usize) -> State {
+    State { ranges: Vec::new(), pinned: true, stop: false, in_flight, deferred: None }
+}
+
+#[test]
+fn a_deferred_release_waits_for_the_last_request_in_flight() {
+    let mut state = pinned_state(2);
+    state.on_pressure(Some(WARNING), 2);
+    assert!(state.pinned, "deferred, not released");
+    assert_eq!(state.deferred, Some(WARNING));
+    // The next poll reads it again: still one deferral.
+    state.on_pressure(Some(WARNING), 2);
+    assert_eq!(state.deferred, Some(WARNING));
+    state.end_request();
+    assert!(state.pinned, "another request is still in flight");
+    state.end_request();
+    assert!(!state.pinned, "released as the last one ended");
+    assert_eq!((state.in_flight, state.deferred), (0, None));
+}
+
+#[test]
+fn a_warning_seen_during_a_request_releases_at_its_end_even_once_normal() {
+    let mut state = pinned_state(1);
+    state.on_pressure(Some(WARNING), 1);
+    state.on_pressure(Some(1), 1);
+    assert!(state.pinned);
+    assert_eq!(state.deferred, Some(WARNING), "the warning stays decided");
+    state.end_request();
+    assert!(!state.pinned);
+}
+
+#[test]
+fn critical_after_a_deferral_releases_at_once() {
+    let mut state = pinned_state(1);
+    state.on_pressure(Some(WARNING), 1);
+    state.on_pressure(Some(4), 1);
+    assert!(!state.pinned, "released mid-request");
+    assert_eq!(state.deferred, None);
+    // The request's end finds nothing left to release.
+    state.end_request();
+    assert_eq!((state.pinned, state.in_flight), (false, 0));
+}
+
+#[test]
+fn a_request_end_without_a_warning_keeps_the_pin() {
+    let mut state = pinned_state(1);
+    state.on_pressure(Some(1), 1);
+    state.on_pressure(None, 1);
+    state.end_request();
+    assert!(state.pinned);
+    assert_eq!((state.in_flight, state.deferred), (0, None));
+    // An unbalanced end cannot wrap the count.
+    state.end_request();
+    assert_eq!(state.in_flight, 0);
 }
 
 #[test]
@@ -353,7 +506,7 @@ fn a_skipped_decision_never_pins() {
     )
     .expect("pin");
     let t0 = Instant::now();
-    assert!(!pin.before_request(t0));
+    assert!(!pin.before_request(t0).pinned());
     pin.after_request(t0);
     assert_eq!(wired(&bufs), vec![false; bufs.len()]);
     assert!(pin.monitor.is_none(), "no monitor thread without a pin");
@@ -372,7 +525,7 @@ fn a_failed_lock_unlocks_what_it_locked_and_waits_for_the_next_period() {
     let bogus = (8usize << 40, 1usize << 20);
     pin.shared.lock().ranges.push(bogus);
     let t0 = Instant::now();
-    assert!(!pin.before_request(t0), "the lock failed");
+    assert!(!pin.before_request(t0).pinned(), "the lock failed");
     assert_eq!(
         wired(&bufs),
         vec![false; bufs.len()],
@@ -382,9 +535,9 @@ fn a_failed_lock_unlocks_what_it_locked_and_waits_for_the_next_period() {
     assert_eq!(pin.keep_warm_remaining(t0), None, "unpinned: no keep-alive");
     // Not retried within the period...
     pin.shared.lock().ranges.pop();
-    assert!(!pin.before_request(t0 + Duration::from_secs(30)));
+    assert!(!pin.before_request(t0 + Duration::from_secs(30)).pinned());
     pin.after_request(t0 + Duration::from_secs(30));
     // ...but at the next one.
-    assert!(pin.before_request(t0 + Duration::from_secs(120)));
+    assert!(pin.before_request(t0 + Duration::from_secs(120)).pinned());
     assert_eq!(wired(&bufs), vec![true; bufs.len()]);
 }

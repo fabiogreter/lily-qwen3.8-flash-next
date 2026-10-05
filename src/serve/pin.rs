@@ -13,11 +13,26 @@
 //! weights before its prefill (that request pays for it, about 2 to 3 s for
 //! the full model, more when they were already compressed), the pin holds
 //! while requests keep coming and is released `--pin-hold` (default 1m)
-//! after the last one finished, as soon as the memory pressure level reaches
-//! warning (a monitor thread polls it every second), and before the engine
-//! drops its buffers (idle unload, GPU fault, shutdown). A failed `mlock`
-//! unlocks what it had locked, is logged, and is not retried before the
-//! next active period; the server serves unpinned meanwhile.
+//! after the last one finished, under memory pressure (below), and before
+//! the engine drops its buffers (idle unload, GPU fault, shutdown). A failed
+//! `mlock` unlocks what it had locked, is logged, and is not retried before
+//! the next active period; the server serves unpinned meanwhile.
+//!
+//! Memory pressure, which a monitor thread polls every second while pinned
+//! (`pressure_action`): warning releases the pin at once between requests
+//! (during the hold, or found at the start of a request), and at the end of
+//! the request when one is in flight, so a prefill or decode does not have
+//! its weights unwired under it for the first level the system raises
+//! (owner decision 2026-10-05; before, warning released mid-request too).
+//! A warning seen during a request stays decided: the release follows at the
+//! request's end even if the level fell back to normal meanwhile, since the
+//! system did ask for memory and warning comes and goes. Critical, or any
+//! level above warning, releases at once, mid-request too. Requests in flight
+//! are a count of [`InFlight`] guards, so with several at once the deferred
+//! release waits for the last; the guard that ends it unlocks as it drops,
+//! on the engine thread, without waiting for a poll. While the level is
+//! warning or above a request does not pin (`pin skipped: memory pressure`);
+//! the next request once it is normal pins again.
 //!
 //! The hold is also the GPU keep-alive's window
 //! ([`WeightPin::keep_warm_remaining`]): while the weights are pinned and
@@ -203,7 +218,9 @@ pub fn decide(i: &PinInputs) -> PinDecision {
     PinDecision::Pin
 }
 
-/// The memorystatus level from which the pin is released (2: warning).
+/// The memorystatus level from which the pin is released (2: warning; at
+/// the end of the request when one is in flight). Any level above it (4:
+/// critical) releases at once.
 const WARNING: u32 = 2;
 /// How often the monitor thread reads the pressure level while pinned.
 const PRESSURE_POLL: Duration = Duration::from_secs(1);
@@ -286,22 +303,93 @@ struct State {
     ranges: Vec<(usize, usize)>,
     pinned: bool,
     stop: bool,
+    /// Requests between [`WeightPin::before_request`] and their
+    /// [`InFlight`]'s drop.
+    in_flight: usize,
+    /// The warning seen while pinned and requests were in flight: the last
+    /// of them releases the pin as it ends. Cleared by every release.
+    deferred: Option<u32>,
 }
 
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
 
-    /// The raised pressure level, if it is warning or higher.
-    fn raised_pressure(&self) -> Option<u32> {
-        (self.pressure)().filter(|&level| level >= WARNING)
+/// What a pressure reading does to a held pin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PressureAction {
+    /// Below warning, or unreadable.
+    Keep,
+    /// Warning with a request in flight: released when the last one ends.
+    Defer(u32),
+    /// Warning between requests, or anything above warning: released now.
+    Release(u32),
+}
+
+/// The pressure policy: `level` read while pinned with `running` requests
+/// in flight.
+fn pressure_action(level: Option<u32>, running: usize) -> PressureAction {
+    match level {
+        Some(level) if level == WARNING && running > 0 => PressureAction::Defer(level),
+        Some(level) if level >= WARNING => PressureAction::Release(level),
+        _ => PressureAction::Keep,
     }
 }
 
-/// While pinned, releases the pin as soon as the pressure level reaches
-/// warning; sleeps on the condition variable otherwise. Unlocking while a
-/// request runs is fine: `munlock` only makes the pages pageable again.
+fn pressure_line(level: u32) -> String {
+    format!("released pin: memory pressure {}", crate::stats::pressure_name(level))
+}
+
+impl State {
+    /// Unlocks when pinned and logs `line` then.
+    fn release(&mut self, line: &str) {
+        self.deferred = None;
+        if self.pinned {
+            unlock_all(&self.ranges);
+            self.pinned = false;
+            eprintln!("{line}");
+        }
+    }
+
+    /// Applies [`pressure_action`] to `level` with `running` requests in
+    /// flight; nothing when not pinned. A deferral is logged once.
+    fn on_pressure(&mut self, level: Option<u32>, running: usize) {
+        if !self.pinned {
+            return;
+        }
+        match pressure_action(level, running) {
+            PressureAction::Keep => {}
+            PressureAction::Defer(level) => {
+                if self.deferred.is_none() {
+                    eprintln!(
+                        "pin release deferred to the end of the request: memory pressure {}",
+                        crate::stats::pressure_name(level)
+                    );
+                    self.deferred = Some(level);
+                }
+            }
+            PressureAction::Release(level) => self.release(&pressure_line(level)),
+        }
+    }
+
+    /// A request ended: the last one in flight does a deferred release,
+    /// whatever the level reads now.
+    fn end_request(&mut self) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        if self.in_flight == 0
+            && let Some(level) = self.deferred
+        {
+            self.release(&pressure_line(level));
+        }
+    }
+}
+
+/// While pinned, reads the pressure level every second and applies
+/// [`pressure_action`]; sleeps on the condition variable otherwise.
+/// Unlocking while a request runs (critical) is fine: `munlock` only makes
+/// the pages pageable again.
 fn monitor(shared: Arc<Shared>) {
     let mut state = shared.lock();
     loop {
@@ -320,14 +408,33 @@ fn monitor(shared: Arc<Shared>) {
         if state.stop || !state.pinned {
             continue;
         }
-        if let Some(level) = shared.raised_pressure() {
-            unlock_all(&state.ranges);
-            state.pinned = false;
-            eprintln!(
-                "released pin: memory pressure {}",
-                crate::stats::pressure_name(level)
-            );
-        }
+        let running = state.in_flight;
+        state.on_pressure((shared.pressure)(), running);
+    }
+}
+
+/// A request in flight, from [`WeightPin::before_request`] until it drops,
+/// on every exit path (an error, a cancellation, a panic's unwinding): a
+/// warning meanwhile defers the pin's release to the end of the last
+/// request in flight, which this drop then does. It holds the shared state,
+/// not the pin, so the engine runs the request while it lives; one that
+/// outlived the pin would find it released and unlock nothing.
+#[must_use = "the request is in flight until this drops"]
+pub struct InFlight {
+    shared: Arc<Shared>,
+    pinned: bool,
+}
+
+impl InFlight {
+    /// Whether the weights were pinned when the request started.
+    pub fn pinned(&self) -> bool {
+        self.pinned
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.shared.lock().end_request();
     }
 }
 
@@ -364,7 +471,13 @@ impl WeightPin {
     ) -> Result<Self> {
         let (ranges, bytes) = page_ranges(&buffers);
         let shared = Arc::new(Shared {
-            state: Mutex::new(State { ranges, pinned: false, stop: false }),
+            state: Mutex::new(State {
+                ranges,
+                pinned: false,
+                stop: false,
+                in_flight: 0,
+                deferred: None,
+            }),
             wake: Condvar::new(),
             pressure,
         });
@@ -396,11 +509,22 @@ impl WeightPin {
         self.shared.lock().pinned
     }
 
-    /// Called before a request's prefill: pins unless the decision says
-    /// not to, the pin is held already, an `mlock` failed earlier in this
-    /// active period, or the memory pressure is raised. Returns whether the
-    /// weights are pinned for the request.
-    pub fn before_request(&mut self, now: Instant) -> bool {
+    /// Called before a request's prefill: marks it in flight until the
+    /// returned guard drops, which the engine keeps for the whole request,
+    /// and pins (see `pin_for_request`).
+    pub fn before_request(&mut self, now: Instant) -> InFlight {
+        self.shared.lock().in_flight += 1;
+        let mut request = InFlight { shared: self.shared.clone(), pinned: false };
+        request.pinned = self.pin_for_request(now);
+        request
+    }
+
+    /// Pins unless the decision says not to, the pin is held already, an
+    /// `mlock` failed earlier in this active period, or the memory pressure
+    /// is raised. A held pin under a raised level the monitor has not read
+    /// yet is released here as between requests, since this request has not
+    /// started. Returns whether the weights are pinned for the request.
+    fn pin_for_request(&mut self, now: Instant) -> bool {
         if self.decision != PinDecision::Pin {
             return false;
         }
@@ -411,14 +535,20 @@ impl WeightPin {
             self.failed = false;
             self.pressure_logged = false;
         }
+        let level = (self.shared.pressure)();
         let mut state = self.shared.lock();
         if state.pinned {
-            return true;
+            // The requests in flight other than this one.
+            let running = state.in_flight.saturating_sub(1);
+            state.on_pressure(level, running);
+            if state.pinned {
+                return true;
+            }
         }
         if self.failed {
             return false;
         }
-        if let Some(level) = self.shared.raised_pressure() {
+        if let Some(level) = level.filter(|&level| level >= WARNING) {
             if !self.pressure_logged {
                 eprintln!(
                     "pin skipped: memory pressure {}",
@@ -489,12 +619,7 @@ impl WeightPin {
 
     /// Unlocks when pinned and logs `line` then.
     fn release(&self, line: &str) {
-        let mut state = self.shared.lock();
-        if state.pinned {
-            unlock_all(&state.ranges);
-            state.pinned = false;
-            eprintln!("{line}");
-        }
+        self.shared.lock().release(line);
     }
 }
 
