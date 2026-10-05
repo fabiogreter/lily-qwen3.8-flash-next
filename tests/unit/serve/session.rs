@@ -1144,6 +1144,27 @@ mod store {
     }
 
     #[test]
+    fn a_second_conversation_sharing_only_the_resumed_prefix_forks() {
+        let mut f = fixture("cut-back-second", 10_000_000, None);
+        let lineage = answered(&mut f);
+        // Conversation A resumes at the prompt end (299) and appends a long
+        // question of its own, so its latest request began at 299.
+        let a = [&lineage[..300], &prompt(8, 400)[..]].concat();
+        serve(&mut f, &a);
+        // Conversation B shares only those 300 tokens. It resumes at 299 too,
+        // at or after A's request start but before A's answer: cutting A back
+        // would discard A's whole question.
+        let b = [&lineage[..300], &prompt(9, 400)[..]].concat();
+        let (acquired, _) = serve(&mut f, &b);
+        assert_eq!(
+            (acquired.reused, acquired.forked, acquired.cut_back),
+            (299, true, None)
+        );
+        let kept = f.store.entries.iter().find(|s| s.tokens == a);
+        assert_holds(&kept.expect("conversation A survives").state, &a);
+    }
+
+    #[test]
     fn cutting_back_a_session_written_ahead_deletes_its_stale_copy() {
         let mut f = fixture("cut-back-ahead", 1_500_000, Some(300_000));
         let lineage = answered(&mut f);

@@ -868,10 +868,10 @@ recently used under the byte budget.
 
 **Cutting back.** Most rollbacks are not a parallel conversation. When the
 tail a resident session's resume discards lies entirely within what the
-session's most recent request appended (its prompt extension and its
-answer), the client re-sent the same conversation with the last turn
-rendered differently: a re-tokenized answer, or the reasoning the template
-drops from earlier turns. That tail is never resumed again, and the fork
+session's most recent request generated, the client re-sent the same
+conversation with the answer tokenized differently (every such fork in a
+day of opencode sessions sat inside the previous answer, most of them in
+its reasoning). That tail is never resumed again, and the fork
 cost the copy of every per-token cache up to the resume position: 0.63 s at
 97 000 tokens, 0.82 s at 110 000, 1.24 s at 130 000 in a day of opencode
 sessions, plus a transient second state of 3 to 4 GB inside an 8.6 GB
@@ -880,11 +880,16 @@ such a session is **cut back** in place instead: the checkpoint is restored
 into its own state, the tokens, image spans and checkpoints past it are
 dropped, and the per-token caches stay (valid up to the position, overwritten
 past it). Nothing is copied or allocated; the state keeps its capacity, so the
-budget sees no new bytes. Each session records where its most recent request
-began (the position it resumed at), and the rule is `resume >= that start`;
-a resume further back, such as a second agent run that shares a preamble
-with a long conversation or a regeneration of an older turn, forks exactly
-as before. A session parked for a write ahead is first taken back by the
+budget sees no new bytes. Each session records where its most recent
+request's answer began (its prompt end checkpoint, `prompt - 1`), and the
+rule is `resume >= that position`; a resume further back forks exactly as
+before. The rule is measured from the answer, not from where the request
+resumed: a second conversation that shares only the first one's resumed
+prefix (a durable preamble) resumes at or after that request's start but
+before its answer, and cutting back there would discard the first
+conversation's whole prompt. The durable e2e check showed it (two questions
+after one preamble, the second cut the first back by its question); so does
+a second agent run, or a regeneration of an older turn. A session parked for a write ahead is first taken back by the
 usual rule (the write is cancelled when the prompt resumes it at least as
 far as anything else). A copy written ahead describes the longer lineage
 after the cut; the release deletes it, as it deletes the copy of every

@@ -21,9 +21,10 @@
 //!
 //! Extending the live end reuses the session in place. So does a resume
 //! behind the live end that discards only what the session's latest request
-//! appended (its prompt extension and its answer): the client re-sent the
-//! same conversation with the last turn rendered differently, and the old
-//! tail is never resumed again, so the session is **cut back** to the
+//! generated (the resume lies at or past that request's prompt end): the
+//! client re-sent the same conversation with the answer tokenized
+//! differently, and the old tail is never resumed again, so the session is
+//! **cut back** to the
 //! checkpoint (`Session::cut_back`) instead of copied. Anything else forks:
 //! the per-token caches up to the resume position are copied into a fresh
 //! state and the checkpoint restored, so the original lineage survives (a
@@ -371,7 +372,7 @@ impl<S: DecodeStateApi> DecodeCheckpoints<S> {
         let mut index = 0usize;
         self.snapshots.retain(|_| {
             index += 1;
-            index % 2 == 0
+            index.is_multiple_of(2)
         });
         self.stride = self.stride.saturating_mul(2);
     }
@@ -440,6 +441,11 @@ pub struct Session<M: LanguageModel> {
     /// position it resumed at. Everything past it is that request's prompt
     /// extension and the tokens it generated.
     request_start: usize,
+    /// Where the latest request's answer began: its prompt end checkpoint
+    /// (the prompt minus the token the generator feeds). Everything past it
+    /// is what the model generated, the only part a client re-sends
+    /// re-tokenized; a prompt that resumes at or after it cuts back.
+    answer_start: usize,
     cache_key: Option<String>,
     last_used: u64,
     /// What the disk tier holds of this session as it is now.
@@ -470,6 +476,7 @@ impl<M: LanguageModel> Session<M> {
             state,
             checkpoints: Vec::new(),
             request_start: 0,
+            answer_start: 0,
             cache_key: None,
             last_used: 0,
             disk: DiskCopy::None,
@@ -944,6 +951,7 @@ impl<M: LanguageModel> SessionStore<M> {
         debug_assert!(acquired.reused <= agreement, "resumed past the agreement");
         // Whatever the request appends lies past where it resumed.
         acquired.session.request_start = acquired.reused;
+        acquired.session.answer_start = prompt.len().saturating_sub(1);
         acquired.agreement = agreement;
         acquired.divergent_tail = divergent_tail;
         acquired.evictions = std::mem::take(&mut self.evictions);
@@ -1020,11 +1028,15 @@ impl<M: LanguageModel> SessionStore<M> {
             return Ok(Acquired { reused: resume_at, ..Acquired::fresh(session) });
         }
 
-        if resume_at >= self.entries[index].request_start {
+        if resume_at >= self.entries[index].answer_start {
             // Everything the prompt discards is what the session's latest
-            // request appended: the client re-sent that conversation with the
-            // last turn rendered differently, and the lineage it replaces is
-            // never resumed again. Rewind in place rather than copy.
+            // request generated: the client re-sent that conversation with
+            // its answer tokenized differently, and the lineage it replaces is
+            // never resumed again. Rewind in place rather than copy. Measured
+            // from the answer, not from where the request resumed: a second
+            // conversation that shares only the first one's resumed prefix (a
+            // durable preamble) must fork, or it would discard the first
+            // one's whole prompt.
             let mut session = self.entries.swap_remove(index);
             let dropped = session.tokens.len() - resume_at;
             session.cut_back(ctx, resume_at)?;

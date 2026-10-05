@@ -1739,7 +1739,7 @@ impl<M: LanguageModel> Engine<M> {
             prefix_secs,
             decode_secs,
             completion_tokens as f64 / decode_secs.max(1e-9),
-            format!(
+            format_args!(
                 "{}{}",
                 if generation.drafted > 0 {
                     format!(
