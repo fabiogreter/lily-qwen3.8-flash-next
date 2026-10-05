@@ -17,7 +17,13 @@ restarted: runs 4 and 5 (two more fresh questions, since an identical prompt
 would resume from its own end checkpoint instead) both resume from the entry,
 which proves it survived the restart and was not consumed by a hit. Finally a
 server with the feature off and an empty disk directory answers run 3's
-prompt cold; the answer must be byte-identical (greedy) to the resumed one.
+prompt cold, in one unsplit prefill. Its first token must be run 3's; the
+rest need not be, because the chunked GDN scan (f192a84) takes the rows of
+the last part-done 64-token block of a prefill token-serially, so where a
+prefill is split changes the rounding of the recurrent state, and the
+four-layer model's near-tied logits turn that into different greedy tokens a
+few steps in. Both answers are printed. What a resume does guarantee, that
+it reproduces the run that wrote the entry, is checked across the restart.
 
 The server's stderr goes to `--log`; the `durable prefix ... written` and
 `divergence at ...` lines are printed at the end."""
@@ -92,8 +98,8 @@ class Server:
             except (urllib.error.URLError, ConnectionError):
                 break
 
-    def chat(self, messages, key=None):
-        body = {"model": MODEL_ID, "messages": messages, "temperature": 0, "max_tokens": 40,
+    def chat(self, messages, key=None, max_tokens=40):
+        body = {"model": MODEL_ID, "messages": messages, "temperature": 0, "max_tokens": max_tokens,
                 "chat_template_kwargs": {"enable_thinking": False}}
         if key:
             body["prompt_cache_key"] = key
@@ -138,9 +144,9 @@ def check(cond, what):
         failures.append(what)
 
 
-def run(server, label, preamble, question, log_path):
+def run(server, label, preamble, question, log_path, max_tokens=40):
     msgs = [{"role": "system", "content": preamble}, {"role": "user", "content": question}]
-    r = server.chat(msgs)
+    r = server.chat(msgs, max_tokens=max_tokens)
     u, t = r["usage"], r["timings"]
     answer = r["choices"][0]["message"]["content"]
     line = log_line(log_path, r["id"])
@@ -221,7 +227,16 @@ def main():
         rc = run(s, "cold run (C)", preamble, questions["C"], args.log)
         check(rc["timings"]["cached_tokens"] == 0, "cold run cached nothing")
         check("durable_prefix_tokens" not in rc["timings"], "cold run wrote nothing with the feature off")
-        check(rc["answer"] == answer3, f"resumed answer is byte-identical to the cold one ({answer3!r} vs {rc['answer']!r})")
+        print(f"  full answers {'identical' if rc['answer'] == answer3 else 'differ'} "
+              f"(resumed {answer3[:40]!r}, cold {rc['answer'][:40]!r}): not checked, see the docstring")
+    # The first token on a server of its own: on the same one the request
+    # would resume from the cold run's end and not be cold.
+    first_dir = cold_dir + "-first"
+    shutil.rmtree(first_dir, ignore_errors=True)
+    os.makedirs(first_dir)
+    with Server(args, first_dir, 0, args.log) as s:
+        first = run(s, "cold run (C), first token only", preamble, questions["C"], args.log, max_tokens=1)["answer"]
+        check(first and answer3.startswith(first), f"the resumed answer starts with the cold run's first token ({first!r})")
 
     print("== server log lines of interest")
     with open(args.log, errors="replace") as f:

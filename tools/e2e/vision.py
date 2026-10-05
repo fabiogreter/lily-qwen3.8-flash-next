@@ -19,8 +19,14 @@ or inequality, never for quality. What is checked:
      span (its own end checkpoint) with the identical answer.
   2. a durable boundary with an image in the shared preamble: three runs
      share preamble + image and diverge in the question; run 2 writes the
-     durable entry after the image, run 3 resumes there and answers as a
-     cold server does. A fourth run with another image behind the same
+     durable entry after the image, run 3 resumes there. A fresh server
+     replaying the three runs (so its run 2 splits the prefill at the same
+     boundary) answers run 3 byte-identically; a cold server, one unsplit
+     prefill, agrees on the first token only. The chunked GDN scan
+     (f192a84) takes the rows of the last part-done 64-token block of a
+     prefill token-serially, so where a prefill is split changes the
+     rounding of the recurrent state, and the four-layer model's near-tied
+     logits turn that into different greedy tokens a few steps in. A fourth run with another image behind the same
      preamble must not resume from that entry: it agrees up to the image
      start, where a second durable entry is written, and a fifth run with
      a third image resumes exactly there.
@@ -175,6 +181,9 @@ def main():
     preamble = ("You are a careful assistant. The reference list below is authoritative for this conversation.\n"
                 f"Reference list:\n{filler(args.filler_words)}\n\nAnswer every question with just the item, nothing else.")
     text_only = [{"role": "user", "content": "What is the capital of Switzerland? Answer in one sentence."}]
+    q_a = "Alpha question: what is the 5th item of the reference list?"
+    q_b = "Bravo question: what is the 9th item of the reference list?"
+    q_c = "Charlie question: what is the 12th item of the reference list?"
 
     print(f"== phase 1: server under test, --durable-min-tokens {args.min_tokens}, empty disk dir {args.disk_dir}")
     with Server(args, args.disk_dir, args.min_tokens, args.log) as s:
@@ -276,28 +285,29 @@ def main():
         check(other["timings"].get("vision_ms", 0) > 0, "the tower ran over all of them")
 
         print("-- 2. a durable boundary with the image in the shared preamble")
-        def run(label, image, q):
-            return chat(s, [{"role": "system", "content": preamble},
-                            {"role": "user", "content": [image_part(image), {"type": "text", "text": q}]}], label, args.log)
-        d1 = run("durable run 1 (disc, A)", disc, "Alpha question: what is the 5th item of the reference list?")
-        d2 = run("durable run 2 (disc, B)", disc, "Bravo question: what is the 9th item of the reference list?")
+        def run(label, image, q, server=None, max_tokens=40):
+            return chat(server or s, [{"role": "system", "content": preamble},
+                                      {"role": "user", "content": [image_part(image), {"type": "text", "text": q}]}],
+                        label, args.log, max_tokens=max_tokens)
+        d1 = run("durable run 1 (disc, A)", disc, q_a)
+        d2 = run("durable run 2 (disc, B)", disc, q_b)
         n = d2["usage"]["prompt_tokens"]
         b = d2["timings"].get("durable_prefix_tokens")
         check(d2["timings"]["cached_tokens"] == 0, "run 2 cached nothing (the checkpoint cliff)")
         check(b is not None and n - 40 <= b < n - 1, f"run 2 wrote a durable prefix at {b} after the image (prompt {n})")
         check(b is not None and b > (n - image_tokens - 40), f"the boundary {b} lies past the image (span ends before {n - 1})")
-        d3 = run("durable run 3 (disc, C)", disc, "Charlie question: what is the 12th item of the reference list?")
+        d3 = run("durable run 3 (disc, C)", disc, q_c)
         check(d3["timings"]["cached_tokens"] == b, f"run 3 resumed from the durable position ({d3['timings']['cached_tokens']} == {b})")
         check(d3["timings"].get("vision_ms") == 0, "run 3 did not run the tower (the image is inside the reused prefix)")
         check("from disk in" in d3["line"], "run 3 read the prefix back from disk")
-        d4 = run("durable run 4 (bars, C)", bars, "Charlie question: what is the 12th item of the reference list?")
+        d4 = run("durable run 4 (bars, C)", bars, q_c)
         image_start = d4["timings"]["agreement_tokens"]
         check(d4["timings"]["cached_tokens"] <= image_start < b - image_tokens,
               f"run 4 with another image did not touch the entry behind the image (cached {d4['timings']['cached_tokens']}, agreement {image_start}, entry at {b})")
         b2 = d4["timings"].get("durable_prefix_tokens")
         check(b2 == image_start, f"run 4 wrote a second durable entry at the image start ({b2})")
         check(d4["timings"].get("vision_ms", 0) > 0, "run 4 ran the tower for its image")
-        d5 = run("durable run 5 (third image, C)", third, "Charlie question: what is the 12th item of the reference list?")
+        d5 = run("durable run 5 (third image, C)", third, q_c)
         check(d5["timings"]["cached_tokens"] == b2, f"run 5 with a third image resumed at the image-start entry ({d5['timings']['cached_tokens']} == {b2})")
         check(d5["answer"] != d3["answer"] or d5["answer"] != d4["answer"], "three images give at least two different answers")
         answer3 = d3["answer"]
@@ -307,13 +317,29 @@ def main():
         check("image_tokens" not in t1["timings"] and "vision_ms" not in t1["timings"], "a text request has no image fields")
         check("images" not in t1["line"], "a text request's log line has no image part")
 
-    print(f"== phase 2: cold reference, --durable-min-tokens 0, empty disk dir {cold_dir}")
-    with Server(args, cold_dir, 0, args.log) as s:
-        c3 = chat(s, [{"role": "system", "content": preamble},
-                      {"role": "user", "content": [image_part(disc), {"type": "text", "text": "Charlie question: what is the 12th item of the reference list?"}]}],
-                  "cold run (disc, C)", args.log)
+    split_dir = cold_dir + "-split"
+    shutil.rmtree(split_dir, ignore_errors=True)
+    os.makedirs(split_dir)
+    print(f"== phase 2a: same split in a fresh process, --durable-min-tokens {args.min_tokens}, empty disk dir {split_dir}")
+    with Server(args, split_dir, args.min_tokens, args.log) as s2:
+        run("replay run 1 (disc, A)", disc, q_a, s2)
+        run("replay run 2 (disc, B)", disc, q_b, s2)
+        r3 = run("replay run 3 (disc, C)", disc, q_c, s2)
+        check(r3["timings"]["cached_tokens"] == b, f"the replayed run 3 resumed at the same boundary ({r3['timings']['cached_tokens']} == {b})")
+        check(r3["answer"] == answer3, f"and answers byte-identically ({r3['answer'][:40]!r} vs {answer3[:40]!r})")
+
+    print(f"== phase 2b: cold reference, --durable-min-tokens 0, empty disk dir {cold_dir}")
+    with Server(args, cold_dir, 0, args.log) as s2:
+        c3 = run("cold run (disc, C)", disc, q_c, s2)
         check(c3["timings"]["cached_tokens"] == 0, "cold run cached nothing")
-        check(c3["answer"] == answer3, f"the resumed answer is byte-identical to the cold one ({answer3[:40]!r} vs {c3['answer'][:40]!r})")
+        print(f"  full answers {'identical' if c3['answer'] == answer3 else 'differ'}: not checked, see the docstring")
+    first_dir = cold_dir + "-first"
+    shutil.rmtree(first_dir, ignore_errors=True)
+    os.makedirs(first_dir)
+    # On a server of its own: on the cold one it would resume from the cold run's end.
+    with Server(args, first_dir, 0, args.log) as s2:
+        first = run("cold run (disc, C), first token only", disc, q_c, s2, max_tokens=1)["answer"]
+        check(first and answer3.startswith(first), f"the resumed answer starts with the cold run's first token ({first!r})")
 
     if args.baseline_lily:
         print(f"== phase 3: text-only request on the committed binary {args.baseline_lily}")

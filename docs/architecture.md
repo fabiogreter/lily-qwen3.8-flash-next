@@ -948,7 +948,16 @@ shares only the preamble writes it once, and the third run resumes from it.
 The prefill is split at the boundary on purpose: chunks are 4 096 tokens and
 the batched kernels are not row-count invariant, so a run resuming at the
 boundary must process the remainder in the same chunks the materialising run
-did, and it does, because both start a chunk there.
+did, and it does, because both start a chunk there. What this guarantees is
+that a resumed run reproduces the run that wrote the entry, not a cold run
+of the same prompt in one unsplit prefill: the chunked GDN scan takes the
+rows of a prefill's last part-done 64-token block token-serially, so a split
+inside a block the cold run takes whole rounds the recurrent state
+differently (the error against the reference is the same either way). On
+the four-layer test model, whose logits are nearly tied, that changes the
+greedy answer a few tokens in; the e2e scripts check first-token agreement
+against the cold run and byte equality against a fresh process that splits
+the same way.
 
 Durable entries live **only on disk**. They are never kept as resident
 sessions or as extra checkpoints on a live session, because they are hit far
