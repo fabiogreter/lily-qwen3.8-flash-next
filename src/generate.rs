@@ -458,6 +458,15 @@ impl Generator {
                 parked_draw: None,
             })
         } else {
+            // The loop's first step reads its input from slot 0, where the
+            // prefill's draw left it; anything since (another request's
+            // prefill, batched steps) may have overwritten it. The GPU is
+            // idle here. After a prefill this rewrites the value it holds.
+            let last = *tokens.last().expect("checked above");
+            scratch
+                .next_token()
+                .view(0, &[1])?
+                .write_bytes(bytemuck::cast_slice(&[last]))?;
             let mut parked_draw = None;
             let finish = self.decode_loop(
                 ctx,
