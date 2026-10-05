@@ -208,13 +208,18 @@ pub fn agreement<'a>(
 /// conversation out of the disk tier: a turn that resumes at the previous
 /// request's end and diverges a few hundred tokens later (a regenerated
 /// answer, a re-tokenized message) has nothing a later run would reuse.
+/// Nor does a resume that cut its session back in place (`cut_back`): the
+/// agreement then lies inside the turn the prompt re-sent, however far past
+/// the resume position, and that text is in the session's lineage again.
 pub fn boundary_position(
     agreement: usize,
     reused: usize,
     prompt_len: usize,
     min_tokens: usize,
+    cut_back: bool,
 ) -> Option<usize> {
-    let worth_it = min_tokens > 0 && agreement.saturating_sub(reused) >= min_tokens;
+    let worth_it =
+        min_tokens > 0 && !cut_back && agreement.saturating_sub(reused) >= min_tokens;
     (worth_it && agreement <= prompt_len.checked_sub(1)?).then_some(agreement)
 }
 

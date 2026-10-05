@@ -1276,9 +1276,15 @@ impl<M: LanguageModel> Engine<M> {
         // is dropped, not kept as a checkpoint: durable entries live on disk
         // only (see the session module).
         let min_tokens = sessions.durable_min_tokens();
-        let boundary = sessions
-            .disk()
-            .and_then(|_| boundary_position(agreement, reused, n, min_tokens));
+        let boundary = sessions.disk().and_then(|_| {
+            boundary_position(
+                agreement,
+                reused,
+                n,
+                min_tokens,
+                acquired.cut_back.is_some(),
+            )
+        });
         // A client that went away (or the stop signal's grace running out)
         // stops the prefill at the next chunk boundary, before that chunk is
         // committed, instead of holding the engine for the rest of it.

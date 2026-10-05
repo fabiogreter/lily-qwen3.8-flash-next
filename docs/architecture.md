@@ -1011,7 +1011,12 @@ at its end, with the boundary as the entry's live end), drops the snapshot,
 and prefills the rest as usual. Two real prompts shared that prefix, so a
 third is likely. Within one growing conversation the agreement equals the
 reused position, or runs a few hundred tokens past it when a turn is
-re-rendered differently, and nothing is written turn after turn; a parallel run that
+re-rendered differently, and nothing is written turn after turn. A resume
+that cut its session back in place writes nothing either, however far the
+agreement runs past it: the agreement then lies inside the re-sent turn
+(twice in a day of opencode sessions a re-tokenized answer diverged more
+than 1 024 tokens past its resume position and wrote an entry nothing would
+hit, taking a durable slot). A parallel run that
 shares only the preamble writes it once, and the third run resumes from it.
 The prefill is split at the boundary on purpose: chunks are 4 096 tokens and
 the batched kernels are not row-count invariant, so a run resuming at the
