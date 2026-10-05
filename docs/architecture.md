@@ -1018,6 +1018,24 @@ agreement runs past it: the agreement then lies inside the re-sent turn
 than 1 024 tokens past its resume position and wrote an entry nothing would
 hit, taking a durable slot). A parallel run that
 shares only the preamble writes it once, and the third run resumes from it.
+
+The boundary is not always the agreement itself. Two tasks can begin with
+the same words: one day's entry was written at an agreement of 15 689, 40
+tokens into the first user message (both tasks opened `"Read`). An opencode
+compaction then sent the preamble and `What did we do so far?`, diverging at
+15 649, right after `<|im_start|>user\n`; the entry had nothing resumable
+below its end, so the prompt recomputed 34 900 tokens (16.45 s) and wrote a
+near-duplicate entry at 15 649. So the boundary snaps back to where the last
+user message opened before the agreement begins: the position right after
+the last complete `<|im_start|>user\n` (the template's user-turn opener,
+`[248045, 846, 198]` for this tokenizer, found by encoding the opener text
+the way the rendered prompt is encoded) within the agreement, provided it
+still lies at least `--durable-min-tokens` beyond the resume position;
+otherwise the boundary stays the agreement. The snapped boundary is a prefix
+both prompts share, images included, and never inside an image span (the
+token before it is the opener's newline). Tool results render as user turns
+too, so in a longer conversation the snap lands at the start of the last
+user or tool turn opened before the seam.
 The prefill is split at the boundary on purpose: chunks are 4 096 tokens and
 the batched kernels are not row-count invariant, so a run resuming at the
 boundary must process the remainder in the same chunks the materialising run

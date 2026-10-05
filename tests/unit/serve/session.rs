@@ -1,6 +1,6 @@
 use super::{
     CachedImage, agreement, boundary_position, common_prefix_len, images_within,
-    resume_position, shared_prefix,
+    last_user_turn, resume_position, shared_prefix,
 };
 
 /// No images: the lineages are text.
@@ -70,42 +70,107 @@ fn agreement_with_images_stops_at_a_different_image_and_the_boundary_follows() {
     // The durable boundary is the agreement, so a shared preamble plus a
     // shared image is materialised after the image and a different image
     // before it.
-    assert_eq!(boundary_position(10, 0, b.len(), 4, false), Some(10));
-    assert_eq!(boundary_position(4, 0, b.len(), 4, false), Some(4));
-    assert_eq!(boundary_position(4, 0, b.len(), 5, false), None);
+    assert_eq!(boundary_position(10, 0, b.len(), 4, false, None), Some(10));
+    assert_eq!(boundary_position(4, 0, b.len(), 4, false, None), Some(4));
+    assert_eq!(boundary_position(4, 0, b.len(), 5, false, None), None);
 }
 
 #[test]
 fn boundary_rule_materialises_only_a_long_unresumed_agreement() {
     // Two runs shared 2 000 tokens, nothing was resumable: materialise there.
-    assert_eq!(boundary_position(2000, 0, 3000, 1024, false), Some(2000));
+    assert_eq!(boundary_position(2000, 0, 3000, 1024, false, None), Some(2000));
     // Below the threshold: not worth a disk entry.
-    assert_eq!(boundary_position(900, 0, 3000, 1024, false), None);
+    assert_eq!(boundary_position(900, 0, 3000, 1024, false, None), None);
     // Threshold 0 disables the feature entirely.
-    assert_eq!(boundary_position(2000, 0, 3000, 0, false), None);
+    assert_eq!(boundary_position(2000, 0, 3000, 0, false, None), None);
     // A pure extension (one growing conversation): agreement == reused.
-    assert_eq!(boundary_position(2000, 2000, 3000, 1024, false), None);
+    assert_eq!(boundary_position(2000, 2000, 3000, 1024, false, None), None);
     // Resumed past the agreement never happens, but must not materialise.
-    assert_eq!(boundary_position(2000, 2500, 3000, 1024, false), None);
+    assert_eq!(boundary_position(2000, 2500, 3000, 1024, false, None), None);
     // The agreement may sit at the last feedable position ...
-    assert_eq!(boundary_position(2999, 0, 3000, 1024, false), Some(2999));
+    assert_eq!(boundary_position(2999, 0, 3000, 1024, false, None), Some(2999));
     // ... but never at or past the prompt end (a token must remain to feed).
-    assert_eq!(boundary_position(3000, 0, 3000, 1024, false), None);
-    assert_eq!(boundary_position(1, 0, 0, 1, false), None);
+    assert_eq!(boundary_position(3000, 0, 3000, 1024, false, None), None);
+    assert_eq!(boundary_position(1, 0, 0, 1, false, None), None);
     // Exactly the threshold counts.
-    assert_eq!(boundary_position(1024, 0, 3000, 1024, false), Some(1024));
+    assert_eq!(boundary_position(1024, 0, 3000, 1024, false, None), Some(1024));
     // The threshold is measured from the resume position: a turn that
     // resumed at 74 000 and diverged 240 tokens later is an ordinary fork
     // inside one conversation, not a shared preamble.
-    assert_eq!(boundary_position(74_240, 74_000, 90_000, 1024, false), None);
-    assert_eq!(boundary_position(75_023, 74_000, 90_000, 1024, false), None);
-    assert_eq!(boundary_position(75_024, 74_000, 90_000, 1024, false), Some(75_024));
+    assert_eq!(boundary_position(74_240, 74_000, 90_000, 1024, false, None), None);
+    assert_eq!(boundary_position(75_023, 74_000, 90_000, 1024, false, None), None);
+    assert_eq!(
+        boundary_position(75_024, 74_000, 90_000, 1024, false, None),
+        Some(75_024)
+    );
     // A resume that cut its session back in place never materialises: the
     // agreement lies inside the re-sent turn, however far past the resume
     // (a divergence 7 500 tokens into an answer, resumed at a checkpoint
     // 3 000 tokens before it).
-    assert_eq!(boundary_position(75_024, 74_000, 90_000, 1024, true), None);
-    assert_eq!(boundary_position(83_000, 80_000, 90_000, 1024, true), None);
+    assert_eq!(boundary_position(75_024, 74_000, 90_000, 1024, true, None), None);
+    assert_eq!(boundary_position(83_000, 80_000, 90_000, 1024, true, None), None);
+}
+
+/// `<|im_start|>user\n` as Qwen3.8-Flash-Next tokenizes it (the golden
+/// prompts' ids).
+const USER: [u32; 3] = [248_045, 846, 198];
+
+#[test]
+fn the_last_user_turn_is_found_after_its_complete_opener() {
+    // system turn, user turn "a b", assistant, user turn "c".
+    let tokens: Vec<u32> = [
+        &[248_045, 8678, 198, 1, 2, 248_046, 198][..],
+        &USER[..],
+        &[10, 11, 248_046, 198, 248_045, 74_455, 198, 12, 248_046, 198][..],
+        &USER[..],
+        &[20][..],
+    ]
+    .concat();
+    assert_eq!(last_user_turn(&tokens, &USER), Some(tokens.len() - 1));
+    // Cut inside the second opener: the first user turn's content start.
+    assert_eq!(last_user_turn(&tokens[..tokens.len() - 2], &USER), Some(10));
+    assert_eq!(last_user_turn(&tokens[..10], &USER), Some(10));
+    assert_eq!(last_user_turn(&tokens[..9], &USER), None);
+    assert_eq!(last_user_turn(&tokens, &[]), None);
+}
+
+#[test]
+fn the_durable_boundary_snaps_back_to_where_the_user_message_begins() {
+    // The case from the server log: a 15 649-token preamble ending in
+    // `<|im_start|>user\n`, two tasks sharing their first 40 words.
+    assert_eq!(
+        boundary_position(15_689, 0, 30_000, 1024, false, Some(15_649)),
+        Some(15_649)
+    );
+    // No user turn opened before the agreement: the agreement, as before.
+    assert_eq!(boundary_position(15_689, 0, 30_000, 1024, false, None), Some(15_689));
+    // The snap lands exactly on the agreement when that is where the
+    // message begins.
+    assert_eq!(
+        boundary_position(15_649, 0, 30_000, 1024, false, Some(15_649)),
+        Some(15_649)
+    );
+    // A user turn too close to the resume position to be worth an entry is
+    // not snapped to; the agreement, far enough out, still is the boundary.
+    assert_eq!(
+        boundary_position(16_000, 14_500, 30_000, 1024, false, Some(15_000)),
+        Some(16_000)
+    );
+    // Exactly the threshold counts, as for the agreement.
+    assert_eq!(
+        boundary_position(16_000, 14_000, 30_000, 1024, false, Some(15_024)),
+        Some(15_024)
+    );
+    // A position past the agreement is never used.
+    assert_eq!(
+        boundary_position(15_689, 0, 30_000, 1024, false, Some(15_700)),
+        Some(15_689)
+    );
+    // The rules that refuse an entry still win: a cut back, a short
+    // agreement, the feature off.
+    assert_eq!(boundary_position(15_689, 0, 30_000, 1024, true, Some(15_649)), None);
+    assert_eq!(boundary_position(900, 0, 30_000, 1024, false, Some(600)), None);
+    assert_eq!(boundary_position(15_689, 0, 30_000, 0, false, Some(15_649)), None);
 }
 
 #[test]

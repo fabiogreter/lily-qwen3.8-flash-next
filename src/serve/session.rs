@@ -43,7 +43,11 @@
 //! because checkpoints sit at the end of served prompts and two agent runs
 //! diverge before that. The engine materialises such a boundary once, as a
 //! disk entry whose live end is the boundary, and every later prompt with the
-//! same preamble resumes there. These entries live only on disk, never as
+//! same preamble resumes there. The boundary is the agreement snapped back to
+//! where the last user message opened before it begins
+//! ([`boundary_position`], [`last_user_turn`]): two tasks that start with the
+//! same words agree a few tokens into the message, and an entry ending there
+//! serves no prompt with another message. These entries live only on disk, never as
 //! resident sessions or extra checkpoints: they are hit far more rarely than
 //! the live conversation's cache and must not compete with it for the GPU
 //! budget. A hit never consumes them.
@@ -211,16 +215,49 @@ pub fn agreement<'a>(
 /// Nor does a resume that cut its session back in place (`cut_back`): the
 /// agreement then lies inside the turn the prompt re-sent, however far past
 /// the resume position, and that text is in the session's lineage again.
+///
+/// `user_turn` is where the content of the last user turn that opens at or
+/// before the agreement begins ([`last_user_turn`]). The boundary snaps back
+/// to it when it still lies at least `min_tokens` beyond the resume
+/// position; otherwise it stays at the agreement. Two runs whose tasks
+/// happen to start with the same words agree a few tokens into the user
+/// message, and an entry ending there resumes nothing for a third prompt
+/// with a different message; one ending where the message begins serves
+/// every prompt behind the same preamble. A snapped boundary is earlier than
+/// the agreement, so it is still a prefix both prompts share images
+/// included, and it is never inside an image span: the token before it is
+/// the opener's newline, not a placeholder.
 pub fn boundary_position(
     agreement: usize,
     reused: usize,
     prompt_len: usize,
     min_tokens: usize,
     cut_back: bool,
+    user_turn: Option<usize>,
 ) -> Option<usize> {
     let worth_it =
         min_tokens > 0 && !cut_back && agreement.saturating_sub(reused) >= min_tokens;
-    (worth_it && agreement <= prompt_len.checked_sub(1)?).then_some(agreement)
+    if !(worth_it && agreement <= prompt_len.checked_sub(1)?) {
+        return None;
+    }
+    Some(
+        user_turn
+            .filter(|&p| p <= agreement && p.saturating_sub(reused) >= min_tokens)
+            .unwrap_or(agreement),
+    )
+}
+
+/// Where the content of the last user turn opened within `tokens` begins:
+/// the position right after the last complete occurrence of `opener` (the
+/// template's `<|im_start|>user\n` as the prompt tokenizes it). `None` when
+/// there is none, or `opener` is empty.
+pub fn last_user_turn(tokens: &[u32], opener: &[u32]) -> Option<usize> {
+    if opener.is_empty() || tokens.len() < opener.len() {
+        return None;
+    }
+    (opener.len()..=tokens.len())
+        .rev()
+        .find(|&end| tokens[end - opener.len()..end] == *opener)
 }
 
 /// The best position to resume `prompt` from given a lineage's tokens,

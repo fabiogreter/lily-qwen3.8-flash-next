@@ -64,7 +64,7 @@ use crate::qwen4exp::{
     ImageEmbeds, NgramStorage, Qwen4ExpModel, VisionInput, positions_for_prompt,
 };
 use api::{Defaults, ImagePolicy, Kind, Prepared};
-use session::{CachedImage, SessionStore, boundary_position};
+use session::{CachedImage, SessionStore, boundary_position, last_user_turn};
 use stream::{Event, OutputParser, ParserConfig};
 use timings::{
     EvictionPhase, EvictionTimings, MemoryStats, NgramStats, PrefillParts,
@@ -1276,13 +1276,22 @@ impl<M: LanguageModel> Engine<M> {
         // is dropped, not kept as a checkpoint: durable entries live on disk
         // only (see the session module).
         let min_tokens = sessions.durable_min_tokens();
+        // The boundary snaps back to the start of the last user message
+        // opened before the agreement (see `boundary_position`).
         let boundary = sessions.disk().and_then(|_| {
+            let user_turn = (min_tokens > 0 && agreement > reused)
+                .then(|| {
+                    let opener = user_turn_opener(generator.tokenizer());
+                    last_user_turn(&p.prompt[..agreement.min(n)], &opener)
+                })
+                .flatten();
             boundary_position(
                 agreement,
                 reused,
                 n,
                 min_tokens,
                 acquired.cut_back.is_some(),
+                user_turn,
             )
         });
         // A client that went away (or the stop signal's grace running out)
@@ -1869,8 +1878,22 @@ impl<M: LanguageModel> Engine<M> {
     }
 }
 
-/// A response id, `chatcmpl-<created>-<n>` or `cmpl-…`, unique within the
-/// process; advances the counter.
+/// The tokens that open a user turn in the chat template,
+/// `<|im_start|>user\n`, encoded as the rendered prompt is (the template
+/// writes the marker as text and the tokenizer maps it to the special
+/// token; for Qwen3.8-Flash-Next that is `[248045, 846, 198]`, the golden
+/// prompts' ids). Empty, which turns the durable boundary's snap off, when
+/// the vocabulary has no `<|im_start|>`.
+fn user_turn_opener(tokenizer: &crate::tokenizer::Tokenizer) -> Vec<u32> {
+    let Some(start) = tokenizer.token_id("<|im_start|>") else {
+        return Vec::new();
+    };
+    match tokenizer.encode("<|im_start|>user\n") {
+        Ok(ids) if ids.len() > 1 && ids[0] == start => ids,
+        _ => Vec::new(),
+    }
+}
+
 /// How the session cache reused a lineage behind its live end, for the
 /// request's log line: cut back in place (by how many tokens) or forked.
 fn describe_reuse(cut_back: Option<usize>, forked: bool) -> String {
@@ -1881,6 +1904,8 @@ fn describe_reuse(cut_back: Option<usize>, forked: bool) -> String {
     }
 }
 
+/// A response id, `chatcmpl-<created>-<n>` or `cmpl-…`, unique within the
+/// process; advances the counter.
 fn response_id(kind: Kind, created: u64, next_id: &mut u64) -> String {
     let id = format!(
         "{}-{created}-{}",
