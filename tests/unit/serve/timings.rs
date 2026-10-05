@@ -111,6 +111,8 @@ fn the_json_shape_is_the_documented_one() {
             "generated_tokens": 19,
             "decode_ms": 190.0,
             "decode_per_second": 100.0,
+            "decode_checkpoints": 0,
+            "decode_checkpoint_ms": 0.0,
             "drafted_tokens": 14,
             "accepted_tokens": 11,
             "acceptance_ratio": 0.7857,

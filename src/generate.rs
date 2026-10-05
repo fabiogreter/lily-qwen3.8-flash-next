@@ -5,6 +5,12 @@
 //! (some models stage per-token host inputs, see
 //! [`LanguageModel::prepare_step_inputs`]). Tokens are delivered to a callback
 //! as they are drawn, so callers stream them and can stop early.
+//!
+//! A caller can also have recurrent-state checkpoints taken along the way
+//! ([`DecodeCheckpointer`], [`Generator::generate_checkpointed`]): when one
+//! is due, the loop lets its pipeline drain for one step, so that nothing is
+//! in flight and no speculative step is pending, and hands the caller the
+//! state at rest.
 
 use std::path::Path;
 
@@ -56,6 +62,23 @@ pub struct GenerateOptions<'a> {
     pub drafts: usize,
 }
 
+/// Recurrent-state checkpoints taken during a generation (the session
+/// cache's decode checkpoints). Before the loop pipelines the step that
+/// would carry the state past a point of rest, it asks [`Self::due`] with
+/// the number of tokens the state holds there; on a yes it lets the pipeline
+/// drain at that point (no pass in flight, no step parked, no speculative
+/// step pending) and calls [`Self::take`].
+pub trait DecodeCheckpointer<S: DecodeStateApi> {
+    /// Whether a checkpoint is due once the state holds `pos` tokens. It may
+    /// be asked more than once for the same `pos` before [`Self::take`] and
+    /// must give the same answer each time.
+    fn due(&mut self, pos: usize) -> bool;
+    /// Takes the checkpoint: `state` is at rest at a position [`Self::due`]
+    /// accepted, holding the prompt and every drawn token but the last one
+    /// (the next step's input).
+    fn take(&mut self, ctx: &MetalContext, state: &S) -> Result<()>;
+}
+
 /// What [`speculate`] reports.
 pub struct Speculated {
     pub finish: FinishReason,
@@ -82,8 +105,40 @@ pub fn speculate<M: LanguageModel>(
     is_stop: &dyn Fn(u32) -> bool,
     on_token: &mut dyn FnMut(u32) -> Result<bool>,
 ) -> Result<Speculated> {
+    speculate_checkpointed(
+        ctx, model, state, scratch, params, drafts, max_tokens, tokens, is_stop, None,
+        on_token,
+    )
+}
+
+/// [`speculate`] with decode checkpoints. A step after which one is due
+/// completes its verify pass without committing the next one
+/// ([`LanguageModel::finish_speculation`] without a next step, as at the end
+/// of a generation), so the state is at rest with the accepted rows fed; the
+/// checkpoint is taken there and the head proposes afresh for the fresh draw
+/// ([`LanguageModel::draft_initial`], as after the prefill). The emitted
+/// tokens are the trunk's draws either way; only the proposals after the
+/// restart can differ, which under sampling changes which draws a seed
+/// realises, not their distribution.
+#[allow(clippy::too_many_arguments)]
+fn speculate_checkpointed<M: LanguageModel>(
+    ctx: &MetalContext,
+    model: &M,
+    state: &mut M::State,
+    scratch: &mut M::Scratch,
+    params: &SamplingParams,
+    drafts: usize,
+    max_tokens: usize,
+    tokens: &mut Vec<u32>,
+    is_stop: &dyn Fn(u32) -> bool,
+    mut checkpoints: Option<&mut dyn DecodeCheckpointer<M::State>>,
+    on_token: &mut dyn FnMut(u32) -> Result<bool>,
+) -> Result<Speculated> {
     let k = drafts.min(model.max_drafts()).max(1);
     ensure!(tokens.len() == 1, "speculation starts right after the first draw");
+    // The state holds the prompt here; at every later point of rest it also
+    // holds the drawn tokens, all but the last.
+    let base = state.pos();
     let (mut drafted, mut accepted) = (0usize, 0usize);
     let mut proposals =
         model.draft_initial(ctx, state, scratch, tokens[0], k, params, tokens.len())?;
@@ -143,6 +198,30 @@ pub fn speculate<M: LanguageModel>(
                 return Ok(Speculated { finish, drafted, accepted });
             }
             None => {
+                let rest = base + tokens.len() - 1;
+                if checkpoints.as_mut().is_some_and(|c| c.due(rest)) {
+                    model.finish_speculation(ctx, state, scratch, kept, None, draft)?;
+                    ensure!(
+                        state.pos() == rest,
+                        "speculation came to rest at {} instead of {rest}",
+                        state.pos()
+                    );
+                    if let Some(c) = checkpoints.as_mut() {
+                        c.take(ctx, &*state)?;
+                    }
+                    proposals = model.draft_initial(
+                        ctx,
+                        state,
+                        scratch,
+                        sampled[kept],
+                        k,
+                        params,
+                        tokens.len(),
+                    )?;
+                    // Nothing is parked: the next verify pass is encoded and
+                    // committed by `verify` itself.
+                    continue;
+                }
                 let next =
                     NextStep { token: sampled[kept], params, step0: tokens.len() };
                 let (next_proposals, next_parked) = model.finish_speculation(
@@ -215,6 +294,25 @@ impl Generator {
         options: &GenerateOptions<'_>,
         on_token: &mut dyn FnMut(u32) -> Result<bool>,
     ) -> Result<Generation> {
+        self.generate_checkpointed(
+            ctx, model, state, scratch, prompt_ids, options, None, on_token,
+        )
+    }
+
+    /// [`Self::generate`], taking a checkpoint of the state whenever
+    /// `checkpoints` says one is due ([`DecodeCheckpointer`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_checkpointed<M: LanguageModel>(
+        &self,
+        ctx: &MetalContext,
+        model: &M,
+        state: &mut M::State,
+        scratch: &mut M::Scratch,
+        prompt_ids: &[u32],
+        options: &GenerateOptions<'_>,
+        checkpoints: Option<&mut dyn DecodeCheckpointer<M::State>>,
+        on_token: &mut dyn FnMut(u32) -> Result<bool>,
+    ) -> Result<Generation> {
         ensure!(!prompt_ids.is_empty(), "empty prompt");
         ensure!(options.max_tokens > 0, "max_tokens must be positive");
         let pos_before = state.pos();
@@ -245,7 +343,7 @@ impl Generator {
             finish = FinishReason::Callback;
         } else if tokens.len() < options.max_tokens {
             if options.drafts > 0 && model.max_drafts() > 0 {
-                let outcome = speculate(
+                let outcome = speculate_checkpointed(
                     ctx,
                     model,
                     state,
@@ -255,6 +353,7 @@ impl Generator {
                     options.max_tokens,
                     &mut tokens,
                     &is_stop,
+                    checkpoints,
                     on_token,
                 )?;
                 finish = outcome.finish;
@@ -268,6 +367,7 @@ impl Generator {
                     scratch,
                     options,
                     &mut tokens,
+                    checkpoints,
                     on_token,
                 )?;
             }
@@ -298,6 +398,11 @@ impl Generator {
     /// anyway (fed with the final token, which a continued conversation wants
     /// in the state). Without parking the next step is only encoded ahead and
     /// committed after staging.
+    ///
+    /// When a decode checkpoint is due at the position the current step
+    /// leaves the state at, the following step is not encoded ahead: once
+    /// the current step completes nothing is in flight, and the top of the
+    /// loop takes the checkpoint before it encodes the next step unparked.
     #[allow(clippy::too_many_arguments)]
     fn decode_loop<M: LanguageModel>(
         &self,
@@ -307,6 +412,7 @@ impl Generator {
         scratch: &M::Scratch,
         options: &GenerateOptions<'_>,
         tokens: &mut Vec<u32>,
+        mut checkpoints: Option<&mut dyn DecodeCheckpointer<M::State>>,
         on_token: &mut dyn FnMut(u32) -> Result<bool>,
     ) -> Result<FinishReason> {
         let params = options.sampling;
@@ -346,6 +452,16 @@ impl Generator {
                 ahead = None;
                 state.ensure_capacity(ctx, state.pos() + 1)?;
             }
+            // Nothing in flight and nothing encoded: the state is at rest,
+            // holding every drawn token but `input`.
+            if parked.is_none() && ahead.is_none() {
+                let pos = state.pos();
+                if let Some(c) = checkpoints.as_mut()
+                    && c.due(pos)
+                {
+                    c.take(ctx, &*state)?;
+                }
+            }
             let step = tokens.len();
             let pending = match parked.take() {
                 Some(pass) => {
@@ -379,8 +495,11 @@ impl Generator {
             // caches without one outstanding. Prompts that end within a few
             // hundred tokens below a capacity step hit this every time;
             // skipping the pipelining for one step there costs nothing.
+            let pos = state.pos();
+            let rest_due = checkpoints.as_mut().is_some_and(|c| c.due(pos));
             if tokens.len() + 1 < options.max_tokens
                 && state.pos() + 1 < state.capacity()
+                && !rest_due
             {
                 let draw = Draw { params, step: step + 1 };
                 if parking {

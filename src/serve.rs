@@ -53,7 +53,7 @@ use crate::engine::{
     DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, SnapshotApi,
     VisionMode, VisionTower,
 };
-use crate::generate::{FinishReason, GenerateOptions, Generator};
+use crate::generate::{DecodeCheckpointer, FinishReason, GenerateOptions, Generator};
 use crate::kernels::attention::MAX_SEQ;
 use crate::kernels::sample::SamplingParams;
 use crate::metal::MetalContext;
@@ -80,6 +80,10 @@ use tools::ParsedToolCall;
 const MAX_REQUEST_BYTES: usize = 1 << 30;
 /// Recurrent-state checkpoints kept per session (the newest ones).
 const CHECKPOINTS_PER_SESSION: usize = 3;
+/// Decode checkpoints a generation holds and a session keeps of its latest
+/// request (113 MB each on the full model): a 2 048-token interval stays at
+/// that spacing up to an 8 192-token answer and thins to 4 096 up to 16 384.
+const DECODE_CHECKPOINTS_PER_SESSION: usize = 4;
 /// Completed requests `GET /v1/timings` remembers (a ring buffer; a client
 /// polls it right after its request, so a handful of entries is plenty).
 const TIMINGS_LOG_CAPACITY: usize = 32;
@@ -185,6 +189,10 @@ pub struct ServeOptions {
     /// being able to resume there is written to the disk tier as a durable
     /// prefix entry, so later prompts resume from it (0 disables).
     pub durable_min_tokens: usize,
+    /// A generation takes a recurrent-state checkpoint every this many
+    /// tokens, so a next prompt that diverges inside the answer resumes
+    /// near the divergence (0 disables).
+    pub decode_checkpoint_tokens: usize,
     pub thinking: bool,
     pub reasoning_effort: Option<String>,
     pub queue: usize,
@@ -902,6 +910,32 @@ impl<M: LanguageModel> Engine<M> {
         }
         let mut sessions =
             SessionStore::new(budget, options.max_sessions, CHECKPOINTS_PER_SESSION);
+        // The expert cache's plan reserved one session with exactly
+        // `CHECKPOINTS_PER_SESSION` snapshots; more would outgrow it.
+        if model.session_reserve().is_some() {
+            if options.decode_checkpoint_tokens > 0 {
+                eprintln!(
+                    "session cache: no decode checkpoints (the expert cache budgets one session with {CHECKPOINTS_PER_SESSION} checkpoints)"
+                );
+            }
+        } else if options.decode_checkpoint_tokens > 0 {
+            sessions = sessions.with_decode_checkpoints(
+                options.decode_checkpoint_tokens,
+                DECODE_CHECKPOINTS_PER_SESSION,
+            );
+            eprintln!(
+                "session cache: decode checkpoints every {} generated tokens, at most {DECODE_CHECKPOINTS_PER_SESSION} per session{}",
+                options.decode_checkpoint_tokens,
+                model
+                    .session_bytes(4, 1)
+                    .zip(model.session_bytes(4, 0))
+                    .map(|(with, without)| format!(
+                        " ({:.0} MB each)",
+                        with.saturating_sub(without) as f64 / 1e6
+                    ))
+                    .unwrap_or_default()
+            );
+        }
         if let (Some(dir), true) =
             (&options.disk_cache_dir, options.disk_cache_bytes > 0)
         {
@@ -1527,14 +1561,19 @@ impl<M: LanguageModel> Engine<M> {
             stop_tokens: &[],
             drafts: *drafts,
         };
+        // Decode checkpoints count from the one the prefill just took.
+        let mut decode_checkpoints = sessions.decode_checkpoints(n - 1);
+        let checkpointer: &mut dyn DecodeCheckpointer<M::State> =
+            &mut decode_checkpoints;
         let decode_started = Instant::now();
-        let generation = generator.generate(
+        let generation = generator.generate_checkpointed(
             ctx,
             model,
             &mut session.state,
             scratch,
             &p.prompt[n - 1..],
             &options,
+            Some(checkpointer),
             &mut |token| {
                 let events = parser.push(token)?;
                 deliver(events, sink);
@@ -1569,6 +1608,11 @@ impl<M: LanguageModel> Engine<M> {
             session.state.pos() == session.tokens.len(),
             "session token/state position mismatch"
         );
+        // Every decode checkpoint sits at a point the state passed: a prefix
+        // of the tokens just recorded.
+        let decode_checkpoints_taken = decode_checkpoints.taken();
+        let decode_checkpoint_secs = decode_checkpoints.secs();
+        session.add_decode_checkpoints(decode_checkpoints.into_snapshots(), &images)?;
         let released = sessions.release(ctx, session, &images, p.cache_key.as_deref());
 
         if ctx.profiling() {
@@ -1605,6 +1649,7 @@ impl<M: LanguageModel> Engine<M> {
         )
         .with_agreement(agreement, durable.map(|(b, _)| b))
         .with_vision(image_tokens, vision_secs)
+        .with_decode_checkpoints(decode_checkpoints_taken, decode_checkpoint_secs)
         .with_pinned(pinned)
         .with_cancel(cancelled_by, None)
         .with_evictions(EvictionTimings {
@@ -1674,14 +1719,24 @@ impl<M: LanguageModel> Engine<M> {
             prefix_secs,
             decode_secs,
             completion_tokens as f64 / decode_secs.max(1e-9),
-            if generation.drafted > 0 {
-                format!(
-                    ", drafts {}/{} accepted",
-                    generation.accepted, generation.drafted
-                )
-            } else {
-                String::new()
-            },
+            format!(
+                "{}{}",
+                if generation.drafted > 0 {
+                    format!(
+                        ", drafts {}/{} accepted",
+                        generation.accepted, generation.drafted
+                    )
+                } else {
+                    String::new()
+                },
+                if decode_checkpoints_taken > 0 {
+                    format!(
+                        ", {decode_checkpoints_taken} decode checkpoints in {decode_checkpoint_secs:.2}s"
+                    )
+                } else {
+                    String::new()
+                }
+            ),
             cancelled_by
                 .map(|by| format!(" (cancelled by the {by} during the decode)"))
                 .unwrap_or_default(),

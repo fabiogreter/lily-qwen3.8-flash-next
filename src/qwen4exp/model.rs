@@ -3638,6 +3638,9 @@ impl DecodeStateApi for DecodeState {
     }
 
     fn snapshot(&self, ctx: &MetalContext) -> Result<Snapshot> {
+        // Mid-step the recurrent state holds rows the draft pass may still
+        // roll back, and the position counts them.
+        ensure!(self.spec.is_none(), "snapshot while a speculative step is pending");
         let slot = self.conv_slot;
         let mut gdn = Vec::new();
         for lstate in &self.layers {

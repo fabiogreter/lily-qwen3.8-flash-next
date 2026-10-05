@@ -738,7 +738,7 @@ On a 128 GB machine with the full checkpoint:
 | n-gram table                        | 32.0 GB  | page cache, memory-mapped, evictable |
 | draft head                          | 1.5 GB   | in the 71.1 GB above when converted |
 | per-token cache, all layers         | 28 416 B | session cache                      |
-| GDN recurrent checkpoint            | 113 MB   | session cache, up to 3 per session |
+| GDN recurrent checkpoint            | 113 MB   | session cache, up to 3 + 4 per session |
 | prefill scratch                     | ~2.4 GB  | grown on demand to the 4 096-token chunk |
 
 Moving the n-gram table off the GPU is what makes the model fit without
@@ -815,6 +815,47 @@ construction, so a checkpoint makes every prefix up to its position
 resumable. The position is `prompt_len - 1` and not `prompt_len` because an
 identical prompt, a regeneration, must still feed one token to produce
 logits.
+
+**Decode checkpoints.** The next prompt can diverge inside the answer the
+session just generated. A client such as opencode sends the answer back as
+text, lily tokenizes it canonically, and where the model had sampled a
+non-canonical split of the same text the tokens differ from there on; a day
+of opencode sessions showed it 9 times in about 400 requests, always inside
+reasoning text, 2 000 to 7 500 tokens into the previous generation. With
+checkpoints only at prompt ends such a prompt resumes at the previous
+prompt's end and prefills the whole answer again: 18 000 tokens (9.0 s) for
+one divergence 7 514 tokens into a 17 756-token answer. So a generation also
+takes a checkpoint every `--decode-checkpoint-tokens` (default 2 048)
+generated tokens. It is taken at rest: when one is due, the plain decode
+loop does not encode the following step ahead, so once the current step
+completes nothing is in flight or parked, and the speculative loop completes
+its verify pass without committing the next one (as at the end of a
+generation, no step pending), snapshots, and proposes afresh with the
+head's initial draft pass. The position is then exactly the tokens fed: the
+prompt and every drawn token but the last, which is the next step's input,
+and the session's tokens are recorded to the same count after the
+generation, so a checkpoint is always a prefix of them; generated tokens are
+text, so none lies inside an image span. A greedy output is unchanged (an
+ignored test on the checkpoint holds it to the token with and without
+drafts); under sampling only the proposals after a restart differ, which
+changes which draws a seed realises and not their distribution. The cost is
+one snapshot (113 MB on the full model, about 20 ms like the prefill's
+checkpoint) and one step without pipelining per interval, reported as
+`decode_checkpoints` and `decode_checkpoint_ms` (part of `decode_ms`) in the
+`timings` and as `N decode checkpoints in Ts` on the log line.
+
+A generation holds at most four. When a fifth is due, every other one goes,
+the oldest first, and the interval doubles, so the spacing stays even: every
+2 048 tokens up to an 8 192-token answer, every 4 096 up to 16 384, and so
+on, never more than four snapshots at a time. They count toward the session
+budget like any checkpoint and are capped separately from the three prompt
+ends. Only the request right after a generation can diverge inside it (the
+one after that re-sends the turn as the previous prompt rendered it), so a
+session keeps the decode checkpoints of the request it ran last and drops
+older ones at the release. The disk tier writes them like every other
+checkpoint (one file per position), so a spilled or written-ahead session
+resumes at one from the file. Under the expert cache they are off: its plan
+reserves one session with three checkpoints, exactly.
 
 Acquiring a session for a new prompt: for every session, find the longest
 common prefix with the prompt and the latest checkpoint at or below

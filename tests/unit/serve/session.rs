@@ -248,11 +248,14 @@ mod store {
 
     use anyhow::{Result, bail};
 
-    use super::super::{Acquired, DiskCopy, Evictions, SessionStore};
+    use super::super::{
+        Acquired, DecodeCheckpoints, DiskCopy, Evictions, SessionStore,
+    };
     use crate::engine::{
         DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, Segment,
         SnapshotApi,
     };
+    use crate::generate::DecodeCheckpointer;
     use crate::metal::{EncodedPass, MetalContext};
     use crate::serve::disk::DiskStore;
     use crate::tensor::Tensor;
@@ -850,5 +853,170 @@ mod store {
         assert_eq!(f.store.len(), 1);
         let (retry, _) = serve(&mut f, &turn);
         assert_eq!((retry.reused, retry.forked), (300, false));
+    }
+
+    // --- decode checkpoints ---------------------------------------------------
+
+    /// Feeds `tokens` one at a time, asking `checkpoints` at every point of
+    /// rest as the decode loop does.
+    fn decode(
+        ctx: &MetalContext,
+        state: &mut State,
+        checkpoints: &mut DecodeCheckpoints<State>,
+        tokens: &[u32],
+    ) {
+        for &t in tokens {
+            state.feed(&[t]);
+            let pos = state.pos();
+            if checkpoints.due(pos) {
+                assert!(checkpoints.due(pos), "asked twice, the same answer");
+                checkpoints.take(ctx, state).expect("take");
+            }
+        }
+    }
+
+    #[test]
+    fn decode_checkpoints_follow_the_interval_and_thin_evenly_once_full() {
+        let ctx = MetalContext::new().expect("metal");
+        let mut state = State { data: vec![], recurrent: 0, capacity: 0 };
+        state.feed(&prompt(1, 10));
+        // Counted from the prefill's checkpoint at 9, every 100 tokens.
+        let mut c = DecodeCheckpoints::<State>::new(100, 4, 9);
+        decode(&ctx, &mut state, &mut c, &prompt(2, 400));
+        assert_eq!(c.positions(), [109, 209, 309, 409]);
+        // A fifth is due at 509 with four held: every other one goes and the
+        // interval doubles, which moves the next one to 609.
+        decode(&ctx, &mut state, &mut c, &prompt(3, 100));
+        assert_eq!(c.positions(), [209, 409]);
+        decode(&ctx, &mut state, &mut c, &prompt(4, 400));
+        assert_eq!(c.positions(), [209, 409, 609, 809]);
+        assert_eq!(c.taken(), 6);
+        assert!(c.secs() >= 0.0);
+        // Each holds exactly the state at its position.
+        let all: Vec<u32> =
+            [prompt(1, 10), prompt(2, 400), prompt(3, 100), prompt(4, 400)].concat();
+        for snapshot in c.into_snapshots() {
+            let mut expected = State { data: vec![], recurrent: 0, capacity: 0 };
+            expected.feed(&all[..snapshot.pos]);
+            assert_eq!(snapshot.recurrent, expected.recurrent);
+        }
+        // Off: no interval, or nothing may be held.
+        for (interval, max) in [(0, 4), (100, 0)] {
+            let mut off = DecodeCheckpoints::<State>::new(interval, max, 0);
+            assert!(!off.due(1_000_000));
+        }
+    }
+
+    /// [`serve`] for a request that also generates: after the prefill's
+    /// checkpoint at `n - 1` the state is fed the prompt's last token and all
+    /// of `generated` but the last (drawn, never fed), with decode checkpoints
+    /// as the store configures them. Returns the acquire.
+    fn serve_generating(
+        f: &mut Fixture,
+        prompt: &[u32],
+        generated: &[u32],
+    ) -> Acquired<Model> {
+        let n = prompt.len();
+        let mut acquired =
+            f.store.acquire(&f.ctx, &Model, prompt, &[], None).expect("acquire");
+        let reused = acquired.reused;
+        let mut session = std::mem::replace(
+            &mut acquired.session,
+            super::super::Session::new(State {
+                data: vec![],
+                recurrent: 0,
+                capacity: 0,
+            }),
+        );
+        session.state.feed(&prompt[reused..n - 1]);
+        let snapshot = session.state.snapshot(&f.ctx).expect("snapshot");
+        session.add_checkpoint(snapshot);
+        let mut checkpoints = f.store.decode_checkpoints(n - 1);
+        session.state.feed(&prompt[n - 1..]);
+        let fed = &generated[..generated.len() - 1];
+        decode(&f.ctx, &mut session.state, &mut checkpoints, fed);
+        session.tokens.truncate(reused);
+        session.tokens.extend_from_slice(&prompt[reused..]);
+        session.tokens.extend_from_slice(fed);
+        session.add_decode_checkpoints(checkpoints.into_snapshots(), &[]).expect("add");
+        f.store.release(&f.ctx, session, &[], None);
+        acquired
+    }
+
+    /// The checkpoint positions of the resident session that starts with
+    /// `seed`'s prompt.
+    fn positions_of(f: &Fixture, seed: u32) -> Vec<usize> {
+        f.store
+            .entries
+            .iter()
+            .find(|s| s.tokens.first() == Some(&(seed * 1000)))
+            .map(|s| s.checkpoints.iter().map(|c| c.pos()).collect())
+            .unwrap_or_default()
+    }
+
+    /// A 300-token prompt and a 600-token answer with decode checkpoints
+    /// every 100 tokens, four held: 399 to 699, thinned at 799 to 499 and
+    /// 699, then 899, which the release drops: it is the live end. Returns the
+    /// lineage the session holds.
+    fn answered(f: &mut Fixture) -> Vec<u32> {
+        f.store.decode_interval = 100;
+        f.store.max_decode_checkpoints = 4;
+        let a = prompt(1, 300);
+        let answer = prompt(5, 600);
+        serve_generating(f, &a, &answer);
+        assert_eq!(positions_of(f, 1), [299, 499, 699]);
+        [a, answer[..599].to_vec()].concat()
+    }
+
+    /// The next prompt: the lineage up to `at`, then a different token (the
+    /// answer re-tokenized there) and a new message.
+    fn diverging(lineage: &[u32], at: usize) -> Vec<u32> {
+        [&lineage[..at], &[7777u32][..], &prompt(6, 50)[..]].concat()
+    }
+
+    #[test]
+    fn a_prompt_diverging_inside_the_last_answer_resumes_at_its_decode_checkpoint() {
+        let mut f = fixture("decode-resume", 10_000_000, None);
+        let lineage = answered(&mut f);
+        // Diverging 450 tokens into the answer: the decode checkpoint at 699
+        // instead of the prompt's end at 299.
+        let next = diverging(&lineage, 750);
+        let (acquired, _) = serve(&mut f, &next);
+        assert_eq!((acquired.reused, acquired.from_disk), (699, None));
+        assert_eq!(acquired.agreement, 750);
+        let resumed = f.store.entries.iter().find(|s| s.tokens == next);
+        assert_holds(&resumed.expect("served").state, &next);
+    }
+
+    #[test]
+    fn a_session_keeps_only_the_decode_checkpoints_of_its_latest_request() {
+        let mut f = fixture("decode-latest", 10_000_000, None);
+        let lineage = answered(&mut f);
+        // The next turn extends the live end and generates too little for a
+        // decode checkpoint: the first answer's go, its own prompt end stays.
+        let turn = [lineage.clone(), prompt(7, 100)].concat();
+        let n = turn.len();
+        f.store.decode_interval = 1000;
+        serve_generating(&mut f, &turn, &prompt(8, 10));
+        assert_eq!(positions_of(&f, 1), [299, n - 1]);
+    }
+
+    #[test]
+    fn decode_checkpoints_survive_the_disk_tier() {
+        // Room for the answered session, not for it and another one.
+        let mut f = fixture("decode-disk", 1_000_000, None);
+        let lineage = answered(&mut f);
+        let (other, _) = serve(&mut f, &prompt(2, 300));
+        assert_eq!((other.evictions.evicted, other.evictions.spilled), (1, 1));
+        let disk = f.store.disk().expect("disk");
+        let entry = disk.entries().iter().find(|e| e.tokens == lineage);
+        assert_eq!(entry.expect("spilled").checkpoints, [299, 499, 699, 899]);
+        // The diverging prompt resumes from the file at the decode checkpoint
+        // with exactly the state the answer had there.
+        let next = diverging(&lineage, 750);
+        let acquired = f.store.acquire(&f.ctx, &Model, &next, &[], None).expect("next");
+        assert_eq!(acquired.reused, 699);
+        assert!(acquired.from_disk.is_some());
+        assert_holds(&acquired.session.state, &lineage[..699]);
     }
 }
