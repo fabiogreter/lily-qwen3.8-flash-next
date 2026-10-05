@@ -151,10 +151,6 @@ struct Cli {
     #[arg(long, default_value_t = lily::qwen4exp::image::DEFAULT_MIN_PIXELS)]
     image_min_pixels: usize,
 
-    /// Most images one chat request may carry.
-    #[arg(long, default_value_t = 8)]
-    max_images: usize,
-
     /// Chat prompts open a reasoning block unless the request says otherwise.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     thinking: bool,
@@ -242,7 +238,6 @@ fn run() -> Result<()> {
         vision: cli.vision,
         image_max_pixels: cli.image_max_pixels,
         image_min_pixels: cli.image_min_pixels,
-        max_images: cli.max_images,
         thinking: cli.thinking,
         reasoning_effort: cli.reasoning_effort,
         queue: cli.queue,

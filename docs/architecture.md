@@ -1044,14 +1044,31 @@ URL must be a base64 data URI of type `image/png` or `image/jpeg`: the
 server makes no outbound request for an image, ever (a fetch from the server
 is a request-forgery surface, and the agent clients send data URIs anyway),
 and `http(s)`, `file` and other schemes are refused with a 400 that says so,
-as are other media types, more than `--max-images` images, and any image
-when the tower is not loaded (`--vision off`, or a checkpoint without one;
+as are other media types and any image when the tower is not loaded (`--vision off`, or a checkpoint without one;
 the front decides this from the flag and the checkpoint's `lily.vision`
 block before the engine has loaded). Decoding, resizing and patchifying
 (`src/qwen4exp/image.rs`, under `--image-max-pixels` and
 `--image-min-pixels`) and the SHA-256 of the result run on the connection
 thread with tokenisation, about 35 ms plus the digest for a Retina capture;
 decoder errors and limit violations become 400s with the module's message.
+There is no limit on how many images a request carries: agent clients
+resend the whole history every turn, so any cap, or dropping old images to
+stay under one, either wedges the session or changes the prompt early on and
+costs a prefill of nearly all of it. What bounds a request is the context
+(about 2 040 tokens a 1920 x 1080 screenshot) and the 1 GiB body limit, near
+400 opencode screenshots of 2.5 MB base64 each. Resending is made cheap by
+the image memo (`ImageMemo` in `src/serve/api.rs`): the identity
+preprocessing gave an image (grid and digest) is kept under the SHA-256 of
+its data URI, 4 096 entries, oldest first out. A known image costs a hash
+of its URI instead of a decode, a resize and a hash of the rows, and its
+rows are made again only if the tower has to run over it, on the engine
+thread, checked against the remembered digest. Measured on the 4-layer
+checkpoint with the solarsim session's own 2000 x 1182 screenshots
+(re-encoded, 1.3 MB each): a turn behind 10, 30 and 60 earlier images spent
+1.57, 4.68 and 9.35 s preparing them before the memo, 0.05, 0.14 and
+0.27 s with it (JSON parsing and the URI hashes). The request log line says
+how many images were decoded on the connection thread when the memo knew
+some (`images 31 (9300 tokens, 1 encoded, 1 decoded, prepared in 0.049s)`).
 A message with an image reaches the chat template as structured content
 (`{type: text}` and `{type: image}` items in order) so it writes
 `<|vision_start|><|image_pad|><|vision_end|>` where the image sits; a

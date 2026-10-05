@@ -72,7 +72,12 @@ use timings::{
 };
 use tools::ParsedToolCall;
 
-const MAX_REQUEST_BYTES: usize = 32 << 20;
+/// Largest request body. Agent clients resend every image of the history
+/// as base64 on every turn, about 2.5 MB per 2000 x 1182 screenshot, so 32
+/// MiB refused a session after a dozen of them; the context (about 2 000
+/// tokens an image) bounds a request near 130 screenshots, well inside
+/// this. The body buffer is zero-filled pages until read into.
+const MAX_REQUEST_BYTES: usize = 1 << 30;
 /// Recurrent-state checkpoints kept per session (the newest ones).
 const CHECKPOINTS_PER_SESSION: usize = 3;
 /// Completed requests `GET /v1/timings` remembers (a ring buffer; a client
@@ -170,8 +175,6 @@ pub struct ServeOptions {
     pub image_max_pixels: usize,
     /// An image with fewer pixels is scaled up to reach it.
     pub image_min_pixels: usize,
-    /// Most images one chat request may carry.
-    pub max_images: usize,
     /// Where evicted sessions are kept on disk (`None` disables the tier).
     pub disk_cache_dir: Option<std::path::PathBuf>,
     /// Most bytes the disk tier may hold.
@@ -1206,11 +1209,13 @@ impl<M: LanguageModel> Engine<M> {
         let mut encoded: Vec<(usize, crate::tensor::Tensor)> = Vec::new();
         for (k, image) in p.images.iter().enumerate() {
             if image.span.end() > reused {
+                let pixels =
+                    image.rows().with_context(|| format!("image {}", k + 1))?;
                 let rows = model
                     .encode_image(
                         ctx,
                         scratch,
-                        &image.pixels,
+                        &pixels,
                         image.span.grid_h,
                         image.span.grid_w,
                     )
@@ -1650,13 +1655,19 @@ impl<M: LanguageModel> Engine<M> {
                 String::new()
             } else {
                 format!(
-                    ", images {} ({image_tokens} tokens{}), tower {vision_secs:.2}s",
+                    ", images {} ({image_tokens} tokens{}{}, prepared in {:.3}s), tower {vision_secs:.2}s",
                     p.images.len(),
                     if encoded_images < p.images.len() {
                         format!(", {encoded_images} encoded")
                     } else {
                         String::new()
-                    }
+                    },
+                    if p.images_decoded < p.images.len() {
+                        format!(", {} decoded", p.images_decoded)
+                    } else {
+                        String::new()
+                    },
+                    p.prepare_secs
                 )
             },
             completion_tokens,
@@ -2041,8 +2052,8 @@ fn image_policy(model_dir: &Path, options: &ServeOptions) -> Result<ImagePolicy>
             min_pixels: options.image_min_pixels,
             ..ImageLimits::default()
         },
-        max_images: options.max_images,
         available,
+        memo: Default::default(),
     })
 }
 
@@ -2458,8 +2469,8 @@ fn run_with<M: LanguageModel + 'static>(
         "images: {}",
         match &images.available {
             Ok(()) => format!(
-                "PNG and JPEG data URIs, at most {} per request, {} to {} pixels after resizing",
-                images.max_images, images.limits.min_pixels, images.limits.max_pixels
+                "PNG and JPEG data URIs, {} to {} pixels after resizing",
+                images.limits.min_pixels, images.limits.max_pixels
             ),
             Err(why) => format!("refused ({why})"),
         }
@@ -2635,6 +2646,7 @@ fn handle(front: &Front, mut stream: TcpStream) {
             {
                 queue.arrival_taken();
             }
+            let prepare_started = Instant::now();
             let prepared = if path == "/v1/chat/completions" {
                 serde_json::from_slice::<api::ChatRequest>(&request.body)
                     .context("parsing the chat request")
@@ -2659,7 +2671,7 @@ fn handle(front: &Front, mut stream: TcpStream) {
                         )
                     })
             };
-            let prepared = match prepared {
+            let mut prepared = match prepared {
                 Ok(p) => p,
                 Err(error) => {
                     refuse(
@@ -2672,6 +2684,7 @@ fn handle(front: &Front, mut stream: TcpStream) {
                     return;
                 }
             };
+            prepared.prepare_secs = prepare_started.elapsed().as_secs_f64();
             if let Some(asked) = prepared.clamped_from {
                 eprintln!(
                     "warning: {what}: max_tokens {asked} clamped to {} (the prompt has {} tokens, the server context \

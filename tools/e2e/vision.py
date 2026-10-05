@@ -25,8 +25,14 @@ or inequality, never for quality. What is checked:
      start, where a second durable entry is written, and a fifth run with
      a third image resumes exactly there.
   3. refusals: an https URL, a GIF data URI, a 100 000 x 100 000 PNG
-     header, nine images, and a `<|image_pad|>` typed into message text all
-     get 400 with a message that says why.
+     header, and a `<|image_pad|>` typed into message text all get 400 with
+     a message that says why.
+  6. a long visual history: thirty distinct images over thirty turns are
+     all taken (there is no image limit); a turn with one more resumes from
+     the whole previous prompt and decodes and encodes only the new image;
+     the same history behind another system prompt misses the session cache
+     and re-encodes every image from the memo's deferred rows, decoding
+     none on the connection thread.
   4. a text-only request gives the same answer and `prompt_tokens` on the
      committed binary (`--baseline-lily`, when given) as on the one under
      test, and its response carries no image fields.
@@ -194,7 +200,7 @@ def main():
               f"request 2 cached at most the image start ({r2['timings']['cached_tokens']} <= {span_start})")
         check(r2["timings"].get("vision_ms", 0) > 0, "request 2 ran the tower for its own image")
         check(r1["answer"] != r2["answer"], f"the answers differ ({r1['answer'][:40]!r} vs {r2['answer'][:40]!r})")
-        check("images 1 (300 tokens), tower" in r1["line"], "the log line reports the image and the tower time")
+        check("images 1 (300 tokens, prepared in" in r1["line"] and "), tower" in r1["line"], "the log line reports the image and the tower time")
         r1b = chat(s, m1, "image request 1 again (same PNG)", args.log)
         check(r1b["timings"]["cached_tokens"] == n1 - 1 and n1 - 1 > span_start + image_tokens,
               f"the same image resumes past its span ({r1b['timings']['cached_tokens']} > {span_start + image_tokens})")
@@ -211,7 +217,7 @@ def main():
         two = [{"role": "user", "content": [{"type": "text", "text": "First:"}, image_part(disc), {"type": "text", "text": "second:"},
                                             image_part(bars), {"type": "text", "text": "Which is brighter?"}]}]
         r2i = chat(s, two, "two images in one message", args.log)
-        check(r2i["timings"].get("image_tokens") == 600 and "images 2 (600 tokens)" in r2i["line"],
+        check(r2i["timings"].get("image_tokens") == 600 and "images 2 (600 tokens," in r2i["line"],
               f"two 640 x 480 images are 600 placeholder tokens ({r2i['timings'].get('image_tokens')})")
         check(r2i["timings"]["cached_tokens"] == 0 and r2i["timings"].get("vision_ms", 0) > 0, "both images went through the tower")
         r2j = chat(s, two, "two images again", args.log)
@@ -235,9 +241,6 @@ def main():
         expect_400(s, one(image_part(data_uri("image/gif", b"GIF89a" + bytes(20)))), "GIF data URI", '"image/gif" are not accepted')
         expect_400(s, one(image_part(data_uri("image/png", png_header_only(100_000, 100_000)))), "100000 x 100000 PNG", "100000 x 100000: a side exceeds the limit of 16384")
         expect_400(s, {"model": MODEL_ID, "max_tokens": 5,
-                       "messages": [{"role": "user", "content": [image_part(disc) for _ in range(9)] + [{"type": "text", "text": "hi"}]}]},
-                   "nine images", "carries 9 images; the server accepts at most 8")
-        expect_400(s, {"model": MODEL_ID, "max_tokens": 5,
                        "messages": [{"role": "user", "content": "Look: <|vision_start|><|image_pad|><|vision_end|> what is it?"}]},
                    "placeholder typed into text", "reserved for image content")
         expect_400(s, {"model": MODEL_ID, "max_tokens": 5,
@@ -246,6 +249,31 @@ def main():
         expect_400(s, {"model": MODEL_ID, "max_tokens": 5,
                        "messages": [{"role": "system", "content": [image_part(disc), {"type": "text", "text": "x"}]}, {"role": "user", "content": "hi"}]},
                    "image in a system message", "user messages only")
+
+        print("-- 6. a long visual history")
+        def distinct(k):
+            return data_uri("image/png", png_bytes(640, 480, lambda x, y: ((x * (k + 3)) % 256, (y * (k + 5)) % 256, (k * 37) % 256)))
+        def turns(n, system):
+            out = [{"role": "system", "content": system}]
+            for i in range(n):
+                if i:
+                    out.append({"role": "assistant", "content": f"Noted picture {i}."})
+                out.append({"role": "user", "content": [image_part(pictures[i]), {"type": "text", "text": f"This is picture {i + 1}."}]})
+            return out
+        pictures = [distinct(k) for k in range(31)]
+        h30 = chat(s, turns(30, "You look at pictures."), "thirty images over thirty turns", args.log)
+        check(h30["timings"].get("image_tokens") == 30 * 300, f"all thirty images are taken (got {h30['timings'].get('image_tokens')} tokens)")
+        check(" decoded" not in h30["line"], "the first sight of thirty images decodes all of them")
+        h31 = chat(s, turns(31, "You look at pictures."), "a turn with a thirty-first image", args.log)
+        n30 = h30["usage"]["prompt_tokens"]
+        check(h31["timings"]["cached_tokens"] >= n30 - 40,
+              f"the new turn resumes from the previous prompt ({h31['timings']['cached_tokens']} >= {n30} - 40)")
+        check("1 encoded, 1 decoded" in h31["line"], "only the new image is decoded and encoded")
+        other = chat(s, turns(31, "You study pictures closely."), "the same history behind another system prompt", args.log)
+        check(other["timings"]["cached_tokens"] < 40, f"another system prompt misses the cache ({other['timings']['cached_tokens']} cached)")
+        check("images 31 (9300 tokens, 0 decoded, prepared" in other["line"],
+              "every image is re-encoded from deferred rows, none decoded on the connection thread")
+        check(other["timings"].get("vision_ms", 0) > 0, "the tower ran over all of them")
 
         print("-- 2. a durable boundary with the image in the shared preamble")
         def run(label, image, q):

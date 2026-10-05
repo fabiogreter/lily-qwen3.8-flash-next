@@ -2,14 +2,21 @@
 //! [`Prepared`] generation.
 //!
 //! Images (`docs/architecture.md`, "The server") arrive as `image_url`
-//! content parts whose URL is a base64 data URI; they are decoded,
+//! content parts whose URL is a base64 data URI; a new one is decoded,
 //! preprocessed and digested here, on the connection thread, so the engine
-//! thread only ever sees pixel rows it can hand straight to the tower. The
+//! thread gets pixel rows it can hand straight to the tower. One the
+//! [`ImageMemo`] already knows (an agent resends its whole history every
+//! turn) only has its URI hashed, and is preprocessed on the engine thread
+//! in the rare case the tower has to run over it again. The
 //! chat template writes `<|vision_start|><|image_pad|><|vision_end|>` where
 //! an image sits; after tokenisation the single pad is expanded to one
 //! placeholder per 2 x 2 patch block, which is what the reference processor
 //! does before tokenising, and the placeholder ids are counted against the
 //! images so no message text can smuggle one in.
+
+use std::borrow::Cow;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, Result, bail, ensure};
 use serde::Deserialize;
@@ -149,14 +156,16 @@ pub(super) fn template_content(items: Vec<ContentItem>) -> Value {
     )
 }
 
-/// What the server accepts as images: the preprocessing limits, how many a
-/// request may carry, and whether the tower is there to run them at all
-/// (`Err` carries the reason a request with an image is refused).
+/// What the server accepts as images: the preprocessing limits, whether the
+/// tower is there to run them at all (`Err` carries the reason a request with
+/// an image is refused), and the memo of images already seen. There is no
+/// limit on how many images a request carries: agent clients resend the whole
+/// history every turn, and the context is the only real bound.
 #[derive(Debug, Clone)]
 pub struct ImagePolicy {
     pub limits: ImageLimits,
-    pub max_images: usize,
     pub available: Result<(), String>,
+    pub memo: Arc<ImageMemo>,
 }
 
 impl ImagePolicy {
@@ -164,24 +173,144 @@ impl ImagePolicy {
     pub fn unavailable(why: &str) -> Self {
         Self {
             limits: ImageLimits::default(),
-            max_images: 0,
             available: Err(why.to_owned()),
+            memo: Arc::default(),
         }
     }
 }
 
-/// One image of a request after preprocessing: the tower's input rows, the
-/// placeholder span in the expanded prompt and the digest the caches
-/// identify it by.
+/// What preprocessing an image produced, short of the rows themselves: its
+/// grid and [`image_digest`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageIdentity {
+    pub grid_h: usize,
+    pub grid_w: usize,
+    pub digest: [u8; 32],
+}
+
+/// Images seen recently, by the SHA-256 of their data URI, with the
+/// identity preprocessing gave them. An agent session resends every earlier
+/// image on every turn; with the memo those cost a hash of the URI instead of
+/// a decode, a resize and a hash of the rows, and their rows are only made
+/// again if the tower has to run over them (the session cache lost them).
+/// The limits are fixed for the process, so an identity never goes stale.
+/// Bounded at [`ImageMemo::CAPACITY`] entries, oldest insertion first out.
+#[derive(Debug, Default)]
+pub struct ImageMemo {
+    inner: Mutex<MemoInner>,
+}
+
+#[derive(Debug, Default)]
+struct MemoInner {
+    map: HashMap<[u8; 32], ImageIdentity>,
+    order: VecDeque<[u8; 32]>,
+}
+
+impl ImageMemo {
+    /// About 80 bytes an entry.
+    pub const CAPACITY: usize = 4096;
+
+    /// The memo key of a data URI.
+    pub fn key(url: &str) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(url.as_bytes());
+        h.finish()
+    }
+
+    pub fn get(&self, key: &[u8; 32]) -> Option<ImageIdentity> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).map.get(key).copied()
+    }
+
+    pub fn insert(&self, key: [u8; 32], identity: ImageIdentity) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.map.insert(key, identity).is_none() {
+            inner.order.push_back(key);
+            while inner.order.len() > Self::CAPACITY {
+                if let Some(old) = inner.order.pop_front() {
+                    inner.map.remove(&old);
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).map.len()
+    }
+}
+
+/// The tower's input rows of an image: made on the connection thread for an
+/// image the memo did not know, or kept as the data URI for one it did, to
+/// be preprocessed only if the tower has to run over it.
+#[derive(Debug, Clone)]
+pub enum ImagePixels {
+    Ready(Vec<f32>),
+    Deferred { url: String, limits: ImageLimits },
+}
+
+/// One image of a request: its rows (or how to make them), the placeholder
+/// span in the expanded prompt and the digest the caches identify it by.
 #[derive(Debug, Clone)]
 pub struct PreparedImage {
     /// `[grid_h * grid_w, PATCH_DIM]` f32 rows (see
     /// [`crate::qwen4exp::image::preprocess`]).
-    pub pixels: Vec<f32>,
+    pub pixels: ImagePixels,
     pub span: ImageSpan,
     /// SHA-256 over the f32 pixel rows followed by the grid: two files that
     /// preprocess to the same rows are the same image to the model.
     pub digest: [u8; 32],
+}
+
+impl PreparedImage {
+    /// The rows, preprocessing a deferred image now. A deferred image must
+    /// come out with the grid and digest the memo gave it; anything else is
+    /// refused rather than encoded under the wrong cache identity.
+    pub fn rows(&self) -> Result<Cow<'_, [f32]>> {
+        match &self.pixels {
+            ImagePixels::Ready(rows) => Ok(Cow::Borrowed(rows)),
+            ImagePixels::Deferred { url, limits } => {
+                let data = parse_image_data_uri(url)?;
+                let pv = preprocess(&data.bytes, limits)
+                    .with_context(|| format!("preprocessing a {}", data.media_type))?;
+                let identity = ImageIdentity {
+                    grid_h: pv.grid_h,
+                    grid_w: pv.grid_w,
+                    digest: image_digest(&pv.data, pv.grid_h, pv.grid_w),
+                };
+                ensure!(
+                    identity.grid_h == self.span.grid_h
+                        && identity.grid_w == self.span.grid_w
+                        && identity.digest == self.digest,
+                    "a remembered image preprocessed differently the second time"
+                );
+                Ok(Cow::Owned(pv.data))
+            }
+        }
+    }
+}
+
+/// The identity and, when it had to be made, the rows of the image at `url`:
+/// from the memo without decoding when it knows the URI, otherwise
+/// preprocessed here and remembered. `k` numbers the image in errors.
+fn prepare_image(
+    url: String,
+    k: usize,
+    images: &ImagePolicy,
+) -> Result<(ImagePixels, ImageIdentity)> {
+    let key = ImageMemo::key(&url);
+    if let Some(identity) = images.memo.get(&key) {
+        return Ok((ImagePixels::Deferred { url, limits: images.limits }, identity));
+    }
+    let data = parse_image_data_uri(&url).with_context(|| format!("image {k}"))?;
+    let pv = preprocess(&data.bytes, &images.limits)
+        .with_context(|| format!("image {k} ({})", data.media_type))?;
+    let identity = ImageIdentity {
+        grid_h: pv.grid_h,
+        grid_w: pv.grid_w,
+        digest: image_digest(&pv.data, pv.grid_h, pv.grid_w),
+    };
+    images.memo.insert(key, identity);
+    Ok((ImagePixels::Ready(pv.data), identity))
 }
 
 /// Digests the preprocessed rows and the grid ([`PreparedImage::digest`]).
@@ -422,6 +551,12 @@ pub struct Prepared {
     /// The request's images in prompt order, preprocessed; their spans are
     /// runs of `<|image_pad|>` in `prompt`. Empty for text.
     pub images: Vec<PreparedImage>,
+    /// Images decoded on the connection thread, the ones the memo did not
+    /// know (for the log).
+    pub images_decoded: usize,
+    /// Wall time of parsing and preparing the request on the connection
+    /// thread, images included (set by the caller, for the log).
+    pub prepare_secs: f64,
 }
 
 /// The completion budget a request gets.
@@ -580,21 +715,15 @@ pub fn prepare_chat(
     let mut messages = Vec::with_capacity(request.messages.len());
     let mut prepared_images: Vec<PreparedImage> = Vec::new();
     let mut grids: Vec<(usize, usize)> = Vec::new();
+    let mut images_decoded = 0;
     for (index, message) in request.messages.into_iter().enumerate() {
-        let items = message
+        let mut items = message
             .content
             .map(Content::into_items)
             .transpose()
             .with_context(|| format!("message {index}"))?
             .unwrap_or_default();
-        let urls: Vec<&str> = items
-            .iter()
-            .filter_map(|i| match i {
-                ContentItem::Image(url) => Some(url.as_str()),
-                ContentItem::Text(_) => None,
-            })
-            .collect();
-        if !urls.is_empty() {
+        if items.iter().any(|i| matches!(i, ContentItem::Image(_))) {
             if let Err(why) = &images.available {
                 bail!("message {index} carries an image: {why}");
             }
@@ -603,33 +732,26 @@ pub fn prepare_chat(
                 "message {index}: images are accepted in user messages only (got role {:?})",
                 message.role
             );
-            let total = prepared_images.len() + urls.len();
-            ensure!(
-                total <= images.max_images,
-                "the request carries {total} images; the server accepts at most {} per request \
-                 (--max-images)",
-                images.max_images
-            );
-            for url in urls {
-                let k = prepared_images.len() + 1;
-                let data =
-                    parse_image_data_uri(url).with_context(|| format!("image {k}"))?;
-                let pv = preprocess(&data.bytes, &images.limits)
-                    .with_context(|| format!("image {k} ({})", data.media_type))?;
-                let digest = image_digest(&pv.data, pv.grid_h, pv.grid_w);
-                grids.push((pv.grid_h, pv.grid_w));
-                // The span is filled in after tokenisation.
-                prepared_images.push(PreparedImage {
-                    pixels: pv.data,
-                    span: ImageSpan {
-                        start: 0,
-                        len: 0,
-                        grid_h: pv.grid_h,
-                        grid_w: pv.grid_w,
-                    },
-                    digest,
-                });
+        }
+        for item in &mut items {
+            let ContentItem::Image(url) = item else { continue };
+            let k = prepared_images.len() + 1;
+            let (pixels, identity) = prepare_image(std::mem::take(url), k, images)?;
+            if matches!(pixels, ImagePixels::Ready(_)) {
+                images_decoded += 1;
             }
+            grids.push((identity.grid_h, identity.grid_w));
+            // The span is filled in after tokenisation.
+            prepared_images.push(PreparedImage {
+                pixels,
+                span: ImageSpan {
+                    start: 0,
+                    len: 0,
+                    grid_h: identity.grid_h,
+                    grid_w: identity.grid_w,
+                },
+                digest: identity.digest,
+            });
         }
         let text = template_content(items);
         let mut value = match message.role.as_str() {
@@ -706,6 +828,8 @@ pub fn prepare_chat(
         cache_key: request.prompt_cache_key,
         clamped_from: budget.clamped_from,
         images: prepared_images,
+        images_decoded,
+        prepare_secs: 0.0,
     })
 }
 
@@ -748,6 +872,8 @@ pub fn prepare_completion(
         cache_key: request.prompt_cache_key,
         clamped_from: budget.clamped_from,
         images: Vec::new(),
+        images_decoded: 0,
+        prepare_secs: 0.0,
     })
 }
 
