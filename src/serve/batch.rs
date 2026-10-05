@@ -22,7 +22,8 @@
 //! tower, the durable boundary, cancellation, the checkpoint, timings, the
 //! log line, the response). The two are kept separate so that batching off
 //! is the unchanged code; a change to one usually needs the other.
-//! `docs/continuous-batching-draft.md` has the design and its status.
+//! `docs/architecture.md`, "Continuous batching", has the design and what
+//! it was measured to give.
 
 use std::cell::Cell;
 use std::sync::mpsc::Receiver;
@@ -676,7 +677,8 @@ impl<M: LanguageModel> Engine<M> {
         // GPU-side accepted count and control block per session in the draft
         // pass, per-session rollback, and parked next passes for every
         // combination of accepted counts. That is a second engine-shape
-        // change; see docs/continuous-batching-draft.md, "Speculation".
+        // change, and the measured gain does not ask for it yet; see
+        // docs/architecture.md, "Continuous batching".
         let members: Vec<u64> = rows.iter().map(|r| r.seq).collect();
         let draws = {
             let mut batch: Vec<BatchRow<'_, M::State>> = rows

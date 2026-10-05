@@ -178,7 +178,7 @@ struct Cli {
     /// arrive at once (continuous batching, up to 4). A request decoding
     /// alone keeps speculative decoding; requests sharing a step decode one
     /// token each. 1 serves one request at a time.
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = 4)]
     max_batch: usize,
 
     /// Default sampling overrides (the checkpoint's generation_config.json

@@ -28,8 +28,8 @@
 //! Numerics: the batched kernels reduce in a different order than the
 //! decode step's GEMVs, so a row agrees with the same session decoded alone
 //! up to bf16 rounding, as a verify row does (`docs/architecture.md`,
-//! "Speculative decoding"). Nothing here has run on a GPU yet
-//! (`docs/continuous-batching-draft.md`).
+//! "Speculative decoding"; measured in "Continuous batching"). A row never
+//! depends on the rows beside it: that is exact, and tested.
 
 use super::*;
 use crate::engine::{BatchRow, CountsSlot};

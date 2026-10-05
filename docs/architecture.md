@@ -1088,7 +1088,8 @@ capturing proxy.
 ## The server
 
 One engine thread owns the model's lifetime and runs one generation at a
-time; a bounded queue holds the rest. Tokenization and chat-template
+time, or up to `--max-batch` decoding together (see "Continuous batching"
+below); a bounded queue holds the rest. Tokenization and chat-template
 rendering run on the connection thread, so they never touch the engine
 thread. Detokenization and the output parser run per token inside the token
 callback, which executes while the parked next step is already running.
@@ -1486,10 +1487,92 @@ and the caches are not trustworthy; disk entries written earlier by a healthy
 queue stay valid. A budget of 3 recoveries per sliding 10-minute window
 bounds the loop; the fourth fault exits 1 for the supervisor.
 
+### Continuous batching
+
+Up to `--max-batch` requests (default 4, the fused small-batch
+hyper-connection read's row limit) decode together. With one request at a
+time nothing changes: a lone request runs the production single-session
+loop (`Generator::resume`, speculation and parking included), and with
+`--max-batch 1` the engine runs `Engine::serve` as before. When a request
+arrives while another decodes, the scheduler (`src/serve/batch.rs`) stops
+that one at its next token, admits the newcomer (session lookup, tower,
+durable boundary, prefill, checkpoint, first draw), and from then on runs
+one batched step over all rows per token (`LanguageModel::decode_rows`,
+`src/qwen4exp/batch.rs`). A newcomer's prefill stays exclusive on the GPU
+but is cut at chunk boundaries, with 8 batched steps of the running rows
+between chunks, so they keep producing about 5 tokens a second meanwhile.
+When the batch shrinks to one row, that row goes back to the
+single-session loop and speculates again.
+
+The batched step runs everything that touches no per-session state once
+over all rows with the kernels the verify pass already uses at 2 to 4 rows
+(skinny GEMMs, the fused small-batch hyper-connection read, the small-m
+MoE, the LM head), and dispatches the decode step's own kernels once per
+row for what does (GDN state and conv windows, the PLE window, attention
+and indexer caches, position and rope delta, the draw with the row's own
+sampler settings and penalty counts, one sampler per batch slot). Metal 4
+binds every dispatch through its own argument table entries, so per-row
+cache pointers need no new kernel. The draft head is caught up on every
+row in every step, so a row that is alone again speculates with complete
+head caches: measured acceptance after a batched stretch 0.63 to 0.66,
+against 0.63 without one. Sessions in flight count against the cache
+budget (`SessionStore::set_in_flight_bytes`), and admission holds back a
+request whose estimated session does not fit beside them. A row takes
+decode checkpoints between batched steps as the single-session loop takes
+them, and resumes from them work the same way.
+
+**Numerics.** A row never depends on the rows beside it: the same session
+paired with different neighbours, in either position, draws bit-identical
+tokens and leaves bit-identical caches and state
+(`a_row_does_not_depend_on_the_row_beside_it`). It does not equal the
+session decoded alone, because the batched kernels are not row-count
+invariant, exactly as a verify row is not. Measured on the full model over
+64 teacher-forced steps of real text against the production decode step:
+a batched row has a mean KL of 9.5e-3 (top-1 agreement 60/64), prefill
+1.16e-2 (59/64). Over HTTP, concurrent greedy requests depart from their
+solo runs at the same near-ties, and often into the same alternative text,
+as speculative decoding does. One request at a time is bit-identical to
+the server without batching, greedy and seeded sampling, plain and
+speculative, short and sparse-path prompts.
+
+**What it gives.** Aggregate decode over HTTP, 400-token answers, short
+prompts (2026-10-05, M5 Max):
+
+| clients | `--max-batch 1`, 2 drafts | `--max-batch 4`, 2 drafts | `--max-batch 4`, no drafts |
+| --- | --- | --- | --- |
+| 1 | 95 tok/s | 99 tok/s | 74 tok/s |
+| 2 | 99 tok/s | 103 tok/s | 103 tok/s |
+| 3 | 98 tok/s | 120 tok/s | 122 tok/s |
+| 4 | 99 tok/s | 117 tok/s | 120 tok/s |
+
+A two-row step costs about 1.47 single steps, not the 1.25 a dense model
+would: two tokens mostly route to different experts, so the expert weights
+read barely overlap. The aggregate gain is therefore modest; the gain that
+matters for agent use is latency. A short request (a title, a subagent's
+turn) that arrives during a long answer is answered in its own decode time
+instead of after the long answer: 150 tokens in 2.6 s next to a
+1 200-token answer that itself took no longer than alone.
+
+**Drafting.** Kept for a request decoding alone (about 30 % for the common
+single-agent case); rows that share a step decode plainly. Speculation
+inside the batch would need per-session spec scratch, one GPU-side
+accepted count and control block per session, per-session rollback and
+parked next passes for every combination of accepted counts, and would put
+2 to 3 more rows per session into every pass, past the fused kernels' four
+rows from two sessions on. At two to four clients the plain batch already
+matches what drafting adds to one, so it is left as a `TODO(batch)`.
+
+Not batched yet: parking for batched steps (each pays the host round trip,
+0.4 to 0.6 ms), the expert cache (small-machine mode serves one request at
+a time), and admission's host work (a synchronous spill, a disk restore,
+the tower) still stalls the running rows while it runs. The engine
+counters behind a request's `prefill_phases` and `ngram` are engine-wide,
+so with interleaving they include the other rows' steps; the `batch`
+object in its timings says when that happened.
+
 ## What is deliberately not here
 
-Constrained decoding (`response_format: json_schema`), batching across
-requests, video input (the template's `<|video_pad|>` is refused), and
+Constrained decoding (`response_format: json_schema`), video input (the template's `<|video_pad|>` is refused), and
 fetching images by URL (data URIs only, by design). The engine trait's
 persistence methods keep defaults that refuse, so an architecture added
 later runs without the disk tier until it implements them.

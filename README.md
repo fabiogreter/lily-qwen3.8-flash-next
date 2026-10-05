@@ -43,8 +43,12 @@ opencode. The differences:
 - **Images** are base64 data URIs (PNG or JPEG, up to eight per request);
   the server never fetches URLs. A 1920 x 1080 screenshot costs about 2 000
   prompt tokens. No video.
-- **One request runs at a time.** Others queue, with 503 when the queue is
-  full. Batching was not in scope yet, but could be implemented if required.
+- **Up to four requests decode together** (`--max-batch`, continuous
+  batching): a request that arrives while another decodes gets its prefill
+  between the other's steps instead of waiting for its answer, then the two
+  share each decode step. A request decoding alone keeps speculative
+  decoding. Prefills run one at a time; more requests queue, with 503 when
+  the queue is full. `--max-batch 1` serves one request at a time.
 - **Thinking is on by default.** `reasoning_effort` (`none`, `low`,
   `medium`, `high`) sets it per request; `--thinking` and
   `--reasoning-effort` set the server's default.
