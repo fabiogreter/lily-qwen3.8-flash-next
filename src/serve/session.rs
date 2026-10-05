@@ -803,6 +803,10 @@ pub struct SessionStore<M: LanguageModel> {
     recent_new: VecDeque<usize>,
     /// Evictions of the acquire or release in progress.
     evictions: Evictions,
+    /// GPU bytes of the sessions checked out by requests other than the one
+    /// being acquired or released (the batch scheduler's rows, see
+    /// [`Self::set_in_flight_bytes`]); 0 when one request runs at a time.
+    in_flight_bytes: usize,
     /// Tests: while set, a writer thread waits before writing (cancellable).
     #[cfg(test)]
     write_gate: Option<Arc<AtomicBool>>,
@@ -828,6 +832,7 @@ impl<M: LanguageModel> SessionStore<M> {
             write_ahead_floor: None,
             recent_new: VecDeque::with_capacity(RECENT_NEW_SESSIONS),
             evictions: Evictions::default(),
+            in_flight_bytes: 0,
             #[cfg(test)]
             write_gate: None,
         }
@@ -868,6 +873,15 @@ impl<M: LanguageModel> SessionStore<M> {
     /// checkpoint at `start`.
     pub fn decode_checkpoints(&self, start: usize) -> DecodeCheckpoints<M::State> {
         DecodeCheckpoints::new(self.decode_interval, self.max_decode_checkpoints, start)
+    }
+
+    /// Counts `bytes` of sessions that other requests hold checked out
+    /// against the budget from now on: the store cannot evict them, so it
+    /// makes room among the resident sessions instead. The batch scheduler
+    /// sets it before every acquire and release to the sessions of the other
+    /// requests in flight; one request at a time leaves it at 0.
+    pub fn set_in_flight_bytes(&mut self, bytes: usize) {
+        self.in_flight_bytes = bytes;
     }
 
     /// Whether the store writes sessions ahead.
@@ -1180,7 +1194,9 @@ impl<M: LanguageModel> SessionStore<M> {
     /// budget (or the store is empty): dropped when written ahead, else
     /// spilled to the disk tier on the spot.
     fn trim(&mut self, ctx: &MetalContext, extra: usize) {
-        while !self.is_empty() && self.used_bytes() + extra > self.budget_bytes {
+        while !self.is_empty()
+            && self.used_bytes() + self.in_flight_bytes + extra > self.budget_bytes
+        {
             if !self.evict_lru(ctx) {
                 break;
             }
@@ -1617,7 +1633,8 @@ impl<M: LanguageModel> SessionStore<M> {
         session.cache_key = cache_key.map(str::to_owned);
         self.entries.push(session);
         while self.len() > self.max_sessions
-            || (self.used_bytes() > self.budget_bytes && self.len() > 1)
+            || (self.used_bytes() + self.in_flight_bytes > self.budget_bytes
+                && self.len() > 1)
         {
             if !self.evict_lru(ctx) {
                 break;

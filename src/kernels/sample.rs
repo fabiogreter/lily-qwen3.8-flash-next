@@ -162,6 +162,17 @@ impl SamplerScratch {
         self.counts.zero_fill();
     }
 
+    /// Takes over `other`'s emission histogram (a request moving between
+    /// the engine's sampler and a batch slot's). The GPU must be idle on
+    /// both scratches.
+    pub fn copy_counts_from(&self, other: &SamplerScratch) -> Result<()> {
+        ensure!(
+            other.counts.numel() == self.counts.numel(),
+            "sampler scratches for different vocabularies"
+        );
+        self.counts.write_bytes(other.counts.contents())
+    }
+
     pub fn vocab(&self) -> usize {
         self.adjusted.numel()
     }

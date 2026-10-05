@@ -360,6 +360,28 @@ pub struct Draw<'p> {
     pub step: usize,
 }
 
+/// One session's row of a batched decode step
+/// ([`LanguageModel::decode_rows`]): its state, the token the step feeds
+/// at the state's position (drawn by the row's previous step, not yet fed)
+/// and the draw the step ends with.
+pub struct BatchRow<'r, S> {
+    pub state: &'r mut S,
+    pub token: u32,
+    pub draw: Draw<'r>,
+    /// The batch slot whose sampler scratch holds this row's penalty counts
+    /// (`0..max_batch_rows`), see [`CountsSlot`].
+    pub slot: usize,
+}
+
+/// Where a request's penalty counts live: the engine's own sampler (the
+/// single-session paths: prefill draws, the decode loop, speculation) or
+/// the sampler of a batch slot while the request decodes in a batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CountsSlot {
+    Engine,
+    Batch(usize),
+}
+
 pub trait LanguageModel: Sized {
     /// The expert cache's counters, when the model serves its experts from
     /// one (`LoadOptions::expert_slots`).
@@ -604,6 +626,45 @@ pub trait LanguageModel: Sized {
     fn release_parked(&self, scratch: &Self::Scratch) -> Result<()> {
         let _ = scratch;
         Ok(())
+    }
+
+    // --- batched decode across sessions (`--max-batch`) -------------------
+
+    /// Rows [`Self::decode_rows`] takes at once; `0` when the model cannot
+    /// batch sessions (the server then serves one request at a time).
+    fn max_batch_rows(&self) -> usize {
+        0
+    }
+
+    /// One decode step over independent sessions: row `r` feeds `token` at
+    /// its own state's position and draws with its own sampler settings
+    /// into slot `slot`'s sampler. Stages every row's per-token host inputs,
+    /// commits, waits, and advances every state by one. Returns the draws in
+    /// row order. Every state must be at rest (no pending speculative step,
+    /// nothing parked) with room for one more token. With a draft head
+    /// loaded the head is caught up on every row, so a row can return to
+    /// speculative decoding afterwards.
+    fn decode_rows(
+        &self,
+        ctx: &MetalContext,
+        scratch: &mut Self::Scratch,
+        rows: &mut [BatchRow<'_, Self::State>],
+    ) -> Result<Vec<u32>> {
+        let _ = (ctx, scratch, rows);
+        anyhow::bail!("this model cannot batch decode steps across sessions")
+    }
+
+    /// Copies a request's penalty counts from one sampler to another (a
+    /// request entering or leaving a batch). The GPU must be idle on both.
+    fn move_sampler_counts(
+        &self,
+        ctx: &MetalContext,
+        scratch: &mut Self::Scratch,
+        from: CountsSlot,
+        to: CountsSlot,
+    ) -> Result<()> {
+        let _ = (ctx, scratch, from, to);
+        anyhow::bail!("this model cannot batch decode steps across sessions")
     }
 
     // --- speculative decoding (models with a draft head) ------------------

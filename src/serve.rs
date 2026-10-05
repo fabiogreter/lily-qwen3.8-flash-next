@@ -25,6 +25,7 @@
 //! process with status 1 for the supervisor to restart it.
 
 pub mod api;
+pub mod batch;
 pub mod data_uri;
 pub mod disk;
 pub mod http;
@@ -196,6 +197,10 @@ pub struct ServeOptions {
     pub thinking: bool,
     pub reasoning_effort: Option<String>,
     pub queue: usize,
+    /// Requests that decode together in one batched step (`--max-batch`);
+    /// 1 serves one request at a time, exactly as before batching existed.
+    /// Capped by what the model supports.
+    pub max_batch: usize,
     pub sampling: SamplingOverrides,
     /// Seconds without a request after which the engine is unloaded (0: never).
     pub idle_unload_secs: u64,
@@ -645,6 +650,12 @@ impl EngineQueue {
     fn arrival_taken(&self) {
         self.arrival_pending.store(false, Ordering::Release);
     }
+
+    /// Whether a job is waiting in the channel (the batch scheduler's cue to
+    /// stop a request decoding alone at its next token and admit the job).
+    fn has_waiting(&self) -> bool {
+        self.waiting.load(Ordering::Acquire) > 0
+    }
 }
 
 /// Relays one request's output from the engine to the client on the
@@ -713,6 +724,9 @@ struct Engine<M: LanguageModel> {
     scratch: M::Scratch,
     max_seq: usize,
     drafts: usize,
+    /// Requests decoded together at most (`--max-batch` capped by the
+    /// model); 1 serves them one at a time.
+    max_batch: usize,
     next_id: u64,
     shutdown: Arc<Shutdown>,
     /// Where each finished request's numbers go for `GET /v1/timings`.
@@ -772,6 +786,26 @@ impl<M: LanguageModel> Engine<M> {
             },
         )?;
         let drafts = options.mtp_drafts.min(model.max_drafts());
+        let max_batch = options.max_batch.clamp(1, model.max_batch_rows().max(1));
+        if options.max_batch > 1 && max_batch == 1 {
+            eprintln!(
+                "batching: off, {} cannot batch decode steps in this configuration (the expert cache)",
+                M::MODEL_ID
+            );
+        } else if options.max_batch > 1 {
+            eprintln!(
+                "batching: up to {max_batch} requests decode together{}",
+                if max_batch < options.max_batch {
+                    format!(
+                        " (--max-batch {} capped by what {} batches)",
+                        options.max_batch,
+                        M::MODEL_ID
+                    )
+                } else {
+                    String::new()
+                }
+            );
+        }
         let tower = model.vision_tower();
         eprintln!(
             "loaded {} in {:.1}s ({:.1} GB resident{}){}",
@@ -1038,6 +1072,7 @@ impl<M: LanguageModel> Engine<M> {
             scratch,
             max_seq,
             drafts,
+            max_batch,
             next_id,
             shutdown,
             timings,
@@ -1194,6 +1229,7 @@ impl<M: LanguageModel> Engine<M> {
             scratch,
             max_seq,
             drafts,
+            max_batch: _,
             next_id,
             shutdown,
             timings,
@@ -2395,7 +2431,15 @@ fn engine_loop<M: LanguageModel>(
                     );
                     engine.as_ref().expect("engine loaded").inject_fault();
                 }
-                let fault = engine.as_mut().expect("engine loaded").serve(*job);
+                let loaded = engine.as_mut().expect("engine loaded");
+                // Batching off: one request at a time, exactly as before.
+                // On: this job and every job that arrives while anything is
+                // active, decoded together (`batch`).
+                let fault = if loaded.max_batch > 1 {
+                    loaded.serve_batched(*job, &rx, queue)
+                } else {
+                    loaded.serve(*job)
+                };
                 idle.touch(Instant::now());
                 keep_alive.touch(Instant::now());
                 if fault.is_none() {

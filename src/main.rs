@@ -174,6 +174,13 @@ struct Cli {
     #[arg(long, default_value_t = 32)]
     queue: usize,
 
+    /// Requests that decode together in one batched step when several
+    /// arrive at once (continuous batching, up to 4). A request decoding
+    /// alone keeps speculative decoding; requests sharing a step decode one
+    /// token each. 1 serves one request at a time.
+    #[arg(long, default_value_t = 2)]
+    max_batch: usize,
+
     /// Default sampling overrides (the checkpoint's generation_config.json
     /// supplies the rest).
     #[arg(long)]
@@ -252,6 +259,7 @@ fn run() -> Result<()> {
         thinking: cli.thinking,
         reasoning_effort: cli.reasoning_effort,
         queue: cli.queue,
+        max_batch: cli.max_batch,
         sampling: SamplingOverrides {
             temperature: cli.temperature,
             top_k: cli.top_k,

@@ -86,8 +86,22 @@ pub struct Speculated {
     pub accepted: usize,
 }
 
+/// What [`Generator::resume`] reports.
+pub struct Resumed {
+    pub finish: FinishReason,
+    /// Speculative decoding: draft tokens proposed and confirmed.
+    pub drafted: usize,
+    pub accepted: usize,
+    /// The decode loop ended with a step parked, which then ran on the final
+    /// draw: the state has fed every token of `tokens`, and this is what
+    /// that step drew (a valid next draw, already counted by the sampler).
+    /// `None` when the final draw is not fed.
+    pub parked_draw: Option<u32>,
+}
+
 /// Speculative decoding through a model's draft head, from a state that has
-/// fed its prompt and drawn `tokens[0]` (already delivered). Each step
+/// fed everything but the last of `tokens` (the draws so far, all already
+/// delivered; the prefill's single draw for a new request). Each step
 /// verifies the pending token plus the current drafts in one pass, emits the
 /// confirmed prefix and one fresh draw, then rolls back and proposes again.
 /// Tokens reach `on_token` as they are confirmed; `is_stop` ends the
@@ -135,13 +149,18 @@ fn speculate_checkpointed<M: LanguageModel>(
     on_token: &mut dyn FnMut(u32) -> Result<bool>,
 ) -> Result<Speculated> {
     let k = drafts.min(model.max_drafts()).max(1);
-    ensure!(tokens.len() == 1, "speculation starts right after the first draw");
-    // The state holds the prompt here; at every later point of rest it also
-    // holds the drawn tokens, all but the last.
-    let base = state.pos();
+    // The last drawn token is the one not yet fed: the prefill's draw for a
+    // new request, or where a resumed request left off.
+    let last =
+        *tokens.last().ok_or_else(|| anyhow::anyhow!("speculation without a draw"))?;
+    // The state holds the prompt and every draw but the last, here and at
+    // every later point of rest: `base` is where the prompt ends.
+    let base = state.pos().checked_sub(tokens.len() - 1).ok_or_else(|| {
+        anyhow::anyhow!("speculation from a state behind its draws")
+    })?;
     let (mut drafted, mut accepted) = (0usize, 0usize);
     let mut proposals =
-        model.draft_initial(ctx, state, scratch, tokens[0], k, params, tokens.len())?;
+        model.draft_initial(ctx, state, scratch, last, k, params, tokens.len())?;
     // The next verify pass, committed by finish_speculation and parked on the
     // GPU until verify stages its n-gram rows.
     let mut parked: Option<PendingPass<'_>> = None;
@@ -280,6 +299,37 @@ impl Generator {
         self.tokenizer.decode(tokens, true)
     }
 
+    /// Whether `token` ends a generation under `options`.
+    pub fn is_stop(&self, token: u32, options: &GenerateOptions<'_>) -> bool {
+        self.stop_tokens.contains(&token) || options.stop_tokens.contains(&token)
+    }
+
+    /// The start of a request: clears the per-request sampler state, feeds
+    /// `prompt_ids` (the not yet cached suffix) and returns the first draw
+    /// (draw 0 of the request, not fed). What [`Self::generate`] does before
+    /// its loops, for a caller that runs the loops itself (the server's
+    /// batch scheduler).
+    pub fn begin<M: LanguageModel>(
+        &self,
+        ctx: &MetalContext,
+        model: &M,
+        state: &mut M::State,
+        scratch: &mut M::Scratch,
+        prompt_ids: &[u32],
+        params: &SamplingParams,
+    ) -> Result<u32> {
+        ensure!(!prompt_ids.is_empty(), "empty prompt");
+        scratch.begin_request();
+        model.prefill(
+            ctx,
+            state,
+            scratch,
+            prompt_ids,
+            Some(Draw { params, step: 0 }),
+        )?;
+        Ok(scratch.next_token().view(0, &[1])?.to_u32()?[0])
+    }
+
     /// Feeds `prompt_ids` (the not yet cached suffix) and generates greedily
     /// or by sampling, delivering each token to `on_token`; a `false` return
     /// stops after that token.
@@ -316,61 +366,31 @@ impl Generator {
         ensure!(!prompt_ids.is_empty(), "empty prompt");
         ensure!(options.max_tokens > 0, "max_tokens must be positive");
         let pos_before = state.pos();
-        scratch.begin_request();
-        let params = options.sampling;
-        model.prefill(
-            ctx,
-            state,
-            scratch,
-            prompt_ids,
-            Some(Draw { params, step: 0 }),
-        )?;
-
-        let is_stop =
-            |t: u32| self.stop_tokens.contains(&t) || options.stop_tokens.contains(&t);
-        let read_slot = |scratch: &M::Scratch, slot: usize| -> Result<u32> {
-            Ok(scratch.next_token().view(slot, &[1])?.to_u32()?[0])
-        };
+        let first =
+            self.begin(ctx, model, state, scratch, prompt_ids, options.sampling)?;
 
         let mut tokens = Vec::with_capacity(options.max_tokens.min(4096));
-        let first = read_slot(scratch, 0)?;
         tokens.push(first);
         let mut finish = FinishReason::Length;
         let (mut drafted, mut accepted) = (0usize, 0usize);
-        if is_stop(first) {
+        if self.is_stop(first, options) {
             finish = FinishReason::StopToken;
         } else if !on_token(first)? {
             finish = FinishReason::Callback;
         } else if tokens.len() < options.max_tokens {
-            if options.drafts > 0 && model.max_drafts() > 0 {
-                let outcome = speculate_checkpointed(
-                    ctx,
-                    model,
-                    state,
-                    scratch,
-                    params,
-                    options.drafts,
-                    options.max_tokens,
-                    &mut tokens,
-                    &is_stop,
-                    checkpoints,
-                    on_token,
-                )?;
-                finish = outcome.finish;
-                drafted = outcome.drafted;
-                accepted = outcome.accepted;
-            } else {
-                finish = self.decode_loop(
-                    ctx,
-                    model,
-                    state,
-                    scratch,
-                    options,
-                    &mut tokens,
-                    checkpoints,
-                    on_token,
-                )?;
-            }
+            let resumed = self.resume(
+                ctx,
+                model,
+                state,
+                scratch,
+                &mut tokens,
+                options,
+                checkpoints,
+                on_token,
+            )?;
+            finish = resumed.finish;
+            drafted = resumed.drafted;
+            accepted = resumed.accepted;
         }
         let fed = state
             .pos()
@@ -385,6 +405,73 @@ impl Generator {
             tokens.len()
         );
         Ok(Generation { tokens, finish, fed, drafted, accepted })
+    }
+
+    /// Continues a generation from a state that has fed everything but the
+    /// last of `tokens` (the draws so far, all delivered): the speculative
+    /// loop when `options.drafts` and the model allow it, the pipelined decode
+    /// loop otherwise, until a stop token, `options.max_tokens` draws in all
+    /// or `on_token` returning false. New draws are appended to `tokens`.
+    /// [`Self::generate`] runs this after the first draw; the server's batch
+    /// scheduler runs it for a request that decodes alone, also after a
+    /// batched stretch (the draw indices continue from `tokens.len()`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn resume<M: LanguageModel>(
+        &self,
+        ctx: &MetalContext,
+        model: &M,
+        state: &mut M::State,
+        scratch: &mut M::Scratch,
+        tokens: &mut Vec<u32>,
+        options: &GenerateOptions<'_>,
+        checkpoints: Option<&mut dyn DecodeCheckpointer<M::State>>,
+        on_token: &mut dyn FnMut(u32) -> Result<bool>,
+    ) -> Result<Resumed> {
+        ensure!(!tokens.is_empty(), "a generation resumes after a draw");
+        if tokens.len() >= options.max_tokens {
+            return Ok(Resumed {
+                finish: FinishReason::Length,
+                drafted: 0,
+                accepted: 0,
+                parked_draw: None,
+            });
+        }
+        if options.drafts > 0 && model.max_drafts() > 0 {
+            let is_stop = |t: u32| self.is_stop(t, options);
+            let outcome = speculate_checkpointed(
+                ctx,
+                model,
+                state,
+                scratch,
+                options.sampling,
+                options.drafts,
+                options.max_tokens,
+                tokens,
+                &is_stop,
+                checkpoints,
+                on_token,
+            )?;
+            Ok(Resumed {
+                finish: outcome.finish,
+                drafted: outcome.drafted,
+                accepted: outcome.accepted,
+                parked_draw: None,
+            })
+        } else {
+            let mut parked_draw = None;
+            let finish = self.decode_loop(
+                ctx,
+                model,
+                state,
+                scratch,
+                options,
+                tokens,
+                checkpoints,
+                on_token,
+                &mut parked_draw,
+            )?;
+            Ok(Resumed { finish, drafted: 0, accepted: 0, parked_draw })
+        }
     }
 
     /// The pipelined loop proper. `tokens` holds the tokens drawn so far, the
@@ -414,6 +501,7 @@ impl Generator {
         tokens: &mut Vec<u32>,
         mut checkpoints: Option<&mut dyn DecodeCheckpointer<M::State>>,
         on_token: &mut dyn FnMut(u32) -> Result<bool>,
+        parked_draw: &mut Option<u32>,
     ) -> Result<FinishReason> {
         let params = options.sampling;
         let is_stop =
@@ -548,6 +636,10 @@ impl Generator {
                     model.prepare_step_inputs(state, scratch, drawn)?;
                     model.release_parked(scratch)?;
                     pass.wait()?;
+                    // It drew the token after `drawn` (draw `tokens.len()`)
+                    // into the other slot: a caller that continues the
+                    // generation later takes it as its next draw.
+                    *parked_draw = Some(read_slot(1 - slot_in)?);
                 }
                 return Ok(finish);
             }
