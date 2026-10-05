@@ -656,6 +656,14 @@ impl<M: LanguageModel> Engine<M> {
                 state.ensure_capacity(&self.ctx, state.pos() + 1)?;
             }
         }
+        // TODO(batch): speculation inside a batch. A row shares a step
+        // plainly and speculates again once it is alone; batching the
+        // verify pass (rows = the sum of 1 + drafts over sessions) needs a
+        // per-session spec scratch (mid-step GDN states, conv inputs), one
+        // GPU-side accepted count and control block per session in the draft
+        // pass, per-session rollback, and parked next passes for every
+        // combination of accepted counts. That is a second engine-shape
+        // change; see docs/continuous-batching-draft.md, "Speculation".
         let members: Vec<u64> = rows.iter().map(|r| r.seq).collect();
         let draws = {
             let mut batch: Vec<BatchRow<'_, M::State>> = rows
