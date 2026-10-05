@@ -1,5 +1,5 @@
 //! The batched decode step across sessions against the 4-layer checkpoint
-//! (`LILY_MODEL_DIR_FLASH`). Written with the draft, not run yet.
+//! (`LILY_MODEL_DIR_FLASH`).
 
 use std::path::Path;
 
@@ -57,70 +57,63 @@ fn fingerprint(ctx: &MetalContext, state: &DecodeState) -> Fingerprint {
     (caches, recurrent)
 }
 
-/// A row of a two-row step computes what the same row computes in a
-/// one-row step: same draws, same caches, same recurrent state, the draft
-/// head's included. This is the exact check of the batched graph's
-/// per-row bindings (a row reading another row's cache, position or state
-/// breaks it); it relies on the batched kernels being row-count invariant
-/// per row, which a failure here would also expose (then compare with a
-/// tolerance and look at which part moved). Prompts of different lengths,
-/// so the rows sit at different positions and complete indexer blocks at
-/// different steps.
+/// A row of a two-row step does not depend on the row beside it: the same
+/// session paired with two different neighbours (different prompts and
+/// lengths, so different positions, and indexer blocks completing at
+/// different steps), in either position, draws the same tokens and leaves
+/// the same caches and recurrent state, the draft head's included. This is
+/// the exact check of the batched graph's per-row bindings: a row reading
+/// another row's cache, position or state breaks it. It is not compared
+/// with the session decoded in a one-row step: the batched kernels are not
+/// row-count invariant (a skinny GEMM at two rows reduces differently than
+/// at one), so that agrees only up to near-ties, which the four-layer
+/// model's logits are full of (measured 2026-10-05: row 0 alone and paired
+/// differ by the same amounts whatever the neighbour, and flip at a top-2
+/// gap of 0.07 after 20 equal draws).
 #[test]
 #[ignore = "requires LILY_MODEL_DIR_FLASH"]
-fn a_row_beside_another_decodes_as_it_does_alone() {
+fn a_row_does_not_depend_on_the_row_beside_it() {
     let ctx = MetalContext::new().expect("metal context");
     let Some(model) = load(&ctx) else { return };
     let steps = 24;
-    let prompts = [prompt(41, 1), prompt(70, 2)];
-    let alone: Vec<(Vec<u32>, Fingerprint)> = prompts
-        .iter()
-        .map(|p| {
-            let mut s = model.new_scratch_with_capacity(&ctx, 256).expect("scratch");
-            let (mut state, first) = prefilled(&ctx, &model, &mut s, p);
-            let mut tokens = vec![first];
-            for _ in 0..steps {
-                let mut rows = [BatchRow {
-                    token: *tokens.last().expect("drawn"),
-                    draw: Draw { params: &GREEDY, step: tokens.len() },
-                    slot: 0,
-                    state: &mut state,
-                }];
-                tokens
-                    .push(model.decode_rows(&ctx, &mut s, &mut rows).expect("step")[0]);
-            }
-            let print = fingerprint(&ctx, &state);
-            (tokens, print)
-        })
-        .collect();
-
-    let mut s = model.new_scratch_with_capacity(&ctx, 256).expect("scratch");
-    let (mut a, first_a) = prefilled(&ctx, &model, &mut s, &prompts[0]);
-    let (mut b, first_b) = prefilled(&ctx, &model, &mut s, &prompts[1]);
-    let (mut ta, mut tb) = (vec![first_a], vec![first_b]);
-    for _ in 0..steps {
-        let mut rows = [
-            BatchRow {
+    let own = prompt(41, 1);
+    // Runs `own` at `at` (0 or 1) beside `other`; returns own's draws and
+    // fingerprint.
+    let paired = |other: &[u32], at: usize| -> (Vec<u32>, Fingerprint) {
+        let mut s = model.new_scratch_with_capacity(&ctx, 256).expect("scratch");
+        let (mut a, first_a) = prefilled(&ctx, &model, &mut s, &own);
+        let (mut b, first_b) = prefilled(&ctx, &model, &mut s, other);
+        let (mut ta, mut tb) = (vec![first_a], vec![first_b]);
+        for _ in 0..steps {
+            let row_a = BatchRow {
                 token: *ta.last().expect("drawn"),
                 draw: Draw { params: &GREEDY, step: ta.len() },
-                slot: 0,
+                slot: at,
                 state: &mut a,
-            },
-            BatchRow {
+            };
+            let row_b = BatchRow {
                 token: *tb.last().expect("drawn"),
                 draw: Draw { params: &GREEDY, step: tb.len() },
-                slot: 1,
+                slot: 1 - at,
                 state: &mut b,
-            },
-        ];
-        let draws = model.decode_rows(&ctx, &mut s, &mut rows).expect("step");
-        ta.push(draws[0]);
-        tb.push(draws[1]);
+            };
+            let mut rows = if at == 0 { [row_a, row_b] } else { [row_b, row_a] };
+            let draws = model.decode_rows(&ctx, &mut s, &mut rows).expect("step");
+            ta.push(draws[at]);
+            tb.push(draws[1 - at]);
+        }
+        let print = fingerprint(&ctx, &a);
+        (ta, print)
+    };
+    for at in [0, 1] {
+        let (draws_b, print_b) = paired(&prompt(70, 2), at);
+        let (draws_c, print_c) = paired(&prompt(23, 3), at);
+        assert_eq!(draws_b, draws_c, "row {at}'s draws depend on its neighbour");
+        assert!(
+            print_b == print_c,
+            "row {at}'s caches or state depend on its neighbour"
+        );
     }
-    assert_eq!(ta, alone[0].0, "row 0's draws");
-    assert_eq!(tb, alone[1].0, "row 1's draws");
-    assert!(fingerprint(&ctx, &a) == alone[0].1, "row 0's caches or state differ");
-    assert!(fingerprint(&ctx, &b) == alone[1].1, "row 1's caches or state differ");
 }
 
 /// A one-row batched step against the production decode step: the same
