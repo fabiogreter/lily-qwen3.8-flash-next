@@ -19,11 +19,17 @@
 //! a session keeps the decode checkpoints of the request it ran last, a
 //! bounded number thinned evenly, and drops older ones at its release.
 //!
-//! Extending the live end reuses the session in place. Anything else forks:
+//! Extending the live end reuses the session in place. So does a resume
+//! behind the live end that discards only what the session's latest request
+//! appended (its prompt extension and its answer): the client re-sent the
+//! same conversation with the last turn rendered differently, and the old
+//! tail is never resumed again, so the session is **cut back** to the
+//! checkpoint (`Session::cut_back`) instead of copied. Anything else forks:
 //! the per-token caches up to the resume position are copied into a fresh
 //! state and the checkpoint restored, so the original lineage survives (a
 //! parallel conversation sharing only the system prompt must not destroy a
-//! long context). Sessions are evicted least-recently-used under the budget.
+//! long context). A disk hit never cuts back. Sessions are evicted
+//! least-recently-used under the budget.
 //!
 //! Below the GPU tier sits an optional disk tier ([`DiskStore`]): sessions
 //! evicted from GPU memory are written out (per-token caches plus their
@@ -510,6 +516,33 @@ impl<M: LanguageModel> Session<M> {
     fn checkpoint_at(&self, pos: usize) -> Option<&Checkpoint<SnapshotOf<M>>> {
         self.checkpoints.iter().find(|c| c.pos() == pos)
     }
+
+    /// Rewinds the session in place to its checkpoint at `pos`, below the
+    /// live end: the recurrent state from the checkpoint, the per-token
+    /// caches kept (valid up to `pos`, overwritten past it), the tokens, the
+    /// image spans and the checkpoints past `pos` dropped. The state keeps
+    /// its capacity, so the budget sees no new bytes, and nothing is copied.
+    /// A copy written ahead now describes the longer lineage; the release
+    /// deletes it as it deletes the copy of any session a request resumed.
+    fn cut_back(&mut self, ctx: &MetalContext, pos: usize) -> Result<()> {
+        ensure!(
+            pos < self.tokens.len() && self.state.pos() == self.tokens.len(),
+            "cut back to {pos} of a session at {} with {} tokens",
+            self.state.pos(),
+            self.tokens.len()
+        );
+        let snapshot = self
+            .checkpoint_at(pos)
+            .ok_or_else(|| anyhow::anyhow!("cut back to {pos} without a checkpoint"))?
+            .snapshot
+            .clone();
+        self.state.restore(ctx, &snapshot)?;
+        self.tokens.truncate(pos);
+        // A checkpoint is never inside an image span.
+        self.images.retain(|i| i.end() <= pos);
+        self.checkpoints.retain(|c| c.pos() <= pos);
+        Ok(())
+    }
 }
 
 /// What [`SessionStore::acquire`] hands out.
@@ -519,6 +552,9 @@ pub struct Acquired<M: LanguageModel> {
     pub reused: usize,
     /// Whether the session was forked from a cached lineage (diagnostics).
     pub forked: bool,
+    /// The resident session was cut back in place instead of forked (its
+    /// latest request's tail was discarded), by this many tokens.
+    pub cut_back: Option<usize>,
     /// Whether the reused prefix was read from the disk tier, and how long
     /// that took.
     pub from_disk: Option<std::time::Duration>,
@@ -688,6 +724,7 @@ impl<M: LanguageModel> Acquired<M> {
             session,
             reused: 0,
             forked: false,
+            cut_back: None,
             from_disk: None,
             agreement: 0,
             divergent_tail: Vec::new(),
@@ -825,8 +862,10 @@ impl<M: LanguageModel> SessionStore<M> {
     }
 
     /// Checks out the session that can resume `prompt` (with `images` at
-    /// their spans) from the furthest position, forking when that position
-    /// is not the live end. `cache_key` only breaks ties between equally
+    /// their spans) from the furthest position, cutting it back in place or
+    /// forking when that position is not the live end (see the module docs;
+    /// a parked session is taken back first by the rules of
+    /// `reclaim_for`). `cache_key` only breaks ties between equally
     /// good candidates. Also reports how far the prompt agreed with any
     /// lineage at all (`agreement`), which the engine compares with `reused`
     /// to decide on a durable prefix entry, and what making room cost.
@@ -937,6 +976,21 @@ impl<M: LanguageModel> SessionStore<M> {
                 "cached decode state out of step with its tokens"
             );
             return Ok(Acquired { reused: resume_at, ..Acquired::fresh(session) });
+        }
+
+        if resume_at >= self.entries[index].request_start {
+            // Everything the prompt discards is what the session's latest
+            // request appended: the client re-sent that conversation with the
+            // last turn rendered differently, and the lineage it replaces is
+            // never resumed again. Rewind in place rather than copy.
+            let mut session = self.entries.swap_remove(index);
+            let dropped = session.tokens.len() - resume_at;
+            session.cut_back(ctx, resume_at)?;
+            return Ok(Acquired {
+                reused: resume_at,
+                cut_back: Some(dropped),
+                ..Acquired::fresh(session)
+            });
         }
 
         // Fork: copy the per-token prefix, restore the recurrent checkpoint.

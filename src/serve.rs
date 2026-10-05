@@ -1395,7 +1395,7 @@ impl<M: LanguageModel> Engine<M> {
                 );
             eprintln!(
                 "{id}: {n} prompt tokens ({reused} cached{}{}), cancelled by the {by} at {at} after {} prefilled in {prefix_secs:.2}s, kept {at} tokens as a session, sessions={} ({:.1}/{:.1} GB){}{}",
-                if acquired.forked { ", forked" } else { "" },
+                describe_reuse(acquired.cut_back, acquired.forked),
                 acquired
                     .from_disk
                     .map(|d| format!(", from disk in {:.2}s", d.as_secs_f64()))
@@ -1683,7 +1683,7 @@ impl<M: LanguageModel> Engine<M> {
             id,
             n,
             reused,
-            if acquired.forked { ", forked" } else { "" },
+            describe_reuse(acquired.cut_back, acquired.forked),
             acquired
                 .from_disk
                 .map(|d| format!(", from disk in {:.2}s", d.as_secs_f64()))
@@ -1865,6 +1865,16 @@ impl<M: LanguageModel> Engine<M> {
 
 /// A response id, `chatcmpl-<created>-<n>` or `cmpl-…`, unique within the
 /// process; advances the counter.
+/// How the session cache reused a lineage behind its live end, for the
+/// request's log line: cut back in place (by how many tokens) or forked.
+fn describe_reuse(cut_back: Option<usize>, forked: bool) -> String {
+    match (cut_back, forked) {
+        (Some(dropped), _) => format!(", cut back by {dropped}"),
+        (None, true) => ", forked".to_owned(),
+        (None, false) => String::new(),
+    }
+}
+
 fn response_id(kind: Kind, created: u64, next_id: &mut u64) -> String {
     let id = format!(
         "{}-{created}-{}",

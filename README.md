@@ -176,8 +176,11 @@ Prompt state is cached in three tiers; clients see them only as
 `cached_tokens` in the usage block.
 
 1. **Resident sessions.** Each conversation's state stays in GPU memory
-   within a budget, so continuing it costs only the new tokens. Edits,
-   regenerations and branches fork a copy instead of overwriting it.
+   within a budget, so continuing it costs only the new tokens. A re-sent
+   last turn (a regenerated or re-tokenized answer) rewinds the session in
+   place; edits further back and other conversations fork a copy instead
+   of overwriting it. Long answers carry checkpoints of their own, so a
+   prompt that diverges inside one resumes near the divergence.
 2. **Disk.** Sessions evicted from GPU memory move to disk and come back in
    about a second per few gigabytes. They survive restarts.
 3. **Durable prefixes.** Runs of the same agent share a preamble (system

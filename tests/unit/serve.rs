@@ -623,3 +623,10 @@ fn a_failed_tick_is_not_retried_until_the_engine_submits_again() {
         None
     );
 }
+
+#[test]
+fn the_log_line_says_whether_a_session_was_cut_back_or_forked() {
+    assert_eq!(describe_reuse(Some(9_000), false), ", cut back by 9000");
+    assert_eq!(describe_reuse(None, true), ", forked");
+    assert_eq!(describe_reuse(None, false), "");
+}

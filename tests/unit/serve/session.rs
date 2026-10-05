@@ -1018,5 +1018,104 @@ mod store {
         assert_eq!(acquired.reused, 699);
         assert!(acquired.from_disk.is_some());
         assert_holds(&acquired.session.state, &lineage[..699]);
+        // A disk hit is never cut back: it forks from the file, which stays.
+        assert_eq!((acquired.forked, acquired.cut_back), (true, None));
+        let disk = f.store.disk().expect("disk");
+        assert!(disk.entries().iter().any(|e| e.tokens == lineage));
+    }
+
+    // --- cutting back in place ------------------------------------------------
+
+    #[test]
+    fn a_divergence_inside_the_latest_request_cuts_the_session_back_in_place() {
+        let mut f = fixture("cut-back", 10_000_000, None);
+        let lineage = answered(&mut f);
+        let before = f.store.used_bytes();
+        let next = diverging(&lineage, 750);
+        let (acquired, _) = serve(&mut f, &next);
+        // The answer's tail from 699 on is gone, not copied: one session,
+        // the same state, no more bytes than it held.
+        assert_eq!((acquired.reused, acquired.forked), (699, false));
+        assert_eq!(acquired.cut_back, Some(lineage.len() - 699));
+        assert_eq!(f.store.len(), 1);
+        assert!(f.store.used_bytes() <= before);
+        assert_holds(&f.store.entries[0].state, &next);
+        assert_eq!(f.store.entries[0].tokens, next);
+        // Its checkpoints: the prompt end, the decode checkpoint below the
+        // seam (dropped at the release, it lies where this request began)
+        // and this request's own prompt end.
+        assert_eq!(positions_of(&f, 1), [299, next.len() - 1]);
+        // The prompt end of the first request still serves a regeneration.
+        let regenerate = [&lineage[..300], &[4242u32][..]].concat();
+        let (again, _) = serve(&mut f, &regenerate);
+        assert_eq!((again.reused, again.forked, again.cut_back), (299, true, None));
+        assert_eq!(f.store.len(), 2);
+    }
+
+    #[test]
+    fn a_divergence_before_the_latest_request_forks_as_before() {
+        let mut f = fixture("cut-back-fork", 10_000_000, None);
+        let lineage = answered(&mut f);
+        // The next turn extends the live end: it began at 899.
+        let turn = [lineage.clone(), prompt(7, 100)].concat();
+        serve(&mut f, &turn);
+        // A prompt that diverges inside the first answer discards more than
+        // the latest request appended: the long lineage must survive.
+        let other = diverging(&lineage, 600);
+        let (acquired, _) = serve(&mut f, &other);
+        assert_eq!(
+            (acquired.reused, acquired.forked, acquired.cut_back),
+            (299, true, None)
+        );
+        assert_eq!(f.store.len(), 2);
+        let kept = f.store.entries.iter().find(|s| s.tokens == turn);
+        assert_holds(&kept.expect("the original survives").state, &turn);
+    }
+
+    #[test]
+    fn cutting_back_a_session_written_ahead_deletes_its_stale_copy() {
+        let mut f = fixture("cut-back-ahead", 1_500_000, Some(300_000));
+        let lineage = answered(&mut f);
+        serve(&mut f, &prompt(2, 300));
+        // 301 000 free, a new session as large as the answered one wanted:
+        // the answered session (least recently used) is written ahead.
+        assert_eq!(settle(&mut f), 1);
+        assert!(matches!(copy_of(&f, 1), Some(DiskCopy::Written(_))));
+        let next = diverging(&lineage, 750);
+        let (acquired, _) = serve(&mut f, &next);
+        assert_eq!(
+            (acquired.reused, acquired.cut_back),
+            (699, Some(lineage.len() - 699))
+        );
+        assert!(acquired.from_disk.is_none());
+        // The copy held the longer lineage: gone, and the session has none.
+        assert_eq!(copy_of(&f, 1), Some(DiskCopy::None));
+        let disk = f.store.disk().expect("disk");
+        assert!(!disk.entries().iter().any(|e| e.tokens == lineage));
+        assert_eq!(disk.len(), 0);
+    }
+
+    #[test]
+    fn a_prompt_that_cuts_back_the_session_being_written_cancels_the_write() {
+        let mut f = fixture("cut-back-parked", 1_500_000, Some(300_000));
+        let gate = Arc::new(AtomicBool::new(true));
+        f.store.write_gate = Some(gate.clone());
+        let lineage = answered(&mut f);
+        serve(&mut f, &prompt(2, 300));
+        assert!(f.store.write_ahead(&f.ctx), "the write of the answer is held");
+        let next = diverging(&lineage, 750);
+        let (acquired, _) = serve(&mut f, &next);
+        // Taken back from the write as any resume of it is, then cut back.
+        assert_eq!(acquired.evictions.cancelled, 1);
+        assert_eq!(
+            (acquired.reused, acquired.cut_back),
+            (699, Some(lineage.len() - 699))
+        );
+        assert!(!f.store.writing());
+        assert_eq!(f.store.disk().expect("disk").len(), 0);
+        assert_eq!(entry_dirs(&f), 0);
+        let cut = f.store.entries.iter().find(|s| s.tokens == next);
+        assert_holds(&cut.expect("cut back").state, &next);
+        gate.store(false, Ordering::Release);
     }
 }

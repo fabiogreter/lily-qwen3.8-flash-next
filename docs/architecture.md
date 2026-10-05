@@ -866,6 +866,33 @@ copied into a new session, so a parallel conversation that shares only a
 system prompt never destroys a long context. Sessions are evicted least
 recently used under the byte budget.
 
+**Cutting back.** Most rollbacks are not a parallel conversation. When the
+tail a resident session's resume discards lies entirely within what the
+session's most recent request appended (its prompt extension and its
+answer), the client re-sent the same conversation with the last turn
+rendered differently: a re-tokenized answer, or the reasoning the template
+drops from earlier turns. That tail is never resumed again, and the fork
+cost the copy of every per-token cache up to the resume position: 0.63 s at
+97 000 tokens, 0.82 s at 110 000, 1.24 s at 130 000 in a day of opencode
+sessions, plus a transient second state of 3 to 4 GB inside an 8.6 GB
+budget, which evicted other sessions and pushed macOS into compression. So
+such a session is **cut back** in place instead: the checkpoint is restored
+into its own state, the tokens, image spans and checkpoints past it are
+dropped, and the per-token caches stay (valid up to the position, overwritten
+past it). Nothing is copied or allocated; the state keeps its capacity, so the
+budget sees no new bytes. Each session records where its most recent request
+began (the position it resumed at), and the rule is `resume >= that start`;
+a resume further back, such as a second agent run that shares a preamble
+with a long conversation or a regeneration of an older turn, forks exactly
+as before. A session parked for a write ahead is first taken back by the
+usual rule (the write is cancelled when the prompt resumes it at least as
+far as anything else). A copy written ahead describes the longer lineage
+after the cut; the release deletes it, as it deletes the copy of every
+session a request resumed, and the next write ahead writes the new one. Disk
+hits keep their semantics: one at an earlier checkpoint forks from the file
+and leaves it in place. The log line says `cut back by N` (the tokens
+dropped) where a fork says `forked`.
+
 **The disk tier.** An evicted session is written to
 `<disk-cache-dir>/<format>/<id>/` as its per-token caches for all tokens,
 every checkpoint and a snapshot of the live end, and indexed in memory. A
