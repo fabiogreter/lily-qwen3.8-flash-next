@@ -73,6 +73,16 @@ struct Cli {
     #[arg(long, default_value_t = 1024)]
     durable_min_tokens: usize,
 
+    /// Take a recurrent-state checkpoint every this many generated tokens
+    /// (at most four per session, thinned evenly for longer answers), so a
+    /// next prompt that diverges inside the answer (a client re-sending it
+    /// as text, re-tokenized) resumes near the divergence instead of at the
+    /// end of the previous prompt. Each costs one snapshot (113 MB on the
+    /// full model) in the session budget. Off under the expert cache; `0`
+    /// turns it off.
+    #[arg(long, default_value_t = 2048)]
+    decode_checkpoint_tokens: usize,
+
     /// Unload the model (weights, caches, the n-gram table) after this long
     /// without a request, e.g. `30m`, `2h`; resident sessions go to the disk
     /// tier first, a preload still running stops, and the next request
@@ -230,6 +240,7 @@ fn run() -> Result<()> {
         disk_cache_bytes: parse_bytes(&cli.disk_cache_bytes)? as u64,
         disk_cache_ttl_secs: parse_duration_secs(&cli.disk_cache_ttl)?,
         durable_min_tokens: cli.durable_min_tokens,
+        decode_checkpoint_tokens: cli.decode_checkpoint_tokens,
         ngram_storage: cli.ngram_table,
         ngram_preload: cli.ngram_preload,
         ngram_lock: cli.ngram_lock,

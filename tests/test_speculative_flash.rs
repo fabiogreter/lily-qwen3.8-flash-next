@@ -234,3 +234,63 @@ fn plain_decoding_grows_the_caches_across_a_capacity_step() -> Result<()> {
     assert!(state.pos() > step, "position {} never crossed {step}", state.pos());
     Ok(())
 }
+
+/// Decode checkpoints (`Generator::generate_checkpointed`) drain the
+/// pipeline for one step and, with the draft head, restart the proposals;
+/// neither may change a greedy token. Every checkpoint lands where the state
+/// was at rest, at least the interval after the one before it.
+#[test]
+#[ignore = "requires LILY_MODEL_DIR_FLASH"]
+fn decode_checkpoints_change_no_token() -> Result<()> {
+    use lily::generate::DecodeCheckpointer;
+    use lily::qwen4exp::DecodeState;
+    use lily::serve::session::DecodeCheckpoints;
+
+    let dir = model_dir()?;
+    let ctx = MetalContext::new()?;
+    let model = <Qwen4ExpModel as LanguageModel>::load(
+        &ctx,
+        Path::new(&dir),
+        &LoadOptions { mtp_drafts: 2, ..LoadOptions::default() },
+    )?;
+    let generator = Generator::from_model_dir(Path::new(&dir))?;
+    let prompt = prompt(&generator)?;
+    let n = prompt.len();
+    let greedy = SamplingParams::greedy();
+    let max_tokens = 48;
+    let capacity = n + max_tokens + 8;
+    let mut scratch = model.new_scratch_with_capacity(&ctx, capacity)?;
+    for drafts in [0usize, 2] {
+        let options =
+            GenerateOptions { max_tokens, sampling: &greedy, stop_tokens: &[], drafts };
+        let mut run = |every: usize| -> Result<_> {
+            let mut state = model.new_state(&ctx, capacity)?;
+            model.prefill(&ctx, &mut state, &mut scratch, &prompt[..n - 1], None)?;
+            let mut checkpoints =
+                DecodeCheckpoints::<DecodeState>::new(every, 64, n - 1);
+            let checkpointer: &mut dyn DecodeCheckpointer<DecodeState> =
+                &mut checkpoints;
+            let g = generator.generate_checkpointed(
+                &ctx,
+                &model,
+                &mut state,
+                &mut scratch,
+                &prompt[n - 1..],
+                &options,
+                Some(checkpointer),
+                &mut |_| Ok(true),
+            )?;
+            Ok((g.tokens, state.pos(), checkpoints))
+        };
+        let (plain, _, none) = run(0)?;
+        assert_eq!(none.taken(), 0);
+        let (tokens, end, checkpoints) = run(8)?;
+        assert_eq!(tokens, plain, "drafts={drafts}: checkpoints changed the output");
+        let positions = checkpoints.positions();
+        assert!(positions.len() >= 3, "drafts={drafts}: {positions:?}");
+        assert!(positions.windows(2).all(|w| w[1] >= w[0] + 8));
+        assert!(positions.iter().all(|&p| p >= n - 1 + 8 && p <= end));
+        assert_eq!(checkpoints.taken(), positions.len());
+    }
+    Ok(())
+}

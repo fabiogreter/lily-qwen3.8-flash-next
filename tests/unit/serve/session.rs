@@ -1,6 +1,6 @@
 use super::{
     CachedImage, agreement, boundary_position, common_prefix_len, images_within,
-    resume_position, shared_prefix,
+    last_user_turn, resume_position, shared_prefix,
 };
 
 /// No images: the lineages are text.
@@ -70,36 +70,107 @@ fn agreement_with_images_stops_at_a_different_image_and_the_boundary_follows() {
     // The durable boundary is the agreement, so a shared preamble plus a
     // shared image is materialised after the image and a different image
     // before it.
-    assert_eq!(boundary_position(10, 0, b.len(), 4), Some(10));
-    assert_eq!(boundary_position(4, 0, b.len(), 4), Some(4));
-    assert_eq!(boundary_position(4, 0, b.len(), 5), None);
+    assert_eq!(boundary_position(10, 0, b.len(), 4, false, None), Some(10));
+    assert_eq!(boundary_position(4, 0, b.len(), 4, false, None), Some(4));
+    assert_eq!(boundary_position(4, 0, b.len(), 5, false, None), None);
 }
 
 #[test]
 fn boundary_rule_materialises_only_a_long_unresumed_agreement() {
     // Two runs shared 2 000 tokens, nothing was resumable: materialise there.
-    assert_eq!(boundary_position(2000, 0, 3000, 1024), Some(2000));
+    assert_eq!(boundary_position(2000, 0, 3000, 1024, false, None), Some(2000));
     // Below the threshold: not worth a disk entry.
-    assert_eq!(boundary_position(900, 0, 3000, 1024), None);
+    assert_eq!(boundary_position(900, 0, 3000, 1024, false, None), None);
     // Threshold 0 disables the feature entirely.
-    assert_eq!(boundary_position(2000, 0, 3000, 0), None);
+    assert_eq!(boundary_position(2000, 0, 3000, 0, false, None), None);
     // A pure extension (one growing conversation): agreement == reused.
-    assert_eq!(boundary_position(2000, 2000, 3000, 1024), None);
+    assert_eq!(boundary_position(2000, 2000, 3000, 1024, false, None), None);
     // Resumed past the agreement never happens, but must not materialise.
-    assert_eq!(boundary_position(2000, 2500, 3000, 1024), None);
+    assert_eq!(boundary_position(2000, 2500, 3000, 1024, false, None), None);
     // The agreement may sit at the last feedable position ...
-    assert_eq!(boundary_position(2999, 0, 3000, 1024), Some(2999));
+    assert_eq!(boundary_position(2999, 0, 3000, 1024, false, None), Some(2999));
     // ... but never at or past the prompt end (a token must remain to feed).
-    assert_eq!(boundary_position(3000, 0, 3000, 1024), None);
-    assert_eq!(boundary_position(1, 0, 0, 1), None);
+    assert_eq!(boundary_position(3000, 0, 3000, 1024, false, None), None);
+    assert_eq!(boundary_position(1, 0, 0, 1, false, None), None);
     // Exactly the threshold counts.
-    assert_eq!(boundary_position(1024, 0, 3000, 1024), Some(1024));
+    assert_eq!(boundary_position(1024, 0, 3000, 1024, false, None), Some(1024));
     // The threshold is measured from the resume position: a turn that
     // resumed at 74 000 and diverged 240 tokens later is an ordinary fork
     // inside one conversation, not a shared preamble.
-    assert_eq!(boundary_position(74_240, 74_000, 90_000, 1024), None);
-    assert_eq!(boundary_position(75_023, 74_000, 90_000, 1024), None);
-    assert_eq!(boundary_position(75_024, 74_000, 90_000, 1024), Some(75_024));
+    assert_eq!(boundary_position(74_240, 74_000, 90_000, 1024, false, None), None);
+    assert_eq!(boundary_position(75_023, 74_000, 90_000, 1024, false, None), None);
+    assert_eq!(
+        boundary_position(75_024, 74_000, 90_000, 1024, false, None),
+        Some(75_024)
+    );
+    // A resume that cut its session back in place never materialises: the
+    // agreement lies inside the re-sent turn, however far past the resume
+    // (a divergence 7 500 tokens into an answer, resumed at a checkpoint
+    // 3 000 tokens before it).
+    assert_eq!(boundary_position(75_024, 74_000, 90_000, 1024, true, None), None);
+    assert_eq!(boundary_position(83_000, 80_000, 90_000, 1024, true, None), None);
+}
+
+/// `<|im_start|>user\n` as Qwen3.8-Flash-Next tokenizes it (the golden
+/// prompts' ids).
+const USER: [u32; 3] = [248_045, 846, 198];
+
+#[test]
+fn the_last_user_turn_is_found_after_its_complete_opener() {
+    // system turn, user turn "a b", assistant, user turn "c".
+    let tokens: Vec<u32> = [
+        &[248_045, 8678, 198, 1, 2, 248_046, 198][..],
+        &USER[..],
+        &[10, 11, 248_046, 198, 248_045, 74_455, 198, 12, 248_046, 198][..],
+        &USER[..],
+        &[20][..],
+    ]
+    .concat();
+    assert_eq!(last_user_turn(&tokens, &USER), Some(tokens.len() - 1));
+    // Cut inside the second opener: the first user turn's content start.
+    assert_eq!(last_user_turn(&tokens[..tokens.len() - 2], &USER), Some(10));
+    assert_eq!(last_user_turn(&tokens[..10], &USER), Some(10));
+    assert_eq!(last_user_turn(&tokens[..9], &USER), None);
+    assert_eq!(last_user_turn(&tokens, &[]), None);
+}
+
+#[test]
+fn the_durable_boundary_snaps_back_to_where_the_user_message_begins() {
+    // The case from the server log: a 15 649-token preamble ending in
+    // `<|im_start|>user\n`, two tasks sharing their first 40 words.
+    assert_eq!(
+        boundary_position(15_689, 0, 30_000, 1024, false, Some(15_649)),
+        Some(15_649)
+    );
+    // No user turn opened before the agreement: the agreement, as before.
+    assert_eq!(boundary_position(15_689, 0, 30_000, 1024, false, None), Some(15_689));
+    // The snap lands exactly on the agreement when that is where the
+    // message begins.
+    assert_eq!(
+        boundary_position(15_649, 0, 30_000, 1024, false, Some(15_649)),
+        Some(15_649)
+    );
+    // A user turn too close to the resume position to be worth an entry is
+    // not snapped to; the agreement, far enough out, still is the boundary.
+    assert_eq!(
+        boundary_position(16_000, 14_500, 30_000, 1024, false, Some(15_000)),
+        Some(16_000)
+    );
+    // Exactly the threshold counts, as for the agreement.
+    assert_eq!(
+        boundary_position(16_000, 14_000, 30_000, 1024, false, Some(15_024)),
+        Some(15_024)
+    );
+    // A position past the agreement is never used.
+    assert_eq!(
+        boundary_position(15_689, 0, 30_000, 1024, false, Some(15_700)),
+        Some(15_689)
+    );
+    // The rules that refuse an entry still win: a cut back, a short
+    // agreement, the feature off.
+    assert_eq!(boundary_position(15_689, 0, 30_000, 1024, true, Some(15_649)), None);
+    assert_eq!(boundary_position(900, 0, 30_000, 1024, false, Some(600)), None);
+    assert_eq!(boundary_position(15_689, 0, 30_000, 0, false, Some(15_649)), None);
 }
 
 #[test]
@@ -248,11 +319,14 @@ mod store {
 
     use anyhow::{Result, bail};
 
-    use super::super::{Acquired, DiskCopy, Evictions, SessionStore};
+    use super::super::{
+        Acquired, DecodeCheckpoints, DiskCopy, Evictions, SessionStore,
+    };
     use crate::engine::{
         DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, Segment,
         SnapshotApi,
     };
+    use crate::generate::DecodeCheckpointer;
     use crate::metal::{EncodedPass, MetalContext};
     use crate::serve::disk::DiskStore;
     use crate::tensor::Tensor;
@@ -850,5 +924,269 @@ mod store {
         assert_eq!(f.store.len(), 1);
         let (retry, _) = serve(&mut f, &turn);
         assert_eq!((retry.reused, retry.forked), (300, false));
+    }
+
+    // --- decode checkpoints ---------------------------------------------------
+
+    /// Feeds `tokens` one at a time, asking `checkpoints` at every point of
+    /// rest as the decode loop does.
+    fn decode(
+        ctx: &MetalContext,
+        state: &mut State,
+        checkpoints: &mut DecodeCheckpoints<State>,
+        tokens: &[u32],
+    ) {
+        for &t in tokens {
+            state.feed(&[t]);
+            let pos = state.pos();
+            if checkpoints.due(pos) {
+                assert!(checkpoints.due(pos), "asked twice, the same answer");
+                checkpoints.take(ctx, state).expect("take");
+            }
+        }
+    }
+
+    #[test]
+    fn decode_checkpoints_follow_the_interval_and_thin_evenly_once_full() {
+        let ctx = MetalContext::new().expect("metal");
+        let mut state = State { data: vec![], recurrent: 0, capacity: 0 };
+        state.feed(&prompt(1, 10));
+        // Counted from the prefill's checkpoint at 9, every 100 tokens.
+        let mut c = DecodeCheckpoints::<State>::new(100, 4, 9);
+        decode(&ctx, &mut state, &mut c, &prompt(2, 400));
+        assert_eq!(c.positions(), [109, 209, 309, 409]);
+        // A fifth is due at 509 with four held: every other one goes and the
+        // interval doubles, which moves the next one to 609.
+        decode(&ctx, &mut state, &mut c, &prompt(3, 100));
+        assert_eq!(c.positions(), [209, 409]);
+        decode(&ctx, &mut state, &mut c, &prompt(4, 400));
+        assert_eq!(c.positions(), [209, 409, 609, 809]);
+        assert_eq!(c.taken(), 6);
+        assert!(c.secs() >= 0.0);
+        // Each holds exactly the state at its position.
+        let all: Vec<u32> =
+            [prompt(1, 10), prompt(2, 400), prompt(3, 100), prompt(4, 400)].concat();
+        for snapshot in c.into_snapshots() {
+            let mut expected = State { data: vec![], recurrent: 0, capacity: 0 };
+            expected.feed(&all[..snapshot.pos]);
+            assert_eq!(snapshot.recurrent, expected.recurrent);
+        }
+        // Off: no interval, or nothing may be held.
+        for (interval, max) in [(0, 4), (100, 0)] {
+            let mut off = DecodeCheckpoints::<State>::new(interval, max, 0);
+            assert!(!off.due(1_000_000));
+        }
+    }
+
+    /// [`serve`] for a request that also generates: after the prefill's
+    /// checkpoint at `n - 1` the state is fed the prompt's last token and all
+    /// of `generated` but the last (drawn, never fed), with decode checkpoints
+    /// as the store configures them. Returns the acquire.
+    fn serve_generating(
+        f: &mut Fixture,
+        prompt: &[u32],
+        generated: &[u32],
+    ) -> Acquired<Model> {
+        let n = prompt.len();
+        let mut acquired =
+            f.store.acquire(&f.ctx, &Model, prompt, &[], None).expect("acquire");
+        let reused = acquired.reused;
+        let mut session = std::mem::replace(
+            &mut acquired.session,
+            super::super::Session::new(State {
+                data: vec![],
+                recurrent: 0,
+                capacity: 0,
+            }),
+        );
+        session.state.feed(&prompt[reused..n - 1]);
+        let snapshot = session.state.snapshot(&f.ctx).expect("snapshot");
+        session.add_checkpoint(snapshot);
+        let mut checkpoints = f.store.decode_checkpoints(n - 1);
+        session.state.feed(&prompt[n - 1..]);
+        let fed = &generated[..generated.len() - 1];
+        decode(&f.ctx, &mut session.state, &mut checkpoints, fed);
+        session.tokens.truncate(reused);
+        session.tokens.extend_from_slice(&prompt[reused..]);
+        session.tokens.extend_from_slice(fed);
+        session.add_decode_checkpoints(checkpoints.into_snapshots(), &[]).expect("add");
+        f.store.release(&f.ctx, session, &[], None);
+        acquired
+    }
+
+    /// The checkpoint positions of the resident session that starts with
+    /// `seed`'s prompt.
+    fn positions_of(f: &Fixture, seed: u32) -> Vec<usize> {
+        f.store
+            .entries
+            .iter()
+            .find(|s| s.tokens.first() == Some(&(seed * 1000)))
+            .map(|s| s.checkpoints.iter().map(|c| c.pos()).collect())
+            .unwrap_or_default()
+    }
+
+    /// A 300-token prompt and a 600-token answer with decode checkpoints
+    /// every 100 tokens, four held: 399 to 699, thinned at 799 to 499 and
+    /// 699, then 899, which the release drops: it is the live end. Returns the
+    /// lineage the session holds.
+    fn answered(f: &mut Fixture) -> Vec<u32> {
+        f.store.decode_interval = 100;
+        f.store.max_decode_checkpoints = 4;
+        let a = prompt(1, 300);
+        let answer = prompt(5, 600);
+        serve_generating(f, &a, &answer);
+        assert_eq!(positions_of(f, 1), [299, 499, 699]);
+        [a, answer[..599].to_vec()].concat()
+    }
+
+    /// The next prompt: the lineage up to `at`, then a different token (the
+    /// answer re-tokenized there) and a new message.
+    fn diverging(lineage: &[u32], at: usize) -> Vec<u32> {
+        [&lineage[..at], &[7777u32][..], &prompt(6, 50)[..]].concat()
+    }
+
+    #[test]
+    fn a_prompt_diverging_inside_the_last_answer_resumes_at_its_decode_checkpoint() {
+        let mut f = fixture("decode-resume", 10_000_000, None);
+        let lineage = answered(&mut f);
+        // Diverging 450 tokens into the answer: the decode checkpoint at 699
+        // instead of the prompt's end at 299.
+        let next = diverging(&lineage, 750);
+        let (acquired, _) = serve(&mut f, &next);
+        assert_eq!((acquired.reused, acquired.from_disk), (699, None));
+        assert_eq!(acquired.agreement, 750);
+        let resumed = f.store.entries.iter().find(|s| s.tokens == next);
+        assert_holds(&resumed.expect("served").state, &next);
+    }
+
+    #[test]
+    fn a_session_keeps_only_the_decode_checkpoints_of_its_latest_request() {
+        let mut f = fixture("decode-latest", 10_000_000, None);
+        let lineage = answered(&mut f);
+        // The next turn extends the live end and generates too little for a
+        // decode checkpoint: the first answer's go, its own prompt end stays.
+        let turn = [lineage.clone(), prompt(7, 100)].concat();
+        let n = turn.len();
+        f.store.decode_interval = 1000;
+        serve_generating(&mut f, &turn, &prompt(8, 10));
+        assert_eq!(positions_of(&f, 1), [299, n - 1]);
+    }
+
+    #[test]
+    fn decode_checkpoints_survive_the_disk_tier() {
+        // Room for the answered session, not for it and another one.
+        let mut f = fixture("decode-disk", 1_000_000, None);
+        let lineage = answered(&mut f);
+        let (other, _) = serve(&mut f, &prompt(2, 300));
+        assert_eq!((other.evictions.evicted, other.evictions.spilled), (1, 1));
+        let disk = f.store.disk().expect("disk");
+        let entry = disk.entries().iter().find(|e| e.tokens == lineage);
+        assert_eq!(entry.expect("spilled").checkpoints, [299, 499, 699, 899]);
+        // The diverging prompt resumes from the file at the decode checkpoint
+        // with exactly the state the answer had there.
+        let next = diverging(&lineage, 750);
+        let acquired = f.store.acquire(&f.ctx, &Model, &next, &[], None).expect("next");
+        assert_eq!(acquired.reused, 699);
+        assert!(acquired.from_disk.is_some());
+        assert_holds(&acquired.session.state, &lineage[..699]);
+        // A disk hit is never cut back: it forks from the file, which stays.
+        assert_eq!((acquired.forked, acquired.cut_back), (true, None));
+        let disk = f.store.disk().expect("disk");
+        assert!(disk.entries().iter().any(|e| e.tokens == lineage));
+    }
+
+    // --- cutting back in place ------------------------------------------------
+
+    #[test]
+    fn a_divergence_inside_the_latest_request_cuts_the_session_back_in_place() {
+        let mut f = fixture("cut-back", 10_000_000, None);
+        let lineage = answered(&mut f);
+        let before = f.store.used_bytes();
+        let next = diverging(&lineage, 750);
+        let (acquired, _) = serve(&mut f, &next);
+        // The answer's tail from 699 on is gone, not copied: one session,
+        // the same state, no more bytes than it held.
+        assert_eq!((acquired.reused, acquired.forked), (699, false));
+        assert_eq!(acquired.cut_back, Some(lineage.len() - 699));
+        assert_eq!(f.store.len(), 1);
+        assert!(f.store.used_bytes() <= before);
+        assert_holds(&f.store.entries[0].state, &next);
+        assert_eq!(f.store.entries[0].tokens, next);
+        // Its checkpoints: the prompt end, the decode checkpoint below the
+        // seam (dropped at the release, it lies where this request began)
+        // and this request's own prompt end.
+        assert_eq!(positions_of(&f, 1), [299, next.len() - 1]);
+        // The prompt end of the first request still serves a regeneration.
+        let regenerate = [&lineage[..300], &[4242u32][..]].concat();
+        let (again, _) = serve(&mut f, &regenerate);
+        assert_eq!((again.reused, again.forked, again.cut_back), (299, true, None));
+        assert_eq!(f.store.len(), 2);
+    }
+
+    #[test]
+    fn a_divergence_before_the_latest_request_forks_as_before() {
+        let mut f = fixture("cut-back-fork", 10_000_000, None);
+        let lineage = answered(&mut f);
+        // The next turn extends the live end: it began at 899.
+        let turn = [lineage.clone(), prompt(7, 100)].concat();
+        serve(&mut f, &turn);
+        // A prompt that diverges inside the first answer discards more than
+        // the latest request appended: the long lineage must survive.
+        let other = diverging(&lineage, 600);
+        let (acquired, _) = serve(&mut f, &other);
+        assert_eq!(
+            (acquired.reused, acquired.forked, acquired.cut_back),
+            (299, true, None)
+        );
+        assert_eq!(f.store.len(), 2);
+        let kept = f.store.entries.iter().find(|s| s.tokens == turn);
+        assert_holds(&kept.expect("the original survives").state, &turn);
+    }
+
+    #[test]
+    fn cutting_back_a_session_written_ahead_deletes_its_stale_copy() {
+        let mut f = fixture("cut-back-ahead", 1_500_000, Some(300_000));
+        let lineage = answered(&mut f);
+        serve(&mut f, &prompt(2, 300));
+        // 301 000 free, a new session as large as the answered one wanted:
+        // the answered session (least recently used) is written ahead.
+        assert_eq!(settle(&mut f), 1);
+        assert!(matches!(copy_of(&f, 1), Some(DiskCopy::Written(_))));
+        let next = diverging(&lineage, 750);
+        let (acquired, _) = serve(&mut f, &next);
+        assert_eq!(
+            (acquired.reused, acquired.cut_back),
+            (699, Some(lineage.len() - 699))
+        );
+        assert!(acquired.from_disk.is_none());
+        // The copy held the longer lineage: gone, and the session has none.
+        assert_eq!(copy_of(&f, 1), Some(DiskCopy::None));
+        let disk = f.store.disk().expect("disk");
+        assert!(!disk.entries().iter().any(|e| e.tokens == lineage));
+        assert_eq!(disk.len(), 0);
+    }
+
+    #[test]
+    fn a_prompt_that_cuts_back_the_session_being_written_cancels_the_write() {
+        let mut f = fixture("cut-back-parked", 1_500_000, Some(300_000));
+        let gate = Arc::new(AtomicBool::new(true));
+        f.store.write_gate = Some(gate.clone());
+        let lineage = answered(&mut f);
+        serve(&mut f, &prompt(2, 300));
+        assert!(f.store.write_ahead(&f.ctx), "the write of the answer is held");
+        let next = diverging(&lineage, 750);
+        let (acquired, _) = serve(&mut f, &next);
+        // Taken back from the write as any resume of it is, then cut back.
+        assert_eq!(acquired.evictions.cancelled, 1);
+        assert_eq!(
+            (acquired.reused, acquired.cut_back),
+            (699, Some(lineage.len() - 699))
+        );
+        assert!(!f.store.writing());
+        assert_eq!(f.store.disk().expect("disk").len(), 0);
+        assert_eq!(entry_dirs(&f), 0);
+        let cut = f.store.entries.iter().find(|s| s.tokens == next);
+        assert_holds(&cut.expect("cut back").state, &next);
+        gate.store(false, Ordering::Release);
     }
 }

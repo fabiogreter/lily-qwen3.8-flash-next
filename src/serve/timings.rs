@@ -64,6 +64,11 @@ pub struct Timings {
     pub decode_ms: f64,
     /// `generated_tokens` per second, `null` when nothing was generated.
     pub decode_per_second: Option<f64>,
+    /// Recurrent-state checkpoints the decode took (one every
+    /// `--decode-checkpoint-tokens`), thinned ones included.
+    pub decode_checkpoints: usize,
+    /// Wall time taking them, part of `decode_ms`.
+    pub decode_checkpoint_ms: f64,
     /// Draft tokens proposed, `null` when speculative decoding is off.
     pub drafted_tokens: Option<usize>,
     /// Draft tokens accepted, `null` when speculative decoding is off.
@@ -441,6 +446,8 @@ impl Timings {
             generated_tokens,
             decode_ms: round(decode_secs * 1e3, 1e3),
             decode_per_second: rate(generated_tokens, decode_secs),
+            decode_checkpoints: 0,
+            decode_checkpoint_ms: 0.0,
             drafted_tokens: speculation.map(|s| s.drafted),
             accepted_tokens: speculation.map(|s| s.accepted),
             acceptance_ratio: speculation.filter(|s| s.drafted > 0).map(|s| {
@@ -560,6 +567,13 @@ impl Timings {
             ));
         }
         parts.iter().map(|part| format!("; {part}")).collect()
+    }
+
+    /// Adds the decode checkpoints the generation took and their time.
+    pub fn with_decode_checkpoints(mut self, taken: usize, secs: f64) -> Self {
+        self.decode_checkpoints = taken;
+        self.decode_checkpoint_ms = round(secs * 1e3, 1e3);
+        self
     }
 
     /// Adds what evicting sessions cost at the acquire and the release.

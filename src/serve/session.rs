@@ -7,11 +7,29 @@
 //! end) and a common prefix of the session's tokens and the prompt, capped at
 //! `prompt_len - 1` so at least one token is fed to produce logits.
 //!
-//! Extending the live end reuses the session in place. Anything else forks:
+//! Checkpoints come from two places. Every request takes one at the end of
+//! its prefill (`prompt_len - 1`); a session keeps the newest few of those.
+//! And a long generation takes **decode checkpoints** every so many tokens
+//! ([`DecodeCheckpoints`]), because the next prompt can diverge inside it: a
+//! client that sends the answer back as text gets it re-tokenized, and where
+//! the model had sampled a non-canonical split the tokens differ from there
+//! on. Without them such a prompt resumes at the end of the previous prompt
+//! and prefills the whole answer again. Only the next request can diverge
+//! there (the one after it re-sends the turn as rendered the first time), so
+//! a session keeps the decode checkpoints of the request it ran last, a
+//! bounded number thinned evenly, and drops older ones at its release.
+//!
+//! Extending the live end reuses the session in place. So does a resume
+//! behind the live end that discards only what the session's latest request
+//! appended (its prompt extension and its answer): the client re-sent the
+//! same conversation with the last turn rendered differently, and the old
+//! tail is never resumed again, so the session is **cut back** to the
+//! checkpoint (`Session::cut_back`) instead of copied. Anything else forks:
 //! the per-token caches up to the resume position are copied into a fresh
 //! state and the checkpoint restored, so the original lineage survives (a
 //! parallel conversation sharing only the system prompt must not destroy a
-//! long context). Sessions are evicted least-recently-used under the budget.
+//! long context). A disk hit never cuts back. Sessions are evicted
+//! least-recently-used under the budget.
 //!
 //! Below the GPU tier sits an optional disk tier ([`DiskStore`]): sessions
 //! evicted from GPU memory are written out (per-token caches plus their
@@ -25,7 +43,11 @@
 //! because checkpoints sit at the end of served prompts and two agent runs
 //! diverge before that. The engine materialises such a boundary once, as a
 //! disk entry whose live end is the boundary, and every later prompt with the
-//! same preamble resumes there. These entries live only on disk, never as
+//! same preamble resumes there. The boundary is the agreement snapped back to
+//! where the last user message opened before it begins
+//! ([`boundary_position`], [`last_user_turn`]): two tasks that start with the
+//! same words agree a few tokens into the message, and an entry ending there
+//! serves no prompt with another message. These entries live only on disk, never as
 //! resident sessions or extra checkpoints: they are hit far more rarely than
 //! the live conversation's cache and must not compete with it for the GPU
 //! budget. A hit never consumes them.
@@ -66,6 +88,7 @@ use super::disk::{self, DiskStore, NewEntry, Reserved};
 use crate::engine::{
     DecodeStateApi, LanguageModel, Segment, SnapshotApi, write_layout,
 };
+use crate::generate::DecodeCheckpointer;
 use crate::metal::MetalContext;
 use crate::qwen4exp::ImageSpan;
 
@@ -189,14 +212,52 @@ pub fn agreement<'a>(
 /// conversation out of the disk tier: a turn that resumes at the previous
 /// request's end and diverges a few hundred tokens later (a regenerated
 /// answer, a re-tokenized message) has nothing a later run would reuse.
+/// Nor does a resume that cut its session back in place (`cut_back`): the
+/// agreement then lies inside the turn the prompt re-sent, however far past
+/// the resume position, and that text is in the session's lineage again.
+///
+/// `user_turn` is where the content of the last user turn that opens at or
+/// before the agreement begins ([`last_user_turn`]). The boundary snaps back
+/// to it when it still lies at least `min_tokens` beyond the resume
+/// position; otherwise it stays at the agreement. Two runs whose tasks
+/// happen to start with the same words agree a few tokens into the user
+/// message, and an entry ending there resumes nothing for a third prompt
+/// with a different message; one ending where the message begins serves
+/// every prompt behind the same preamble. A snapped boundary is earlier than
+/// the agreement, so it is still a prefix both prompts share images
+/// included, and it is never inside an image span: the token before it is
+/// the opener's newline, not a placeholder.
 pub fn boundary_position(
     agreement: usize,
     reused: usize,
     prompt_len: usize,
     min_tokens: usize,
+    cut_back: bool,
+    user_turn: Option<usize>,
 ) -> Option<usize> {
-    let worth_it = min_tokens > 0 && agreement.saturating_sub(reused) >= min_tokens;
-    (worth_it && agreement <= prompt_len.checked_sub(1)?).then_some(agreement)
+    let worth_it =
+        min_tokens > 0 && !cut_back && agreement.saturating_sub(reused) >= min_tokens;
+    if !(worth_it && agreement <= prompt_len.checked_sub(1)?) {
+        return None;
+    }
+    Some(
+        user_turn
+            .filter(|&p| p <= agreement && p.saturating_sub(reused) >= min_tokens)
+            .unwrap_or(agreement),
+    )
+}
+
+/// Where the content of the last user turn opened within `tokens` begins:
+/// the position right after the last complete occurrence of `opener` (the
+/// template's `<|im_start|>user\n` as the prompt tokenizes it). `None` when
+/// there is none, or `opener` is empty.
+pub fn last_user_turn(tokens: &[u32], opener: &[u32]) -> Option<usize> {
+    if opener.is_empty() || tokens.len() < opener.len() {
+        return None;
+    }
+    (opener.len()..=tokens.len())
+        .rev()
+        .find(|&end| tokens[end - opener.len()..end] == *opener)
 }
 
 /// The best position to resume `prompt` from given a lineage's tokens,
@@ -223,6 +284,150 @@ fn resume_position(
     checkpoints.iter().rev().copied().find(|&p| p > 0 && p <= limit)
 }
 
+/// One recurrent-state checkpoint of a session.
+struct Checkpoint<S> {
+    snapshot: Arc<S>,
+    /// Taken during a generation ([`DecodeCheckpoints`]) rather than at the
+    /// end of a prefill; the two kinds are capped separately.
+    decode: bool,
+}
+
+impl<S> Clone for Checkpoint<S> {
+    fn clone(&self) -> Self {
+        Self { snapshot: self.snapshot.clone(), decode: self.decode }
+    }
+}
+
+impl<S: SnapshotApi> Checkpoint<S> {
+    fn pos(&self) -> usize {
+        self.snapshot.pos()
+    }
+
+    fn bytes(&self) -> usize {
+        self.snapshot.bytes()
+    }
+}
+
+/// Drops the oldest checkpoints of one kind (`decode` or not) until at most
+/// `max` of that kind remain; the other kind is left alone.
+fn keep_newest<S>(checkpoints: &mut Vec<Checkpoint<S>>, decode: bool, max: usize) {
+    let mut excess =
+        checkpoints.iter().filter(|c| c.decode == decode).count().saturating_sub(max);
+    checkpoints.retain(|c| {
+        let drop = excess > 0 && c.decode == decode;
+        if drop {
+            excess -= 1;
+        }
+        !drop
+    });
+}
+
+/// The decode checkpoints of one generation: a snapshot of the recurrent
+/// state every `interval` tokens, counted from the checkpoint that ended the
+/// prefill, each taken where the decode loop is at rest
+/// ([`DecodeCheckpointer`]). At most `max` are held. When one more is due
+/// with all of them held, every other one goes (the oldest first) and the
+/// interval doubles, so a long generation keeps evenly spaced resume points
+/// and never more snapshots: with an interval of 2 048 and four held, an
+/// 8 000-token answer has one every 2 048 tokens, a 16 000-token one every
+/// 4 096.
+pub struct DecodeCheckpoints<S: DecodeStateApi> {
+    /// Tokens between two checkpoints (0: none are taken).
+    stride: usize,
+    max: usize,
+    /// The position the first interval counts from.
+    start: usize,
+    /// Ascending by position.
+    snapshots: Vec<S::Snapshot>,
+    /// Snapshots taken, the ones thinned out since included.
+    taken: usize,
+    secs: f64,
+}
+
+impl<S: DecodeStateApi> DecodeCheckpoints<S> {
+    /// Checkpoints every `interval` tokens past `start` (0: none), at most
+    /// `max` of them held.
+    pub fn new(interval: usize, max: usize, start: usize) -> Self {
+        Self {
+            stride: interval,
+            max,
+            start,
+            snapshots: Vec::new(),
+            taken: 0,
+            secs: 0.0,
+        }
+    }
+
+    /// Where the next checkpoint is due.
+    fn next_at(&self) -> usize {
+        self.snapshots
+            .last()
+            .map_or(self.start, |s| s.pos())
+            .saturating_add(self.stride)
+    }
+
+    /// Drops every other snapshot, the oldest first, and doubles the interval.
+    fn thin(&mut self) {
+        let mut index = 0usize;
+        self.snapshots.retain(|_| {
+            index += 1;
+            index % 2 == 0
+        });
+        self.stride = self.stride.saturating_mul(2);
+    }
+
+    /// The positions held, ascending.
+    pub fn positions(&self) -> Vec<usize> {
+        self.snapshots.iter().map(|s| s.pos()).collect()
+    }
+
+    /// Snapshots taken over the generation, thinned ones included.
+    pub fn taken(&self) -> usize {
+        self.taken
+    }
+
+    /// Wall time spent taking them.
+    pub fn secs(&self) -> f64 {
+        self.secs
+    }
+
+    /// The snapshots held, for [`Session::add_decode_checkpoints`].
+    pub fn into_snapshots(self) -> Vec<S::Snapshot> {
+        self.snapshots
+    }
+}
+
+impl<S: DecodeStateApi> DecodeCheckpointer<S> for DecodeCheckpoints<S> {
+    fn due(&mut self, pos: usize) -> bool {
+        if self.stride == 0 || self.max == 0 || pos < self.next_at() {
+            return false;
+        }
+        // Thinning moves the next position out, possibly past `pos`; asked
+        // again for the same `pos`, nothing is held in excess any more and
+        // the answer is the same.
+        if self.snapshots.len() >= self.max {
+            self.thin();
+        }
+        pos >= self.next_at()
+    }
+
+    fn take(&mut self, ctx: &MetalContext, state: &S) -> Result<()> {
+        let started = Instant::now();
+        let snapshot = state.snapshot(ctx)?;
+        self.secs += started.elapsed().as_secs_f64();
+        self.taken += 1;
+        let pos = snapshot.pos();
+        ensure!(
+            pos == state.pos() && self.snapshots.last().is_none_or(|s| s.pos() < pos),
+            "decode checkpoint at {pos} with the state at {} after {:?}",
+            state.pos(),
+            self.positions()
+        );
+        self.snapshots.push(snapshot);
+        Ok(())
+    }
+}
+
 pub struct Session<M: LanguageModel> {
     /// Tokens fed into `state`; `state.pos() == tokens.len()` when at rest.
     pub tokens: Vec<u32>,
@@ -230,7 +435,11 @@ pub struct Session<M: LanguageModel> {
     pub images: Vec<CachedImage>,
     pub state: M::State,
     /// Recurrent-state checkpoints, ascending by position, all `<= tokens.len()`.
-    checkpoints: Vec<Arc<SnapshotOf<M>>>,
+    checkpoints: Vec<Checkpoint<SnapshotOf<M>>>,
+    /// Where the request that last held the session began appending: the
+    /// position it resumed at. Everything past it is that request's prompt
+    /// extension and the tokens it generated.
+    request_start: usize,
     cache_key: Option<String>,
     last_used: u64,
     /// What the disk tier holds of this session as it is now.
@@ -260,6 +469,7 @@ impl<M: LanguageModel> Session<M> {
             images: Vec::new(),
             state,
             checkpoints: Vec::new(),
+            request_start: 0,
             cache_key: None,
             last_used: 0,
             disk: DiskCopy::None,
@@ -270,12 +480,48 @@ impl<M: LanguageModel> Session<M> {
     /// Records a checkpoint of the state's current position. Duplicates by
     /// position are dropped.
     pub fn add_checkpoint(&mut self, snapshot: SnapshotOf<M>) {
-        let pos = snapshot.pos();
+        self.insert_checkpoint(Checkpoint {
+            snapshot: Arc::new(snapshot),
+            decode: false,
+        });
+    }
+
+    /// Records the decode checkpoints a generation took
+    /// ([`DecodeCheckpoints::into_snapshots`]), once `tokens` holds what the
+    /// state was fed. Each must lie within the tokens and after every span
+    /// of `images` (the prompt's: generated tokens are text), so it is
+    /// resumable like a prefill's checkpoint.
+    pub fn add_decode_checkpoints(
+        &mut self,
+        snapshots: Vec<SnapshotOf<M>>,
+        images: &[CachedImage],
+    ) -> Result<()> {
+        for snapshot in snapshots {
+            let pos = snapshot.pos();
+            ensure!(
+                pos <= self.tokens.len() && pos <= self.state.pos(),
+                "a decode checkpoint at {pos} lies past the {} tokens fed",
+                self.tokens.len()
+            );
+            ensure!(
+                images.iter().all(|i| i.end() <= pos),
+                "a decode checkpoint at {pos} lies inside an image"
+            );
+            self.insert_checkpoint(Checkpoint {
+                snapshot: Arc::new(snapshot),
+                decode: true,
+            });
+        }
+        Ok(())
+    }
+
+    fn insert_checkpoint(&mut self, checkpoint: Checkpoint<SnapshotOf<M>>) {
+        let pos = checkpoint.pos();
         if self.checkpoints.iter().any(|c| c.pos() == pos) {
             return;
         }
         let at = self.checkpoints.partition_point(|c| c.pos() < pos);
-        self.checkpoints.insert(at, Arc::new(snapshot));
+        self.checkpoints.insert(at, checkpoint);
     }
 
     /// The lineage after a prefill that stopped early: the request resumed
@@ -309,8 +555,35 @@ impl<M: LanguageModel> Session<M> {
         resume_position(&self.tokens, &self.images, &positions, true, prompt, images)
     }
 
-    fn checkpoint_at(&self, pos: usize) -> Option<&Arc<SnapshotOf<M>>> {
+    fn checkpoint_at(&self, pos: usize) -> Option<&Checkpoint<SnapshotOf<M>>> {
         self.checkpoints.iter().find(|c| c.pos() == pos)
+    }
+
+    /// Rewinds the session in place to its checkpoint at `pos`, below the
+    /// live end: the recurrent state from the checkpoint, the per-token
+    /// caches kept (valid up to `pos`, overwritten past it), the tokens, the
+    /// image spans and the checkpoints past `pos` dropped. The state keeps
+    /// its capacity, so the budget sees no new bytes, and nothing is copied.
+    /// A copy written ahead now describes the longer lineage; the release
+    /// deletes it as it deletes the copy of any session a request resumed.
+    fn cut_back(&mut self, ctx: &MetalContext, pos: usize) -> Result<()> {
+        ensure!(
+            pos < self.tokens.len() && self.state.pos() == self.tokens.len(),
+            "cut back to {pos} of a session at {} with {} tokens",
+            self.state.pos(),
+            self.tokens.len()
+        );
+        let snapshot = self
+            .checkpoint_at(pos)
+            .ok_or_else(|| anyhow::anyhow!("cut back to {pos} without a checkpoint"))?
+            .snapshot
+            .clone();
+        self.state.restore(ctx, &snapshot)?;
+        self.tokens.truncate(pos);
+        // A checkpoint is never inside an image span.
+        self.images.retain(|i| i.end() <= pos);
+        self.checkpoints.retain(|c| c.pos() <= pos);
+        Ok(())
     }
 }
 
@@ -321,6 +594,9 @@ pub struct Acquired<M: LanguageModel> {
     pub reused: usize,
     /// Whether the session was forked from a cached lineage (diagnostics).
     pub forked: bool,
+    /// The resident session was cut back in place instead of forked (its
+    /// latest request's tail was discarded), by this many tokens.
+    pub cut_back: Option<usize>,
     /// Whether the reused prefix was read from the disk tier, and how long
     /// that took.
     pub from_disk: Option<std::time::Duration>,
@@ -414,7 +690,7 @@ impl Plan {
         for c in &session.checkpoints {
             let pos = c.pos();
             if pos > 0 && pos < n {
-                checkpoints.push((pos, c.layout()?));
+                checkpoints.push((pos, c.snapshot.layout()?));
             }
         }
         checkpoints.push((n, session.state.live_layout()?));
@@ -490,6 +766,7 @@ impl<M: LanguageModel> Acquired<M> {
             session,
             reused: 0,
             forked: false,
+            cut_back: None,
             from_disk: None,
             agreement: 0,
             divergent_tail: Vec::new(),
@@ -505,6 +782,10 @@ pub struct SessionStore<M: LanguageModel> {
     budget_bytes: usize,
     max_sessions: usize,
     max_checkpoints: usize,
+    /// Tokens between two decode checkpoints (0: none are taken).
+    decode_interval: usize,
+    /// Decode checkpoints a session keeps (of the request it ran last).
+    max_decode_checkpoints: usize,
     clock: u64,
     disk: Option<DiskStore>,
     /// Shortest shared prefix worth a durable disk entry (0: never).
@@ -532,6 +813,8 @@ impl<M: LanguageModel> SessionStore<M> {
             budget_bytes,
             max_sessions,
             max_checkpoints: max_checkpoints.max(1),
+            decode_interval: 0,
+            max_decode_checkpoints: 0,
             clock: 0,
             disk: None,
             durable_min_tokens: 0,
@@ -563,6 +846,21 @@ impl<M: LanguageModel> SessionStore<M> {
     pub fn with_write_ahead(mut self, floor_bytes: usize) -> Self {
         self.write_ahead_floor = Some(floor_bytes);
         self
+    }
+
+    /// Turns decode checkpoints on: a generation takes one every `interval`
+    /// tokens (0 keeps them off) and holds at most `max`, which is also
+    /// what a released session keeps of them ([`DecodeCheckpoints`]).
+    pub fn with_decode_checkpoints(mut self, interval: usize, max: usize) -> Self {
+        self.decode_interval = interval;
+        self.max_decode_checkpoints = max;
+        self
+    }
+
+    /// The decode checkpoints of a generation whose prefill ended with a
+    /// checkpoint at `start`.
+    pub fn decode_checkpoints(&self, start: usize) -> DecodeCheckpoints<M::State> {
+        DecodeCheckpoints::new(self.decode_interval, self.max_decode_checkpoints, start)
     }
 
     /// Whether the store writes sessions ahead.
@@ -606,8 +904,10 @@ impl<M: LanguageModel> SessionStore<M> {
     }
 
     /// Checks out the session that can resume `prompt` (with `images` at
-    /// their spans) from the furthest position, forking when that position
-    /// is not the live end. `cache_key` only breaks ties between equally
+    /// their spans) from the furthest position, cutting it back in place or
+    /// forking when that position is not the live end (see the module docs;
+    /// a parked session is taken back first by the rules of
+    /// `reclaim_for`). `cache_key` only breaks ties between equally
     /// good candidates. Also reports how far the prompt agreed with any
     /// lineage at all (`agreement`), which the engine compares with `reused`
     /// to decide on a durable prefix entry, and what making room cost.
@@ -642,6 +942,8 @@ impl<M: LanguageModel> SessionStore<M> {
         let mut acquired =
             self.acquire_resumable(ctx, model, prompt, images, cache_key)?;
         debug_assert!(acquired.reused <= agreement, "resumed past the agreement");
+        // Whatever the request appends lies past where it resumed.
+        acquired.session.request_start = acquired.reused;
         acquired.agreement = agreement;
         acquired.divergent_tail = divergent_tail;
         acquired.evictions = std::mem::take(&mut self.evictions);
@@ -718,6 +1020,21 @@ impl<M: LanguageModel> SessionStore<M> {
             return Ok(Acquired { reused: resume_at, ..Acquired::fresh(session) });
         }
 
+        if resume_at >= self.entries[index].request_start {
+            // Everything the prompt discards is what the session's latest
+            // request appended: the client re-sent that conversation with the
+            // last turn rendered differently, and the lineage it replaces is
+            // never resumed again. Rewind in place rather than copy.
+            let mut session = self.entries.swap_remove(index);
+            let dropped = session.tokens.len() - resume_at;
+            session.cut_back(ctx, resume_at)?;
+            return Ok(Acquired {
+                reused: resume_at,
+                cut_back: Some(dropped),
+                ..Acquired::fresh(session)
+            });
+        }
+
         // Fork: copy the per-token prefix, restore the recurrent checkpoint.
         // The new state briefly exceeds the budget until `trim` runs after
         // the copy (the source must survive until then).
@@ -728,7 +1045,7 @@ impl<M: LanguageModel> SessionStore<M> {
             .ok_or_else(|| anyhow::anyhow!("resume position without checkpoint"))?
             .clone();
         state.copy_prefix_from(ctx, &source.state, resume_at)?;
-        state.restore(ctx, &checkpoint)?;
+        state.restore(ctx, &checkpoint.snapshot)?;
         let mut session = Session::new(state);
         session.tokens = source.tokens[..resume_at].to_vec();
         session.images = images_within(&source.images, resume_at);
@@ -797,7 +1114,9 @@ impl<M: LanguageModel> SessionStore<M> {
         let mut session = Session::new(state);
         session.tokens = tokens;
         session.images = images;
-        session.checkpoints.push(Arc::new(snapshot));
+        session
+            .checkpoints
+            .push(Checkpoint { snapshot: Arc::new(snapshot), decode: false });
         self.trim(ctx, session.bytes());
         Ok(Acquired {
             reused: pos,
@@ -1241,7 +1560,9 @@ impl<M: LanguageModel> SessionStore<M> {
     /// served (which are now the lineage's: every earlier span the prompt
     /// kept is among them). Old checkpoints beyond the per-session cap are
     /// dropped (the newest are the ones the next request most likely resumes
-    /// from), and the store is trimmed to budget and count. A copy written
+    /// from); decode checkpoints are capped on their own, and only those the
+    /// request took are kept (see the module docs). Then the store is
+    /// trimmed to budget and count. A copy written
     /// ahead of what the session was before the request is stale and is
     /// deleted, as a live-end disk hit consumes its entry. Returns what the
     /// trim evicted.
@@ -1265,9 +1586,14 @@ impl<M: LanguageModel> SessionStore<M> {
         }
         session.images = images_within(images, session.tokens.len());
         session.checkpoints.retain(|c| c.pos() <= session.tokens.len());
-        while session.checkpoints.len() > self.max_checkpoints {
-            session.checkpoints.remove(0);
-        }
+        // A decode checkpoint at or before where this request began lies in
+        // a turn the conversation has re-sent since: no prompt diverges
+        // there any more. One at the live end (the generation stopped right
+        // after it) duplicates the live end.
+        let (start, end) = (session.request_start, session.tokens.len());
+        session.checkpoints.retain(|c| !c.decode || (c.pos() > start && c.pos() < end));
+        keep_newest(&mut session.checkpoints, false, self.max_checkpoints);
+        keep_newest(&mut session.checkpoints, true, self.max_decode_checkpoints);
         if std::mem::take(&mut session.born) {
             if self.recent_new.len() == RECENT_NEW_SESSIONS {
                 self.recent_new.pop_front();

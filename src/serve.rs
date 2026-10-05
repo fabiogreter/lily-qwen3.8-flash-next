@@ -53,7 +53,7 @@ use crate::engine::{
     DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, SnapshotApi,
     VisionMode, VisionTower,
 };
-use crate::generate::{FinishReason, GenerateOptions, Generator};
+use crate::generate::{DecodeCheckpointer, FinishReason, GenerateOptions, Generator};
 use crate::kernels::attention::MAX_SEQ;
 use crate::kernels::sample::SamplingParams;
 use crate::metal::MetalContext;
@@ -64,7 +64,7 @@ use crate::qwen4exp::{
     ImageEmbeds, NgramStorage, Qwen4ExpModel, VisionInput, positions_for_prompt,
 };
 use api::{Defaults, ImagePolicy, Kind, Prepared};
-use session::{CachedImage, SessionStore, boundary_position};
+use session::{CachedImage, SessionStore, boundary_position, last_user_turn};
 use stream::{Event, OutputParser, ParserConfig};
 use timings::{
     EvictionPhase, EvictionTimings, MemoryStats, NgramStats, PrefillParts,
@@ -80,6 +80,10 @@ use tools::ParsedToolCall;
 const MAX_REQUEST_BYTES: usize = 1 << 30;
 /// Recurrent-state checkpoints kept per session (the newest ones).
 const CHECKPOINTS_PER_SESSION: usize = 3;
+/// Decode checkpoints a generation holds and a session keeps of its latest
+/// request (113 MB each on the full model): a 2 048-token interval stays at
+/// that spacing up to an 8 192-token answer and thins to 4 096 up to 16 384.
+const DECODE_CHECKPOINTS_PER_SESSION: usize = 4;
 /// Completed requests `GET /v1/timings` remembers (a ring buffer; a client
 /// polls it right after its request, so a handful of entries is plenty).
 const TIMINGS_LOG_CAPACITY: usize = 32;
@@ -185,6 +189,10 @@ pub struct ServeOptions {
     /// being able to resume there is written to the disk tier as a durable
     /// prefix entry, so later prompts resume from it (0 disables).
     pub durable_min_tokens: usize,
+    /// A generation takes a recurrent-state checkpoint every this many
+    /// tokens, so a next prompt that diverges inside the answer resumes
+    /// near the divergence (0 disables).
+    pub decode_checkpoint_tokens: usize,
     pub thinking: bool,
     pub reasoning_effort: Option<String>,
     pub queue: usize,
@@ -902,6 +910,32 @@ impl<M: LanguageModel> Engine<M> {
         }
         let mut sessions =
             SessionStore::new(budget, options.max_sessions, CHECKPOINTS_PER_SESSION);
+        // The expert cache's plan reserved one session with exactly
+        // `CHECKPOINTS_PER_SESSION` snapshots; more would outgrow it.
+        if model.session_reserve().is_some() {
+            if options.decode_checkpoint_tokens > 0 {
+                eprintln!(
+                    "session cache: no decode checkpoints (the expert cache budgets one session with {CHECKPOINTS_PER_SESSION} checkpoints)"
+                );
+            }
+        } else if options.decode_checkpoint_tokens > 0 {
+            sessions = sessions.with_decode_checkpoints(
+                options.decode_checkpoint_tokens,
+                DECODE_CHECKPOINTS_PER_SESSION,
+            );
+            eprintln!(
+                "session cache: decode checkpoints every {} generated tokens, at most {DECODE_CHECKPOINTS_PER_SESSION} per session{}",
+                options.decode_checkpoint_tokens,
+                model
+                    .session_bytes(4, 1)
+                    .zip(model.session_bytes(4, 0))
+                    .map(|(with, without)| format!(
+                        " ({:.0} MB each)",
+                        with.saturating_sub(without) as f64 / 1e6
+                    ))
+                    .unwrap_or_default()
+            );
+        }
         if let (Some(dir), true) =
             (&options.disk_cache_dir, options.disk_cache_bytes > 0)
         {
@@ -1247,9 +1281,24 @@ impl<M: LanguageModel> Engine<M> {
         // is dropped, not kept as a checkpoint: durable entries live on disk
         // only (see the session module).
         let min_tokens = sessions.durable_min_tokens();
-        let boundary = sessions
-            .disk()
-            .and_then(|_| boundary_position(agreement, reused, n, min_tokens));
+        // The boundary snaps back to the start of the last user message
+        // opened before the agreement (see `boundary_position`).
+        let boundary = sessions.disk().and_then(|_| {
+            let user_turn = (min_tokens > 0 && agreement > reused)
+                .then(|| {
+                    let opener = user_turn_opener(generator.tokenizer());
+                    last_user_turn(&p.prompt[..agreement.min(n)], &opener)
+                })
+                .flatten();
+            boundary_position(
+                agreement,
+                reused,
+                n,
+                min_tokens,
+                acquired.cut_back.is_some(),
+                user_turn,
+            )
+        });
         // A client that went away (or the stop signal's grace running out)
         // stops the prefill at the next chunk boundary, before that chunk is
         // committed, instead of holding the engine for the rest of it.
@@ -1366,7 +1415,7 @@ impl<M: LanguageModel> Engine<M> {
                 );
             eprintln!(
                 "{id}: {n} prompt tokens ({reused} cached{}{}), cancelled by the {by} at {at} after {} prefilled in {prefix_secs:.2}s, kept {at} tokens as a session, sessions={} ({:.1}/{:.1} GB){}{}",
-                if acquired.forked { ", forked" } else { "" },
+                describe_reuse(acquired.cut_back, acquired.forked),
                 acquired
                     .from_disk
                     .map(|d| format!(", from disk in {:.2}s", d.as_secs_f64()))
@@ -1532,14 +1581,19 @@ impl<M: LanguageModel> Engine<M> {
             stop_tokens: &[],
             drafts: *drafts,
         };
+        // Decode checkpoints count from the one the prefill just took.
+        let mut decode_checkpoints = sessions.decode_checkpoints(n - 1);
+        let checkpointer: &mut dyn DecodeCheckpointer<M::State> =
+            &mut decode_checkpoints;
         let decode_started = Instant::now();
-        let generation = generator.generate(
+        let generation = generator.generate_checkpointed(
             ctx,
             model,
             &mut session.state,
             scratch,
             &p.prompt[n - 1..],
             &options,
+            Some(checkpointer),
             &mut |token| {
                 let events = parser.push(token)?;
                 deliver(events, sink);
@@ -1574,6 +1628,11 @@ impl<M: LanguageModel> Engine<M> {
             session.state.pos() == session.tokens.len(),
             "session token/state position mismatch"
         );
+        // Every decode checkpoint sits at a point the state passed: a prefix
+        // of the tokens just recorded.
+        let decode_checkpoints_taken = decode_checkpoints.taken();
+        let decode_checkpoint_secs = decode_checkpoints.secs();
+        session.add_decode_checkpoints(decode_checkpoints.into_snapshots(), &images)?;
         let released = sessions.release(ctx, session, &images, p.cache_key.as_deref());
 
         if ctx.profiling() {
@@ -1610,6 +1669,7 @@ impl<M: LanguageModel> Engine<M> {
         )
         .with_agreement(agreement, durable.map(|(b, _)| b))
         .with_vision(image_tokens, vision_secs)
+        .with_decode_checkpoints(decode_checkpoints_taken, decode_checkpoint_secs)
         .with_pinned(pinned)
         .with_cancel(cancelled_by, None)
         .with_evictions(EvictionTimings {
@@ -1643,7 +1703,7 @@ impl<M: LanguageModel> Engine<M> {
             id,
             n,
             reused,
-            if acquired.forked { ", forked" } else { "" },
+            describe_reuse(acquired.cut_back, acquired.forked),
             acquired
                 .from_disk
                 .map(|d| format!(", from disk in {:.2}s", d.as_secs_f64()))
@@ -1679,14 +1739,24 @@ impl<M: LanguageModel> Engine<M> {
             prefix_secs,
             decode_secs,
             completion_tokens as f64 / decode_secs.max(1e-9),
-            if generation.drafted > 0 {
-                format!(
-                    ", drafts {}/{} accepted",
-                    generation.accepted, generation.drafted
-                )
-            } else {
-                String::new()
-            },
+            format!(
+                "{}{}",
+                if generation.drafted > 0 {
+                    format!(
+                        ", drafts {}/{} accepted",
+                        generation.accepted, generation.drafted
+                    )
+                } else {
+                    String::new()
+                },
+                if decode_checkpoints_taken > 0 {
+                    format!(
+                        ", {decode_checkpoints_taken} decode checkpoints in {decode_checkpoint_secs:.2}s"
+                    )
+                } else {
+                    String::new()
+                }
+            ),
             cancelled_by
                 .map(|by| format!(" (cancelled by the {by} during the decode)"))
                 .unwrap_or_default(),
@@ -1810,6 +1880,32 @@ impl<M: LanguageModel> Engine<M> {
             sink.send(serde_json::to_vec(&body)?);
         }
         Ok(())
+    }
+}
+
+/// The tokens that open a user turn in the chat template,
+/// `<|im_start|>user\n`, encoded as the rendered prompt is (the template
+/// writes the marker as text and the tokenizer maps it to the special
+/// token; for Qwen3.8-Flash-Next that is `[248045, 846, 198]`, the golden
+/// prompts' ids). Empty, which turns the durable boundary's snap off, when
+/// the vocabulary has no `<|im_start|>`.
+fn user_turn_opener(tokenizer: &crate::tokenizer::Tokenizer) -> Vec<u32> {
+    let Some(start) = tokenizer.token_id("<|im_start|>") else {
+        return Vec::new();
+    };
+    match tokenizer.encode("<|im_start|>user\n") {
+        Ok(ids) if ids.len() > 1 && ids[0] == start => ids,
+        _ => Vec::new(),
+    }
+}
+
+/// How the session cache reused a lineage behind its live end, for the
+/// request's log line: cut back in place (by how many tokens) or forked.
+fn describe_reuse(cut_back: Option<usize>, forked: bool) -> String {
+    match (cut_back, forked) {
+        (Some(dropped), _) => format!(", cut back by {dropped}"),
+        (None, true) => ", forked".to_owned(),
+        (None, false) => String::new(),
     }
 }
 

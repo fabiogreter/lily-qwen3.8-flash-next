@@ -738,7 +738,7 @@ On a 128 GB machine with the full checkpoint:
 | n-gram table                        | 32.0 GB  | page cache, memory-mapped, evictable |
 | draft head                          | 1.5 GB   | in the 71.1 GB above when converted |
 | per-token cache, all layers         | 28 416 B | session cache                      |
-| GDN recurrent checkpoint            | 113 MB   | session cache, up to 3 per session |
+| GDN recurrent checkpoint            | 113 MB   | session cache, up to 3 + 4 per session |
 | prefill scratch                     | ~2.4 GB  | grown on demand to the 4 096-token chunk |
 
 Moving the n-gram table off the GPU is what makes the model fit without
@@ -816,6 +816,47 @@ resumable. The position is `prompt_len - 1` and not `prompt_len` because an
 identical prompt, a regeneration, must still feed one token to produce
 logits.
 
+**Decode checkpoints.** The next prompt can diverge inside the answer the
+session just generated. A client such as opencode sends the answer back as
+text, lily tokenizes it canonically, and where the model had sampled a
+non-canonical split of the same text the tokens differ from there on; a day
+of opencode sessions showed it 9 times in about 400 requests, always inside
+reasoning text, 2 000 to 7 500 tokens into the previous generation. With
+checkpoints only at prompt ends such a prompt resumes at the previous
+prompt's end and prefills the whole answer again: 18 000 tokens (9.0 s) for
+one divergence 7 514 tokens into a 17 756-token answer. So a generation also
+takes a checkpoint every `--decode-checkpoint-tokens` (default 2 048)
+generated tokens. It is taken at rest: when one is due, the plain decode
+loop does not encode the following step ahead, so once the current step
+completes nothing is in flight or parked, and the speculative loop completes
+its verify pass without committing the next one (as at the end of a
+generation, no step pending), snapshots, and proposes afresh with the
+head's initial draft pass. The position is then exactly the tokens fed: the
+prompt and every drawn token but the last, which is the next step's input,
+and the session's tokens are recorded to the same count after the
+generation, so a checkpoint is always a prefix of them; generated tokens are
+text, so none lies inside an image span. A greedy output is unchanged (an
+ignored test on the checkpoint holds it to the token with and without
+drafts); under sampling only the proposals after a restart differ, which
+changes which draws a seed realises and not their distribution. The cost is
+one snapshot (113 MB on the full model, about 20 ms like the prefill's
+checkpoint) and one step without pipelining per interval, reported as
+`decode_checkpoints` and `decode_checkpoint_ms` (part of `decode_ms`) in the
+`timings` and as `N decode checkpoints in Ts` on the log line.
+
+A generation holds at most four. When a fifth is due, every other one goes,
+the oldest first, and the interval doubles, so the spacing stays even: every
+2 048 tokens up to an 8 192-token answer, every 4 096 up to 16 384, and so
+on, never more than four snapshots at a time. They count toward the session
+budget like any checkpoint and are capped separately from the three prompt
+ends. Only the request right after a generation can diverge inside it (the
+one after that re-sends the turn as the previous prompt rendered it), so a
+session keeps the decode checkpoints of the request it ran last and drops
+older ones at the release. The disk tier writes them like every other
+checkpoint (one file per position), so a spilled or written-ahead session
+resumes at one from the file. Under the expert cache they are off: its plan
+reserves one session with three checkpoints, exactly.
+
 Acquiring a session for a new prompt: for every session, find the longest
 common prefix with the prompt and the latest checkpoint at or below
 `min(lcp, prompt_len - 1)`, where the live end counts as a checkpoint. Take
@@ -824,6 +865,33 @@ session in place. A rollback **forks**: the KV prefix and the checkpoint are
 copied into a new session, so a parallel conversation that shares only a
 system prompt never destroys a long context. Sessions are evicted least
 recently used under the byte budget.
+
+**Cutting back.** Most rollbacks are not a parallel conversation. When the
+tail a resident session's resume discards lies entirely within what the
+session's most recent request appended (its prompt extension and its
+answer), the client re-sent the same conversation with the last turn
+rendered differently: a re-tokenized answer, or the reasoning the template
+drops from earlier turns. That tail is never resumed again, and the fork
+cost the copy of every per-token cache up to the resume position: 0.63 s at
+97 000 tokens, 0.82 s at 110 000, 1.24 s at 130 000 in a day of opencode
+sessions, plus a transient second state of 3 to 4 GB inside an 8.6 GB
+budget, which evicted other sessions and pushed macOS into compression. So
+such a session is **cut back** in place instead: the checkpoint is restored
+into its own state, the tokens, image spans and checkpoints past it are
+dropped, and the per-token caches stay (valid up to the position, overwritten
+past it). Nothing is copied or allocated; the state keeps its capacity, so the
+budget sees no new bytes. Each session records where its most recent request
+began (the position it resumed at), and the rule is `resume >= that start`;
+a resume further back, such as a second agent run that shares a preamble
+with a long conversation or a regeneration of an older turn, forks exactly
+as before. A session parked for a write ahead is first taken back by the
+usual rule (the write is cancelled when the prompt resumes it at least as
+far as anything else). A copy written ahead describes the longer lineage
+after the cut; the release deletes it, as it deletes the copy of every
+session a request resumed, and the next write ahead writes the new one. Disk
+hits keep their semantics: one at an earlier checkpoint forks from the file
+and leaves it in place. The log line says `cut back by N` (the tokens
+dropped) where a fork says `forked`.
 
 **The disk tier.** An evicted session is written to
 `<disk-cache-dir>/<format>/<id>/` as its per-token caches for all tokens,
@@ -943,8 +1011,31 @@ at its end, with the boundary as the entry's live end), drops the snapshot,
 and prefills the rest as usual. Two real prompts shared that prefix, so a
 third is likely. Within one growing conversation the agreement equals the
 reused position, or runs a few hundred tokens past it when a turn is
-re-rendered differently, and nothing is written turn after turn; a parallel run that
+re-rendered differently, and nothing is written turn after turn. A resume
+that cut its session back in place writes nothing either, however far the
+agreement runs past it: the agreement then lies inside the re-sent turn
+(twice in a day of opencode sessions a re-tokenized answer diverged more
+than 1 024 tokens past its resume position and wrote an entry nothing would
+hit, taking a durable slot). A parallel run that
 shares only the preamble writes it once, and the third run resumes from it.
+
+The boundary is not always the agreement itself. Two tasks can begin with
+the same words: one day's entry was written at an agreement of 15 689, 40
+tokens into the first user message (both tasks opened `"Read`). An opencode
+compaction then sent the preamble and `What did we do so far?`, diverging at
+15 649, right after `<|im_start|>user\n`; the entry had nothing resumable
+below its end, so the prompt recomputed 34 900 tokens (16.45 s) and wrote a
+near-duplicate entry at 15 649. So the boundary snaps back to where the last
+user message opened before the agreement begins: the position right after
+the last complete `<|im_start|>user\n` (the template's user-turn opener,
+`[248045, 846, 198]` for this tokenizer, found by encoding the opener text
+the way the rendered prompt is encoded) within the agreement, provided it
+still lies at least `--durable-min-tokens` beyond the resume position;
+otherwise the boundary stays the agreement. The snapped boundary is a prefix
+both prompts share, images included, and never inside an image span (the
+token before it is the opener's newline). Tool results render as user turns
+too, so in a longer conversation the snap lands at the start of the last
+user or tool turn opened before the seam.
 The prefill is split at the boundary on purpose: chunks are 4 096 tokens and
 the batched kernels are not row-count invariant, so a run resuming at the
 boundary must process the remainder in the same chunks the materialising run
