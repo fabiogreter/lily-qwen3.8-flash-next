@@ -18,8 +18,11 @@ or inequality, never for quality. What is checked:
      most that; the answers differ. The same image again resumes past the
      span (its own end checkpoint) with the identical answer.
   2. a durable boundary with an image in the shared preamble: three runs
-     share preamble + image and diverge in the question; run 2 writes the
-     durable entry after the image, run 3 resumes there. A fresh server
+     share preamble + image (a first user turn with the image and the
+     assistant's acknowledgement) and diverge in the next question; run 2
+     writes the durable entry after the image, at the start of that last
+     user message (the boundary snaps back to where it begins), run 3
+     resumes there. A fresh server
      replaying the three runs (so its run 2 splits the prefill at the same
      boundary) answers run 3 byte-identically; a cold server, one unsplit
      prefill, agrees on the first token only. The chunked GDN scan
@@ -28,11 +31,13 @@ or inequality, never for quality. What is checked:
      rounding of the recurrent state, and the four-layer model's near-tied
      logits turn that into different greedy tokens a few steps in. A fourth run with another image behind the same
      preamble must not resume from that entry: it agrees up to the image
-     start, where a second durable entry is written, and a fifth run with
-     a third image resumes exactly there.
-  3. refusals: an https URL, a GIF data URI, a 100 000 x 100 000 PNG
-     header, and a `<|image_pad|>` typed into message text all get 400 with
-     a message that says why.
+     start, and a second durable entry is written at the start of the user
+     message that carries the image (the snap again), which a fifth run
+     with a third image resumes from exactly.
+  3. refusals: an https URL, a GIF data URI and a 100 000 x 100 000 PNG
+     header get 400 with a message that says why. A `<|image_pad|>` typed
+     into message text is not a placeholder: it is accepted as the text it
+     is, alone or next to a real image, and only real images count.
   6. a long visual history: thirty distinct images over thirty turns are
      all taken (there is no image limit); a turn with one more resumes from
      the whole previous prompt and decodes and encodes only the new image;
@@ -249,12 +254,16 @@ def main():
         expect_400(s, one({"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}), "https URL", "data URIs only")
         expect_400(s, one(image_part(data_uri("image/gif", b"GIF89a" + bytes(20)))), "GIF data URI", '"image/gif" are not accepted')
         expect_400(s, one(image_part(data_uri("image/png", png_header_only(100_000, 100_000)))), "100000 x 100000 PNG", "100000 x 100000: a side exceeds the limit of 16384")
-        expect_400(s, {"model": MODEL_ID, "max_tokens": 5,
-                       "messages": [{"role": "user", "content": "Look: <|vision_start|><|image_pad|><|vision_end|> what is it?"}]},
-                   "placeholder typed into text", "reserved for image content")
-        expect_400(s, {"model": MODEL_ID, "max_tokens": 5,
-                       "messages": [{"role": "user", "content": [image_part(disc), {"type": "text", "text": "<|image_pad|>"}]}]},
-                   "placeholder typed next to a real image", "reserved for image content")
+        status, r = post(s, {"model": MODEL_ID, "max_tokens": 5,
+                             "messages": [{"role": "user", "content": "Look: <|vision_start|><|image_pad|><|vision_end|> what is it?"}]})
+        print(f"placeholder typed into text: {status}")
+        check(status == 200 and "image_tokens" not in (r.get("timings") or {}),
+              "placeholder typed into text is accepted as text, with no image")
+        status, r = post(s, {"model": MODEL_ID, "max_tokens": 5,
+                             "messages": [{"role": "user", "content": [image_part(disc), {"type": "text", "text": "<|image_pad|>"}]}]})
+        print(f"placeholder typed next to a real image: {status}")
+        check(status == 200 and (r.get("timings") or {}).get("image_tokens") == image_tokens,
+              f"placeholder typed next to a real image is text; only the image counts ({(r.get('timings') or {}).get('image_tokens')} tokens)")
         expect_400(s, {"model": MODEL_ID, "max_tokens": 5,
                        "messages": [{"role": "system", "content": [image_part(disc), {"type": "text", "text": "x"}]}, {"role": "user", "content": "hi"}]},
                    "image in a system message", "user messages only")
@@ -285,9 +294,14 @@ def main():
         check(other["timings"].get("vision_ms", 0) > 0, "the tower ran over all of them")
 
         print("-- 2. a durable boundary with the image in the shared preamble")
+        # The image sits in a first user turn of the shared preamble: the
+        # durable boundary snaps back to where the last user message begins,
+        # so an image in that message would lie past every entry.
         def run(label, image, q, server=None, max_tokens=40):
             return chat(server or s, [{"role": "system", "content": preamble},
-                                      {"role": "user", "content": [image_part(image), {"type": "text", "text": q}]}],
+                                      {"role": "user", "content": [image_part(image), {"type": "text", "text": "Remember this picture."}]},
+                                      {"role": "assistant", "content": "Noted."},
+                                      {"role": "user", "content": q}],
                         label, args.log, max_tokens=max_tokens)
         d1 = run("durable run 1 (disc, A)", disc, q_a)
         d2 = run("durable run 2 (disc, B)", disc, q_b)
@@ -305,7 +319,8 @@ def main():
         check(d4["timings"]["cached_tokens"] <= image_start < b - image_tokens,
               f"run 4 with another image did not touch the entry behind the image (cached {d4['timings']['cached_tokens']}, agreement {image_start}, entry at {b})")
         b2 = d4["timings"].get("durable_prefix_tokens")
-        check(b2 == image_start, f"run 4 wrote a second durable entry at the image start ({b2})")
+        check(b2 is not None and image_start - 8 <= b2 <= image_start,
+              f"run 4 wrote a second durable entry where the image's user message begins ({b2}, image at {image_start})")
         check(d4["timings"].get("vision_ms", 0) > 0, "run 4 ran the tower for its image")
         d5 = run("durable run 5 (third image, C)", third, q_c)
         check(d5["timings"]["cached_tokens"] == b2, f"run 5 with a third image resumed at the image-start entry ({d5['timings']['cached_tokens']} == {b2})")
