@@ -8,7 +8,7 @@ use anyhow::{Result, ensure};
 use clap::Parser;
 use lily::engine::{
     BatchRow, DecodeStateApi, Draw, LanguageModel, LoadOptions, RowsStepPhases,
-    ScratchApi,
+    RowsStepTiming, ScratchApi,
 };
 use lily::generate::speculate;
 use lily::kernels::attention::MAX_SEQ;
@@ -73,6 +73,12 @@ struct Cli {
     /// head, which the server's batched step catches up on every row.
     #[arg(long)]
     batch_rows: Option<usize>,
+    /// With `--batch-rows`: wait for every batched step before committing
+    /// the next one, instead of committing it parked behind the current one
+    /// as the server's scheduler does (`LanguageModel::park_rows`). The A/B
+    /// of parking on one binary.
+    #[arg(long, default_value_t = false)]
+    no_park: bool,
     #[arg(long)]
     json_out: PathBuf,
 }
@@ -730,13 +736,37 @@ fn median(mut values: Vec<f64>) -> f64 {
     values.get(values.len() / 2).copied().unwrap_or(0.0)
 }
 
+/// The rows of a batched bench step, row `r` in slot `r`, each feeding its
+/// last draw; with `ahead` 1, of the step parked behind the one whose draws
+/// are not taken yet (the token is then not read).
+fn bench_rows<'r, S>(
+    states: &'r mut [S],
+    tokens: &[Vec<u32>],
+    ahead: usize,
+) -> Vec<BatchRow<'r, S>> {
+    states
+        .iter_mut()
+        .zip(tokens)
+        .enumerate()
+        .map(|(slot, (state, drawn))| BatchRow {
+            state,
+            token: *drawn.last().expect("a row has drawn"),
+            draw: draw(drawn.len() + ahead),
+            slot,
+        })
+        .collect()
+}
+
 /// The server's batched decode step over `rows` sessions
 /// (`--batch-rows`): prefill each, then `--decode-steps` steps of all rows
-/// together, greedy or `--sample`d, each step waited for as the server's
-/// scheduler does. Reports aggregate and per-row tokens per second, the
-/// per-step wall time and, with `--gpu-timing`, the median of every phase
-/// of a step (`RowsStepPhases`); with `--kernel-profile`, the per-kernel
-/// table of the `decode rows` pass.
+/// together, greedy or `--sample`d, each step after the first committed
+/// parked behind the one before it as the server's scheduler does within a
+/// stretch, or with `--no-park` each step waited for before the next one is
+/// staged. Reports aggregate and per-row tokens per second, the time from
+/// one step's draws to the next one's and, with `--gpu-timing`, the median
+/// of every phase of a step (`RowsStepPhases`) and of the GPU's idle gap
+/// between two passes; with `--kernel-profile`, the per-kernel table of the
+/// `decode rows` pass.
 fn bench_batched<M: LanguageModel>(
     cli: &Cli,
     ctx: &MetalContext,
@@ -777,39 +807,86 @@ fn bench_batched<M: LanguageModel>(
             }
             Ok((states, firsts, started.elapsed().as_secs_f64()))
         };
-    let step = |scratch: &mut M::Scratch,
-                states: &mut [M::State],
-                tokens: &mut [Vec<u32>]|
-     -> Result<Option<lily::engine::RowsStepTiming>> {
-        let mut batch: Vec<BatchRow<'_, M::State>> = states
-            .iter_mut()
-            .zip(tokens.iter())
-            .enumerate()
-            .map(|(slot, (state, drawn))| BatchRow {
-                state,
-                token: *drawn.last().expect("a row has drawn"),
-                draw: draw(drawn.len()),
-                slot,
-            })
-            .collect();
-        let (draws, timing) = if cli.gpu_timing {
-            model.decode_rows_timed(ctx, scratch, &mut batch)?
-        } else {
-            (model.decode_rows(ctx, scratch, &mut batch)?, None)
+    let park = !cli.no_park;
+    ensure!(
+        !park || model.supports_rows_parking(),
+        "this model cannot park batched steps; pass --no-park"
+    );
+    // `steps` batched steps over `states`, each draw appended to its row:
+    // parked behind each other (the first committed unparked, the last not
+    // followed by a parked one, as a stretch of the server's scheduler), or
+    // one at a time. Returns, per step, the time from the previous step's
+    // draws (or the call) to its own, and the steps' timings under
+    // `--gpu-timing`.
+    let run_steps = |scratch: &mut M::Scratch,
+                     states: &mut [M::State],
+                     tokens: &mut [Vec<u32>],
+                     steps: usize|
+     -> Result<(Vec<f64>, Vec<RowsStepTiming>)> {
+        let timed = cli.gpu_timing;
+        let batch = bench_rows::<M::State>;
+        let take = |tokens: &mut [Vec<u32>], draws: Vec<u32>| {
+            for (drawn, token) in tokens.iter_mut().zip(draws) {
+                drawn.push(token);
+            }
         };
-        for (drawn, token) in tokens.iter_mut().zip(draws) {
-            drawn.push(token);
+        let mut walls = Vec::with_capacity(steps);
+        let mut timings = Vec::new();
+        let mut last = Instant::now();
+        let mut lap = |walls: &mut Vec<f64>| {
+            let now = Instant::now();
+            walls.push((now - last).as_secs_f64());
+            last = now;
+        };
+        if !park {
+            for _ in 0..steps {
+                let (draws, timing) = if timed {
+                    model.decode_rows_timed(
+                        ctx,
+                        scratch,
+                        &mut batch(states, tokens, 0),
+                    )?
+                } else {
+                    (
+                        model.decode_rows(
+                            ctx,
+                            scratch,
+                            &mut batch(states, tokens, 0),
+                        )?,
+                        None,
+                    )
+                };
+                take(tokens, draws);
+                timings.extend(timing);
+                lap(&mut walls);
+            }
+            return Ok((walls, timings));
         }
-        Ok(timing)
+        let mut current =
+            model.commit_rows(ctx, scratch, &mut batch(states, tokens, 0), timed)?;
+        for i in 0..steps {
+            let next = if i + 1 < steps {
+                let rows = &mut batch(states, tokens, 1);
+                Some(model.park_rows(ctx, scratch, rows, &current, timed)?)
+            } else {
+                None
+            };
+            let (draws, timing) = model.finish_rows(scratch, current)?;
+            take(tokens, draws);
+            timings.extend(timing);
+            lap(&mut walls);
+            let Some(mut next) = next else { break };
+            model.release_rows(scratch, &mut next, &mut batch(states, tokens, 0))?;
+            current = next;
+        }
+        Ok((walls, timings))
     };
 
     // Warm-up: the same row count compiles every shape the steps use.
     {
         let (mut states, firsts, _) = prefill_all(&mut scratch)?;
         let mut tokens: Vec<Vec<u32>> = firsts.into_iter().map(|t| vec![t]).collect();
-        for _ in 0..2 {
-            step(&mut scratch, &mut states, &mut tokens)?;
-        }
+        run_steps(&mut scratch, &mut states, &mut tokens, 2)?;
     }
     if ctx.profiling() {
         profile::take();
@@ -817,16 +894,9 @@ fn bench_batched<M: LanguageModel>(
 
     let (mut states, firsts, prefill_secs) = prefill_all(&mut scratch)?;
     let mut tokens: Vec<Vec<u32>> = firsts.into_iter().map(|t| vec![t]).collect();
-    let mut step_wall = Vec::with_capacity(cli.decode_steps);
-    let mut timings = Vec::new();
     let decode_start = Instant::now();
-    for _ in 0..cli.decode_steps {
-        let started = Instant::now();
-        if let Some(timing) = step(&mut scratch, &mut states, &mut tokens)? {
-            timings.push(timing);
-        }
-        step_wall.push(started.elapsed().as_secs_f64());
-    }
+    let (step_wall, timings) =
+        run_steps(&mut scratch, &mut states, &mut tokens, cli.decode_steps)?;
     let decode_secs = decode_start.elapsed().as_secs_f64();
     let kernel_profile =
         ctx.profiling().then(|| kernel_profile_report(&profile::take()));
@@ -834,10 +904,20 @@ fn bench_batched<M: LanguageModel>(
     let generated = rows * cli.decode_steps;
     let phases: Vec<RowsStepPhases> = timings.iter().map(|t| t.phases()).collect();
     let med = |f: fn(&RowsStepPhases) -> f64| median(phases.iter().map(f).collect());
-    // Host time between one step's end and the next one's start (the
-    // scheduler's own bookkeeping, here the loop's).
-    let between_ms =
-        median(timings.windows(2).map(|w| (w[1].began - w[0].ended) * 1e3).collect());
+    // Unparked: host time between one step's end and the next one's start
+    // (the scheduler's own bookkeeping, here the loop's). Parked steps
+    // begin before the one ahead of them ends.
+    let between_ms = (!park).then(|| {
+        median(timings.windows(2).map(|w| (w[1].began - w[0].ended) * 1e3).collect())
+    });
+    // The GPU's idle time between two consecutive passes: the host round
+    // trip unparked, what is left of it parked.
+    let gpu_gap_ms = median(
+        timings
+            .windows(2)
+            .map(|w| (w[1].gpu.gpu_start_secs - w[0].gpu.gpu_end_secs) * 1e3)
+            .collect(),
+    );
     let phase_medians = (!phases.is_empty()).then(|| {
         serde_json::json!({
             "stage_ms": med(|p| p.stage_ms),
@@ -848,6 +928,8 @@ fn bench_batched<M: LanguageModel>(
             "wake_ms": med(|p| p.wake_ms),
             "finish_ms": med(|p| p.finish_ms),
             "between_steps_ms": between_ms,
+            "gpu_gap_ms": gpu_gap_ms,
+            // `began` to `ended`; parked steps overlap the step before.
             "step_wall_ms": median(timings.iter().map(|t| t.wall_ms()).collect()),
         })
     });
@@ -862,6 +944,7 @@ fn bench_batched<M: LanguageModel>(
             "decode_steps": cli.decode_steps,
             "decode_mode": "batched_rows",
             "batch_rows": rows,
+            "parked": park,
             "draft_head_loaded": cli.drafts > 0,
             "sampling": if cli.sample { "server_defaults" } else { "greedy" },
             "seed": cli.seed,
@@ -889,7 +972,8 @@ fn bench_batched<M: LanguageModel>(
     });
     std::fs::write(&cli.json_out, serde_json::to_vec_pretty(&report)?)?;
     eprintln!(
-        "batched decode: {rows} rows x {} steps in {decode_secs:.3}s = {:.1} tok/s ({:.1} per row), step median {:.3} ms | digests {}",
+        "batched decode ({}): {rows} rows x {} steps in {decode_secs:.3}s = {:.1} tok/s ({:.1} per row), step median {:.3} ms | digests {}",
+        if park { "parked" } else { "unparked" },
         cli.decode_steps,
         generated as f64 / decode_secs,
         cli.decode_steps as f64 / decode_secs,
