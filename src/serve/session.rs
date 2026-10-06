@@ -323,6 +323,21 @@ fn keep_newest<S>(checkpoints: &mut Vec<Checkpoint<S>>, decode: bool, max: usize
     });
 }
 
+/// The most decode checkpoints a generation holds at once over its first
+/// `tokens` draws, with a checkpoint every `interval` tokens (0: none) and
+/// at most `max` held ([`DecodeCheckpoints`]). After draw `j` the state is
+/// at `start + j`, so they fall at `start + interval`, `start + 2 * interval`
+/// and so on: `tokens / interval` of them, the one exactly at the window's
+/// end included (taken there when the generation goes on). Thinning never
+/// lets more than `max` be held, and halves what is held when it runs, so
+/// the peak is the smaller of the two.
+pub fn decode_checkpoints_within(interval: usize, max: usize, tokens: usize) -> usize {
+    match interval {
+        0 => 0,
+        i => (tokens / i).min(max),
+    }
+}
+
 /// The decode checkpoints of one generation: a snapshot of the recurrent
 /// state every `interval` tokens, counted from the checkpoint that ended the
 /// prefill, each taken where the decode loop is at rest
@@ -880,6 +895,18 @@ impl<M: LanguageModel> SessionStore<M> {
     /// checkpoint at `start`.
     pub fn decode_checkpoints(&self, start: usize) -> DecodeCheckpoints<M::State> {
         DecodeCheckpoints::new(self.decode_interval, self.max_decode_checkpoints, start)
+    }
+
+    /// The most decode checkpoints a generation holds at once over its
+    /// first `tokens` draws, as the store configures them
+    /// ([`decode_checkpoints_within`]): what admission budgets a newcomer
+    /// for beside its session.
+    pub fn decode_checkpoints_within(&self, tokens: usize) -> usize {
+        decode_checkpoints_within(
+            self.decode_interval,
+            self.max_decode_checkpoints,
+            tokens,
+        )
     }
 
     /// Counts `bytes` of sessions that other requests hold checked out

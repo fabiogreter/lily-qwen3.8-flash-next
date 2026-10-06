@@ -1,6 +1,7 @@
 use super::{
-    CachedImage, agreement, boundary_position, common_prefix_len, images_within,
-    last_user_turn, resume_position, shared_prefix,
+    CachedImage, agreement, boundary_position, common_prefix_len,
+    decode_checkpoints_within, images_within, last_user_turn, resume_position,
+    shared_prefix,
 };
 
 /// No images: the lineages are text.
@@ -306,6 +307,28 @@ fn resume_rule_with_images_never_reuses_another_images_placeholders() {
     let durable = &served[..8];
     assert_eq!(resume_position(durable, &mine, &[8], true, &served, &mine), Some(8));
     assert_eq!(resume_position(durable, &mine, &[8], true, &served, &theirs), None);
+}
+
+/// What admission budgets a newcomer's decode for: one checkpoint per whole
+/// interval of its growth, at most `max` held, none with them off.
+#[test]
+fn a_generation_holds_one_decode_checkpoint_per_interval_up_to_the_maximum() {
+    // Off: no interval, or nothing may be held.
+    assert_eq!(decode_checkpoints_within(0, 4, 8192), 0);
+    assert_eq!(decode_checkpoints_within(2048, 0, 8192), 0);
+    // Less than one interval: none is due yet.
+    assert_eq!(decode_checkpoints_within(2048, 4, 0), 0);
+    assert_eq!(decode_checkpoints_within(2048, 4, 2047), 0);
+    // Exactly at a multiple: the one at the window's end counts.
+    assert_eq!(decode_checkpoints_within(2048, 4, 2048), 1);
+    assert_eq!(decode_checkpoints_within(2048, 4, 4095), 1);
+    assert_eq!(decode_checkpoints_within(2048, 4, 4096), 2);
+    // The defaults over the admission's 8 192-token growth: all four.
+    assert_eq!(decode_checkpoints_within(2048, 4, 8192), 4);
+    // More intervals than may be held: thinning keeps it at the maximum.
+    assert_eq!(decode_checkpoints_within(2048, 4, 8193), 4);
+    assert_eq!(decode_checkpoints_within(100, 4, 100_000), 4);
+    assert_eq!(decode_checkpoints_within(1, 3, usize::MAX), 3);
 }
 
 // --- the store, with a model whose state lives in host memory -----------------
@@ -1002,6 +1025,34 @@ mod store {
         assert_eq!(c.bytes(), 11 + 17);
         let held: usize = c.into_snapshots().iter().map(SnapshotApi::bytes).sum();
         assert_eq!(held, 11 + 17, "what the session gets at the answer");
+    }
+
+    /// The count admission budgets ([`super::decode_checkpoints_within`]) is
+    /// the most a generation actually holds at once: the decode loop asks at
+    /// every point of rest (`start + j` after draw `j`, the last included)
+    /// and each due one is put in place as `take` would. Intervals that
+    /// divide the window and ones that do not, fewer and more intervals than
+    /// may be held.
+    #[test]
+    fn the_admission_count_is_the_peak_a_generation_holds() {
+        let start = 9;
+        for (interval, max) in [(100, 4), (7, 4), (2048, 4), (3, 1), (5, 6)] {
+            for tokens in [0, 1, 99, 100, 101, 400, 401, 799, 800, 801, 1000, 8192] {
+                let mut c = DecodeCheckpoints::<State>::new(interval, max, start);
+                let mut peak = 0;
+                for pos in start + 1..=start + tokens {
+                    if c.due(pos) {
+                        c.snapshots.push(Snap { pos, recurrent: 0, size: 0 });
+                    }
+                    peak = peak.max(c.positions().len());
+                }
+                assert_eq!(
+                    super::super::decode_checkpoints_within(interval, max, tokens),
+                    peak,
+                    "every {interval}, at most {max}, over {tokens} draws"
+                );
+            }
+        }
     }
 
     /// [`serve`] for a request that also generates: after the prefill's

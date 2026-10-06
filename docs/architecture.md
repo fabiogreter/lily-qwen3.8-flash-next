@@ -1572,7 +1572,10 @@ against 0.63 without one. Sessions in flight count against the cache
 budget (`SessionStore::set_in_flight_bytes`), each with the decode
 checkpoints its request took so far (113 MB apiece on the full model; they
 join the session only at the answer), and admission holds back a request
-whose estimated session does not fit beside them. A row takes
+whose estimated session does not fit beside them: its prompt plus 8 192
+tokens of decode, the prefill's checkpoint, and the decode checkpoints it
+would hold over those tokens (one per interval, at most the store's
+maximum: four with the defaults). A row takes
 decode checkpoints between batched steps as the single-session loop takes
 them, and resumes from them work the same way.
 

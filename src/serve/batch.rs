@@ -568,12 +568,17 @@ impl<M: LanguageModel> Engine<M> {
     /// Whether `job` may be admitted beside `rows` (see [`admits`]). Its
     /// session is estimated at the prompt plus [`ADMIT_GROWTH_TOKENS`] of
     /// decode (clients that leave `max_tokens` unset get the whole remaining
-    /// context, which would keep every second request out), with one
-    /// checkpoint.
+    /// context, which would keep every second request out), with the
+    /// checkpoint that ends its prefill and the decode checkpoints it holds
+    /// at most over that growth (one per decode interval, up to the store's
+    /// maximum; none with them off), since the running rows are counted
+    /// with theirs ([`Engine::in_flight`]).
     fn fits(&self, job: &Job, rows: &[Row<'_, M>]) -> bool {
         let growth = job.prepared.max_tokens.min(ADMIT_GROWTH_TOKENS);
         let tokens = (job.prepared.prompt.len() + growth).min(self.max_seq);
-        let estimate = self.model.session_bytes(tokens, 1).unwrap_or(0) as usize;
+        let checkpoints = 1 + self.sessions.decode_checkpoints_within(growth);
+        let estimate =
+            self.model.session_bytes(tokens, checkpoints).unwrap_or(0) as usize;
         admits(
             rows.len(),
             self.max_batch,
