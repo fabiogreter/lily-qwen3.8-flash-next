@@ -86,6 +86,16 @@ The n-gram table rows are 160 wide, which is not a multiple of 64, hence
 group 32 there. Routers, gates and the small mixing projections stay at 8 bits
 because they steer the computation and cost almost nothing.
 
+Two converter flags move rows of the table to Q8 group 64 (experimental):
+`--q8-dense` the attention, GDN and shared-expert projections (in the trunk and
+in the draft head) together with `lm_head`, `--q8-embed` `embed_tokens`. The
+routed experts stay Q4 either way. On the full model `--q8-dense` adds 1.8 GB
+(107.3 GB with the draft head and the tower) and `--q8-embed` another 0.3 GB.
+A conversion records them in `lily.quantization` (below) and the loader
+expects exactly the widths recorded, so a checkpoint without the flags loads
+as before and an older binary refuses a Q8 one by name instead of misreading
+it.
+
 ### Expert split
 
 HF stores `mlp.experts.gate_up_proj` as `[E, 2*I, H]` with the gate rows first
@@ -141,6 +151,15 @@ what lily's vision path is written for (`gelu_pytorch_tanh`, no deepstack
 injection, `out_hidden_size` equal to the text hidden size, 2 x 2 merge over
 2-frame patches, `rope_parameters.mrope_section` `[11, 11, 10]` interleaved);
 a checkpoint outside that fails at load naming the field.
+
+`lily.quantization` carries `default` (4 / 64), `ngram_embedding` (4 / 32)
+and `q8_suffixes`, the regular expressions of the 8-bit tensors (documentation
+for other tools; lily does not evaluate them). A `--q8-dense` conversion adds
+`"q8_dense": true` and appends the dense patterns and `^lm_head\.weight$` to
+`q8_suffixes`; `--q8-embed` adds `"q8_embed": true` and
+`^model\.language_model\.embed_tokens\.weight$`. The two booleans are what the
+loader reads (`StoragePolicy`); without them a `config.json` is byte-identical
+to one written before they existed.
 
 `text_config.num_hidden_layers` and `text_config.layer_types` are rewritten to
 the kept layer count when the converter truncates (`--layers N`), so a
