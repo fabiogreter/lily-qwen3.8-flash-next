@@ -374,12 +374,6 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
             ..LoadOptions::default()
         },
     )?;
-    if let Some(rows) = cli.batch_rows {
-        return bench_batched(cli, &ctx, &model, rows);
-    }
-    if cli.drafts > 0 {
-        return bench_speculative(cli, &ctx, &model);
-    }
     if cli.ngram_preload {
         let started = Instant::now();
         let bytes = model.warm_storage(false)?;
@@ -388,6 +382,12 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
             bytes as f64 / 1e9,
             started.elapsed().as_secs_f64()
         );
+    }
+    if let Some(rows) = cli.batch_rows {
+        return bench_batched(cli, &ctx, &model, rows);
+    }
+    if cli.drafts > 0 {
+        return bench_speculative(cli, &ctx, &model);
     }
     let vocab = u32::try_from(model.vocab_size())?;
     let prompt = prompt_tokens(cli, vocab)?;
@@ -780,15 +780,6 @@ fn bench_batched<M: LanguageModel>(
         "--batch-rows takes 1 to {} for this model",
         model.max_batch_rows()
     );
-    if cli.ngram_preload {
-        let started = Instant::now();
-        let bytes = model.warm_storage(false)?;
-        eprintln!(
-            "paged weights: {:.1} GB resident after preload in {:.1}s",
-            bytes as f64 / 1e9,
-            started.elapsed().as_secs_f64()
-        );
-    }
     let max_seq = cli.prompt_len + cli.decode_steps + 2;
     let vocab = u32::try_from(model.vocab_size())?;
     // Row `r`'s prompt: tokens `r * prompt_len ..` of one long sequence.
