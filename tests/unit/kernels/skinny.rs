@@ -876,3 +876,139 @@ fn gemm_skinny_reg_m1_matches_decode_gemv() {
         );
     }
 }
+
+/// Q4 weights for timing only: cheap hashed codes, plausible scales and
+/// biases, no CPU image.
+fn timing_quant(ctx: &MetalContext, n: usize, k: usize, salt: u32) -> QuantWeights {
+    let words = k / 8;
+    let groups = k / GROUP_SIZE;
+    let codes: Vec<u32> = (0..n * words)
+        .map(|i| (i as u32 ^ salt).wrapping_mul(2_654_435_761).rotate_left(7))
+        .collect();
+    let scales: Vec<f32> =
+        (0..n * groups).map(|i| 0.01 + (i % 97) as f32 * 0.004).collect();
+    let biases: Vec<f32> =
+        (0..n * groups).map(|i| -2.0 + (i % 89) as f32 * 0.02).collect();
+    quant_tensors(ctx, codes, &scales, &biases, n, k, GROUP_SIZE)
+}
+
+/// How the shared-weight projections of a batched decode step scale with
+/// its row count (`docs/architecture.md`, "Continuous batching"): every row
+/// reads the same weights, so a bandwidth-bound kernel would take about as
+/// long at four rows as at one. Measured 2026-10-06 in the kernel profile,
+/// the register-A skinny GEMM took about 44 % longer at m = 4 than at
+/// m = 1. For Qwen3.8-Flash-Next's Q4 shapes (the GDN input stack, the
+/// attention qkv-and-gate stack, the two output projections, the LM head
+/// with f32 logits), this times each kernel variant at m = 1, 2, 3, 4 and 8
+/// over enough distinct copies of the matrix (1.2 GB and up) that the system
+/// cache does not serve them, best and median of five passes, and prints
+/// the effective weight bandwidth and the time relative to m = 1. Variants:
+/// the shipped route (`gemm_skinny_q4_nt`), register-A with 4 simdgroups per
+/// threadgroup instead of 2, the staged route (activations staged in
+/// threadgroup memory, weights rounded to bf16), and the decode GEMV at
+/// m = 1 as the bandwidth reference. Compare with `gemv_q4_bandwidth_probe`
+/// and `memory_bandwidth_probe`.
+#[test]
+#[ignore = "timing probe; run with --ignored --nocapture"]
+fn skinny_rows_scaling_probe() {
+    use crate::kernels::quant::gemv_quant;
+    let ctx = MetalContext::new().expect("metal context");
+    // (name, K, N, f32 output)
+    let shapes: [(&str, usize, usize, bool); 5] = [
+        ("gdn in stack 2560->16480", 2560, 16480, false),
+        ("attn qkv+gate 2560->13312", 2560, 13312, false),
+        ("gdn out 6144->2560", 6144, 2560, false),
+        ("attn out 6144->2560", 6144, 2560, false),
+        ("lm head 2560->248320 f32", 2560, 248320, true),
+    ];
+    let target_bytes = 1.2e9;
+    let mut rng = StdRng::seed_from_u64(31);
+    for (name, k, n, f32_out) in shapes {
+        let probe = timing_quant(&ctx, n, k, 0);
+        let per_matrix = (probe.codes.byte_len()
+            + probe.scales.byte_len()
+            + probe.biases.byte_len()) as f64;
+        drop(probe);
+        let copies = ((target_bytes / per_matrix).ceil() as usize).max(2);
+        let weights: Vec<QuantWeights> =
+            (0..copies).map(|c| timing_quant(&ctx, n, k, c as u32 + 1)).collect();
+        let total = per_matrix * copies as f64;
+        eprintln!(
+            "\n{name}: {copies} copies of {:.1} MB ({:.2} GB per pass)",
+            per_matrix / 1e6,
+            total / 1e9
+        );
+        let out_dtype = if f32_out { DType::F32 } else { DType::BF16 };
+        let base: std::cell::Cell<Option<f64>> = std::cell::Cell::new(None);
+        let time = |encode: &dyn Fn(&ComputePass<'_>) -> Result<()>| -> (f64, f64) {
+            let mut times = Vec::new();
+            for _ in 0..5 {
+                let pass = ctx.begin_concurrent().expect("pass");
+                encode(&pass).expect("encode");
+                let done = pass.commit().expect("commit").wait_retain().expect("wait");
+                let t = done.timing().expect("timing");
+                times.push(t.gpu_end_secs - t.gpu_start_secs);
+            }
+            times.sort_by(f64::total_cmp);
+            (times[0], times[times.len() / 2])
+        };
+        let report = |label: &str, m: usize, (best, median): (f64, f64)| {
+            let rel = base.get().map_or(String::new(), |b| {
+                format!(", x{:.2} vs shipped m=1", best / b)
+            });
+            eprintln!(
+                "  {label:<26} m={m}: {:7.3} ms best, {:7.3} median, {:4.0} GB/s{rel}",
+                best * 1e3,
+                median * 1e3,
+                total / best / 1e9
+            );
+        };
+        if !f32_out {
+            let x: Vec<f32> = (0..k).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+            let tx = Tensor::from_f32_as_bf16(&ctx, &x, &[k]).expect("x");
+            let ys: Vec<Tensor> = (0..copies)
+                .map(|_| Tensor::zeros(&ctx, &[n], DType::BF16).expect("y"))
+                .collect();
+            let t = time(&|pass| {
+                for (w, y) in weights.iter().zip(&ys) {
+                    gemv_quant(&ctx, pass, w, &tx, y)?;
+                }
+                Ok(())
+            });
+            report("decode gemv (reference)", 1, t);
+        }
+        for m in [1usize, 2, 3, 4, 8] {
+            let a: Vec<f32> = (0..m * k).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+            let ta = Tensor::from_f32_as_bf16(&ctx, &a, &[m, k]).expect("a");
+            let cs: Vec<Tensor> = (0..copies)
+                .map(|_| Tensor::zeros(&ctx, &[m, n], out_dtype).expect("c"))
+                .collect();
+            let shipped = time(&|pass| {
+                for (w, c) in weights.iter().zip(&cs) {
+                    gemm_skinny_q4_nt(&ctx, pass, &ta, w, c)?;
+                }
+                Ok(())
+            });
+            if m == 1 {
+                base.set(Some(shipped.0));
+            }
+            report("shipped route", m, shipped);
+            if !f32_out {
+                let wide = time(&|pass| {
+                    for (w, c) in weights.iter().zip(&cs) {
+                        gemm_skinny_q4_nt_reg(&ctx, pass, &ta, w, c, 4)?;
+                    }
+                    Ok(())
+                });
+                report("register-A, 4 sg/tg", m, wide);
+                let staged = time(&|pass| {
+                    for (w, c) in weights.iter().zip(&cs) {
+                        gemm_skinny_q4_nt_staged(&ctx, pass, &ta, w, c, 256)?;
+                    }
+                    Ok(())
+                });
+                report("staged (bf16 weights)", m, staged);
+            }
+        }
+    }
+}

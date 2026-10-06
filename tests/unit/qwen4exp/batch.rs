@@ -469,3 +469,253 @@ fn a_row_finishing_under_a_parked_step_keeps_its_final_token() {
         assert!(fingerprint(&ctx, st) == *pu, "row {}'s caches or state", r + 1);
     }
 }
+
+/// Bytes a projection's weights occupy (what one pass over them reads).
+fn weight_bytes(w: &crate::weights::QuantWeights) -> usize {
+    w.codes.byte_len() + w.scales.byte_len() + w.biases.byte_len()
+}
+
+/// Fills a bf16 tensor with deterministic values in [-1, 1).
+fn fill_bf16(t: &crate::tensor::Tensor, salt: usize) {
+    let v: Vec<half::bf16> = (0..t.numel())
+        .map(|i| {
+            let h = (i.wrapping_add(salt) as u32).wrapping_mul(2_654_435_761);
+            half::bf16::from_f32((h >> 8) as f32 / (1u32 << 23) as f32 - 1.0)
+        })
+        .collect();
+    t.write_bytes(bytemuck::cast_slice(&v)).expect("fill");
+}
+
+/// The shared-weight work of a batched decode step on the real weights, at
+/// 1 to 4 rows (`docs/architecture.md`, "Continuous batching"): the
+/// hyper-connection reads (two per layer and the final one, the fused
+/// small-batch kernels), the mixers' input and output projections (the
+/// skinny GEMMs, as `gdn_rows` and `attn_rows` dispatch them), and the LM
+/// head, each family in its own pass so its GPU time and effective weight
+/// bandwidth stand alone. The MoE is left out: its expert traffic grows with
+/// the rows by construction. Every row reads the same weights, so a
+/// bandwidth-bound family would take about as long at four rows as at one;
+/// the 2026-10-06 kernel profile showed these families growing by about
+/// 1.5 ms per extra row instead. The decode step's own kernels at one row
+/// (`hc_read_decode`, the decode GEMV) are timed as the reference. Best and
+/// median of five passes per point.
+///
+/// Run on the full checkpoint (with the four-layer one every weight fits
+/// the system cache and the bandwidth figures mean nothing):
+/// `LILY_MODEL_DIR_FLASH=<full model> cargo test --release --lib
+/// shared_weight_kernels_vs_rows_probe -- --ignored --nocapture`.
+#[test]
+#[ignore = "timing probe; needs LILY_MODEL_DIR_FLASH (the full model)"]
+fn shared_weight_kernels_vs_rows_probe() {
+    use crate::kernels::quant::gemv_quant;
+    use crate::metal::ComputePass;
+    use crate::tensor::{DType, Tensor};
+    let ctx = MetalContext::new().expect("metal context");
+    let Some(model) = load(&ctx) else { return };
+    let cfg = &model.config;
+    let layers = &model.weights.layers;
+    let time = |encode: &dyn Fn(&ComputePass<'_>) -> anyhow::Result<()>| -> (f64, f64) {
+        let mut times = Vec::new();
+        for _ in 0..5 {
+            let pass = ctx.begin_concurrent().expect("pass");
+            encode(&pass).expect("encode");
+            let done = pass.commit().expect("commit").wait_retain().expect("wait");
+            let t = done.timing().expect("timing");
+            times.push(t.gpu_end_secs - t.gpu_start_secs);
+        }
+        times.sort_by(f64::total_cmp);
+        (times[0], times[times.len() / 2])
+    };
+    let report = |family: &str, m: &str, bytes: usize, (best, median): (f64, f64)| {
+        eprintln!(
+            "  {family:<34} {m:<10} {:7.3} ms best, {:7.3} median, {:4.0} GB/s over {:.0} MB",
+            best * 1e3,
+            median * 1e3,
+            bytes as f64 / best / 1e9,
+            bytes as f64 / 1e6
+        );
+    };
+    let hcs: Vec<&HcWeights> = layers
+        .iter()
+        .flat_map(|l| [&l.attn_hc, &l.mlp_hc])
+        .chain(std::iter::once(&model.weights.final_mixer))
+        .collect();
+    let hc_bytes: usize = hcs
+        .iter()
+        .map(|hc| {
+            weight_bytes(&hc.down)
+                + weight_bytes(&hc.up)
+                + hc.inject.as_ref().map_or(0, weight_bytes)
+        })
+        .sum();
+    let proj_bytes: usize = layers
+        .iter()
+        .map(|l| match &l.mixer {
+            Mixer::Gdn(w) => weight_bytes(&w.in_proj) + weight_bytes(&w.out_proj),
+            Mixer::Attn(w) => {
+                weight_bytes(&w.qkv_proj)
+                    + weight_bytes(&w.indexer.qk_proj)
+                    + weight_bytes(&w.o_proj)
+            }
+        })
+        .sum();
+    let head_bytes = weight_bytes(&model.weights.lm_head);
+    eprintln!(
+        "{} layers; per pass: hc reads {:.0} MB, projections {:.0} MB, lm head {:.0} MB",
+        layers.len(),
+        hc_bytes as f64 / 1e6,
+        proj_bytes as f64 / 1e6,
+        head_bytes as f64 / 1e6
+    );
+
+    // The decode step's kernels at one row: the reference.
+    {
+        let s = model.new_scratch_with_capacity(&ctx, 64).expect("scratch");
+        fill_bf16(&s.hyper, 1);
+        fill_bf16(&s.hc.mixed, 2);
+        let t = time(&|pass| {
+            for hc in &hcs {
+                model.hc_read_decode(&ctx, pass, hc, &s)?;
+            }
+            Ok(())
+        });
+        report("hc reads (decode kernels)", "1 row", hc_bytes, t);
+        // One output per projection, alive until the passes complete.
+        let outs: Vec<(usize, Tensor)> = layers
+            .iter()
+            .enumerate()
+            .flat_map(|(li, l)| match &l.mixer {
+                Mixer::Gdn(w) => {
+                    vec![(li, w.in_proj.codes.shape()[0]), (li, cfg.hidden_size)]
+                }
+                Mixer::Attn(w) => vec![
+                    (li, w.qkv_proj.codes.shape()[0]),
+                    (li, w.indexer.qk_proj.codes.shape()[0]),
+                    (li, cfg.hidden_size),
+                ],
+            })
+            .map(|(li, n)| (li, Tensor::zeros(&ctx, &[n], DType::BF16).expect("out")))
+            .collect();
+        let ins: Vec<Tensor> = [cfg.hidden_size, 6144]
+            .iter()
+            .map(|&k| {
+                let t = Tensor::zeros(&ctx, &[k], DType::BF16).expect("in");
+                fill_bf16(&t, k);
+                t
+            })
+            .collect();
+        let t = time(&|pass| {
+            let mut out = outs.iter();
+            for l in layers {
+                let ws: Vec<&crate::weights::QuantWeights> = match &l.mixer {
+                    Mixer::Gdn(w) => vec![&w.in_proj, &w.out_proj],
+                    Mixer::Attn(w) => vec![&w.qkv_proj, &w.indexer.qk_proj, &w.o_proj],
+                };
+                for w in ws {
+                    let k = w.codes.shape()[1] * 32 / w.bits;
+                    let x = ins.iter().find(|t| t.numel() == k).expect("input width");
+                    gemv_quant(&ctx, pass, w, x, &out.next().expect("out").1)?;
+                }
+                // One level per layer, as the batched pass below.
+                pass.level_barrier(&[])?;
+            }
+            Ok(())
+        });
+        report("projections (decode gemv)", "1 row", proj_bytes, t);
+    }
+
+    for m in 1..=4usize {
+        let mut s = model.new_scratch_with_capacity(&ctx, 64).expect("scratch");
+        model.ensure_prefill_scratch(&ctx, &mut s, m).expect("prefill scratch");
+        let ps = s.prefill.as_ref().expect("prefill scratch").rows(m).expect("rows");
+        fill_bf16(&ps.hyper, 3);
+        fill_bf16(&ps.hc.mixed, 4);
+        fill_bf16(&ps.gdn_gated, 5);
+        fill_bf16(&ps.attn_gated, 6);
+        let rows = format!("{m} row{}", if m == 1 { "" } else { "s" });
+        let t = time(&|pass| {
+            for hc in &hcs {
+                model.hc_read_batched(&ctx, pass, hc, &ps.hyper, &s, &ps)?;
+            }
+            Ok(())
+        });
+        report("hc reads (batched kernels)", &rows, hc_bytes, t);
+        let t = time(&|pass| {
+            for l in layers {
+                match &l.mixer {
+                    Mixer::Gdn(w) => {
+                        project_stack_or_slices(
+                            &ctx,
+                            pass,
+                            &ps.hc.mixed,
+                            &w.in_proj,
+                            &ps.stack,
+                            [
+                                (&w.in_proj_qkv, &ps.qkv),
+                                (&w.in_proj_z, &ps.z),
+                                (&w.in_proj_a, &ps.a),
+                                (&w.in_proj_b, &ps.b),
+                            ],
+                            &s.dequant,
+                        )?;
+                        project_mat(
+                            &ctx,
+                            pass,
+                            &ps.gdn_gated,
+                            &w.out_proj,
+                            &ps.branch_out,
+                            &s.dequant,
+                        )?;
+                    }
+                    Mixer::Attn(w) => {
+                        project_stack_or_slices(
+                            &ctx,
+                            pass,
+                            &ps.hc.mixed,
+                            &w.qkv_proj,
+                            &ps.stack,
+                            [
+                                (&w.q_proj, &ps.qg),
+                                (&w.k_proj, &ps.k_new),
+                                (&w.v_proj, &ps.v_new),
+                            ],
+                            &s.dequant,
+                        )?;
+                        project_mat(
+                            &ctx,
+                            pass,
+                            &ps.hc.mixed,
+                            &w.indexer.qk_proj,
+                            &ps.idx_qk,
+                            &s.dequant,
+                        )?;
+                        project_mat(
+                            &ctx,
+                            pass,
+                            &ps.attn_gated,
+                            &w.o_proj,
+                            &ps.branch_out,
+                            &s.dequant,
+                        )?;
+                    }
+                }
+                pass.level_barrier(&[&ps.branch_out])?;
+            }
+            Ok(())
+        });
+        report("projections (skinny gemm)", &rows, proj_bytes, t);
+        let logits =
+            Tensor::zeros(&ctx, &[m, cfg.vocab_size], DType::F32).expect("logits");
+        let t = time(&|pass| {
+            project_mat(
+                &ctx,
+                pass,
+                &ps.hc.mixed,
+                &model.weights.lm_head,
+                &logits,
+                &s.dequant,
+            )
+        });
+        report("lm head (skinny gemm, f32)", &rows, head_bytes, t);
+    }
+}
