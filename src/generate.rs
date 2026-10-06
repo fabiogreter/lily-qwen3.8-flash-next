@@ -293,7 +293,7 @@ impl Generator {
         thinking: Thinking,
     ) -> Result<Vec<u32>> {
         ensure!(!messages.is_empty(), "empty conversation");
-        self.tokenizer.encode(&self.tokenizer.render_chat(messages, thinking)?)
+        self.tokenizer.encode_conversation(messages, thinking)
     }
 
     pub fn decode_text(&self, tokens: &[u32]) -> Result<String> {

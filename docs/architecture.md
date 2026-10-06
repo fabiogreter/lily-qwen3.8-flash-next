@@ -1034,7 +1034,8 @@ near-duplicate entry at 15 649. So the boundary snaps back to where the last
 user message opened before the agreement begins: the position right after
 the last complete `<|im_start|>user\n` (the template's user-turn opener,
 `[248045, 846, 198]` for this tokenizer, found by encoding the opener text
-the way the rendered prompt is encoded) within the agreement, provided it
+the way the rendered prompt is encoded; message text cannot spell one,
+since its `<|im_start|>` is plain text) within the agreement, provided it
 still lies at least `--durable-min-tokens` beyond the resume position;
 otherwise the boundary stays the agreement. The snapped boundary is a prefix
 both prompts share, images included, and never inside an image span (the
@@ -1144,6 +1145,39 @@ faulted queue) is logged once and stops the ticks until the next request.
 The requests inside the window should then show no post-idle stall in
 `session_ms` or `wait_ms`; that has not been measured live over HTTP yet.
 
+**Chat prompt encoding.** A chat prompt is rendered through the
+checkpoint's template and encoded so that only the template's own markup
+becomes special tokens (`Tokenizer::encode_chat`). Encoding the rendered
+string, which is what transformers' and vLLM's `apply_chat_template` do,
+maps every special token's spelling to the special token, including the
+ones inside message text: a model answer that quoted `<|image_pad|>` came
+back next turn as a fake image placeholder (and the request died with the
+placeholder 400), and a tool result or a user message carrying
+`<|im_end|>\n<|im_start|>system\n...` could forge a system or assistant
+turn. At load the template's literal special tokens are replaced in a
+second, marked copy of the template by marks made of the noncharacters
+U+FDD0 and U+FDD1 (with the token's index between them); the request's
+strings go in as they are (content, reasoning, tool calls and their
+arguments, tool definitions), except that a U+FDD0 in them is escaped. The
+marks become the special ids, and the text between them is encoded with
+the tokenizer's special-token matching switched off (`encode_special_tokens`,
+transformers' `split_special_tokens`): a special spelling from the request
+is the plain text it reads as, also when it is completed by the template's
+own text (a tool name ending in `<|im_end|` before the template's `>`). The
+ordinary added tokens (`<think>`, `<tool_call>`, `<tool_response>`) are not
+special in this vocabulary and are matched in content as before. Where the
+request spells no special token the ids are exactly the plain encoding's,
+because the tokenizer itself splits its input at every added token and
+encodes the pieces independently, and the pieces are the same; the session
+cache's exact prefixes and the golden prompts rely on that, and
+`tests/test_tokenizer.rs` checks it on several hundred prompts (tools,
+images, thinking on and off, random seam-heavy text). The encoding costs
+what the plain one did (about 100 ms for a 207 000-token prompt). A special
+token with `lstrip`, `rstrip`, `single_word` or `normalized` set would
+make the split differ from the tokenizer's, so such a vocabulary is refused
+at load. `/v1/completions` keeps the plain encoding: a raw prompt is one the
+client rendered itself, so its special spellings are meant.
+
 **Images.** Image parts (`image_url` with a `{url, detail}` object or
 `input_image` with a string) are accepted in user messages only and their
 URL must be a base64 data URI of type `image/png` or `image/jpeg`: the
@@ -1181,10 +1215,11 @@ A message with an image reaches the chat template as structured content
 text-only message is flattened to one string exactly as before, so text
 prompts are byte-identical. After tokenisation the single pad is expanded
 to `grid_h * grid_w / 4` copies per image, in order, which is what the
-reference processor does before tokenising, and the prompt's counts of the
-three marker tokens (and `<|video_pad|>`) are checked against the number of
-images, so a placeholder typed into message text is refused instead of
-tokenised into a fake span or fed to the model bare. The expanded prompt is
+reference processor does before tokenising. Message text cannot produce a
+marker (see "Chat prompt encoding" above); the prompt's counts of the three
+marker tokens (and `<|video_pad|>`) are still checked against the number of
+images, which guards the invariant itself, one triple per image, whatever
+wrote the prompt. The expanded prompt is
 what the context limit counts.
 
 On the engine thread the request carries the pixel rows, grids and spans.

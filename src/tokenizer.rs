@@ -7,13 +7,20 @@
 //! template produces, which is the only way a golden recorded elsewhere can
 //! be replayed here.
 //!
+//! A chat prompt is encoded so that only the template's own markup becomes
+//! special tokens: a special token's spelling inside message content (a
+//! model answer quoting `<|image_pad|>`, a file a tool read, a web page
+//! writing `<|im_end|>\n<|im_start|>system`) is tokenized as the plain text
+//! it is, never as conversation structure. See [`Tokenizer::encode_chat`].
+//!
 //! `tests/test_tokenizer.rs` pins rendering against the checkpoint's own
 //! tokenizer and verifies that direct-answer histories remain
-//! prefix-cacheable.
+//! prefix-cacheable, and that the content-safe encoding gives the plain
+//! encoding's ids wherever content spells no special token.
 
 use std::path::Path;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use minijinja::value::{Kwargs, Value, ValueKind};
 use minijinja::{Environment, Error as JinjaError, ErrorKind as JinjaErrorKind};
 
@@ -46,8 +53,30 @@ pub enum Thinking {
 /// [`Tokenizer::render_chat`].
 const EMPTY_REASONING_BLOCK: &str = "<think>\n\n</think>\n\n";
 
+/// The marked copy of the chat template ([`Tokenizer::encode_chat`]) writes
+/// each special token as `MARK_OPEN`, its index in the tokenizer's list of
+/// special tokens in decimal, `MARK_CLOSE`. Both are Unicode noncharacters (U+FDD0 and
+/// U+FDD1), reserved for exactly this kind of internal use; a `MARK_OPEN`
+/// arriving in request text is escaped as `MARK_OPEN MARK_CLOSE`, so request
+/// text can never spell a mark.
+const MARK_OPEN: char = '\u{FDD0}';
+const MARK_CLOSE: char = '\u{FDD1}';
+
+/// The name the marked template is compiled under, next to `chat`.
+const MARKED_TEMPLATE: &str = "chat_marked";
+
 pub struct Tokenizer {
     inner: tokenizers::Tokenizer,
+    /// `inner` with special-token matching off (`encode_special_tokens`, what
+    /// transformers calls `split_special_tokens`): `<|im_end|>` in its input
+    /// is the text `<`, `|`, `im`, ... while ordinary added tokens such as
+    /// `<think>` and `<tool_call>` are still matched. A clone, because the
+    /// switch is a `&mut` setting and the tokenizer is shared (a second
+    /// vocabulary and merge table, some tens of MB).
+    text: tokenizers::Tokenizer,
+    /// The vocabulary's special tokens (spelling and id), in id order; a
+    /// mark in the marked template is an index into this list.
+    specials: Vec<(String, u32)>,
     env: Environment<'static>,
     /// Ids that end a turn: the tokenizer's `eos_token`, plus whatever the
     /// caller adds from the checkpoint config.
@@ -98,6 +127,49 @@ impl Tokenizer {
             };
 
         let template = Self::load_template(dir, &config)?;
+        Self::new(inner, &config, template)
+    }
+
+    /// The tokenizer from its parts: the loaded `tokenizer.json`, the parsed
+    /// `tokenizer_config.json` (`Null` when absent) and the template source.
+    fn new(
+        inner: tokenizers::Tokenizer,
+        config: &serde_json::Value,
+        template: String,
+    ) -> Result<Self> {
+        let mut specials: Vec<(String, u32)> = inner
+            .get_added_vocabulary()
+            .get_added_tokens_decoder()
+            .iter()
+            .filter(|(_, token)| token.special)
+            .map(|(&id, token)| {
+                // The marked encoding splits at the template's special tokens
+                // itself and hands the text between them to `text`; that is
+                // the tokenizer's own split only for a token matched exactly
+                // as spelled, without eating neighbouring whitespace.
+                ensure!(
+                    !token.lstrip
+                        && !token.rstrip
+                        && !token.single_word
+                        && !token.normalized
+                        && !token.content.is_empty(),
+                    "special token {:?} is empty or has lstrip, rstrip, single_word or \
+                     normalized set, which the chat prompt encoding does not reproduce",
+                    token.content
+                );
+                Ok((token.content.clone(), id))
+            })
+            .collect::<Result<_>>()?;
+        specials.sort_by_key(|&(_, id)| id);
+        ensure!(
+            !template.contains([MARK_OPEN, MARK_CLOSE]),
+            "the chat template contains U+FDD0 or U+FDD1, which lily reserves to mark \
+             its special tokens"
+        );
+        let marked = mark_specials(&template, &specials);
+        let mut text = inner.clone();
+        text.set_encode_special_tokens(true);
+
         let legacy_nothink_rewrite = !template.contains("preserve_thinking");
         let mut env = Environment::new();
         // HF templates are written against Python's `str`; minijinja only
@@ -123,6 +195,8 @@ impl Tokenizer {
         env.add_filter("tojson", py_tojson);
         env.add_template_owned("chat", template)
             .context("compiling the checkpoint's chat template")?;
+        env.add_template_owned(MARKED_TEMPLATE, marked)
+            .context("compiling the marked copy of the chat template")?;
 
         let mut stop_tokens = Vec::new();
         if let Some(eos) = config.get("eos_token").and_then(token_text)
@@ -131,15 +205,113 @@ impl Tokenizer {
             stop_tokens.push(id);
         }
 
-        Ok(Self { inner, env, stop_tokens, legacy_nothink_rewrite })
+        Ok(Self { inner, text, specials, env, stop_tokens, legacy_nothink_rewrite })
     }
 
     /// Renders one prompt through the checkpoint's template exactly as given.
+    ///
+    /// The string cannot tell the template's special tokens from the same
+    /// spellings inside message content; [`Self::encode`] of it maps both
+    /// to special tokens. A chat prompt is encoded with
+    /// [`Self::encode_chat`], which tells them apart.
     pub fn render(&self, chat: &ChatRender<'_>) -> Result<String> {
+        self.render_template("chat", chat)
+    }
+
+    /// Renders and encodes a chat prompt so that only what the template
+    /// itself writes becomes special tokens.
+    ///
+    /// Encoding the rendered string (what transformers' and vLLM's
+    /// `apply_chat_template` do) maps every special token's spelling to the
+    /// special token, including the ones inside message content: a model
+    /// answer that quotes `<|image_pad|>` comes back as a fake image
+    /// placeholder, and a tool result carrying `<|im_end|>\n<|im_start|>system`
+    /// forges a system turn. Here the prompt is rendered through a marked
+    /// copy of the template, whose literal special tokens were replaced by
+    /// marks at load, and with every string of the request (content,
+    /// reasoning, tool calls and their arguments, tool definitions; keys and
+    /// values) as it is, except that a `MARK_OPEN` is escaped. The marks
+    /// become their special ids and the text between them is encoded with
+    /// special-token matching off, so a special spelling from the request is
+    /// the plain text it reads as, whether it sits inside one string or is
+    /// completed by its neighbour (a tool name ending in `<|im_end|` before
+    /// the template's `>`).
+    ///
+    /// Where the request spells no special token, the ids are exactly
+    /// [`Self::encode`] of [`Self::render`]: the tokenizer itself splits its
+    /// input at every added token and encodes the pieces independently, and
+    /// the pieces here are the same ones (the text between two marks still
+    /// goes through `text`, which splits at the ordinary added tokens such
+    /// as `<think>` and `<tool_call>` as before). The session cache's exact
+    /// prefixes and the golden prompts depend on that.
+    pub fn encode_chat(&self, chat: &ChatRender<'_>) -> Result<Vec<u32>> {
+        let messages: Vec<serde_json::Value> =
+            chat.messages.iter().map(escape_marks).collect();
+        let tools: Option<Vec<serde_json::Value>> =
+            chat.tools.map(|tools| tools.iter().map(escape_marks).collect());
+        let marked = self.render_template(
+            MARKED_TEMPLATE,
+            &ChatRender { messages: &messages, tools: tools.as_deref(), ..*chat },
+        )?;
+        self.encode_marked(&marked)
+    }
+
+    /// The ids of a render of the marked template: each mark is its special
+    /// token, the text between marks is encoded without special-token
+    /// matching, and an escaped `MARK_OPEN` is the character again.
+    fn encode_marked(&self, marked: &str) -> Result<Vec<u32>> {
+        let mut ids = Vec::new();
+        let mut pending = String::new();
+        let mut rest = marked;
+        while let Some(at) = rest.find(MARK_OPEN) {
+            pending.push_str(&rest[..at]);
+            let after = &rest[at + MARK_OPEN.len_utf8()..];
+            if let Some(tail) = after.strip_prefix(MARK_CLOSE) {
+                pending.push(MARK_OPEN);
+                rest = tail;
+                continue;
+            }
+            let digits =
+                after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
+            let index: Option<usize> = after[..digits].parse().ok();
+            let (Some(index), Some(tail)) =
+                (index, after[digits..].strip_prefix(MARK_CLOSE))
+            else {
+                bail!("the marked chat template wrote a malformed special-token mark");
+            };
+            let Some(&(_, id)) = self.specials.get(index) else {
+                bail!("the marked chat template wrote an unknown special-token mark");
+            };
+            self.encode_text(&pending, &mut ids)?;
+            pending.clear();
+            ids.push(id);
+            rest = tail;
+        }
+        pending.push_str(rest);
+        self.encode_text(&pending, &mut ids)?;
+        Ok(ids)
+    }
+
+    /// Appends the ids of `text` encoded with special-token matching off.
+    fn encode_text(&self, text: &str, ids: &mut Vec<u32>) -> Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let encoding = self
+            .text
+            .encode(text, false)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("encoding text")?;
+        ids.extend_from_slice(encoding.get_ids());
+        Ok(())
+    }
+
+    /// Renders `chat` through the compiled template `name`.
+    fn render_template(&self, name: &str, chat: &ChatRender<'_>) -> Result<String> {
         if chat.messages.is_empty() {
             bail!("empty conversation");
         }
-        let template = self.env.get_template("chat")?;
+        let template = self.env.get_template(name)?;
         let mut ctx = minijinja::value::Value::from_serialize(serde_json::json!({
             "messages": chat.messages,
             "tools": chat.tools,
@@ -214,7 +386,10 @@ impl Tokenizer {
 
     /// Raw encode. Special tokens are never added implicitly: the prompt must
     /// end exactly where the model should continue, and the chat template
-    /// already writes every marker it wants.
+    /// already writes every marker it wants. Every special token's spelling
+    /// in `text` becomes the special token, which is right for a prompt the
+    /// caller rendered by hand (`/v1/completions`) and wrong for a chat
+    /// prompt carrying request text: use [`Self::encode_chat`] for those.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         let encoding = self
             .inner
@@ -252,13 +427,21 @@ impl Tokenizer {
             bail!("empty conversation");
         }
         let messages = self.template_messages(messages, thinking)?;
-        self.render(&ChatRender {
-            messages: &messages,
-            tools: None,
-            enable_thinking: thinking == Thinking::Enabled,
-            reasoning_effort: None,
-            preserve_thinking: None,
-        })
+        self.render(&conversation_render(&messages, thinking))
+    }
+
+    /// The ids of [`Self::render_chat`], with message content encoded as
+    /// text ([`Self::encode_chat`]).
+    pub fn encode_conversation(
+        &self,
+        messages: &Conversation,
+        thinking: Thinking,
+    ) -> Result<Vec<u32>> {
+        if messages.is_empty() {
+            bail!("empty conversation");
+        }
+        let messages = self.template_messages(messages, thinking)?;
+        self.encode_chat(&conversation_render(&messages, thinking))
     }
 
     /// The message list as the template should see it: content flattened to
@@ -281,6 +464,10 @@ impl Tokenizer {
             // last user message; only the earlier ones need the block written
             // in by hand. Setting `reasoning_content` to a string also stops
             // the template splitting `</think>` back out of the content.
+            // The block sits in content, which [`Self::encode_chat`] encodes
+            // as text; `<think>` and `</think>` are ordinary added tokens in
+            // this family (not special), so they are matched there exactly
+            // as the template's own block is.
             let needs_block = self.legacy_nothink_rewrite
                 && thinking == Thinking::Disabled
                 && message.role == Role::Assistant
@@ -297,6 +484,72 @@ impl Tokenizer {
             out.push(value);
         }
         Ok(out)
+    }
+}
+
+/// What [`Tokenizer::render_chat`] passes the template besides the messages.
+fn conversation_render(
+    messages: &[serde_json::Value],
+    thinking: Thinking,
+) -> ChatRender<'_> {
+    ChatRender {
+        messages,
+        tools: None,
+        enable_thinking: thinking == Thinking::Enabled,
+        reasoning_effort: None,
+        preserve_thinking: None,
+    }
+}
+
+/// `template` with every special token's spelling replaced by its mark
+/// (`MARK_OPEN`, index into `specials`, `MARK_CLOSE`), leftmost-longest as
+/// the tokenizer matches them. Only the template's literal text carries
+/// spellings, so after this only the template's own markup renders marks.
+fn mark_specials(template: &str, specials: &[(String, u32)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while !rest.is_empty() {
+        let longest = specials
+            .iter()
+            .enumerate()
+            .filter(|(_, (spelling, _))| rest.starts_with(spelling.as_str()))
+            .max_by_key(|(_, (spelling, _))| spelling.len());
+        match longest {
+            Some((index, (spelling, _))) => {
+                out.push(MARK_OPEN);
+                out.push_str(&index.to_string());
+                out.push(MARK_CLOSE);
+                rest = &rest[spelling.len()..];
+            }
+            None => {
+                let c = rest.chars().next().expect("rest is not empty");
+                out.push(c);
+                rest = &rest[c.len_utf8()..];
+            }
+        }
+    }
+    out
+}
+
+/// `value` with every `MARK_OPEN` in its strings, keys included, escaped as
+/// `MARK_OPEN MARK_CLOSE`, so request text never spells a mark. A value
+/// without one comes back unchanged.
+fn escape_marks(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value as Json;
+    let escape = |s: &str| {
+        if s.contains(MARK_OPEN) {
+            s.replace(MARK_OPEN, &format!("{MARK_OPEN}{MARK_CLOSE}"))
+        } else {
+            s.to_owned()
+        }
+    };
+    match value {
+        Json::String(s) => Json::String(escape(s)),
+        Json::Array(items) => Json::Array(items.iter().map(escape_marks).collect()),
+        Json::Object(map) => Json::Object(
+            map.iter().map(|(k, v)| (escape(k), escape_marks(v))).collect(),
+        ),
+        other => other.clone(),
     }
 }
 

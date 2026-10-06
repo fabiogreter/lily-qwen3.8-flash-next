@@ -1920,11 +1920,13 @@ impl<M: LanguageModel> Engine<M> {
 }
 
 /// The tokens that open a user turn in the chat template,
-/// `<|im_start|>user\n`, encoded as the rendered prompt is (the template
-/// writes the marker as text and the tokenizer maps it to the special
-/// token; for Qwen3.8-Flash-Next that is `[248045, 846, 198]`, the golden
-/// prompts' ids). Empty, which turns the durable boundary's snap off, when
-/// the vocabulary has no `<|im_start|>`.
+/// `<|im_start|>user\n`, encoded as the chat prompt encodes the template's
+/// own opener (the marker as the special token, then the text; for
+/// Qwen3.8-Flash-Next that is `[248045, 846, 198]`, the golden prompts'
+/// ids). Message text cannot produce it: its special spellings are encoded
+/// as text ([`crate::tokenizer::Tokenizer::encode_chat`]). Empty, which
+/// turns the durable boundary's snap off, when the vocabulary has no
+/// `<|im_start|>`.
 fn user_turn_opener(tokenizer: &crate::tokenizer::Tokenizer) -> Vec<u32> {
     let Some(start) = tokenizer.token_id("<|im_start|>") else {
         return Vec::new();

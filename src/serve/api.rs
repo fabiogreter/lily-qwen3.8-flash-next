@@ -11,8 +11,11 @@
 //! chat template writes `<|vision_start|><|image_pad|><|vision_end|>` where
 //! an image sits; after tokenisation the single pad is expanded to one
 //! placeholder per 2 x 2 patch block, which is what the reference processor
-//! does before tokenising, and the placeholder ids are counted against the
-//! images so no message text can smuggle one in.
+//! does before tokenising. Message text cannot produce a placeholder: the
+//! prompt is encoded with [`Tokenizer::encode_chat`], which tokenizes a
+//! special token's spelling in content as plain text. The placeholder ids
+//! are still counted against the images, which guards the invariant itself
+//! (one marker triple per image) whatever writes the prompt.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
@@ -348,8 +351,10 @@ impl PlaceholderIds {
 /// Checks that the tokenised prompt carries exactly the vision markers the
 /// template wrote for `images` images (one `<|vision_start|>`, one
 /// `<|image_pad|>` and one `<|vision_end|>` each, and no `<|video_pad|>`),
-/// so a placeholder typed into message text is refused rather than
-/// tokenised into a fake image span (or, for text, fed to the model as one).
+/// so no prompt reaches the model with a fake image span or a bare
+/// placeholder. Message text cannot produce these ids
+/// ([`Tokenizer::encode_chat`]); what is left to catch is a template that
+/// writes markers other than one triple per image.
 pub fn check_placeholders(
     prompt: &[u32],
     ids: &PlaceholderIds,
@@ -362,14 +367,13 @@ pub fn check_placeholders(
     ensure!(
         pads == n && starts == n && ends == n,
         "the prompt carries {pads} <|image_pad|>, {starts} <|vision_start|> and {ends} <|vision_end|> \
-         tokens for {n} images: these placeholder tokens are reserved for image content and \
-         cannot appear in message text"
+         tokens for {n} images: these placeholder tokens are reserved for image content, one \
+         triple per image"
     );
     if let Some(video) = ids.video_pad {
         ensure!(
             count(video) == 0,
-            "the prompt carries a <|video_pad|> token: video input is not supported and the \
-             placeholder cannot appear in message text"
+            "the prompt carries a <|video_pad|> token: video input is not supported"
         );
     }
     Ok(())
@@ -783,8 +787,11 @@ pub fn prepare_chat(
         "the final message must have role user or tool (got {last_role:?})"
     );
 
-    let rendered = tokenizer
-        .render(&ChatRender {
+    // Message text is encoded as text: a special token's spelling in it (a
+    // model answer quoting `<|image_pad|>`, a tool result writing
+    // `<|im_end|>`) never becomes the special token.
+    let mut prompt = tokenizer
+        .encode_chat(&ChatRender {
             messages: &messages,
             tools: tools_json.as_deref(),
             enable_thinking,
@@ -792,7 +799,6 @@ pub fn prepare_chat(
             preserve_thinking,
         })
         .context("rendering the chat template")?;
-    let mut prompt = tokenizer.encode(&rendered)?;
     match PlaceholderIds::from_tokenizer(tokenizer) {
         Some(ids) if grids.is_empty() => check_placeholders(&prompt, &ids, 0)?,
         Some(ids) => {
@@ -833,7 +839,10 @@ pub fn prepare_chat(
     })
 }
 
-/// Validates a raw text completion request.
+/// Validates a raw text completion request. The prompt is encoded as given:
+/// special tokens spelled in it stay special, since a client sending a raw
+/// prompt renders the template itself (unlike chat, where only the
+/// server's template writes them).
 pub fn prepare_completion(
     request: CompletionRequest,
     tokenizer: &Tokenizer,

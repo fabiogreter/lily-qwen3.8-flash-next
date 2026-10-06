@@ -40,9 +40,15 @@ not), `POST /v1/completions` and `GET /v1/models`, with tools,
 `reasoning_content` and `prompt_cache_key`. It is developed against
 opencode. The differences:
 
-- **Images** are base64 data URIs (PNG or JPEG, up to eight per request);
-  the server never fetches URLs. A 1920 x 1080 screenshot costs about 2 000
-  prompt tokens. No video.
+- **Images** are base64 data URIs (PNG or JPEG, no count limit beyond the
+  context); the server never fetches URLs. A 1920 x 1080 screenshot costs
+  about 2 000 prompt tokens. No video.
+- **Message text is always text.** A special token spelled in a message, a
+  tool result or a tool definition (`<|im_end|>`, `<|image_pad|>`) is
+  tokenized as the characters it is, never as conversation structure or an
+  image placeholder; only the chat template's own markup is special.
+  `/v1/completions` takes its raw prompt as written, special tokens
+  included.
 - **Up to four requests decode together** (`--max-batch`, continuous
   batching): a request that arrives while another decodes gets its prefill
   between the other's steps instead of waiting for its answer, then the two

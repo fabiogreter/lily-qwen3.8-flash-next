@@ -324,7 +324,7 @@ fn image_parts_are_read_in_both_shapes_and_text_only_content_flattens_as_before(
 }
 
 #[test]
-fn placeholders_are_expanded_per_image_and_refused_in_text() {
+fn placeholders_are_expanded_per_image_and_refused_out_of_place() {
     // A rendered prompt with two images: text, marker triple, text, triple, text.
     let prompt = [1, 2, 248053, 248056, 248054, 3, 248053, 248056, 248054, 4];
     // Grids (4, 6) -> 6 placeholders and (2, 4) -> 2.
@@ -341,14 +341,14 @@ fn placeholders_are_expanded_per_image_and_refused_in_text() {
             ImageSpan { start: 12, len: 2, grid_h: 2, grid_w: 4 },
         ]
     );
-    // Fewer or more markers than images: the text carried one (or the
-    // template dropped one); both are refused, never mapped.
+    // Fewer or more markers than images (a template that wrote one too many
+    // or dropped one): both are refused, never mapped.
     let err = api::expand_image_pads(&prompt, &IDS, &[(4, 6)]).unwrap_err().to_string();
     assert!(err.contains("2 <|image_pad|>, 2 <|vision_start|> and 2 <|vision_end|> tokens for 1 images"), "{err}");
     assert!(err.contains("reserved for image content"), "{err}");
     assert!(api::expand_image_pads(&prompt, &IDS, &[(4, 6), (2, 4), (2, 2)]).is_err());
-    // A lone pad typed into text (no start/end around it) is caught by the
-    // marker counts even when the pad count happens to match.
+    // A lone pad (no start/end around it) is caught by the marker counts
+    // even when the pad count happens to match.
     let typed = [1, 248056, 2, 248053, 248056, 248054];
     assert!(api::expand_image_pads(&typed, &IDS, &[(2, 2), (2, 2)]).is_err());
     // A text request may carry none of them.
@@ -357,7 +357,10 @@ fn placeholders_are_expanded_per_image_and_refused_in_text() {
         let err = api::check_placeholders(&[1, reserved, 3], &IDS, 0)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("cannot appear in message text"), "{reserved}: {err}");
+        assert!(
+            err.contains("reserved for image content") || err.contains("video input"),
+            "{reserved}: {err}"
+        );
     }
     // A grid that is not made of 2 x 2 blocks is refused.
     assert!(
