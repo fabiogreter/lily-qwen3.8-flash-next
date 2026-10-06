@@ -58,6 +58,30 @@ opencode. The differences:
 - **Thinking is on by default.** `reasoning_effort` (`none`, `low`,
   `medium`, `high`) sets it per request; `--thinking` and
   `--reasoning-effort` set the server's default.
+- **Thinking controls**, all off by default (experimental; the inserted
+  texts are untested as prompts). Per request, at the top level or in
+  `chat_template_kwargs` (which wins):
+  - `thinking_budget` (tokens; negative turns a server default off): once
+    the reasoning block holds that many of the model's tokens it is closed
+    at the next line end (after a grace window also a sentence end, after
+    a second one anywhere), never inside a code fence or a tool call, with
+    a short preface and `</think>`.
+  - `thinking_nudges` (bool, with a budget): sentences of increasingly firm
+    wording inserted into the reasoning at 50, 75 and 90 % of the budget.
+  - `tool_call_ends_thinking` (bool, chat requests with tools): a
+    `<tool_call>` at a line start inside the reasoning block ends it, with
+    `</think>` inserted in front of it.
+
+  Inserted tokens are fed to the model like generated ones, appear in the
+  stream (the texts in `reasoning_content`) and count as completion
+  tokens. The server's defaults for chat: `--thinking-budget
+  low=4000,medium=8000,xhigh=16000` (by the template's reasoning effort,
+  `xhigh` when unset; or one number for all),
+  `--thinking-budget-tool-turn-factor` (scales it after a tool result),
+  `--thinking-nudges`, `--tool-call-ends-thinking`,
+  `--thinking-budget-grace` and `--thinking-texts` (a JSON file with the
+  texts). `/v1/completions` takes only the request fields, and only for a
+  prompt that ends with `<think>\n`.
 - **Every response carries a `timings` object** with prefill and decode
   rates, cached tokens and draft acceptance. `GET /v1/timings` keeps the
   last 32; `tools/opencode-plugin-timings/` shows them in opencode.

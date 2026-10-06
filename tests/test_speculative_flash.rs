@@ -4,8 +4,10 @@
 //! a session survives the disk-tier round trip, and plain decoding grows the
 //! caches across a capacity step while a step is parked.
 
+use std::cell::RefCell;
 use std::io::Cursor;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use lily::engine::{DecodeStateApi, LanguageModel, LoadOptions, SnapshotApi};
@@ -13,6 +15,9 @@ use lily::generate::{FinishReason, GenerateOptions, Generator};
 use lily::kernels::sample::SamplingParams;
 use lily::metal::MetalContext;
 use lily::qwen4exp::Qwen4ExpModel;
+use lily::thinking::{
+    ThinkingControl, ThinkingSettings, ThinkingTexts, ThinkingTokens,
+};
 
 fn model_dir() -> Result<String> {
     std::env::var("LILY_MODEL_DIR_FLASH").context(
@@ -36,8 +41,13 @@ fn run(
     let capacity = prompt.len() + max_tokens + 8;
     let mut state = model.new_state(ctx, capacity)?;
     let mut scratch = model.new_scratch_with_capacity(ctx, capacity)?;
-    let options =
-        GenerateOptions { max_tokens, sampling: params, stop_tokens: &[], drafts };
+    let options = GenerateOptions {
+        max_tokens,
+        sampling: params,
+        stop_tokens: &[],
+        drafts,
+        thinking: None,
+    };
     let g = generator.generate(
         ctx,
         model,
@@ -123,6 +133,7 @@ fn persisted_session_continues_like_the_original() -> Result<()> {
         sampling: &greedy,
         stop_tokens: &[],
         drafts: 2,
+        thinking: None,
     };
     let expected = generator.generate(
         &ctx,
@@ -250,6 +261,7 @@ fn a_checkpoint_inside_an_entry_longer_than_the_restoring_state_restores_exactly
         sampling: &greedy,
         stop_tokens: &[],
         drafts: 2,
+        thinking: None,
     };
     let mut decode = |state: &mut _| {
         generator.generate(
@@ -301,6 +313,7 @@ fn plain_decoding_grows_the_caches_across_a_capacity_step() -> Result<()> {
         sampling: &params,
         stop_tokens: &[],
         drafts: 0,
+        thinking: None,
     };
     let g = generator.generate(
         &ctx,
@@ -348,8 +361,13 @@ fn decode_checkpoints_change_no_token() -> Result<()> {
     let capacity = n + max_tokens + 8;
     let mut scratch = model.new_scratch_with_capacity(&ctx, capacity)?;
     for drafts in [0usize, 2] {
-        let options =
-            GenerateOptions { max_tokens, sampling: &greedy, stop_tokens: &[], drafts };
+        let options = GenerateOptions {
+            max_tokens,
+            sampling: &greedy,
+            stop_tokens: &[],
+            drafts,
+            thinking: None,
+        };
         let mut run = |every: usize| -> Result<_> {
             let mut state = model.new_state(&ctx, capacity)?;
             model.prefill(&ctx, &mut state, &mut scratch, &prompt[..n - 1], None)?;
@@ -378,6 +396,319 @@ fn decode_checkpoints_change_no_token() -> Result<()> {
         assert!(positions.windows(2).all(|w| w[1] >= w[0] + 8));
         assert!(positions.iter().all(|&p| p >= n - 1 + 8 && p <= end));
         assert_eq!(checkpoints.taken(), positions.len());
+    }
+    Ok(())
+}
+
+// --- thinking controls -------------------------------------------------------
+
+/// A chat prompt whose generation prompt opens a reasoning block, as the
+/// template writes it with thinking on.
+fn thinking_prompt(generator: &Generator) -> Result<Vec<u32>> {
+    generator.tokenizer().encode(
+        "<|im_start|>user\nName three colours and explain each in one sentence.<|im_end|>\n\
+         <|im_start|>assistant\n<think>\n",
+    )
+}
+
+/// The controls' token sequences with the built-in texts, as the server
+/// makes them.
+fn thinking_tokens(generator: &Generator) -> Result<Arc<ThinkingTokens>> {
+    let t = generator.tokenizer();
+    let id =
+        |s: &str| t.token_id(s).with_context(|| format!("no {s} in the vocabulary"));
+    Ok(Arc::new(ThinkingTokens::new(
+        id("</think>")?,
+        id("<tool_call>")?,
+        id("</tool_call>")?,
+        &ThinkingTexts::default(),
+        |s| t.encode(s),
+    )?))
+}
+
+/// A greedy generation of `max_tokens` from a fresh state with `thinking`
+/// (and decode checkpoints every `every` tokens, 0 for none); returns the
+/// tokens, the state and the control.
+#[allow(clippy::too_many_arguments)]
+fn controlled_run(
+    ctx: &MetalContext,
+    model: &Qwen4ExpModel,
+    generator: &Generator,
+    prompt: &[u32],
+    drafts: usize,
+    max_tokens: usize,
+    thinking: Option<&RefCell<ThinkingControl>>,
+    every: usize,
+) -> Result<(Vec<u32>, lily::qwen4exp::DecodeState, FinishReason)> {
+    use lily::generate::DecodeCheckpointer;
+    use lily::qwen4exp::DecodeState;
+    use lily::serve::session::DecodeCheckpoints;
+
+    let greedy = SamplingParams::greedy();
+    let n = prompt.len();
+    let capacity = n + max_tokens + 64;
+    let mut state = model.new_state(ctx, capacity)?;
+    let mut scratch = model.new_scratch_with_capacity(ctx, capacity)?;
+    model.prefill(ctx, &mut state, &mut scratch, &prompt[..n - 1], None)?;
+    let mut checkpoints = DecodeCheckpoints::<DecodeState>::new(every, 64, n - 1);
+    let checkpointer: &mut dyn DecodeCheckpointer<DecodeState> = &mut checkpoints;
+    let options = GenerateOptions {
+        max_tokens,
+        sampling: &greedy,
+        stop_tokens: &[],
+        drafts,
+        thinking,
+    };
+    let g = generator.generate_checkpointed(
+        ctx,
+        model,
+        &mut state,
+        &mut scratch,
+        &prompt[n - 1..],
+        &options,
+        Some(checkpointer),
+        &mut |_| Ok(true),
+    )?;
+    // (`generate_checkpointed` checks that the state fed every token but
+    // the last, or all of them.)
+    Ok((g.tokens, state, g.finish))
+}
+
+fn load_with_head(ctx: &MetalContext) -> Result<(Qwen4ExpModel, Generator)> {
+    let dir = model_dir()?;
+    let model = <Qwen4ExpModel as LanguageModel>::load(
+        ctx,
+        Path::new(&dir),
+        &LoadOptions { mtp_drafts: 2, ..LoadOptions::default() },
+    )?;
+    assert!(model.max_drafts() > 0, "checkpoint has no draft head");
+    let mut generator = Generator::from_model_dir(Path::new(&dir))?;
+    generator.add_stop_tokens(&model.eos_token_ids());
+    Ok((model, generator))
+}
+
+/// Controls that are present but have nothing to do (no setting on, or a
+/// prompt that does not open a reasoning block) change no token, plain or
+/// speculative: off means byte-identical output.
+#[test]
+#[ignore = "requires LILY_MODEL_DIR_FLASH"]
+fn idle_thinking_controls_change_no_token() -> Result<()> {
+    let ctx = MetalContext::new()?;
+    let (model, generator) = load_with_head(&ctx)?;
+    let tokens = thinking_tokens(&generator)?;
+    let opened = thinking_prompt(&generator)?;
+    let plain = prompt(&generator)?;
+    for drafts in [0usize, 2] {
+        for p in [&opened, &plain] {
+            let (expected, _, _) =
+                controlled_run(&ctx, &model, &generator, p, drafts, 40, None, 0)?;
+            let idle = RefCell::new(ThinkingControl::new(
+                tokens.clone(),
+                ThinkingSettings::default(),
+                true,
+            ));
+            let (got, _, _) = controlled_run(
+                &ctx,
+                &model,
+                &generator,
+                p,
+                drafts,
+                40,
+                Some(&idle),
+                0,
+            )?;
+            assert_eq!(got, expected, "drafts={drafts}: settings all off");
+            let unopened = RefCell::new(ThinkingControl::new(
+                tokens.clone(),
+                ThinkingSettings {
+                    budget: Some(1),
+                    nudges: true,
+                    tool_call_ends_thinking: true,
+                    ..ThinkingSettings::default()
+                },
+                false,
+            ));
+            let (got, _, _) = controlled_run(
+                &ctx,
+                &model,
+                &generator,
+                p,
+                drafts,
+                40,
+                Some(&unopened),
+                0,
+            )?;
+            assert_eq!(got, expected, "drafts={drafts}: no reasoning block opened");
+        }
+    }
+    Ok(())
+}
+
+/// A budget closes the block: `</think>` is in the stream right after the
+/// transition text, and the state the generation leaves is the state a
+/// prefill of the same tokens makes: the next draw and the continuation
+/// agree, draft head included.
+#[test]
+#[ignore = "requires LILY_MODEL_DIR_FLASH"]
+fn a_forced_close_leaves_the_state_a_prefill_of_the_same_tokens_makes() -> Result<()> {
+    let ctx = MetalContext::new()?;
+    let (model, generator) = load_with_head(&ctx)?;
+    let tokens = thinking_tokens(&generator)?;
+    let think_end = tokens.think_end;
+    let prompt = thinking_prompt(&generator)?;
+    let n = prompt.len();
+    for drafts in [0usize, 2] {
+        // Grace 0: the close comes right at the budget, wherever that is.
+        let control = RefCell::new(ThinkingControl::new(
+            tokens.clone(),
+            ThinkingSettings {
+                budget: Some(8),
+                grace: 0,
+                ..ThinkingSettings::default()
+            },
+            true,
+        ));
+        let (generated, mut state, finish) = controlled_run(
+            &ctx,
+            &model,
+            &generator,
+            &prompt,
+            drafts,
+            48,
+            Some(&control),
+            0,
+        )?;
+        let closed = control.borrow().closed().context("the budget did not close")?;
+        assert_eq!(closed.thinking_tokens, 8);
+        let at = generated
+            .iter()
+            .position(|&t| t == think_end)
+            .context("no </think> in the stream")?;
+        assert!(at > 8, "the transition text comes first");
+        let text = generator.decode_text(&generated[..at + 1])?;
+        assert!(text.contains("time to act"), "drafts={drafts}: {text:?}");
+        if finish != FinishReason::Length {
+            eprintln!(
+                "drafts={drafts}: ended by {finish:?}; the continuation check is skipped"
+            );
+            continue;
+        }
+
+        // The reference: the prompt and every generated token but the last
+        // fed as one prompt.
+        let all: Vec<u32> =
+            prompt.iter().chain(&generated[..generated.len() - 1]).copied().collect();
+        let capacity = all.len() + 64;
+        let mut reference = model.new_state(&ctx, capacity)?;
+        let mut scratch = model.new_scratch_with_capacity(&ctx, capacity)?;
+        model.prefill(&ctx, &mut reference, &mut scratch, &all, None)?;
+        assert_eq!(state.pos(), reference.pos(), "drafts={drafts}: positions");
+        assert_eq!(state.pos(), n + generated.len() - 1);
+
+        // The same next token fed into both: the same logits' argmax, and
+        // the same continuation.
+        let greedy = SamplingParams::greedy();
+        let last = *generated.last().expect("generated");
+        let options = GenerateOptions {
+            max_tokens: 16,
+            sampling: &greedy,
+            stop_tokens: &[],
+            drafts,
+            thinking: None,
+        };
+        let mut logits = Vec::new();
+        let mut continuations = Vec::new();
+        for s in [&mut state, &mut reference] {
+            use lily::engine::ScratchApi;
+            scratch.begin_request();
+            model.prefill(
+                &ctx,
+                s,
+                &mut scratch,
+                &[last],
+                Some(lily::engine::Draw { params: &greedy, step: 0 }),
+            )?;
+            logits.push(scratch.logits().to_f32()?);
+            let first = scratch.next_token().view(0, &[1])?.to_u32()?[0];
+            // On from that draw, both states the same way (the draft head
+            // proposes from what the prefill left it).
+            let mut tokens = vec![first];
+            generator.resume(
+                &ctx,
+                &model,
+                s,
+                &mut scratch,
+                &mut tokens,
+                &options,
+                None,
+                &mut |_| Ok(true),
+            )?;
+            continuations.push(tokens);
+        }
+        let worst = logits[0]
+            .iter()
+            .zip(&logits[1])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let argmax = |l: &[f32]| {
+            l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i)
+        };
+        eprintln!("drafts={drafts}: worst logit gap {worst}");
+        assert_eq!(
+            argmax(&logits[0]),
+            argmax(&logits[1]),
+            "drafts={drafts}: next draw"
+        );
+        assert_eq!(continuations[0], continuations[1], "drafts={drafts}: continuation");
+    }
+    Ok(())
+}
+
+/// The speculative loop (resting, feeding the inserted tokens, proposing
+/// afresh) and the plain loop (unpipelined around an insertion) emit the
+/// same tokens under a budget with nudges, with and without decode
+/// checkpoints.
+#[test]
+#[ignore = "requires LILY_MODEL_DIR_FLASH"]
+fn speculative_and_plain_decoding_agree_under_a_budget() -> Result<()> {
+    let ctx = MetalContext::new()?;
+    let (model, generator) = load_with_head(&ctx)?;
+    let tokens = thinking_tokens(&generator)?;
+    let prompt = thinking_prompt(&generator)?;
+    let settings = ThinkingSettings {
+        budget: Some(24),
+        grace: 2,
+        nudges: true,
+        tool_call_ends_thinking: true,
+        seed: 3,
+    };
+    let run = |drafts: usize, every: usize| -> Result<(Vec<u32>, usize)> {
+        let control =
+            RefCell::new(ThinkingControl::new(tokens.clone(), settings, true));
+        let (generated, _, _) = controlled_run(
+            &ctx,
+            &model,
+            &generator,
+            &prompt,
+            drafts,
+            72,
+            Some(&control),
+            every,
+        )?;
+        let nudged = control.borrow().nudged();
+        Ok((generated, nudged))
+    };
+    let (plain, nudged) = run(0, 0)?;
+    assert!(
+        plain.contains(&tokens.think_end),
+        "the budget closed the block: {:?}",
+        generator.decode_text(&plain)?
+    );
+    eprintln!("nudges: {nudged}; {:?}", generator.decode_text(&plain)?);
+    for (drafts, every) in [(2usize, 0usize), (1, 0), (2, 8), (0, 8)] {
+        let (got, got_nudged) = run(drafts, every)?;
+        assert_eq!(got, plain, "drafts={drafts} checkpoints every {every}");
+        assert_eq!(got_nudged, nudged);
     }
     Ok(())
 }

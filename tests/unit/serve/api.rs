@@ -127,3 +127,105 @@ fn a_remembered_image_is_not_decoded_and_its_deferred_rows_match() {
     assert!(matches!(third, ImagePixels::Ready(_)));
     assert_eq!(policy.memo.len(), 2);
 }
+
+#[test]
+fn thinking_budgets_parse_per_effort_or_for_all() {
+    let all = ThinkingBudgets::parse("8000").unwrap();
+    assert_eq!(
+        all,
+        ThinkingBudgets { low: Some(8000), medium: Some(8000), xhigh: Some(8000) }
+    );
+    let map = ThinkingBudgets::parse("low=4000, medium=8000,high=16000").unwrap();
+    assert_eq!(
+        map,
+        ThinkingBudgets { low: Some(4000), medium: Some(8000), xhigh: Some(16000) }
+    );
+    let partial = ThinkingBudgets::parse("xhigh=12000").unwrap();
+    assert_eq!(partial.at(Some("low")), None);
+    assert_eq!(partial.at(None), Some(12000), "the template's default effort is xhigh");
+    assert_eq!(map.at(Some("medium")), Some(8000));
+    assert!(ThinkingBudgets::parse("max=1").is_err());
+    assert!(ThinkingBudgets::parse("low=many").is_err());
+    assert!(ThinkingBudgets::parse("low").is_err());
+}
+
+#[test]
+fn a_tool_turn_scales_the_default_budget() {
+    let d = ThinkingDefaults {
+        budgets: ThinkingBudgets::parse("medium=8000").unwrap(),
+        tool_turn_factor: 0.5,
+        ..ThinkingDefaults::default()
+    };
+    assert_eq!(d.budget(Some("medium"), false), Some(8000));
+    assert_eq!(d.budget(Some("medium"), true), Some(4000));
+    assert_eq!(d.budget(Some("low"), true), None);
+    assert_eq!(ThinkingDefaults::default().budget(None, false), None, "off by default");
+}
+
+#[test]
+fn thinking_fields_override_the_defaults_and_kwargs_win() {
+    let defaults = ThinkingDefaults {
+        budgets: ThinkingBudgets::parse("8000").unwrap(),
+        nudges: true,
+        tool_call_ends_thinking: true,
+        grace: 64,
+        ..ThinkingDefaults::default()
+    };
+    // Nothing asked: the server's defaults.
+    let s = ThinkingFields::default().resolve(&defaults, Some(8000), 5);
+    assert_eq!(
+        s,
+        ThinkingSettings {
+            budget: Some(8000),
+            grace: 64,
+            nudges: true,
+            tool_call_ends_thinking: true,
+            seed: 5
+        }
+    );
+    // A negative budget turns the default off, and the nudges with it.
+    let off = ThinkingFields { thinking_budget: Some(-1), ..Default::default() };
+    let s = off.resolve(&defaults, Some(8000), 5);
+    assert_eq!((s.budget, s.nudges), (None, false));
+    // The request's own budget wins over the default.
+    let own = ThinkingFields {
+        thinking_budget: Some(3000),
+        thinking_nudges: Some(false),
+        tool_call_ends_thinking: Some(false),
+    };
+    let s = own.resolve(&defaults, Some(8000), 5);
+    assert_eq!(
+        (s.budget, s.nudges, s.tool_call_ends_thinking),
+        (Some(3000), false, false)
+    );
+    // chat_template_kwargs win over the top-level fields.
+    let kwargs =
+        serde_json::json!({"thinking_budget": 100, "tool_call_ends_thinking": true});
+    let merged = ThinkingFields::from_kwargs(kwargs.as_object().unwrap())
+        .unwrap()
+        .or(own.clone());
+    assert_eq!(merged.thinking_budget, Some(100));
+    assert_eq!(merged.tool_call_ends_thinking, Some(true));
+    assert_eq!(merged.thinking_nudges, Some(false));
+    let bad = serde_json::json!({"thinking_nudges": "yes"});
+    assert!(ThinkingFields::from_kwargs(bad.as_object().unwrap()).is_err());
+    // Off by default: no control at all.
+    let none = ThinkingFields::default().resolve(&ThinkingDefaults::default(), None, 5);
+    assert!(!none.any());
+}
+
+#[test]
+fn thinking_fields_deserialize_from_a_chat_request() {
+    let request: ChatRequest = serde_json::from_value(serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking_budget": 8000,
+        "thinking_nudges": true,
+        "tool_call_ends_thinking": true,
+        "temperature": 0.6,
+    }))
+    .unwrap();
+    assert_eq!(request.thinking_controls.thinking_budget, Some(8000));
+    assert_eq!(request.thinking_controls.thinking_nudges, Some(true));
+    assert_eq!(request.thinking_controls.tool_call_ends_thinking, Some(true));
+    assert_eq!(request.sampling.temperature, Some(0.6), "both flattened groups");
+}

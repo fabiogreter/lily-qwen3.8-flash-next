@@ -15,6 +15,8 @@
 //! ([`answer_line`], or [`stopped_line`] for a prefill that was stopped)
 //! and the end of its response ([`stream_end`], [`response_body`]).
 
+use std::cell::RefCell;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -41,6 +43,7 @@ use crate::engine::{DecodeStateApi, LanguageModel};
 use crate::generate::{FinishReason, Generator};
 use crate::qwen4exp::{ImageEmbeds, VisionInput, positions_for_prompt};
 use crate::stats::{Counters, TaskMemory, VmCounters};
+use crate::thinking::{ClosedBy, ThinkingControl, opens_thinking};
 
 /// What a request's admission measured, for its timings and log line.
 #[derive(Debug, Clone, Default)]
@@ -103,6 +106,8 @@ pub(super) struct Outcome<'a> {
     pub(super) cancelled_at: Option<usize>,
     /// How the request shared the GPU; `None` with batching off.
     pub(super) batch: Option<&'a BatchStats>,
+    /// What its thinking controls did; `None` without them.
+    pub(super) thinking: Option<ThinkingOutcome>,
 }
 
 /// The request's `timings`. `counters_end` and `vm_end` are the samples
@@ -231,7 +236,7 @@ pub(super) fn answer_line(
     details: &str,
 ) -> String {
     format!(
-        "{}: {} prompt tokens ({} cached{}{}{}{}){}, {} generated, prefix {:.2}s, decode {:.2}s ({:.1} tok/s){}, finish={finish_reason}{}{}, {store}{details}",
+        "{}: {} prompt tokens ({} cached{}{}{}{}){}, {} generated, prefix {:.2}s, decode {:.2}s ({:.1} tok/s){}, finish={finish_reason}{}{}{}, {store}{details}",
         id,
         f.n,
         f.reused,
@@ -288,8 +293,53 @@ pub(super) fn answer_line(
         o.cancelled_by
             .map(|by| format!(" (cancelled by the {by} during the decode)"))
             .unwrap_or_default(),
+        o.thinking.map(|t| t.describe()).unwrap_or_default(),
         o.batch.map(|b| b.describe(o.generated)).unwrap_or_default(),
     )
+}
+
+/// What a request's thinking controls did, for its log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ThinkingOutcome {
+    pub(super) closed_by: Option<ClosedBy>,
+    /// The model's tokens in the reasoning block (up to the close).
+    pub(super) thinking_tokens: usize,
+    pub(super) nudges: usize,
+}
+
+impl ThinkingOutcome {
+    pub(super) fn of(control: &ThinkingControl) -> Self {
+        let closed = control.closed();
+        Self {
+            closed_by: closed.map(|c| c.by),
+            thinking_tokens: closed
+                .map_or(control.thinking_tokens(), |c| c.thinking_tokens),
+            nudges: control.nudged(),
+        }
+    }
+
+    /// The log line's group: empty when the controls did nothing.
+    pub(super) fn describe(&self) -> String {
+        let nudges = match self.nudges {
+            0 => String::new(),
+            1 => ", 1 nudge".to_owned(),
+            n => format!(", {n} nudges"),
+        };
+        match self.closed_by {
+            Some(ClosedBy::Budget) => format!(
+                ", thinking closed by the budget after {} tokens{nudges}",
+                self.thinking_tokens
+            ),
+            Some(ClosedBy::ToolCall) => format!(
+                ", thinking closed by a tool call after {} tokens{nudges}",
+                self.thinking_tokens
+            ),
+            None if self.nudges > 0 => {
+                format!(", thinking {} tokens{nudges}", self.thinking_tokens)
+            }
+            None => String::new(),
+        }
+    }
 }
 
 /// What the end of an answered request's response is made of.
@@ -781,8 +831,32 @@ impl<M: LanguageModel> Engine<M> {
                 tools: p.tools.clone(),
                 stop_strings: p.stop_strings.clone(),
                 raw: p.kind == Kind::Completion,
+                tool_call_ends_thinking: p.thinking.tool_call_ends_thinking,
             },
         );
+        // The thinking controls, when the request asked for any and the
+        // prompt opens a reasoning block (the generation prompt ends with
+        // `<think>\n`; a raw completion's prompt may too). Off, the decode is
+        // exactly what it is without them.
+        let thinking = match &self.thinking_tokens {
+            Some(tokens) if p.thinking.any() => {
+                let tail = tokenizer.decode(&p.prompt[n.saturating_sub(4)..], false)?;
+                Some(RefCell::new(ThinkingControl::new(
+                    Arc::clone(tokens),
+                    p.thinking,
+                    opens_thinking(&tail),
+                )))
+            }
+            Some(_) => None,
+            None => {
+                if p.thinking.any() {
+                    eprintln!(
+                        "thinking controls: requested, but the vocabulary lacks </think> or the tool call tags; ignored"
+                    );
+                }
+                None
+            }
+        };
         let out = Output {
             id,
             created,
@@ -839,6 +913,7 @@ impl<M: LanguageModel> Engine<M> {
             decode_checkpoints: self.sessions.decode_checkpoints(n - 1),
             parser,
             out,
+            thinking,
         }))
     }
 }
@@ -930,9 +1005,36 @@ pub(super) struct Admitted<'g, M: LanguageModel> {
     pub(super) decode_checkpoints: DecodeCheckpoints<M::State>,
     pub(super) parser: Parser<'g>,
     pub(super) out: Output,
+    /// The request's thinking controls; `None` when it has none.
+    pub(super) thinking: Option<RefCell<ThinkingControl>>,
 }
 
 impl<M: LanguageModel> Admitted<'_, M> {
+    /// Feeds what of `tokens` (every token drawn or inserted so far) the
+    /// session's state has not fed yet, all but the last: tokens a thinking
+    /// control inserted while the state was at rest (the batch scheduler's
+    /// draws). The state must be at rest; a no-op when it holds all but the
+    /// last already, or all of them (a parked step fed the last).
+    pub(super) fn feed_inserted(
+        &mut self,
+        ctx: &crate::metal::MetalContext,
+        model: &M,
+        scratch: &mut M::Scratch,
+        tokens: &[u32],
+    ) -> Result<()> {
+        let n = self.facts.n;
+        if self.session.state.pos() < n + tokens.len().saturating_sub(1) {
+            crate::generate::feed_inserted(
+                ctx,
+                model,
+                &mut self.session.state,
+                scratch,
+                tokens,
+                n,
+            )?;
+        }
+        Ok(())
+    }
     /// GPU bytes the request holds checked out: its session and the decode
     /// checkpoints it took so far, which join the session only at the
     /// answer. One checkpoint is a whole recurrent snapshot (about 113 MB
@@ -1079,6 +1181,7 @@ impl<M: LanguageModel> Engine<M> {
             decode_checkpoints,
             mut parser,
             mut out,
+            thinking,
         } = admitted;
         let final_events = parser.finish();
         out.deliver(final_events, sink);
@@ -1123,6 +1226,9 @@ impl<M: LanguageModel> Engine<M> {
         if self.ctx.profiling() {
             print_kernel_profile(&crate::metal::profile::take());
         }
+        // Tokens a thinking control inserted are in `tokens` with the draws:
+        // they are generated text the state was fed, so they count as
+        // completion tokens (and, inside the block, as reasoning tokens).
         let completion_tokens = decoded.tokens.len();
         let finish_reason = match decoded.finish {
             FinishReason::Length => "length",
@@ -1153,6 +1259,7 @@ impl<M: LanguageModel> Engine<M> {
             cancelled_by,
             cancelled_at: None,
             batch: decoded.batch,
+            thinking: thinking.map(|t| ThinkingOutcome::of(&t.into_inner())),
         };
         let measured = timings(
             &f,

@@ -63,6 +63,7 @@ use crate::qwen4exp::image::ImageLimits;
 use crate::qwen4exp::ngram::BackgroundPreload;
 use crate::qwen4exp::weights::SessionContext;
 use crate::qwen4exp::{NgramStorage, Qwen4ExpModel};
+use crate::thinking::{ThinkingTexts, ThinkingTokens};
 use api::{Defaults, ImagePolicy, Kind, Prepared};
 use request::{Admitted, Alone, Decoded, Ending, Opened};
 use session::SessionStore;
@@ -192,6 +193,11 @@ pub struct ServeOptions {
     pub decode_checkpoint_tokens: usize,
     pub thinking: bool,
     pub reasoning_effort: Option<String>,
+    /// The thinking controls' defaults for chat requests
+    /// ([`crate::thinking`]; all off by default).
+    pub thinking_controls: api::ThinkingDefaults,
+    /// A JSON file replacing the texts the thinking controls insert.
+    pub thinking_texts: Option<std::path::PathBuf>,
     pub queue: usize,
     /// Requests that decode together in one batched step (`--max-batch`);
     /// 1 serves one request at a time, exactly as before batching existed.
@@ -731,6 +737,9 @@ struct Engine<M: LanguageModel> {
     preload: Option<BackgroundPreload>,
     /// The weights' pin (`--pin-weights`); dropped before the model.
     pin: pin::WeightPin,
+    /// The thinking controls' markers and texts; `None` when the vocabulary
+    /// lacks them (the controls are then ignored).
+    thinking_tokens: Option<Arc<ThinkingTokens>>,
 }
 
 /// Where a request's text ends up when not streaming.
@@ -748,7 +757,8 @@ impl<M: LanguageModel> Engine<M> {
         shared: &Shared,
         next_id: u64,
     ) -> Result<Self> {
-        let Shared { generator, shutdown, timings, queue: _ } = shared.clone();
+        let Shared { generator, shutdown, timings, queue: _, thinking_tokens } =
+            shared.clone();
         // `LILY_KERNEL_PROFILE=1`: per-kernel GPU times per pass, printed
         // after every answered request (diagnostic; the profile transport
         // serializes dispatches, so throughput under it is not comparable;
@@ -1076,6 +1086,7 @@ impl<M: LanguageModel> Engine<M> {
             timings,
             preload,
             pin,
+            thinking_tokens,
         })
     }
 
@@ -1194,13 +1205,14 @@ impl<M: LanguageModel> Engine<M> {
 
         let Engine { ctx, model, scratch, drafts, shutdown, .. } = self;
         let n = admitted.facts.n;
-        let Admitted { p, session, decode_checkpoints, parser, out, .. } =
+        let Admitted { p, session, decode_checkpoints, parser, out, thinking, .. } =
             &mut admitted;
         let options = GenerateOptions {
             max_tokens: p.max_tokens,
             sampling: &p.sampling,
             stop_tokens: &[],
             drafts: *drafts,
+            thinking: thinking.as_ref(),
         };
         let checkpointer: &mut dyn DecodeCheckpointer<M::State> = decode_checkpoints;
         let decode_started = Instant::now();
@@ -1606,6 +1618,8 @@ struct Shared {
     /// Where each finished request's numbers go for `GET /v1/timings`.
     timings: Arc<TimingsLog>,
     queue: Arc<EngineQueue>,
+    /// See [`Engine::thinking_tokens`].
+    thinking_tokens: Option<Arc<ThinkingTokens>>,
 }
 
 /// Everything the HTTP thread needs without the engine.
@@ -1887,6 +1901,57 @@ fn loopback_of(address: SocketAddr) -> SocketAddr {
     SocketAddr::new(ip, address.port())
 }
 
+/// The thinking controls' token sequences for `texts`, or `None` when the
+/// vocabulary has no `</think>`, `<tool_call>` or `</tool_call>`.
+fn thinking_tokens(
+    tokenizer: &crate::tokenizer::Tokenizer,
+    texts: &ThinkingTexts,
+) -> Result<Option<ThinkingTokens>> {
+    let (Some(think_end), Some(tool_call), Some(tool_call_end)) = (
+        tokenizer.token_id("</think>"),
+        tokenizer.token_id("<tool_call>"),
+        tokenizer.token_id("</tool_call>"),
+    ) else {
+        return Ok(None);
+    };
+    ThinkingTokens::new(think_end, tool_call, tool_call_end, texts, |text| {
+        tokenizer.encode(text)
+    })
+    .map(Some)
+    .context("the thinking controls' texts")
+}
+
+/// The startup line's account of the thinking controls' defaults.
+fn describe_thinking_defaults(d: &api::ThinkingDefaults, available: bool) -> String {
+    if !available {
+        return "unavailable (the vocabulary lacks </think> or the tool call tags)"
+            .to_owned();
+    }
+    let b = d.budgets;
+    let budget = if b == api::ThinkingBudgets::default() {
+        "no default budget".to_owned()
+    } else {
+        let at = |v: Option<usize>| v.map_or("none".to_owned(), |v| v.to_string());
+        format!(
+            "default budget low {} medium {} xhigh {}{}, grace {}{}",
+            at(b.low),
+            at(b.medium),
+            at(b.xhigh),
+            if d.tool_turn_factor == 1.0 {
+                String::new()
+            } else {
+                format!(" (x{} after a tool result)", d.tool_turn_factor)
+            },
+            d.grace,
+            if d.nudges { ", nudges on" } else { "" },
+        )
+    };
+    format!(
+        "{budget}; a tool call ends thinking: {}; per request: thinking_budget, thinking_nudges, tool_call_ends_thinking",
+        if d.tool_call_ends_thinking { "on" } else { "off" }
+    )
+}
+
 fn run_with<M: LanguageModel + 'static>(
     model_dir: &Path,
     options: ServeOptions,
@@ -1907,7 +1972,22 @@ fn run_with<M: LanguageModel + 'static>(
         sampling: sampling_defaults(model_dir, &options.sampling)?,
         thinking: options.thinking,
         reasoning_effort: options.reasoning_effort.clone(),
+        thinking_controls: options.thinking_controls,
     };
+    // A bad texts file fails the start; a vocabulary without the markers
+    // only turns the controls off.
+    let texts = match &options.thinking_texts {
+        Some(path) => ThinkingTexts::from_file(path)?,
+        None => ThinkingTexts::default(),
+    };
+    let thinking_tokens = thinking_tokens(generator.tokenizer(), &texts)?.map(Arc::new);
+    eprintln!(
+        "thinking controls: {}",
+        describe_thinking_defaults(
+            &options.thinking_controls,
+            thinking_tokens.is_some()
+        )
+    );
     eprintln!(
         "defaults: temperature {} top_k {} top_p {} min_p {} repetition_penalty {} presence {} frequency {}; thinking {}{}",
         defaults.sampling.temperature,
@@ -1959,6 +2039,7 @@ fn run_with<M: LanguageModel + 'static>(
         shutdown: shutdown.clone(),
         timings: Arc::new(TimingsLog::new(TIMINGS_LOG_CAPACITY)),
         queue,
+        thinking_tokens,
     };
     let engine_thread = {
         let model_dir = model_dir.to_path_buf();

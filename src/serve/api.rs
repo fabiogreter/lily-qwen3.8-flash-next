@@ -32,6 +32,7 @@ use crate::kernels::sample::SamplingParams;
 use crate::qwen4exp::ImageSpan;
 use crate::qwen4exp::image::{ImageLimits, preprocess};
 use crate::sha256::Sha256;
+use crate::thinking::ThinkingSettings;
 use crate::tokenizer::{ChatRender, Tokenizer};
 
 #[derive(Deserialize, Debug, Clone)]
@@ -490,6 +491,176 @@ pub struct ChatRequest {
     pub chat_template_kwargs: Option<Value>,
     #[serde(default)]
     pub prompt_cache_key: Option<String>,
+    #[serde(flatten)]
+    pub thinking_controls: ThinkingFields,
+}
+
+/// The thinking controls' request fields ([`crate::thinking`]), on both
+/// endpoints (and in a chat request's `chat_template_kwargs`, which win).
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct ThinkingFields {
+    /// The model's thinking tokens before the block is closed; negative
+    /// turns a server default off.
+    #[serde(default)]
+    pub thinking_budget: Option<i64>,
+    /// Nudges before the budget.
+    #[serde(default)]
+    pub thinking_nudges: Option<bool>,
+    /// A tool call at a line start inside the block ends it.
+    #[serde(default)]
+    pub tool_call_ends_thinking: Option<bool>,
+}
+
+impl ThinkingFields {
+    /// The fields of a `chat_template_kwargs` object (the others ignored).
+    fn from_kwargs(kwargs: &serde_json::Map<String, Value>) -> Result<Self> {
+        let bool_field = |name: &str| -> Result<Option<bool>> {
+            match kwargs.get(name) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::Bool(b)) => Ok(Some(*b)),
+                Some(other) => {
+                    bail!("chat_template_kwargs.{name} must be a boolean, got {other}")
+                }
+            }
+        };
+        let thinking_budget = match kwargs.get("thinking_budget") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(v.as_i64().with_context(|| {
+                format!(
+                    "chat_template_kwargs.thinking_budget must be an integer, got {v}"
+                )
+            })?),
+        };
+        Ok(Self {
+            thinking_budget,
+            thinking_nudges: bool_field("thinking_nudges")?,
+            tool_call_ends_thinking: bool_field("tool_call_ends_thinking")?,
+        })
+    }
+
+    /// `self` where set, `other` elsewhere.
+    fn or(self, other: Self) -> Self {
+        Self {
+            thinking_budget: self.thinking_budget.or(other.thinking_budget),
+            thinking_nudges: self.thinking_nudges.or(other.thinking_nudges),
+            tool_call_ends_thinking: self
+                .tool_call_ends_thinking
+                .or(other.tool_call_ends_thinking),
+        }
+    }
+
+    /// The settings these fields ask for over `defaults`; `default_budget`
+    /// is the server's budget for the request (by its effort and turn), and
+    /// `seed` picks the inserted texts' variants.
+    fn resolve(
+        &self,
+        defaults: &ThinkingDefaults,
+        default_budget: Option<usize>,
+        seed: u64,
+    ) -> ThinkingSettings {
+        let budget = match self.thinking_budget {
+            Some(b) if b < 0 => None,
+            Some(b) => Some(b as usize),
+            None => default_budget,
+        };
+        ThinkingSettings {
+            budget,
+            grace: defaults.grace,
+            nudges: budget.is_some() && self.thinking_nudges.unwrap_or(defaults.nudges),
+            tool_call_ends_thinking: self
+                .tool_call_ends_thinking
+                .unwrap_or(defaults.tool_call_ends_thinking),
+            seed,
+        }
+    }
+}
+
+/// The server's thinking budget per template reasoning effort
+/// (`--thinking-budget`): `low=4000,medium=8000,xhigh=16000` (`high` is
+/// `xhigh`, as in requests), or one number for every level. A level left
+/// out has no budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ThinkingBudgets {
+    pub low: Option<usize>,
+    pub medium: Option<usize>,
+    pub xhigh: Option<usize>,
+}
+
+impl ThinkingBudgets {
+    pub fn parse(text: &str) -> Result<Self> {
+        let text = text.trim();
+        if let Ok(all) = text.parse::<usize>() {
+            return Ok(Self { low: Some(all), medium: Some(all), xhigh: Some(all) });
+        }
+        let mut budgets = Self::default();
+        for part in text.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            let (level, value) = part.split_once('=').with_context(|| {
+                format!("thinking budget {part:?} is not level=tokens or a number")
+            })?;
+            let value: usize = value.trim().parse().with_context(|| {
+                format!("thinking budget {part:?}: {value:?} is not a token count")
+            })?;
+            let slot = match level.trim() {
+                "low" => &mut budgets.low,
+                "medium" => &mut budgets.medium,
+                "high" | "xhigh" => &mut budgets.xhigh,
+                other => bail!(
+                    "unknown reasoning effort {other:?} in the thinking budget (low, medium, xhigh)"
+                ),
+            };
+            *slot = Some(value);
+        }
+        Ok(budgets)
+    }
+
+    /// The budget at a template effort (`None`: the template's default,
+    /// xhigh).
+    pub fn at(&self, effort: Option<&str>) -> Option<usize> {
+        match effort {
+            Some("low") => self.low,
+            Some("medium") => self.medium,
+            _ => self.xhigh,
+        }
+    }
+}
+
+/// The server's defaults for the thinking controls (all off unless the
+/// flags turn them on), for chat requests; a raw completion gets only what
+/// it asks for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThinkingDefaults {
+    pub budgets: ThinkingBudgets,
+    /// Scales the budget of a turn whose last message is a tool result
+    /// (`--thinking-budget-tool-turn-factor`; 1 leaves it).
+    pub tool_turn_factor: f64,
+    pub nudges: bool,
+    pub tool_call_ends_thinking: bool,
+    pub grace: usize,
+}
+
+impl Default for ThinkingDefaults {
+    fn default() -> Self {
+        Self {
+            budgets: ThinkingBudgets::default(),
+            tool_turn_factor: 1.0,
+            nudges: false,
+            tool_call_ends_thinking: false,
+            grace: crate::thinking::DEFAULT_GRACE,
+        }
+    }
+}
+
+impl ThinkingDefaults {
+    /// The server's budget for a chat turn at `effort` (the template's,
+    /// `None` for its default), after a tool result when `tool_turn`.
+    pub fn budget(&self, effort: Option<&str>, tool_turn: bool) -> Option<usize> {
+        let budget = self.budgets.at(effort)?;
+        Some(if tool_turn {
+            ((budget as f64 * self.tool_turn_factor).round() as usize).max(1)
+        } else {
+            budget
+        })
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -515,6 +686,8 @@ pub struct CompletionRequest {
     pub echo: Option<bool>,
     #[serde(default)]
     pub prompt_cache_key: Option<String>,
+    #[serde(flatten)]
+    pub thinking_controls: ThinkingFields,
 }
 
 /// Server-side defaults a request may override.
@@ -525,6 +698,7 @@ pub struct Defaults {
     pub thinking: bool,
     /// Template `reasoning_effort` (`low`, `medium`, `xhigh`) when thinking is on.
     pub reasoning_effort: Option<String>,
+    pub thinking_controls: ThinkingDefaults,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -545,6 +719,10 @@ pub struct Prepared {
     pub include_usage: bool,
     /// The chat prompt ends inside an open `<think>` block.
     pub thinking_open: bool,
+    /// The thinking controls asked for ([`ThinkingSettings::any`] false when
+    /// none). Chat requests only close thinking at a tool call when tools
+    /// were offered: without them the call would come back as text.
+    pub thinking: ThinkingSettings,
     /// Tools the model may call (`None` when none were offered or
     /// `tool_choice` is `none`).
     pub tools: Option<Vec<ToolSchema>>,
@@ -704,6 +882,12 @@ pub fn prepare_chat(
             preserve_thinking = Some(flag);
         }
     }
+    let thinking_fields = match kwargs {
+        Some(kwargs) => {
+            ThinkingFields::from_kwargs(kwargs)?.or(request.thinking_controls.clone())
+        }
+        None => request.thinking_controls.clone(),
+    };
 
     let tool_choice_none = request
         .tool_choice
@@ -818,11 +1002,21 @@ pub fn prepare_chat(
         request.max_completion_tokens.or(request.max_tokens),
         max_seq,
     )?;
+    let sampling = resolve_sampling(&request.sampling, &defaults.sampling)?;
+    let mut thinking = thinking_fields.resolve(
+        &defaults.thinking_controls,
+        defaults.thinking_controls.budget(
+            if enable_thinking { effort.as_deref() } else { None },
+            last_role == "tool",
+        ),
+        sampling.seed,
+    );
+    thinking.tool_call_ends_thinking &= tools.is_some();
     Ok(Prepared {
         kind: Kind::Chat,
         prompt,
         max_tokens: budget.max_tokens,
-        sampling: resolve_sampling(&request.sampling, &defaults.sampling)?,
+        sampling,
         stop_strings: request.stop.map(StringOrVec::into_vec).unwrap_or_default(),
         stream: request.stream,
         include_usage: request
@@ -830,6 +1024,7 @@ pub fn prepare_chat(
             .and_then(|o| o.include_usage)
             .unwrap_or(false),
         thinking_open: enable_thinking,
+        thinking,
         tools,
         cache_key: request.prompt_cache_key,
         clamped_from: budget.clamped_from,
@@ -865,11 +1060,23 @@ pub fn prepare_completion(
     // OpenAI's completions default is 16 tokens.
     let budget =
         resolve_budget(prompt.len(), Some(request.max_tokens.unwrap_or(16)), max_seq)?;
+    let sampling = resolve_sampling(&request.sampling, &defaults.sampling)?;
+    // A raw prompt gets exactly the controls it asks for: the server's
+    // defaults are for chat, and the engine applies them only when the
+    // prompt ends with `<think>\n`.
+    let thinking = request.thinking_controls.resolve(
+        &ThinkingDefaults {
+            grace: defaults.thinking_controls.grace,
+            ..ThinkingDefaults::default()
+        },
+        None,
+        sampling.seed,
+    );
     Ok(Prepared {
         kind: Kind::Completion,
         prompt,
         max_tokens: budget.max_tokens,
-        sampling: resolve_sampling(&request.sampling, &defaults.sampling)?,
+        sampling,
         stop_strings: request.stop.map(StringOrVec::into_vec).unwrap_or_default(),
         stream: request.stream,
         include_usage: request
@@ -877,6 +1084,7 @@ pub fn prepare_completion(
             .and_then(|o| o.include_usage)
             .unwrap_or(false),
         thinking_open: false,
+        thinking,
         tools: None,
         cache_key: request.prompt_cache_key,
         clamped_from: budget.clamped_from,

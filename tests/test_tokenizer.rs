@@ -569,6 +569,7 @@ fn defaults() -> Defaults {
         sampling: SamplingParams::greedy(),
         thinking: true,
         reasoning_effort: None,
+        thinking_controls: Default::default(),
     }
 }
 

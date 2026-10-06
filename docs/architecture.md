@@ -1543,6 +1543,56 @@ and the caches are not trustworthy; disk entries written earlier by a healthy
 queue stay valid. A budget of 3 recoveries per sliding 10-minute window
 bounds the loop; the fourth fault exits 1 for the supervisor.
 
+### Thinking controls
+
+The model sometimes reasons for 8 000 to 14 000 tokens without closing
+its block, and sometimes writes a tool call inside the block and ends the
+turn there, so the client receives only reasoning. Three opt-in controls
+(`src/thinking.rs`; request fields and flags in the README) act while the
+tokens are drawn: a tool call at a line start ends the block
+(`</think>\n\n` inserted in front of it, the shape the template writes
+for a reasoned call, as vLLM's Qwen3 reasoning parser reads it), a budget
+closes the block at the next line end with a short preface (llama.cpp's
+reasoning budget, Qwen's own Qwen3 recipe), and nudges insert firmer
+sentences at fractions of the budget. The output parser treats a
+`<tool_call>` at a line start in the block as its end too, as a safety
+net for text the decode-time rule did not see. None of it exists for a
+request that asks for nothing: no control is made, and the decode is the
+one without them.
+
+`ThinkingControl` is a host state machine that sees every emitted token
+with its text and answers keep, insert before, or insert after. Inserted
+tokens are not drawn, so they cannot ride a speculative step: where the
+control acts, the loop comes to rest as for a decode checkpoint. In the
+speculative loop the verify pass ends at the row in question (the state
+keeps the rows before it, plus the row itself when the insertion follows
+it, through `finish_speculation` without a next step, as at the end of a
+generation), the inserted tokens are emitted and fed as a prefill without
+a draw (which also catches the draft head up), and the head proposes
+afresh from the last of them (`draft_initial`, as after the prefill). A
+sampled `<tool_call>` accepted inside the block is thus fed after the
+`</think>` inserted in front of it, never before. The plain loop and the
+batch scheduler pipeline their steps: a step committed behind the current
+one feeds the current draw before anything could be inserted next to it.
+So they ask the control before they commit ahead
+(`ThinkingControl::may_act_next`: a line start while tool calls end
+thinking, the windows around a nudge or the budget) and decode
+unpipelined there; when the control acts nothing is in flight, the
+inserted tokens are fed at rest (a batch stretch ends for that), and the
+row or loop continues. Rows that share a batched step keep decoding
+plainly; the controls need no single-session fallback. Penalty counts
+cover draws only: inserted tokens are not counted, which a prefill
+without a draw leaves alone.
+
+The session's token list is what the state was fed, inserted tokens
+included, so the cache's bookkeeping and the next turn's prefix lookup
+see them like any generated text. Two costs remain: the inserted texts
+are encoded on their own, so a later turn that re-renders the reasoning
+can tokenize the seam differently and fork the cache a few tokens early,
+and a template that keeps old reasoning (`preserve_thinking`) keeps the
+nudges and prefaces in the history (their variants rotate with the
+request's seed so the same phrase is not repeated turn after turn).
+
 ### Continuous batching
 
 Up to `--max-batch` requests (default 4, the fused small-batch

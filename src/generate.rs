@@ -11,7 +11,15 @@
 //! is due, the loop lets its pipeline drain for one step, so that nothing is
 //! in flight and no speculative step is pending, and hands the caller the
 //! state at rest.
+//!
+//! A generation can carry thinking controls ([`crate::thinking`]): tokens
+//! the control inserts are emitted and fed like drawn ones. Where it acts,
+//! the loop comes to rest as for a checkpoint (nothing in flight, no
+//! speculative step pending), feeds what was inserted the way a prompt is
+//! fed ([`LanguageModel::prefill`]), and carries on from the last inserted
+//! token, re-proposing with the draft head as after the prefill.
 
+use std::cell::RefCell;
 use std::path::Path;
 
 use anyhow::{Result, ensure};
@@ -22,6 +30,7 @@ use crate::kernels::sample::SamplingParams;
 use std::time::Instant;
 
 use crate::metal::{EncodedPass, MetalContext, Pacer, PendingPass};
+use crate::thinking::{Action, ThinkingControl};
 pub use crate::tokenizer::Thinking;
 use crate::tokenizer::Tokenizer;
 
@@ -60,6 +69,126 @@ pub struct GenerateOptions<'a> {
     /// Draft tokens per speculative step (capped by the model; `0` decodes
     /// one token per step).
     pub drafts: usize,
+    /// The request's thinking controls; `None` decodes exactly as without
+    /// them. Behind a `RefCell` because the control outlives one loop: a
+    /// batch row moves between the single-session loop and batched steps
+    /// with the same control.
+    pub thinking: Option<&'a RefCell<ThinkingControl>>,
+}
+
+/// A generation's thinking control with the tokenizer that gives it the
+/// text of each token.
+pub struct ThinkingHook<'a> {
+    pub control: &'a RefCell<ThinkingControl>,
+    pub tokenizer: &'a Tokenizer,
+}
+
+impl ThinkingHook<'_> {
+    /// [`ThinkingControl::decide`] on `token` as it is about to be emitted.
+    pub fn decide(&self, token: u32) -> Result<Action> {
+        // Once the block is closed nothing acts: no decode per token.
+        if !self.control.borrow().is_open() {
+            return Ok(Action::Keep);
+        }
+        let text = self.tokenizer.decode(&[token], false)?;
+        Ok(self.control.borrow_mut().decide(token, &text))
+    }
+
+    /// [`ThinkingControl::may_act_next`].
+    pub fn may_act_next(&self) -> bool {
+        self.control.borrow().may_act_next()
+    }
+}
+
+/// Pushes `group`, tokens the thinking control inserted (with, for a close
+/// in front of a draw, that draw last), delivering each. A group is emitted
+/// whole: a callback that asks to stop (a stop string, a departed client,
+/// the batch scheduler's preemption, which resumes the request later) ends
+/// the generation after the group, never inside it, so a resumed request
+/// never finds half a close. Only `max_tokens` cuts it short. Returns why
+/// the generation ends there, if it does.
+pub fn push_group(
+    tokens: &mut Vec<u32>,
+    group: &[u32],
+    max_tokens: usize,
+    on_token: &mut dyn FnMut(u32) -> Result<bool>,
+) -> Result<Option<FinishReason>> {
+    let mut finish = None;
+    for &token in group {
+        if tokens.len() >= max_tokens {
+            break;
+        }
+        tokens.push(token);
+        if !on_token(token)? {
+            finish.get_or_insert(FinishReason::Callback);
+        }
+    }
+    if tokens.len() >= max_tokens {
+        finish.get_or_insert(FinishReason::Length);
+    }
+    Ok(finish)
+}
+
+/// Emits `drawn`, a draw the thinking control acted on (`action` is not
+/// [`Action::Keep`]), with what the control inserts: the close and then the
+/// draw ([`Action::Before`]), or the draw and then the close
+/// ([`Action::After`]). Returns why the generation ends, if it does.
+pub fn emit_acted(
+    action: Action,
+    drawn: u32,
+    tokens: &mut Vec<u32>,
+    max_tokens: usize,
+    on_token: &mut dyn FnMut(u32) -> Result<bool>,
+) -> Result<Option<FinishReason>> {
+    match action {
+        Action::Keep => anyhow::bail!("emit_acted with nothing to insert"),
+        Action::Before(mut group) => {
+            group.push(drawn);
+            push_group(tokens, &group, max_tokens, on_token)
+        }
+        Action::After(group) => {
+            tokens.push(drawn);
+            let stop = !on_token(drawn)?;
+            let rest = push_group(tokens, &group, max_tokens, on_token)?;
+            Ok(if stop { Some(FinishReason::Callback) } else { rest })
+        }
+    }
+}
+
+/// Feeds the tokens of `tokens` the state has not fed yet, all but the last
+/// (the next step's input), as a prefill without a draw; `base` is the
+/// state's position of `tokens[0]`. The state must be at rest. This is how
+/// inserted tokens reach the state: exactly as a prompt's would, the draft
+/// head's caches included, so the head can propose from the last one
+/// ([`LanguageModel::draft_initial`]) as it does after the prefill.
+pub fn feed_inserted<M: LanguageModel>(
+    ctx: &MetalContext,
+    model: &M,
+    state: &mut M::State,
+    scratch: &mut M::Scratch,
+    tokens: &[u32],
+    base: usize,
+) -> Result<()> {
+    let fed = state
+        .pos()
+        .checked_sub(base)
+        .ok_or_else(|| anyhow::anyhow!("decode state behind its generation"))?;
+    let rest = tokens.len().saturating_sub(1);
+    ensure!(
+        fed <= rest,
+        "decode state fed {fed} of {} generated tokens before an insertion",
+        tokens.len()
+    );
+    if fed < rest {
+        model.prefill(ctx, state, scratch, &tokens[fed..rest], None)?;
+    }
+    ensure!(
+        state.pos() == base + rest,
+        "inserted tokens left the state at {} instead of {}",
+        state.pos(),
+        base + rest
+    );
+    Ok(())
 }
 
 /// Recurrent-state checkpoints taken during a generation (the session
@@ -121,7 +250,7 @@ pub fn speculate<M: LanguageModel>(
 ) -> Result<Speculated> {
     speculate_checkpointed(
         ctx, model, state, scratch, params, drafts, max_tokens, tokens, is_stop, None,
-        on_token,
+        None, on_token,
     )
 }
 
@@ -134,6 +263,15 @@ pub fn speculate<M: LanguageModel>(
 /// tokens are the trunk's draws either way; only the proposals after the
 /// restart can differ, which under sampling changes which draws a seed
 /// realises, not their distribution.
+///
+/// With a thinking control, every confirmed row's token is put to it before
+/// it is emitted. Where the control acts at row `j`, the step ends there as
+/// a generation would (the state keeps the rows before `j`, and row `j`'s
+/// token stays the unfed last one when the insertion follows it), the
+/// inserted tokens are emitted and fed ([`feed_inserted`]), and the head
+/// proposes afresh from the last of them, as after a checkpoint. A sampled
+/// `<tool_call>` the control closes thinking in front of is thus fed after
+/// the close, never before it.
 #[allow(clippy::too_many_arguments)]
 fn speculate_checkpointed<M: LanguageModel>(
     ctx: &MetalContext,
@@ -146,6 +284,7 @@ fn speculate_checkpointed<M: LanguageModel>(
     tokens: &mut Vec<u32>,
     is_stop: &dyn Fn(u32) -> bool,
     mut checkpoints: Option<&mut dyn DecodeCheckpointer<M::State>>,
+    thinking: Option<&ThinkingHook<'_>>,
     on_token: &mut dyn FnMut(u32) -> Result<bool>,
 ) -> Result<Speculated> {
     let k = drafts.min(model.max_drafts()).max(1);
@@ -188,8 +327,22 @@ fn speculate_checkpointed<M: LanguageModel>(
         // does not (or the row after the last draft) supplies the fresh token.
         let mut kept = 0usize;
         let mut finish = None;
+        // Tokens the thinking control inserts where the step ends.
+        let mut group: Option<Vec<u32>> = None;
         let callbacks_began = std::time::Instant::now();
         for (j, &token) in sampled.iter().enumerate() {
+            let action = match thinking {
+                Some(hook) if !is_stop(token) => hook.decide(token)?,
+                _ => Action::Keep,
+            };
+            if let Action::Before(mut close) = action {
+                // The state keeps the rows before this one; the token is
+                // emitted, and fed, after the close.
+                close.push(token);
+                group = Some(close);
+                kept = j;
+                break;
+            }
             tokens.push(token);
             if is_stop(token) {
                 finish = Some(FinishReason::StopToken);
@@ -199,6 +352,14 @@ fn speculate_checkpointed<M: LanguageModel>(
                 finish = Some(FinishReason::Length);
             }
             kept = j;
+            if let Action::After(close) = action {
+                // Emitted whole even when the callback asked to stop (see
+                // `push_group`); only the length leaves no room for it.
+                if finish != Some(FinishReason::Length) {
+                    group = Some(close);
+                }
+                break;
+            }
             if finish.is_some() || j >= proposals.len() || proposals[j] != token {
                 break;
             }
@@ -211,6 +372,34 @@ fn speculate_checkpointed<M: LanguageModel>(
                 callbacks_began.elapsed().as_secs_f64() * 1e3,
                 kept + 1
             );
+        }
+        if let Some(group) = group {
+            // At rest with the kept rows fed, as at the end of a generation.
+            model.finish_speculation(ctx, state, scratch, kept, None, draft)?;
+            if let Some(end) = push_group(tokens, &group, max_tokens, on_token)? {
+                finish.get_or_insert(end);
+            }
+            feed_inserted(ctx, model, state, scratch, tokens, base)?;
+            if let Some(finish) = finish {
+                return Ok(Speculated { finish, drafted, accepted });
+            }
+            if let Some(c) = checkpoints.as_mut()
+                && c.due(state.pos())
+            {
+                c.take(ctx, &*state)?;
+            }
+            let last = *tokens.last().expect("an inserted group is never empty");
+            proposals = model.draft_initial(
+                ctx,
+                state,
+                scratch,
+                last,
+                k,
+                params,
+                tokens.len(),
+            )?;
+            // Nothing is parked: `verify` encodes and commits the next pass.
+            continue;
         }
         match finish {
             Some(finish) => {
@@ -305,6 +494,16 @@ impl Generator {
         self.stop_tokens.contains(&token) || options.stop_tokens.contains(&token)
     }
 
+    /// The thinking control of `options` with this tokenizer, if it has one.
+    pub fn thinking_hook<'a>(
+        &'a self,
+        options: &GenerateOptions<'a>,
+    ) -> Option<ThinkingHook<'a>> {
+        options
+            .thinking
+            .map(|control| ThinkingHook { control, tokenizer: &self.tokenizer })
+    }
+
     /// The start of a request: clears the per-request sampler state, feeds
     /// `prompt_ids` (the not yet cached suffix) and returns the first draw
     /// (draw 0 of the request, not fed). What [`Self::generate`] does before
@@ -371,28 +570,55 @@ impl Generator {
             self.begin(ctx, model, state, scratch, prompt_ids, options.sampling)?;
 
         let mut tokens = Vec::with_capacity(options.max_tokens.min(4096));
-        tokens.push(first);
-        let mut finish = FinishReason::Length;
         let (mut drafted, mut accepted) = (0usize, 0usize);
-        if self.is_stop(first, options) {
-            finish = FinishReason::StopToken;
-        } else if !on_token(first)? {
-            finish = FinishReason::Callback;
-        } else if tokens.len() < options.max_tokens {
-            let resumed = self.resume(
+        let action = match self.thinking_hook(options) {
+            Some(hook) if !self.is_stop(first, options) => hook.decide(first)?,
+            _ => Action::Keep,
+        };
+        let end = if action == Action::Keep {
+            tokens.push(first);
+            if self.is_stop(first, options) {
+                Some(FinishReason::StopToken)
+            } else if !on_token(first)? {
+                Some(FinishReason::Callback)
+            } else if tokens.len() >= options.max_tokens {
+                Some(FinishReason::Length)
+            } else {
+                None
+            }
+        } else {
+            // Thinking ends at the prefill's draw (a tool call right after
+            // the generation prompt's `<think>\n`, or a budget of 1).
+            let end =
+                emit_acted(action, first, &mut tokens, options.max_tokens, on_token)?;
+            feed_inserted(
                 ctx,
                 model,
                 state,
                 scratch,
-                &mut tokens,
-                options,
-                checkpoints,
-                on_token,
+                &tokens,
+                pos_before + prompt_ids.len(),
             )?;
-            finish = resumed.finish;
-            drafted = resumed.drafted;
-            accepted = resumed.accepted;
-        }
+            end
+        };
+        let finish = match end {
+            Some(end) => end,
+            None => {
+                let resumed = self.resume(
+                    ctx,
+                    model,
+                    state,
+                    scratch,
+                    &mut tokens,
+                    options,
+                    checkpoints,
+                    on_token,
+                )?;
+                drafted = resumed.drafted;
+                accepted = resumed.accepted;
+                resumed.finish
+            }
+        };
         let fed = state
             .pos()
             .checked_sub(pos_before)
@@ -437,6 +663,7 @@ impl Generator {
                 parked_draw: None,
             });
         }
+        let hook = self.thinking_hook(options);
         if options.drafts > 0 && model.max_drafts() > 0 {
             let is_stop = |t: u32| self.is_stop(t, options);
             let outcome = speculate_checkpointed(
@@ -450,6 +677,7 @@ impl Generator {
                 tokens,
                 &is_stop,
                 checkpoints,
+                hook.as_ref(),
                 on_token,
             )?;
             Ok(Resumed {
@@ -459,27 +687,48 @@ impl Generator {
                 parked_draw: None,
             })
         } else {
-            // The loop's first step reads its input from slot 0, where the
-            // prefill's draw left it; anything since (another request's
-            // prefill, batched steps) may have overwritten it. The GPU is
-            // idle here. After a prefill this rewrites the value it holds.
-            let last = *tokens.last().expect("checked above");
-            scratch
-                .next_token()
-                .view(0, &[1])?
-                .write_bytes(bytemuck::cast_slice(&[last]))?;
+            // The state's position of `tokens[0]`: it holds all but the last.
+            let base =
+                (state.pos() + 1).checked_sub(tokens.len()).ok_or_else(|| {
+                    anyhow::anyhow!("decoding from a state behind its draws")
+                })?;
+            let mut checkpoints = checkpoints;
             let mut parked_draw = None;
-            let finish = self.decode_loop(
-                ctx,
-                model,
-                state,
-                scratch,
-                options,
-                tokens,
-                checkpoints,
-                on_token,
-                &mut parked_draw,
-            )?;
+            let finish = loop {
+                // The loop's first step reads its input from slot 0, where
+                // the prefill's draw left it; anything since (another
+                // request's prefill, batched steps, an insertion's prefill)
+                // may have overwritten it. The GPU is idle here. After a
+                // prefill with a draw this rewrites the value it holds.
+                let last = *tokens.last().expect("checked above");
+                scratch
+                    .next_token()
+                    .view(0, &[1])?
+                    .write_bytes(bytemuck::cast_slice(&[last]))?;
+                let exit = self.decode_loop(
+                    ctx,
+                    model,
+                    state,
+                    scratch,
+                    options,
+                    tokens,
+                    checkpoints
+                        .as_mut()
+                        .map(|c| &mut **c as &mut dyn DecodeCheckpointer<M::State>),
+                    hook.as_ref(),
+                    on_token,
+                    &mut parked_draw,
+                )?;
+                match exit {
+                    LoopExit::Finished(finish) => break finish,
+                    LoopExit::Inserted(end) => {
+                        feed_inserted(ctx, model, state, scratch, tokens, base)?;
+                        if let Some(finish) = end {
+                            break finish;
+                        }
+                    }
+                }
+            };
             Ok(Resumed { finish, drafted: 0, accepted: 0, parked_draw })
         }
     }
@@ -500,6 +749,13 @@ impl Generator {
     /// leaves the state at, the following step is not encoded ahead: once
     /// the current step completes nothing is in flight, and the top of the
     /// loop takes the checkpoint before it encodes the next step unparked.
+    ///
+    /// Likewise when the thinking control may act on the current step's
+    /// draw ([`ThinkingHook::may_act_next`]): a step committed behind it
+    /// would feed the draw before anything the control inserts. When the
+    /// control acts, the loop emits the draw and the inserted tokens and
+    /// returns [`LoopExit::Inserted`] with nothing in flight, for the caller
+    /// to feed them and come back.
     #[allow(clippy::too_many_arguments)]
     fn decode_loop<M: LanguageModel>(
         &self,
@@ -510,9 +766,10 @@ impl Generator {
         options: &GenerateOptions<'_>,
         tokens: &mut Vec<u32>,
         mut checkpoints: Option<&mut dyn DecodeCheckpointer<M::State>>,
+        thinking: Option<&ThinkingHook<'_>>,
         on_token: &mut dyn FnMut(u32) -> Result<bool>,
         parked_draw: &mut Option<u32>,
-    ) -> Result<FinishReason> {
+    ) -> Result<LoopExit> {
         let params = options.sampling;
         let is_stop =
             |t: u32| self.stop_tokens.contains(&t) || options.stop_tokens.contains(&t);
@@ -599,7 +856,8 @@ impl Generator {
             // hundred tokens below a capacity step hit this every time;
             // skipping the pipelining for one step there costs nothing.
             let pos = state.pos();
-            let rest_due = checkpoints.as_mut().is_some_and(|c| c.due(pos));
+            let rest_due = checkpoints.as_mut().is_some_and(|c| c.due(pos))
+                || thinking.is_some_and(ThinkingHook::may_act_next);
             if tokens.len() + 1 < options.max_tokens
                 && state.pos() + 1 < state.capacity()
                 && !rest_due
@@ -636,6 +894,25 @@ impl Generator {
             }
             slot_in = 1 - slot_in;
             let drawn = read_slot(slot_in)?;
+            if let Some(hook) = thinking
+                && !is_stop(drawn)
+            {
+                let action = hook.decide(drawn)?;
+                if action != Action::Keep {
+                    ensure!(
+                        parked.is_none() && ahead.is_none(),
+                        "the thinking control acted with a step committed ahead"
+                    );
+                    let end = emit_acted(
+                        action,
+                        drawn,
+                        tokens,
+                        options.max_tokens,
+                        on_token,
+                    )?;
+                    return Ok(LoopExit::Inserted(end));
+                }
+            }
             tokens.push(drawn);
             let finish = if is_stop(drawn) {
                 Some(FinishReason::StopToken)
@@ -658,11 +935,20 @@ impl Generator {
                     // generation later takes it as its next draw.
                     *parked_draw = Some(read_slot(1 - slot_in)?);
                 }
-                return Ok(finish);
+                return Ok(LoopExit::Finished(finish));
             }
         }
-        Ok(FinishReason::Length)
+        Ok(LoopExit::Finished(FinishReason::Length))
     }
+}
+
+/// How [`Generator::decode_loop`] returned.
+enum LoopExit {
+    Finished(FinishReason),
+    /// The thinking control acted: the draw and the inserted tokens were
+    /// emitted, the state is at rest without them, and the generation ends
+    /// once they are fed when this says why.
+    Inserted(Option<FinishReason>),
 }
 
 /// Releases a parked decode step when the loop exits early (an error), so

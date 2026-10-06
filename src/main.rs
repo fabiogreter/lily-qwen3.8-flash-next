@@ -6,6 +6,7 @@ use anyhow::{Context as _, Result};
 use clap::Parser;
 use lily::engine::VisionMode;
 use lily::qwen4exp::NgramStorage;
+use lily::serve::api::{ThinkingBudgets, ThinkingDefaults};
 use lily::serve::{SamplingOverrides, ServeOptions, parse_duration_secs};
 
 #[derive(Parser)]
@@ -170,6 +171,40 @@ struct Cli {
     #[arg(long)]
     reasoning_effort: Option<String>,
 
+    /// Default thinking budget of chat requests, by the template's reasoning
+    /// effort: `low=4000,medium=8000,xhigh=16000` (`high` is `xhigh`), or
+    /// one number for all. Once the reasoning block holds that many tokens
+    /// it is closed at the next line end, with a short transition text.
+    /// Unset: no budget. A request's `thinking_budget` overrides it.
+    #[arg(long)]
+    thinking_budget: Option<String>,
+
+    /// Scales the default budget of a turn whose last message is a tool
+    /// result.
+    #[arg(long, default_value_t = 1.0)]
+    thinking_budget_tool_turn_factor: f64,
+
+    /// Tokens the budget's close (and a nudge) waits for a line end, then
+    /// as long again for a sentence end, before it is forced.
+    #[arg(long, default_value_t = lily::thinking::DEFAULT_GRACE)]
+    thinking_budget_grace: usize,
+
+    /// Insert graded nudges into the reasoning at 50, 75 and 90 % of the
+    /// budget by default (request field `thinking_nudges`).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    thinking_nudges: bool,
+
+    /// A `<tool_call>` at a line start inside the reasoning block ends the
+    /// block (`</think>` is inserted before it) by default, for chat
+    /// requests with tools (request field `tool_call_ends_thinking`).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    tool_call_ends_thinking: bool,
+
+    /// JSON file replacing the texts the thinking controls insert:
+    /// `{"close": ["..."], "nudges": [{"at": 0.5, "texts": ["..."]}]}`.
+    #[arg(long)]
+    thinking_texts: Option<PathBuf>,
+
     /// Requests waiting for the engine before new ones get 503.
     #[arg(long, default_value_t = 32)]
     queue: usize,
@@ -258,6 +293,26 @@ fn run() -> Result<()> {
         image_min_pixels: cli.image_min_pixels,
         thinking: cli.thinking,
         reasoning_effort: cli.reasoning_effort,
+        thinking_controls: ThinkingDefaults {
+            budgets: cli
+                .thinking_budget
+                .as_deref()
+                .map(ThinkingBudgets::parse)
+                .transpose()?
+                .unwrap_or_default(),
+            tool_turn_factor: {
+                let f = cli.thinking_budget_tool_turn_factor;
+                anyhow::ensure!(
+                    f.is_finite() && f > 0.0,
+                    "--thinking-budget-tool-turn-factor must be a positive number"
+                );
+                f
+            },
+            nudges: cli.thinking_nudges,
+            tool_call_ends_thinking: cli.tool_call_ends_thinking,
+            grace: cli.thinking_budget_grace,
+        },
+        thinking_texts: cli.thinking_texts,
         queue: cli.queue,
         max_batch: cli.max_batch,
         sampling: SamplingOverrides {

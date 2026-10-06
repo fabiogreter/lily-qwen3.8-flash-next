@@ -34,6 +34,11 @@ pub struct ParserConfig {
     pub stop_strings: Vec<String>,
     /// Raw text completions: no reasoning or tool parsing at all.
     pub raw: bool,
+    /// A `<tool_call>` at a line start inside the reasoning block ends the
+    /// block (with tools offered), as vLLM's Qwen3 reasoning parser has it:
+    /// the safety net behind the decode-time rule
+    /// ([`crate::thinking`]), which normally inserts the `</think>` first.
+    pub tool_call_ends_thinking: bool,
 }
 
 pub struct OutputParser<D: FnMut(&[u32]) -> Result<String>> {
@@ -53,8 +58,13 @@ pub struct OutputParser<D: FnMut(&[u32]) -> Result<String>> {
     phase_started: bool,
     tool_calls_emitted: usize,
     /// Tokens pushed while the reasoning block was open, the closing
-    /// `</think>` included: what `reasoning_content` was generated from.
+    /// `</think>` (or the `<tool_call>` that ended it) included: what
+    /// `reasoning_content` was generated from.
     reasoning_tokens: usize,
+    tool_call_ends_thinking: bool,
+    /// The reasoning text released so far ends a line (or none was): a
+    /// `<tool_call>` at the start of the held text is at a line start.
+    reasoning_line_start: bool,
 }
 
 impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
@@ -76,7 +86,24 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
             phase_started: false,
             tool_calls_emitted: 0,
             reasoning_tokens: 0,
+            tool_call_ends_thinking: config.tool_call_ends_thinking,
+            reasoning_line_start: true,
         }
+    }
+
+    /// Where a `<tool_call>` at a line start ends the reasoning in `buf`,
+    /// when that rule is on and tools were offered.
+    fn tool_call_in_reasoning(&self) -> Option<usize> {
+        if !self.tool_call_ends_thinking || self.tools.is_none() {
+            return None;
+        }
+        self.buf.match_indices(TOOL_START).map(|(i, _)| i).find(|&i| {
+            if i == 0 {
+                self.reasoning_line_start
+            } else {
+                self.buf[..i].ends_with('\n')
+            }
+        })
     }
 
     pub fn tool_calls_emitted(&self) -> usize {
@@ -132,7 +159,25 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
         loop {
             match self.phase {
                 Phase::Reasoning => {
-                    if let Some(idx) = self.buf.find(THINK_END) {
+                    let think_end = self.buf.find(THINK_END);
+                    if let Some(idx) = self.tool_call_in_reasoning()
+                        && think_end.is_none_or(|end| idx < end)
+                    {
+                        // The call ends the block: the text before it is
+                        // reasoning, the call itself content (parsed there).
+                        let reasoning = self.buf[..idx].to_string();
+                        let rest = self.buf[idx..].to_string();
+                        self.emit_text(
+                            &mut events,
+                            reasoning.trim_end_matches('\n'),
+                            Phase::Reasoning,
+                        );
+                        self.phase = Phase::Content;
+                        self.phase_started = false;
+                        self.buf = rest;
+                        continue;
+                    }
+                    if let Some(idx) = think_end {
                         let reasoning = self.buf[..idx].to_string();
                         let rest = self.buf[idx + THINK_END.len()..].to_string();
                         self.emit_text(
@@ -150,11 +195,21 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
                     let hold = if final_flush {
                         0
                     } else {
+                        let tool_hold =
+                            if self.tool_call_ends_thinking && self.tools.is_some() {
+                                partial_suffix_len(&self.buf, TOOL_START)
+                            } else {
+                                0
+                            };
                         partial_suffix_len(&self.buf, THINK_END)
+                            .max(tool_hold)
                             .max(trailing_newlines(&self.buf))
                     };
                     let release = self.buf.len() - hold;
                     let out: String = self.buf.drain(..release).collect();
+                    if !out.is_empty() {
+                        self.reasoning_line_start = out.ends_with('\n');
+                    }
                     self.emit_text(&mut events, &out, Phase::Reasoning);
                     if final_flush && !self.buf.is_empty() {
                         let rest = std::mem::take(&mut self.buf);

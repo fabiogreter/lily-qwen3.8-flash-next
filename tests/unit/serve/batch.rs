@@ -76,7 +76,13 @@ fn the_log_group_says_what_was_shared_and_nothing_for_a_lone_request() {
 /// A row well inside its caches, nothing due, not ending: the next step
 /// may park behind the current one as far as this row is concerned.
 fn going_on(pos: usize) -> RowAhead {
-    RowAhead { pos, capacity: 8192, checkpoint_due: false, ending: false }
+    RowAhead {
+        pos,
+        capacity: 8192,
+        checkpoint_due: false,
+        ending: false,
+        may_insert: false,
+    }
 }
 
 #[test]
@@ -104,6 +110,11 @@ fn any_row_that_needs_the_rest_position_keeps_the_next_step_unparked() {
     assert!(!park_next(&[going_on(100), due], true, false, false), "checkpoint due");
     let ending = RowAhead { ending: true, ..going_on(100) };
     assert!(!park_next(&[ending, going_on(200)], true, false, false), "row ends");
+    let inserting = RowAhead { may_insert: true, ..going_on(300) };
+    assert!(
+        !park_next(&[going_on(100), inserting], true, false, false),
+        "a thinking control may insert after or before this draw"
+    );
 }
 
 #[test]

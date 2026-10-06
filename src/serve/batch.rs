@@ -51,8 +51,12 @@ use super::{Cmd, Engine, EngineQueue, Job, Sink};
 use crate::engine::{
     BatchRow, CountsSlot, DecodeStateApi, Draw, LanguageModel, RowsInFlight,
 };
-use crate::generate::{DecodeCheckpointer, FinishReason, GenerateOptions, Generator};
+use crate::generate::{
+    DecodeCheckpointer, FinishReason, GenerateOptions, Generator, ThinkingHook,
+    emit_acted,
+};
 use crate::qwen4exp::VisionInput;
+use crate::thinking::Action;
 
 /// Batched decode steps of the running rows between two prefill chunks of a
 /// request being admitted. A chunk is a 1.6 to 1.8 s pass the rows cannot
@@ -148,6 +152,10 @@ pub(super) struct RowAhead {
     /// The committed step's draw will end the row whatever it is: it is the
     /// row's `max_tokens`-th, or the client has left.
     pub(super) ending: bool,
+    /// The row's thinking control may act on the committed step's draw
+    /// (insert tokens in front of it or after it), which a parked step
+    /// feeding that draw would get ahead of.
+    pub(super) may_insert: bool,
 }
 
 /// Whether to commit the next batched step parked behind the one just
@@ -157,7 +165,9 @@ pub(super) struct RowAhead {
 /// job could be admitted next (`admission`; its prefill needs the GPU and
 /// the batched scratch), when the server's shutdown grace is over
 /// (`cancel`: every row ends on this step's draw), or when any row ends on
-/// this step's draw, has a decode checkpoint due where this step leaves it
+/// this step's draw, may have its thinking control insert tokens at it (to
+/// be fed at rest before the row's next step), has a decode checkpoint due
+/// where this step leaves it
 /// (taken at rest, with nothing in flight), or would need its caches grown
 /// for the step after the parked one (which cannot happen with a pass in
 /// flight; `pos + 1 < capacity`, as the decode loop checks). A row that
@@ -172,7 +182,9 @@ pub(super) fn park_next(
     another_step
         && !admission
         && !cancel
-        && rows.iter().all(|r| !r.checkpoint_due && !r.ending && r.pos + 1 < r.capacity)
+        && rows.iter().all(|r| {
+            !r.checkpoint_due && !r.ending && !r.may_insert && r.pos + 1 < r.capacity
+        })
 }
 
 /// How one request shared the GPU with others, for its timings and log line.
@@ -293,6 +305,9 @@ struct Row<'g, M: LanguageModel> {
     accepted: usize,
     stats: BatchStats,
     finish: Option<FinishReason>,
+    /// The row's thinking control inserted tokens with its last draw that
+    /// the state has not fed yet ([`feed_inserted_rows`]).
+    inserted: bool,
 }
 
 impl<M: LanguageModel> Row<'_, M> {
@@ -300,14 +315,41 @@ impl<M: LanguageModel> Row<'_, M> {
     /// token ends the row undelivered; otherwise the parser gets it, and a
     /// stop string, a departed client, the end of the shutdown grace or
     /// `max_tokens` end it).
+    ///
+    /// When the row's thinking control acts on the draw, the tokens it
+    /// inserts are emitted with it, whole ([`push_group`]), and the state
+    /// is left behind them: the caller feeds them at rest
+    /// ([`Admitted::feed_inserted`]). A stretch never has a step committed
+    /// ahead of a draw the control may act on (see [`RowAhead::may_insert`]).
     fn take_draw(
         &mut self,
         token: u32,
         generator: &Generator,
         shutdown_cancel: bool,
     ) -> Result<()> {
+        let stop = generator.stop_tokens().contains(&token);
+        let action = match &self.req.thinking {
+            Some(control) if !stop => {
+                ThinkingHook { control, tokenizer: generator.tokenizer() }
+                    .decide(token)?
+            }
+            _ => Action::Keep,
+        };
+        if action != Action::Keep {
+            let Row { req: Admitted { parser, out, p, .. }, sink, generated, .. } =
+                self;
+            let mut deliver = |t: u32| -> Result<bool> {
+                let events = parser.push(t)?;
+                out.deliver(events, sink);
+                Ok(!(sink.cancelled() || parser.stopped || shutdown_cancel))
+            };
+            self.finish =
+                emit_acted(action, token, generated, p.max_tokens, &mut deliver)?;
+            self.inserted = true;
+            return Ok(());
+        }
         self.generated.push(token);
-        if generator.stop_tokens().contains(&token) {
+        if stop {
             self.finish = Some(FinishReason::StopToken);
             return Ok(());
         }
@@ -319,6 +361,25 @@ impl<M: LanguageModel> Row<'_, M> {
             self.finish = Some(FinishReason::Length);
         }
         Ok(())
+    }
+
+    /// Feeds what the row's thinking control inserted, if anything is
+    /// pending ([`Admitted::feed_inserted`]); the state must be at rest.
+    fn feed_inserted(
+        &mut self,
+        ctx: &crate::metal::MetalContext,
+        model: &M,
+        scratch: &mut M::Scratch,
+    ) -> Result<()> {
+        if std::mem::take(&mut self.inserted) {
+            self.req.feed_inserted(ctx, model, scratch, &self.generated)?;
+        }
+        Ok(())
+    }
+
+    /// Whether the row's thinking control may act on its next draw.
+    fn may_insert(&self) -> bool {
+        self.req.thinking.as_ref().is_some_and(|c| c.borrow().may_act_next())
     }
 }
 
@@ -373,6 +434,24 @@ fn take_due_checkpoints<M: LanguageModel>(
         if row.finish.is_none() && row.req.decode_checkpoints.due(pos) {
             row.req.decode_checkpoints.take(ctx, &row.req.session.state)?;
         }
+    }
+    Ok(())
+}
+
+/// At rest between steps (nothing in flight): feeds the tokens a thinking
+/// control inserted for a row (`Row::inserted`), so the row again holds
+/// every token but its last, as its next step expects. A prefill on the
+/// engine's scratch, like an admission's chunk between stretches; the row's
+/// penalty counts stay in its batch slot (a prefill without a draw does not
+/// touch them).
+fn feed_inserted_rows<M: LanguageModel>(
+    ctx: &crate::metal::MetalContext,
+    model: &M,
+    scratch: &mut M::Scratch,
+    rows: &mut [Row<'_, M>],
+) -> Result<()> {
+    for row in rows.iter_mut() {
+        row.feed_inserted(ctx, model, scratch)?;
     }
     Ok(())
 }
@@ -635,21 +714,25 @@ impl<M: LanguageModel> Engine<M> {
             CountsSlot::Batch(row.slot),
             CountsSlot::Engine,
         )?;
-        let options = GenerateOptions {
-            max_tokens: row.req.p.max_tokens,
-            sampling: &row.req.p.sampling,
-            stop_tokens: &[],
-            drafts: *drafts,
-        };
         let before = row.generated.len();
         let mut preempted = false;
         let resumed = {
             let Row {
-                req: Admitted { parser, out, session, decode_checkpoints, .. },
+                req:
+                    Admitted {
+                        p, parser, out, session, decode_checkpoints, thinking, ..
+                    },
                 sink,
                 generated,
                 ..
             } = row;
+            let options = GenerateOptions {
+                max_tokens: p.max_tokens,
+                sampling: &p.sampling,
+                stop_tokens: &[],
+                drafts: *drafts,
+                thinking: thinking.as_ref(),
+            };
             let mut on_token = |token: u32| -> Result<bool> {
                 let events = parser.push(token)?;
                 out.deliver(events, sink);
@@ -681,7 +764,12 @@ impl<M: LanguageModel> Engine<M> {
             match resumed.parked_draw {
                 // The parked step fed the last draw and drew the next one:
                 // that is the row's next draw, as the loop would have used it.
-                Some(token) => row.take_draw(token, generator, shutdown.cancel())?,
+                // A thinking control may act on it: what it inserts is fed
+                // here, where the state is at rest.
+                Some(token) => {
+                    row.take_draw(token, generator, shutdown.cancel())?;
+                    row.feed_inserted(ctx, model, scratch)?;
+                }
                 None if row.generated.len() >= row.req.p.max_tokens => {
                     row.finish = Some(FinishReason::Length)
                 }
@@ -809,6 +897,7 @@ impl<M: LanguageModel> Engine<M> {
                             checkpoint_due: row.req.decode_checkpoints.due(pos),
                             ending: row.generated.len() + 1 >= row.req.p.max_tokens
                                 || row.sink.cancelled(),
+                            may_insert: row.may_insert(),
                         }
                     })
                     .collect();
@@ -826,6 +915,14 @@ impl<M: LanguageModel> Engine<M> {
             let (draws, _) = model.finish_rows(scratch, current)?;
             take_draws(rows, &draws, &members, generator, shutdown.cancel())?;
             let finished = rows.iter().any(|r| r.finish.is_some());
+            // A row whose thinking control inserted tokens holds them unfed:
+            // the stretch ends here and they are fed at rest, before the
+            // row's next step. Nothing is parked then (`park_next`).
+            let inserted = rows.iter().any(|r| r.inserted);
+            ensure!(
+                !(inserted && parked.is_some()),
+                "a thinking control inserted tokens with a batched step parked"
+            );
             match parked.take() {
                 // Parked: nothing was due where this step left the rows, and
                 // the parked step is the next one.
@@ -850,12 +947,16 @@ impl<M: LanguageModel> Engine<M> {
                             row.take_draw(token, generator, cancel)?;
                         }
                     }
+                    // The drained step's draws were not foreseen: a control
+                    // may have acted on one. Nothing is in flight now.
+                    feed_inserted_rows(ctx, model, scratch, rows)?;
                     take_due_checkpoints(ctx, rows)?;
                     return Ok(steps);
                 }
                 None => {
+                    feed_inserted_rows(ctx, model, scratch, rows)?;
                     take_due_checkpoints(ctx, rows)?;
-                    if finished || steps >= max_steps || admission() {
+                    if finished || inserted || steps >= max_steps || admission() {
                         return Ok(steps);
                     }
                 }
@@ -961,8 +1062,14 @@ impl<M: LanguageModel> Engine<M> {
             accepted: 0,
             stats,
             finish: None,
+            inserted: false,
         };
-        let mut taken = row.take_draw(first, generator, self.shutdown.cancel());
+        // The first draw may be where thinking ends (see
+        // `Generator::generate_checkpointed`): what is inserted is fed here.
+        let mut taken =
+            row.take_draw(first, generator, self.shutdown.cancel()).and_then(|()| {
+                row.feed_inserted(&self.ctx, &self.model, &mut self.scratch)
+            });
         if taken.is_ok() && row.finish.is_none() {
             taken = self.model.move_sampler_counts(
                 &self.ctx,

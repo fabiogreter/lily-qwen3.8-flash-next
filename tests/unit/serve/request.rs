@@ -397,6 +397,7 @@ fn an_answers_timings_are_what_both_paths_measured_before() {
             cancelled_by: by,
             cancelled_at: None,
             batch: batch.as_ref(),
+            thinking: None,
         };
         let now = timings(&f, &outcome, &RELEASED, end, vm_end, Some(2), TASK);
         let before = before_answer_timings(
@@ -441,6 +442,7 @@ fn a_stopped_prefills_timings_are_what_both_paths_measured_before() {
             cancelled_by: Some(by),
             cancelled_at: Some(at),
             batch: batch.as_ref(),
+            thinking: None,
             ..Outcome::default()
         };
         let now = timings(&f, &outcome, &RELEASED, end, vm_end, None, None);
@@ -485,6 +487,7 @@ fn the_answer_line_is_what_both_paths_printed_before() {
             cancelled_by: by,
             cancelled_at: None,
             batch,
+            thinking: None,
         };
         let now = answer_line(
             "chatcmpl-1-7",
@@ -524,6 +527,7 @@ fn the_answer_line_reads_as_it_always_did() {
         cancelled_by: Some("client"),
         cancelled_at: None,
         batch: None,
+        thinking: None,
     };
     let store = store((5, 30_000_000_000, 40_000_000_000, Some((17, 7_512_000_000))));
     assert_eq!(

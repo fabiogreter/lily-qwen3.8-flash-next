@@ -76,6 +76,7 @@ fn reasoning_then_content_split_and_trimmed() {
             tools: None,
             stop_strings: vec![],
             raw: false,
+            tool_call_ends_thinking: false,
         },
     );
     // "Hello world\n</think>\n\nThe answer"
@@ -95,6 +96,7 @@ fn think_end_split_across_tokens_is_still_found() {
             tools: None,
             stop_strings: vec![],
             raw: false,
+            tool_call_ends_thinking: false,
         },
     );
     // "Hello" "<" "/think" ">" " world"
@@ -120,6 +122,7 @@ fn tool_call_block_becomes_a_call_and_surrounding_text_is_content() {
             tools: Some(tools),
             stop_strings: vec![],
             raw: false,
+            tool_call_ends_thinking: false,
         },
     );
     // "The answer\n\n<tool_call>\n<function=f>\n<parameter=x>\nab\n</parameter>\n</function>\n</tool_call>"
@@ -146,6 +149,7 @@ fn split_tool_start_marker_is_held_back_then_recognised() {
             tools: Some(tools),
             stop_strings: vec![],
             raw: false,
+            tool_call_ends_thinking: false,
         },
     );
     // "Hello" "<tool" "_call>" "<function=f>" "</function>" "</tool_call>"
@@ -169,6 +173,7 @@ fn unterminated_tool_block_is_returned_as_content() {
             tools: Some(tools),
             stop_strings: vec![],
             raw: false,
+            tool_call_ends_thinking: false,
         },
     );
     let events = run(&mut p, &[5, 2, 7]);
@@ -186,6 +191,7 @@ fn stop_strings_truncate_and_stop() {
             tools: None,
             stop_strings: vec!["STOP".into()],
             raw: false,
+            tool_call_ends_thinking: false,
         },
     );
     let events = run(&mut p, &[0, 1, 14, 0, 0]);
@@ -208,6 +214,7 @@ fn multibyte_codepoints_split_over_tokens_are_not_emitted_partially() {
             tools: None,
             stop_strings: vec![],
             raw: true,
+            tool_call_ends_thinking: false,
         },
     );
     let events = run(&mut p, &[0, 1000 + 0xC3, 1000 + 0xA9, 1]);
@@ -229,6 +236,7 @@ fn raw_mode_ignores_markers() {
             tools: None,
             stop_strings: vec![],
             raw: true,
+            tool_call_ends_thinking: false,
         },
     );
     let events = run(&mut p, &[0, 3, 5]);
@@ -244,6 +252,7 @@ fn reasoning_tokens_count_the_block_and_its_closing_tag() {
         tools: None,
         stop_strings: vec![],
         raw: false,
+        tool_call_ends_thinking: false,
     };
     // "Hello world\n</think>\n\nThe answer": four tokens up to and
     // including `</think>`, two after it.
@@ -262,4 +271,67 @@ fn reasoning_tokens_count_the_block_and_its_closing_tag() {
     let mut p = OutputParser::new(detok(TABLE), config(false));
     run(&mut p, &[0, 3, 16]);
     assert_eq!(p.reasoning_tokens(), 0);
+}
+
+fn reasoning_with_tools(tool_call_ends_thinking: bool) -> ParserConfig {
+    ParserConfig {
+        thinking_open: true,
+        tools: Some(
+            ToolSchema::from_request(&[
+                serde_json::json!({"type": "function", "function": {"name": "f"}}),
+            ])
+            .unwrap(),
+        ),
+        stop_strings: vec![],
+        raw: false,
+        tool_call_ends_thinking,
+    }
+}
+
+/// The response-side safety net: with the rule on, a `<tool_call>` at a
+/// line start inside the reasoning block ends it and is parsed as a call,
+/// the way vLLM's Qwen3 reasoning parser treats it.
+#[test]
+fn a_tool_call_at_a_line_start_ends_the_reasoning_with_the_rule_on() {
+    // "Hello world\n<tool_call>\n<function=f>\n</function>\n</tool_call>"
+    let ids = [0, 1, 2, 5, 2, 7, 2, 10, 2, 6];
+    let mut p = OutputParser::new(detok(TABLE), reasoning_with_tools(true));
+    let (reasoning, content, calls) = text_of(&run(&mut p, &ids));
+    assert_eq!(reasoning, "Hello world");
+    assert_eq!(content, "");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].name, "f");
+    // The block's tokens, the `<tool_call>` that closed it included.
+    assert_eq!(p.reasoning_tokens(), 4);
+
+    // Split across tokens ("<tool" "_call>") and right at the block's start.
+    let mut p = OutputParser::new(detok(TABLE), reasoning_with_tools(true));
+    let (reasoning, _, calls) = text_of(&run(&mut p, &[17, 18, 7, 10, 6]));
+    assert_eq!(reasoning, "");
+    assert_eq!(calls.len(), 1);
+
+    // After the decode-time close the stream is the trained shape and the
+    // ordinary `</think>` path takes it.
+    let mut p = OutputParser::new(detok(TABLE), reasoning_with_tools(true));
+    let (reasoning, content, calls) = text_of(&run(&mut p, &[0, 2, 3, 4, 5, 7, 10, 6]));
+    assert_eq!((reasoning.as_str(), content.as_str(), calls.len()), ("Hello", "", 1));
+}
+
+#[test]
+fn a_tool_call_stays_reasoning_mid_line_or_with_the_rule_off() {
+    // Off (the default): reasoning text, byte for byte as before.
+    let ids = [0, 1, 2, 5, 2, 7, 2, 10, 2, 6];
+    let mut p = OutputParser::new(detok(TABLE), reasoning_with_tools(false));
+    let (reasoning, content, calls) = text_of(&run(&mut p, &ids));
+    assert_eq!(
+        reasoning,
+        "Hello world\n<tool_call>\n<function=f>\n</function>\n</tool_call>"
+    );
+    assert_eq!((content.as_str(), calls.len()), ("", 0));
+
+    // On, but mid-line: "Hello<tool_call>..." stays reasoning.
+    let mut p = OutputParser::new(detok(TABLE), reasoning_with_tools(true));
+    let (reasoning, _, calls) = text_of(&run(&mut p, &[0, 5, 7, 10, 6]));
+    assert!(reasoning.starts_with("Hello<tool_call>"), "{reasoning:?}");
+    assert_eq!(calls.len(), 0);
 }
