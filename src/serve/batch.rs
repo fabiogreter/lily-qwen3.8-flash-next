@@ -12,11 +12,19 @@
 //! batched steps of the running rows between chunks); with one row and no
 //! job waiting, run that row in the production single-session loop
 //! ([`Generator::resume`], speculation and parking included), stopped at its
-//! next token when a job arrives; with two or more rows, one batched step.
+//! next token when a job arrives; with two or more rows, a stretch of
+//! batched steps until a row finishes or a waiting job could be admitted.
 //! A lone request is therefore served by exactly the passes `Engine::run`
 //! would run for it. Rows decode plainly while they share a step; the draft
 //! head is caught up on every row, so a row that is alone again speculates
 //! with complete head caches.
+//!
+//! Within a stretch the next step is committed parked behind the current
+//! one ([`LanguageModel::park_rows`]) and released once the current one's
+//! draws are taken, so the host's round trip between two steps overlaps
+//! the GPU's work instead of following it ([`park_next`] says when). A
+//! stretch returns with nothing in flight, so everything else that needs
+//! the GPU, the batched scratch or a row's state runs between stretches.
 //!
 //! Admission and the answer are the ones `Engine::run` uses
 //! (`serve/request.rs`): [`Engine::admit`] with [`Interleaved`] running the
@@ -40,7 +48,9 @@ use super::request::{self, Admitted, Decoded, Ending, Opened, PrefillChunks};
 use super::session::Session;
 use super::timings::BatchTimings;
 use super::{Cmd, Engine, EngineQueue, Job, Sink};
-use crate::engine::{BatchRow, CountsSlot, DecodeStateApi, Draw, LanguageModel};
+use crate::engine::{
+    BatchRow, CountsSlot, DecodeStateApi, Draw, LanguageModel, RowsInFlight,
+};
 use crate::generate::{DecodeCheckpointer, FinishReason, GenerateOptions, Generator};
 use crate::qwen4exp::VisionInput;
 
@@ -122,6 +132,47 @@ pub(super) fn next_action(rows: usize, held: bool) -> Next {
         1 => Next::Solo { preempt: !held },
         _ => Next::Step,
     }
+}
+
+/// What the scheduler knows of a row, right after committing a batched
+/// step, when it decides whether to park the next one ([`park_next`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RowAhead {
+    /// The position the committed step leaves the row at (its state's
+    /// position, which counts the step's token as fed).
+    pub(super) pos: usize,
+    /// Tokens the row's caches hold before they have to grow.
+    pub(super) capacity: usize,
+    /// A decode checkpoint is due at `pos`.
+    pub(super) checkpoint_due: bool,
+    /// The committed step's draw will end the row whatever it is: it is the
+    /// row's `max_tokens`-th, or the client has left.
+    pub(super) ending: bool,
+}
+
+/// Whether to commit the next batched step parked behind the one just
+/// committed, before that one's draws are read. Only between two steps of
+/// the same rows in the same stretch: not when the stretch ends after this
+/// step (`another_step` false: its step budget is spent), when a waiting
+/// job could be admitted next (`admission`; its prefill needs the GPU and
+/// the batched scratch), when the server's shutdown grace is over
+/// (`cancel`: every row ends on this step's draw), or when any row ends on
+/// this step's draw, has a decode checkpoint due where this step leaves it
+/// (taken at rest, with nothing in flight), or would need its caches grown
+/// for the step after the parked one (which cannot happen with a pass in
+/// flight; `pos + 1 < capacity`, as the decode loop checks). A row that
+/// finishes on a draw nobody saw coming (a stop token, a stop string) while
+/// the next step is parked is the drain's business, not this one's.
+pub(super) fn park_next(
+    rows: &[RowAhead],
+    another_step: bool,
+    admission: bool,
+    cancel: bool,
+) -> bool {
+    another_step
+        && !admission
+        && !cancel
+        && rows.iter().all(|r| !r.checkpoint_due && !r.ending && r.pos + 1 < r.capacity)
 }
 
 /// How one request shared the GPU with others, for its timings and log line.
@@ -270,6 +321,61 @@ impl<M: LanguageModel> Row<'_, M> {
     }
 }
 
+/// The rows of the batched step that feeds each row's last draw, or with
+/// `ahead` 1 of the step parked behind it (whose token is not read: it is
+/// that step's draw, still on the GPU).
+fn batch_of<'r, M: LanguageModel>(
+    rows: &'r mut [Row<'_, M>],
+    ahead: usize,
+) -> Vec<BatchRow<'r, M::State>> {
+    rows.iter_mut()
+        .map(|r| BatchRow {
+            token: *r.generated.last().expect("a row has drawn"),
+            draw: Draw { params: &r.req.p.sampling, step: r.generated.len() + ahead },
+            slot: r.slot,
+            state: &mut r.req.session.state,
+        })
+        .collect()
+}
+
+/// A batched step's draws, one per row in order, taken as the production
+/// loops take a draw.
+fn take_draws<M: LanguageModel>(
+    rows: &mut [Row<'_, M>],
+    draws: &[u32],
+    members: &[u64],
+    generator: &Generator,
+    cancel: bool,
+) -> Result<()> {
+    ensure!(
+        draws.len() == rows.len(),
+        "a batched step of {} rows drew {} tokens",
+        rows.len(),
+        draws.len()
+    );
+    for (row, &token) in rows.iter_mut().zip(draws) {
+        row.stats.record_step(row.seq, members);
+        row.take_draw(token, generator, cancel)?;
+    }
+    Ok(())
+}
+
+/// At rest between steps (nothing in flight), each row holding every draw
+/// but the last: a decode checkpoint due here is taken as the
+/// single-session loop takes one, only for a row that goes on.
+fn take_due_checkpoints<M: LanguageModel>(
+    ctx: &crate::metal::MetalContext,
+    rows: &mut [Row<'_, M>],
+) -> Result<()> {
+    for row in rows.iter_mut() {
+        let pos = row.req.session.state.pos();
+        if row.finish.is_none() && row.req.decode_checkpoints.due(pos) {
+            row.req.decode_checkpoints.take(ctx, &row.req.session.state)?;
+        }
+    }
+    Ok(())
+}
+
 /// The scheduler's prefill: while rows decode, one chunk at a time with
 /// [`DECODE_STEPS_PER_PREFILL_CHUNK`] batched steps of the rows between
 /// chunks (a row that finishes meanwhile is answered there); straight
@@ -326,13 +432,25 @@ impl<M: LanguageModel> PrefillChunks<M> for Interleaved<'_, '_, M> {
             if fed < tokens.len() {
                 let between = Instant::now();
                 let own = session.bytes();
-                for _ in 0..DECODE_STEPS_PER_PREFILL_CHUNK {
-                    if self.rows.is_empty() {
+                // Stretches end where a row finishes (it is answered here),
+                // and always drained: the next chunk has the GPU and the
+                // batched scratch to itself. Nothing is admitted meanwhile.
+                let mut steps = 0;
+                while steps < DECODE_STEPS_PER_PREFILL_CHUNK && !self.rows.is_empty() {
+                    let ran = engine.step_rows(
+                        self.generator,
+                        self.rows,
+                        self.slots,
+                        own,
+                        DECODE_STEPS_PER_PREFILL_CHUNK - steps,
+                        &|| false,
+                    );
+                    if ran == 0 {
                         break;
                     }
-                    engine.step_rows(self.generator, self.rows, self.slots, own);
-                    self.stats.interleaved_steps += 1;
+                    steps += ran;
                 }
+                self.stats.interleaved_steps += steps;
                 self.stats.interleaved_secs += between.elapsed().as_secs_f64();
             }
         }
@@ -385,7 +503,22 @@ impl<M: LanguageModel> Engine<M> {
                 Next::Solo { preempt } => {
                     self.run_solo(&generator, &mut rows, &mut slots, preempt, queue)
                 }
-                Next::Step => self.step_rows(&generator, &mut rows, &mut slots, 0),
+                Next::Step => {
+                    // A stretch of steps until a row finishes or a waiting
+                    // job could be admitted. A job held back for the budget
+                    // cannot start before a row finishes (the sessions in
+                    // flight only grow), and with every row taken none can.
+                    let can_admit = held.is_none() && rows.len() < self.max_batch;
+                    let admission = || can_admit && queue.has_waiting();
+                    self.step_rows(
+                        &generator,
+                        &mut rows,
+                        &mut slots,
+                        0,
+                        usize::MAX,
+                        &admission,
+                    );
+                }
             }
         }
         let fault = self.ctx.fault();
@@ -561,7 +694,8 @@ impl<M: LanguageModel> Engine<M> {
         Ok(())
     }
 
-    /// One batched step over `rows`, then the rows that finished are answered.
+    /// A stretch of batched steps over `rows` (see [`Self::try_stretch`]),
+    /// then the rows that finished are answered. Returns the steps it ran.
     /// `extra_in_flight` is the session of a request being admitted, which
     /// the store must count when a finished row is released. A failed step
     /// fails every row in it.
@@ -571,17 +705,25 @@ impl<M: LanguageModel> Engine<M> {
         rows: &mut Vec<Row<'g, M>>,
         slots: &mut Slots,
         extra_in_flight: usize,
-    ) {
+        max_steps: usize,
+        admission: &dyn Fn() -> bool,
+    ) -> usize {
         if rows.is_empty() {
-            return;
+            return 0;
         }
-        if let Err(error) = self.try_step(generator, rows) {
-            let fault = self.ctx.fault();
-            for row in rows.drain(..) {
-                self.fail_row(row, slots, fault.as_deref(), &error);
+        let steps = match self.try_stretch(generator, rows, max_steps, admission) {
+            Ok(steps) => steps,
+            Err(error) => {
+                // A parked step dropped on the error path released itself;
+                // this clears the model's record of it.
+                let _ = self.model.release_parked(&self.scratch);
+                let fault = self.ctx.fault();
+                for row in rows.drain(..) {
+                    self.fail_row(row, slots, fault.as_deref(), &error);
+                }
+                return 0;
             }
-            return;
-        }
+        };
         let mut i = 0;
         while i < rows.len() {
             if rows[i].finish.is_some() {
@@ -592,20 +734,28 @@ impl<M: LanguageModel> Engine<M> {
                 i += 1;
             }
         }
+        steps
     }
 
-    fn try_step(
+    /// Batched steps over `rows` until `max_steps` ran (at least one), a
+    /// row finished, or `admission` says a waiting job could be admitted;
+    /// returns the steps run. Between two steps of the stretch the next one
+    /// is committed parked behind the current one when [`park_next`] allows
+    /// it, and released once the current one's draws are taken. Whatever
+    /// else needs the GPU, the batched scratch or the rows' states (an
+    /// admission's prefill, a cache growth, a decode checkpoint, a finished
+    /// row's answer, the single-session loop) runs only once the stretch
+    /// returned, and it returns with nothing in flight: a step parked when a
+    /// row finished is drained first, as an ordinary step for the rows that
+    /// go on (the finished row's draw from it is dropped; it fed the row's
+    /// final token, as the single-session loop's parked step does).
+    fn try_stretch(
         &mut self,
         generator: &Generator,
         rows: &mut [Row<'_, M>],
-    ) -> Result<()> {
-        // The GPU is idle between steps: a row at its capacity grows here.
-        for row in rows.iter_mut() {
-            let state = &mut row.req.session.state;
-            if state.pos() >= state.capacity() {
-                state.ensure_capacity(&self.ctx, state.pos() + 1)?;
-            }
-        }
+        max_steps: usize,
+        admission: &dyn Fn() -> bool,
+    ) -> Result<usize> {
         // TODO(batch): speculation inside a batch. A row shares a step
         // plainly and speculates again once it is alone; batching the
         // verify pass (rows = the sum of 1 + drafts over sessions) needs a
@@ -615,38 +765,95 @@ impl<M: LanguageModel> Engine<M> {
         // combination of accepted counts. That is a second engine-shape
         // change, and the measured gain does not ask for it yet; see
         // docs/architecture.md, "Continuous batching".
+        let Engine { ctx, model, scratch, shutdown, .. } = self;
+        let parking = model.supports_rows_parking();
         let members: Vec<u64> = rows.iter().map(|r| r.seq).collect();
-        let draws = {
-            let mut batch: Vec<BatchRow<'_, M::State>> = rows
-                .iter_mut()
-                .map(|r| BatchRow {
-                    token: *r.generated.last().expect("a row has drawn"),
-                    draw: Draw { params: &r.req.p.sampling, step: r.generated.len() },
-                    slot: r.slot,
-                    state: &mut r.req.session.state,
-                })
-                .collect();
-            self.model.decode_rows(&self.ctx, &mut self.scratch, &mut batch)?
-        };
-        ensure!(
-            draws.len() == rows.len(),
-            "a batched step of {} rows drew {} tokens",
-            rows.len(),
-            draws.len()
-        );
-        let cancel = self.shutdown.cancel();
-        for (row, token) in rows.iter_mut().zip(draws) {
-            row.stats.record_step(row.seq, &members);
-            row.take_draw(token, generator, cancel)?;
-            // At rest between steps, holding every draw but the last: a
-            // decode checkpoint due here is taken as the single-session loop
-            // takes one, only for a row that goes on.
-            let pos = row.req.session.state.pos();
-            if row.finish.is_none() && row.req.decode_checkpoints.due(pos) {
-                row.req.decode_checkpoints.take(&self.ctx, &row.req.session.state)?;
+        let mut steps = 0;
+        // The next step, committed parked behind the current one.
+        let mut parked: Option<RowsInFlight<'_>> = None;
+        loop {
+            let current = match parked.take() {
+                Some(mut step) => {
+                    model.release_rows(scratch, &mut step, &mut batch_of(rows, 0))?;
+                    step
+                }
+                None => {
+                    // The GPU is idle between steps: a row at its capacity
+                    // grows here.
+                    for row in rows.iter_mut() {
+                        let state = &mut row.req.session.state;
+                        if state.pos() >= state.capacity() {
+                            state.ensure_capacity(ctx, state.pos() + 1)?;
+                        }
+                    }
+                    model.commit_rows(ctx, scratch, &mut batch_of(rows, 0), false)?
+                }
+            };
+            steps += 1;
+            if parking {
+                let ahead: Vec<RowAhead> = rows
+                    .iter_mut()
+                    .map(|row| {
+                        let state = &row.req.session.state;
+                        let pos = state.pos();
+                        RowAhead {
+                            pos,
+                            capacity: state.capacity(),
+                            checkpoint_due: row.req.decode_checkpoints.due(pos),
+                            ending: row.generated.len() + 1 >= row.req.p.max_tokens
+                                || row.sink.cancelled(),
+                        }
+                    })
+                    .collect();
+                if park_next(&ahead, steps < max_steps, admission(), shutdown.cancel())
+                {
+                    parked = Some(model.park_rows(
+                        ctx,
+                        scratch,
+                        &mut batch_of(rows, 1),
+                        &current,
+                        false,
+                    )?);
+                }
+            }
+            let (draws, _) = model.finish_rows(scratch, current)?;
+            take_draws(rows, &draws, &members, generator, shutdown.cancel())?;
+            let finished = rows.iter().any(|r| r.finish.is_some());
+            match parked.take() {
+                // Parked: nothing was due where this step left the rows, and
+                // the parked step is the next one.
+                Some(step) if !finished => parked = Some(step),
+                Some(mut step) => {
+                    // A row finished on this step's draw: drain. The parked
+                    // step feeds every row's last draw, the finished rows'
+                    // final ones included.
+                    model.release_rows(scratch, &mut step, &mut batch_of(rows, 0))?;
+                    let (draws, _) = model.finish_rows(scratch, step)?;
+                    steps += 1;
+                    ensure!(
+                        draws.len() == rows.len(),
+                        "a batched step of {} rows drew {} tokens",
+                        rows.len(),
+                        draws.len()
+                    );
+                    let cancel = shutdown.cancel();
+                    for (row, token) in rows.iter_mut().zip(draws) {
+                        if row.finish.is_none() {
+                            row.stats.record_step(row.seq, &members);
+                            row.take_draw(token, generator, cancel)?;
+                        }
+                    }
+                    take_due_checkpoints(ctx, rows)?;
+                    return Ok(steps);
+                }
+                None => {
+                    take_due_checkpoints(ctx, rows)?;
+                    if finished || steps >= max_steps || admission() {
+                        return Ok(steps);
+                    }
+                }
             }
         }
-        Ok(())
     }
 
     /// Drops a failed row's session (its state is not trustworthy) and

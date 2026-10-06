@@ -1,4 +1,4 @@
-use super::{BatchStats, Next, Slots, admits, next_action};
+use super::{BatchStats, Next, RowAhead, Slots, admits, next_action, park_next};
 
 #[test]
 fn slots_hand_out_the_lowest_free_one_and_take_them_back() {
@@ -71,4 +71,49 @@ fn the_log_group_says_what_was_shared_and_nothing_for_a_lone_request() {
         ", batched: 2/12 tokens in steps of up to 2 rows (mean 2.00) shared with 1 other request, \
          lone decode stopped 1 time for a new request, prefill shared with 8 decode steps (0.50s)"
     );
+}
+
+/// A row well inside its caches, nothing due, not ending: the next step
+/// may park behind the current one as far as this row is concerned.
+fn going_on(pos: usize) -> RowAhead {
+    RowAhead { pos, capacity: 8192, checkpoint_due: false, ending: false }
+}
+
+#[test]
+fn the_next_step_parks_between_two_steps_of_rows_that_go_on() {
+    let rows = [going_on(100), going_on(4000)];
+    assert!(park_next(&rows, true, false, false));
+    // One row is as good as several (an admission's interleaved steps).
+    assert!(park_next(&rows[..1], true, false, false));
+}
+
+#[test]
+fn the_next_step_does_not_park_past_the_stretch() {
+    let rows = [going_on(100), going_on(200)];
+    // The step budget is spent (the steps between two prefill chunks).
+    assert!(!park_next(&rows, false, false, false), "no step after this one");
+    // A job waiting for a free row gets the GPU after this step.
+    assert!(!park_next(&rows, true, true, false), "admission next");
+    // The shutdown grace is over: every row ends on this step's draw.
+    assert!(!park_next(&rows, true, false, true), "cancelled");
+}
+
+#[test]
+fn any_row_that_needs_the_rest_position_keeps_the_next_step_unparked() {
+    let due = RowAhead { checkpoint_due: true, ..going_on(512) };
+    assert!(!park_next(&[going_on(100), due], true, false, false), "checkpoint due");
+    let ending = RowAhead { ending: true, ..going_on(100) };
+    assert!(!park_next(&[ending, going_on(200)], true, false, false), "row ends");
+}
+
+#[test]
+fn the_next_step_parks_only_with_room_for_it_and_the_step_after_it() {
+    // The committed step leaves the row at `pos`; the parked one writes
+    // there, and the one after it must not need the caches grown while a
+    // pass is in flight: `pos + 1 < capacity`, as the decode loop checks.
+    let at = |pos: usize| RowAhead { capacity: 1024, ..going_on(pos) };
+    assert!(park_next(&[at(1022)], true, false, false));
+    assert!(!park_next(&[at(1023)], true, false, false), "the step after needs room");
+    assert!(!park_next(&[at(1024)], true, false, false), "no room for the parked step");
+    assert!(!park_next(&[going_on(10), at(1023)], true, false, false), "any row");
 }
