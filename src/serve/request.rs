@@ -1,24 +1,35 @@
-//! What every request's answer is made of, built once for both ways of
-//! serving it: one request at a time (`Engine::run`) and the batch scheduler
-//! (`Engine::serve_batched`). [`Facts`] is what a request's admission
-//! measured; [`Outcome`] how its decode went. From the two come its
-//! `timings` ([`timings`]), its log line ([`answer_line`], or
-//! [`stopped_line`] for a prefill that was stopped) and the end of its
-//! response ([`stream_end`], [`response_body`]).
+//! One request's way through the engine, shared by both ways of serving
+//! it: one request at a time ([`Engine::serve`]) and the batch scheduler
+//! ([`Engine::serve_batched`]). A request is taken on ([`Engine::open`]),
+//! decoded by its caller, answered ([`Engine::answer`]) and closed
+//! ([`Engine::close`]). [`Facts`] is what its admission measured;
+//! [`Outcome`] how its decode went. From the two come its `timings`
+//! ([`timings`]), its log line ([`answer_line`], or [`stopped_line`] for a
+//! prefill that was stopped) and the end of its response ([`stream_end`],
+//! [`response_body`]).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 
-use super::api::Kind;
+use super::api::{self, Kind, Prepared};
 use super::batch::BatchStats;
-use super::session::{Evictions, SessionStore};
+use super::pin::InFlight;
+use super::session::{
+    CachedImage, DecodeCheckpoints, Evictions, Session, SessionStore,
+};
+use super::stream::{Event, OutputParser};
 use super::timings::{
     EvictionPhase, EvictionTimings, MemoryStats, NgramStats, PrefillParts,
-    PrefillPhases, Speculation, Timings,
+    PrefillPhases, Speculation, Timings, TimingsEntry,
 };
-use super::{Collected, call_id, chunk, describe_reuse, text_chunk};
-use crate::engine::LanguageModel;
+use super::{
+    Collected, Engine, Job, Sink, call_id, chunk, describe_reuse, error_json,
+    print_kernel_profile, text_chunk,
+};
+use crate::engine::{DecodeStateApi, LanguageModel};
+use crate::generate::FinishReason;
 use crate::stats::{Counters, TaskMemory, VmCounters};
 
 /// What a request's admission measured, for its timings and log line.
@@ -357,6 +368,371 @@ pub(super) fn response_body(c: Closing<'_>, collected: Collected) -> Value {
             "usage": c.usage,
             "timings": c.timings,
         })
+    }
+}
+
+// --- a request's way out -----------------------------------------------------
+
+pub(super) type Detokenize<'g> = Box<dyn FnMut(&[u32]) -> Result<String> + 'g>;
+/// A request's output parser, detokenizing with the generator's tokenizer.
+pub(super) type Parser<'g> = OutputParser<Detokenize<'g>>;
+
+/// Where a request's output goes: SSE chunks or the collected answer.
+pub(super) struct Output {
+    pub(super) id: String,
+    pub(super) created: u64,
+    pub(super) model: &'static str,
+    pub(super) kind: Kind,
+    pub(super) stream: bool,
+    pub(super) collected: Collected,
+    pub(super) tool_index: usize,
+}
+
+impl Output {
+    /// Sends `events` to the client as SSE chunks, or collects them for the
+    /// body when the request is not streamed.
+    pub(super) fn deliver(&mut self, events: Vec<Event>, sink: &Sink) {
+        let (id, created, model) = (self.id.as_str(), self.created, self.model);
+        for event in events {
+            match event {
+                Event::Reasoning(text) => {
+                    if self.stream {
+                        sink.sse(&chunk(
+                            id,
+                            created,
+                            model,
+                            json!({"reasoning_content": text}),
+                            None,
+                        ));
+                    } else {
+                        self.collected.reasoning.push_str(&text);
+                    }
+                }
+                Event::Content(text) => {
+                    if self.stream {
+                        if self.kind == Kind::Chat {
+                            sink.sse(&chunk(
+                                id,
+                                created,
+                                model,
+                                json!({"content": text}),
+                                None,
+                            ));
+                        } else {
+                            sink.sse(&text_chunk(id, created, model, &text, None));
+                        }
+                    } else {
+                        self.collected.content.push_str(&text);
+                    }
+                }
+                Event::ToolCall(call) => {
+                    if self.stream {
+                        let delta = json!({"tool_calls": [{
+                            "index": self.tool_index,
+                            "id": call_id(id, self.tool_index),
+                            "type": "function",
+                            "function": {"name": call.name, "arguments": call.arguments},
+                        }]});
+                        sink.sse(&chunk(id, created, model, delta, None));
+                    } else {
+                        self.collected.tool_calls.push(call);
+                    }
+                    self.tool_index += 1;
+                }
+            }
+        }
+    }
+}
+
+/// A request brought to its decode: its session holds the prompt but its
+/// last token, checkpointed there, and the response has its id (and, when
+/// streamed, its first chunk). Its caller draws the tokens and hands it
+/// to [`Engine::answer`].
+pub(super) struct Admitted<'g, M: LanguageModel> {
+    pub(super) p: Prepared,
+    pub(super) session: Session<M>,
+    /// The prompt's images as the session cache keys them.
+    pub(super) images: Vec<CachedImage>,
+    pub(super) facts: Facts,
+    /// The decode checkpoints, counted from the prefill's checkpoint.
+    pub(super) decode_checkpoints: DecodeCheckpoints<M::State>,
+    pub(super) parser: Parser<'g>,
+    pub(super) out: Output,
+}
+
+/// How an admitted request was decoded, for [`Engine::answer`].
+pub(super) struct Decoded<'a> {
+    /// Every token drawn; the state holds all but the last, or all of them
+    /// when a parked step consumed the last one.
+    pub(super) tokens: &'a [u32],
+    pub(super) finish: FinishReason,
+    /// Draft tokens proposed and accepted.
+    pub(super) drafted: usize,
+    pub(super) accepted: usize,
+    /// Taken right before the first draw.
+    pub(super) started: Instant,
+    /// How it shared the GPU (the batch scheduler); `None` with batching off.
+    pub(super) batch: Option<&'a BatchStats>,
+}
+
+/// A request the engine took on: in flight for the weights' pin until
+/// `in_flight` drops, which [`Engine::close`] does after the response's end.
+pub(super) struct Opened {
+    pub(super) p: Prepared,
+    pub(super) sink: Sink,
+    pub(super) in_flight: InFlight,
+    /// How long it waited for the engine (a reload and the pin included).
+    pub(super) queued: Duration,
+}
+
+/// How a request's response ends, for [`Engine::close`].
+pub(super) enum Ending<'e> {
+    /// Answered, or nothing to say: the client left.
+    Answered,
+    /// Failed with this error; the response names the GPU fault the context
+    /// recorded by then, if any.
+    Failed(&'e anyhow::Error),
+    /// Failed with this error under the fault its caller read once for
+    /// several requests (a failed batched step fails all of its rows).
+    FailedUnder(&'e anyhow::Error, Option<&'e str>),
+}
+
+/// Ends a response with an error: an error body when nothing was sent yet,
+/// an error event and the end of the stream when an event stream started.
+fn error_end(sink: &mut Sink, stream: bool, status: u16, message: &str) {
+    if !sink.started {
+        sink.start(status, "application/json");
+        sink.send(error_json("server_error", message));
+    } else if stream {
+        sink.sse(&json!({"error": {"message": message, "type": "server_error"}}));
+        sink.send(b"data: [DONE]\n\n".to_vec());
+    }
+}
+
+/// Answers a request that failed: logs the error and ends the response
+/// with a 503 on a GPU fault (the engine reloads) or a 500.
+pub(super) fn answer_failure(
+    sink: &mut Sink,
+    stream: bool,
+    fault: Option<&str>,
+    error: &anyhow::Error,
+) {
+    let (status, message) = match fault {
+        Some(fault) => {
+            eprintln!("request failed on a GPU fault (the engine reloads): {error:#}");
+            (
+                503,
+                format!(
+                    "the GPU command queue failed ({fault}); the engine is reloading, retry shortly"
+                ),
+            )
+        }
+        None => {
+            eprintln!("request failed: {error:#}");
+            (500, "internal server error".to_owned())
+        }
+    };
+    error_end(sink, stream, status, &message);
+    sink.end();
+}
+
+impl<M: LanguageModel> Engine<M> {
+    /// Takes `job` on. Pinned before the prefill (the first request of an
+    /// active period pays for it, inside its queue time). The request is in
+    /// flight for the pin until the returned guard drops: a memory pressure
+    /// warning meanwhile releases the pin then, not under the prefill or the
+    /// decode.
+    pub(super) fn open(&mut self, job: Job) -> Opened {
+        let Job { prepared, sink, queued_at } = job;
+        let in_flight = self.pin.before_request(Instant::now());
+        let queued = queued_at.elapsed();
+        Opened { p: prepared, sink, in_flight, queued }
+    }
+
+    /// Ends a request [`Self::open`] took on: the pin's hold counts from
+    /// here, the response ends (with the error when it failed), and only
+    /// then does the request leave flight, so a deferred release's `munlock`
+    /// does not hold up the client (and happens before the caller can drop
+    /// the engine). Returns the GPU fault the context recorded, if any.
+    pub(super) fn close(
+        &mut self,
+        mut sink: Sink,
+        in_flight: InFlight,
+        stream: bool,
+        ending: Ending<'_>,
+    ) -> Option<String> {
+        self.pin.after_request(Instant::now());
+        let fault = self.ctx.fault();
+        match ending {
+            Ending::Answered => sink.end(),
+            Ending::Failed(error) => {
+                answer_failure(&mut sink, stream, fault.as_deref(), error)
+            }
+            Ending::FailedUnder(error, under) => {
+                answer_failure(&mut sink, stream, under, error)
+            }
+        }
+        drop(in_flight);
+        fault
+    }
+
+    /// Answers a decoded request: the session goes back to the cache with
+    /// what the decode fed and its decode checkpoints, then the timings,
+    /// the log line and the end of the response. `in_flight_others` are
+    /// the bytes of the sessions other requests hold checked out (0 for one
+    /// request at a time).
+    pub(super) fn answer(
+        &mut self,
+        admitted: Admitted<'_, M>,
+        sink: &mut Sink,
+        decoded: Decoded<'_>,
+        in_flight_others: usize,
+    ) -> Result<()> {
+        let Admitted {
+            p,
+            mut session,
+            images,
+            facts: f,
+            decode_checkpoints,
+            mut parser,
+            mut out,
+        } = admitted;
+        let final_events = parser.finish();
+        out.deliver(final_events, sink);
+        let decode_secs = decoded.started.elapsed().as_secs_f64();
+        let counters_end = crate::stats::counters();
+        let vm_end = crate::stats::vm_counters();
+
+        // Bookkeeping: the state holds the prompt plus the generated tokens
+        // that were fed: all but the last (drawn, never fed), or all of them
+        // when a parked step consumed the final one.
+        let n = f.n;
+        let pos = session.state.pos();
+        let fed_generated = pos
+            .checked_sub(n)
+            .ok_or_else(|| anyhow::anyhow!("decode state did not advance"))?;
+        ensure!(
+            fed_generated + 1 == decoded.tokens.len()
+                || fed_generated == decoded.tokens.len(),
+            "decode state at {pos} for {n} prompt tokens and {} drawn",
+            decoded.tokens.len()
+        );
+        session.tokens.truncate(f.reused);
+        session.tokens.extend_from_slice(&p.prompt[f.reused..]);
+        session.tokens.extend_from_slice(&decoded.tokens[..fed_generated]);
+        ensure!(
+            session.state.pos() == session.tokens.len(),
+            "session token/state position mismatch"
+        );
+        // Every decode checkpoint sits at a point the state passed: a prefix
+        // of the tokens just recorded.
+        let decode_checkpoints_taken = decode_checkpoints.taken();
+        let decode_checkpoint_secs = decode_checkpoints.secs();
+        session.add_decode_checkpoints(decode_checkpoints.into_snapshots(), &images)?;
+        // The sessions other requests hold are checked out: the store makes
+        // room among the others.
+        self.sessions.set_in_flight_bytes(in_flight_others);
+        let released =
+            self.sessions.release(&self.ctx, session, &images, p.cache_key.as_deref());
+
+        // TODO(batch): the batch scheduler never printed the kernel profile
+        // (nor took the recorded passes); kept so here, fixed on its own.
+        if decoded.batch.is_none() && self.ctx.profiling() {
+            print_kernel_profile(&crate::metal::profile::take());
+        }
+        let completion_tokens = decoded.tokens.len();
+        let finish_reason = match decoded.finish {
+            FinishReason::Length => "length",
+            _ if parser.tool_calls_emitted() > 0 => "tool_calls",
+            _ => "stop",
+        };
+        // The numbers the line below prints, as JSON: attached to the
+        // response below and kept for `GET /v1/timings`. Recorded before the
+        // cancellation checks so the log and the ring buffer never disagree.
+        // A request whose client left (or the server stopped) during the
+        // decode is marked; its answer goes nowhere, or is a 503 below.
+        let cancelled_by = if sink.cancelled() {
+            Some("client")
+        } else if self.shutdown.cancel() {
+            Some("shutdown")
+        } else {
+            None
+        };
+        let outcome = Outcome {
+            generated: completion_tokens,
+            decode_secs,
+            speculation: (self.drafts > 0).then_some(Speculation {
+                drafted: decoded.drafted,
+                accepted: decoded.accepted,
+            }),
+            decode_checkpoints: decode_checkpoints_taken,
+            decode_checkpoint_secs,
+            cancelled_by,
+            cancelled_at: None,
+            batch: decoded.batch,
+        };
+        let measured = timings(
+            &f,
+            &outcome,
+            &released,
+            counters_end,
+            vm_end,
+            crate::stats::pressure_level(),
+            crate::stats::task_memory(),
+        );
+        eprintln!(
+            "{}",
+            answer_line(
+                &out.id,
+                &f,
+                &outcome,
+                finish_reason,
+                &describe_store(&self.sessions),
+                &measured.log_details()
+            )
+        );
+        self.timings.record(TimingsEntry {
+            id: out.id.clone(),
+            model: M::MODEL_ID,
+            created: out.created,
+            timings: measured,
+        });
+        if sink.cancelled() {
+            return Ok(());
+        }
+        if self.shutdown.cancel() {
+            // Stopped by the server, not the client: say so instead of
+            // handing out a truncated answer as a finished one.
+            error_end(sink, p.stream, 503, "the server is shutting down");
+            return Ok(());
+        }
+        let usage = api::usage(
+            n,
+            f.reused,
+            completion_tokens,
+            (p.kind == Kind::Chat).then(|| parser.reasoning_tokens()),
+            outcome.speculation.filter(|s| s.drafted > 0),
+        );
+        let closing = Closing {
+            kind: p.kind,
+            id: &out.id,
+            created: out.created,
+            model: M::MODEL_ID,
+            finish_reason,
+            usage,
+            timings: serde_json::to_value(measured)?,
+        };
+        if p.stream {
+            for event in stream_end(closing, p.include_usage) {
+                sink.sse(&event);
+            }
+            sink.send(b"data: [DONE]\n\n".to_vec());
+        } else {
+            let body = response_body(closing, out.collected);
+            sink.start(200, "application/json");
+            sink.send(serde_json::to_vec(&body)?);
+        }
+        Ok(())
     }
 }
 

@@ -55,7 +55,7 @@ use crate::engine::{
     DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, SnapshotApi,
     VisionMode, VisionTower,
 };
-use crate::generate::{DecodeCheckpointer, FinishReason, GenerateOptions, Generator};
+use crate::generate::{DecodeCheckpointer, GenerateOptions, Generator};
 use crate::kernels::attention::MAX_SEQ;
 use crate::kernels::sample::SamplingParams;
 use crate::metal::MetalContext;
@@ -66,10 +66,10 @@ use crate::qwen4exp::{
     ImageEmbeds, NgramStorage, Qwen4ExpModel, VisionInput, positions_for_prompt,
 };
 use api::{Defaults, ImagePolicy, Kind, Prepared};
-use request::{Closing, Facts, Outcome};
+use request::{Admitted, Decoded, Ending, Facts, Opened, Outcome, Output};
 use session::{CachedImage, SessionStore, boundary_position, last_user_turn};
-use stream::{Event, OutputParser, ParserConfig};
-use timings::{Speculation, TimingsEntry, TimingsLog};
+use stream::{OutputParser, ParserConfig};
+use timings::{TimingsEntry, TimingsLog};
 use tools::ParsedToolCall;
 
 /// Largest request body. Agent clients resend every image of the history
@@ -1157,52 +1157,14 @@ impl<M: LanguageModel> Engine<M> {
     /// recorded, if any: the engine is then unusable and must be replaced,
     /// even when this request happened to finish before the feedback arrived.
     fn serve(&mut self, job: Job) -> Option<String> {
-        let mut sink = job.sink;
-        let stream = job.prepared.stream;
-        let kind = job.prepared.kind;
-        // Pinned before the prefill (the first request of an active period
-        // pays for it, inside its queue time). The request is in flight for
-        // the pin until `request` drops: a memory pressure warning meanwhile
-        // releases the pin then, not under the prefill or the decode.
-        let request = self.pin.before_request(Instant::now());
-        let queued = job.queued_at.elapsed();
-        let result = self.run(job.prepared, &mut sink, queued, request.pinned());
-        self.pin.after_request(Instant::now());
-        let fault = self.ctx.fault();
-        if let Err(error) = result {
-            let (status, message) = match &fault {
-                Some(fault) => {
-                    eprintln!(
-                        "request failed on a GPU fault (the engine reloads): {error:#}"
-                    );
-                    (
-                        503,
-                        format!(
-                            "the GPU command queue failed ({fault}); the engine is reloading, retry shortly"
-                        ),
-                    )
-                }
-                None => {
-                    eprintln!("request failed: {error:#}");
-                    (500, "internal server error".to_owned())
-                }
-            };
-            if !sink.started {
-                sink.start(status, "application/json");
-                sink.send(error_json("server_error", message));
-            } else if stream {
-                sink.sse(
-                    &json!({"error": {"message": message, "type": "server_error"}}),
-                );
-                sink.send(b"data: [DONE]\n\n".to_vec());
-            }
-        }
-        sink.end();
-        // After the response's end, so a deferred release's `munlock` does
-        // not hold up the client; before the caller can drop the engine.
-        drop(request);
-        let _ = kind;
-        fault
+        let Opened { p, mut sink, in_flight, queued } = self.open(job);
+        let stream = p.stream;
+        let result = self.run(p, &mut sink, queued, in_flight.pinned());
+        let ending = match &result {
+            Ok(()) => Ending::Answered,
+            Err(error) => Ending::Failed(error),
+        };
+        self.close(sink, in_flight, stream, ending)
     }
 
     /// `queued` is how long the request waited for the engine (a reload
@@ -1220,10 +1182,12 @@ impl<M: LanguageModel> Engine<M> {
         if sink.cancelled() {
             return Ok(());
         }
+        let generator = self.generator.clone();
+        let generator = &*generator;
         let Engine {
             ctx,
             model,
-            generator,
+            generator: _,
             sessions,
             scratch,
             max_seq,
@@ -1530,8 +1494,10 @@ impl<M: LanguageModel> Engine<M> {
         let created = now();
         let id = response_id(p.kind, created, next_id);
         let tokenizer = generator.tokenizer();
-        let mut parser = OutputParser::new(
-            |ids: &[u32]| tokenizer.decode(ids, false),
+        let detokenize: request::Detokenize<'_> =
+            Box::new(move |ids: &[u32]| tokenizer.decode(ids, false));
+        let parser = OutputParser::new(
+            detokenize,
             ParserConfig {
                 thinking_open: p.thinking_open,
                 tools: p.tools.clone(),
@@ -1539,13 +1505,20 @@ impl<M: LanguageModel> Engine<M> {
                 raw: p.kind == Kind::Completion,
             },
         );
-        let mut collected = Collected::default();
-        let mut tool_index = 0usize;
+        let out = Output {
+            id,
+            created,
+            model: M::MODEL_ID,
+            kind: p.kind,
+            stream: p.stream,
+            collected: Collected::default(),
+            tool_index: 0,
+        };
         if p.stream {
             sink.start(200, "text/event-stream");
             if p.kind == Kind::Chat {
                 sink.sse(&chunk(
-                    &id,
+                    &out.id,
                     created,
                     M::MODEL_ID,
                     json!({"role": "assistant", "content": ""}),
@@ -1553,144 +1526,6 @@ impl<M: LanguageModel> Engine<M> {
                 ));
             }
         }
-        let mut deliver = |events: Vec<Event>, sink: &Sink| {
-            for event in events {
-                match event {
-                    Event::Reasoning(text) => {
-                        if p.stream {
-                            sink.sse(&chunk(
-                                &id,
-                                created,
-                                M::MODEL_ID,
-                                json!({"reasoning_content": text}),
-                                None,
-                            ));
-                        } else {
-                            collected.reasoning.push_str(&text);
-                        }
-                    }
-                    Event::Content(text) => {
-                        if p.stream {
-                            if p.kind == Kind::Chat {
-                                sink.sse(&chunk(
-                                    &id,
-                                    created,
-                                    M::MODEL_ID,
-                                    json!({"content": text}),
-                                    None,
-                                ));
-                            } else {
-                                sink.sse(&text_chunk(
-                                    &id,
-                                    created,
-                                    M::MODEL_ID,
-                                    &text,
-                                    None,
-                                ));
-                            }
-                        } else {
-                            collected.content.push_str(&text);
-                        }
-                    }
-                    Event::ToolCall(call) => {
-                        if p.stream {
-                            let delta = json!({"tool_calls": [{
-                                "index": tool_index,
-                                "id": call_id(&id, tool_index),
-                                "type": "function",
-                                "function": {"name": call.name, "arguments": call.arguments},
-                            }]});
-                            sink.sse(&chunk(&id, created, M::MODEL_ID, delta, None));
-                        } else {
-                            collected.tool_calls.push(call);
-                        }
-                        tool_index += 1;
-                    }
-                }
-            }
-        };
-
-        let options = GenerateOptions {
-            max_tokens: p.max_tokens,
-            sampling: &p.sampling,
-            stop_tokens: &[],
-            drafts: *drafts,
-        };
-        // Decode checkpoints count from the one the prefill just took.
-        let mut decode_checkpoints = sessions.decode_checkpoints(n - 1);
-        let checkpointer: &mut dyn DecodeCheckpointer<M::State> =
-            &mut decode_checkpoints;
-        let decode_started = Instant::now();
-        let generation = generator.generate_checkpointed(
-            ctx,
-            model,
-            &mut session.state,
-            scratch,
-            &p.prompt[n - 1..],
-            &options,
-            Some(checkpointer),
-            &mut |token| {
-                let events = parser.push(token)?;
-                deliver(events, sink);
-                Ok(!sink.cancelled() && !parser.stopped && !shutdown.cancel())
-            },
-        )?;
-        let final_events = parser.finish();
-        deliver(final_events, sink);
-        let decode_secs = decode_started.elapsed().as_secs_f64();
-        let counters_end = crate::stats::counters();
-        let vm_end = crate::stats::vm_counters();
-
-        // Bookkeeping: the state holds the prompt plus the generated tokens
-        // that were fed: all but the last (drawn, never fed), or all of them
-        // when a parked step consumed the final one. `fed` counts the last
-        // prompt token too.
-        let fed_generated = generation
-            .fed
-            .checked_sub(1)
-            .ok_or_else(|| anyhow::anyhow!("decode state did not advance"))?;
-        ensure!(
-            fed_generated + 1 == generation.tokens.len()
-                || fed_generated == generation.tokens.len(),
-            "decode state advanced {} tokens for {} drawn",
-            generation.fed,
-            generation.tokens.len()
-        );
-        session.tokens.truncate(reused);
-        session.tokens.extend_from_slice(&p.prompt[reused..]);
-        session.tokens.extend_from_slice(&generation.tokens[..fed_generated]);
-        ensure!(
-            session.state.pos() == session.tokens.len(),
-            "session token/state position mismatch"
-        );
-        // Every decode checkpoint sits at a point the state passed: a prefix
-        // of the tokens just recorded.
-        let decode_checkpoints_taken = decode_checkpoints.taken();
-        let decode_checkpoint_secs = decode_checkpoints.secs();
-        session.add_decode_checkpoints(decode_checkpoints.into_snapshots(), &images)?;
-        let released = sessions.release(ctx, session, &images, p.cache_key.as_deref());
-
-        if ctx.profiling() {
-            print_kernel_profile(&crate::metal::profile::take());
-        }
-        let completion_tokens = generation.tokens.len();
-        let finish_reason = match generation.finish {
-            FinishReason::Length => "length",
-            _ if parser.tool_calls_emitted() > 0 => "tool_calls",
-            _ => "stop",
-        };
-        // The numbers the line below prints, as JSON: attached to the
-        // response below and kept for `GET /v1/timings`. Recorded before the
-        // cancellation checks so the log and the ring buffer never disagree.
-        // A request whose client left (or the server stopped) during the
-        // decode is marked; its answer goes nowhere, or is a 503 below.
-        let cancelled_by = if sink.cancelled() {
-            Some("client")
-        } else if shutdown.cancel() {
-            Some("shutdown")
-        } else {
-            None
-        };
         let facts = Facts {
             n,
             reused,
@@ -1717,88 +1552,54 @@ impl<M: LanguageModel> Engine<M> {
             vm_start,
             vm_prefill,
         };
-        let outcome = Outcome {
-            generated: completion_tokens,
-            decode_secs,
-            speculation: (*drafts > 0).then_some(Speculation {
+        let mut admitted = Admitted {
+            p,
+            session,
+            images,
+            facts,
+            // Counted from the checkpoint the prefill just took.
+            decode_checkpoints: sessions.decode_checkpoints(n - 1),
+            parser,
+            out,
+        };
+
+        let Admitted { p, session, decode_checkpoints, parser, out, .. } =
+            &mut admitted;
+        let options = GenerateOptions {
+            max_tokens: p.max_tokens,
+            sampling: &p.sampling,
+            stop_tokens: &[],
+            drafts: *drafts,
+        };
+        let checkpointer: &mut dyn DecodeCheckpointer<M::State> = decode_checkpoints;
+        let decode_started = Instant::now();
+        let generation = generator.generate_checkpointed(
+            ctx,
+            model,
+            &mut session.state,
+            scratch,
+            &p.prompt[n - 1..],
+            &options,
+            Some(checkpointer),
+            &mut |token| {
+                let events = parser.push(token)?;
+                out.deliver(events, sink);
+                Ok(!sink.cancelled() && !parser.stopped && !shutdown.cancel())
+            },
+        )?;
+        self.answer(
+            admitted,
+            sink,
+            Decoded {
+                tokens: &generation.tokens,
+                finish: generation.finish,
                 drafted: generation.drafted,
                 accepted: generation.accepted,
-            }),
-            decode_checkpoints: decode_checkpoints_taken,
-            decode_checkpoint_secs,
-            cancelled_by,
-            cancelled_at: None,
-            batch: None,
-        };
-        let measured = request::timings(
-            &facts,
-            &outcome,
-            &released,
-            counters_end,
-            vm_end,
-            crate::stats::pressure_level(),
-            crate::stats::task_memory(),
-        );
-        let store = request::describe_store(sessions);
-        eprintln!(
-            "{}",
-            request::answer_line(
-                &id,
-                &facts,
-                &outcome,
-                finish_reason,
-                &store,
-                &measured.log_details()
-            )
-        );
-        timings.record(TimingsEntry {
-            id: id.clone(),
-            model: M::MODEL_ID,
-            created,
-            timings: measured,
-        });
-        if sink.cancelled() {
-            return Ok(());
-        }
-        if shutdown.cancel() {
-            // Stopped by the server, not the client: say so instead of
-            // handing out a truncated answer as a finished one.
-            if !sink.started {
-                sink.start(503, "application/json");
-                sink.send(error_json("server_error", "the server is shutting down"));
-            } else if p.stream {
-                sink.sse(&json!({"error": {"message": "the server is shutting down", "type": "server_error"}}));
-                sink.send(b"data: [DONE]\n\n".to_vec());
-            }
-            return Ok(());
-        }
-        let usage = api::usage(
-            n,
-            reused,
-            completion_tokens,
-            (p.kind == Kind::Chat).then(|| parser.reasoning_tokens()),
-            outcome.speculation.filter(|s| s.drafted > 0),
-        );
-        let closing = Closing {
-            kind: p.kind,
-            id: &id,
-            created,
-            model: M::MODEL_ID,
-            finish_reason,
-            usage,
-            timings: serde_json::to_value(measured)?,
-        };
-        if p.stream {
-            for event in request::stream_end(closing, p.include_usage) {
-                sink.sse(&event);
-            }
-            sink.send(b"data: [DONE]\n\n".to_vec());
-        } else {
-            let body = request::response_body(closing, collected);
-            sink.start(200, "application/json");
-            sink.send(serde_json::to_vec(&body)?);
-        }
-        Ok(())
+                started: decode_started,
+                batch: None,
+            },
+            0,
+        )
     }
 }
 

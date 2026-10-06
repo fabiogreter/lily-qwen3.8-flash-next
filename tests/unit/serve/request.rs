@@ -675,3 +675,80 @@ fn the_store_summary_names_the_disk_tier_only_when_there_is_one() {
         "sessions=4 (21.5/64.0 GB), disk 211 (500.0 GB)"
     );
 }
+
+fn sink() -> (Sink, std::sync::mpsc::Receiver<crate::serve::Out>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    (Sink { tx, cancelled, started: false }, rx)
+}
+
+/// What the responder thread would get, one line per message.
+fn sent(rx: &std::sync::mpsc::Receiver<crate::serve::Out>) -> Vec<String> {
+    use crate::serve::Out;
+    rx.try_iter()
+        .map(|out| match out {
+            Out::Start { status, content_type } => {
+                format!("start {status} {content_type}")
+            }
+            Out::Body(bytes) => String::from_utf8(bytes).unwrap(),
+            Out::End => "end".to_owned(),
+        })
+        .collect()
+}
+
+#[test]
+fn a_failure_is_an_error_body_before_the_response_started_and_an_event_after() {
+    let error = anyhow::anyhow!("a kernel failed");
+    let (mut before, rx) = sink();
+    answer_failure(&mut before, true, None, &error);
+    assert_eq!(
+        sent(&rx),
+        [
+            "start 500 application/json",
+            r#"{"error":{"message":"internal server error","type":"server_error"}}"#,
+            "end",
+        ]
+    );
+    let (mut streaming, rx) = sink();
+    streaming.start(200, "text/event-stream");
+    answer_failure(&mut streaming, true, Some("timeout"), &error);
+    assert_eq!(
+        sent(&rx),
+        [
+            "start 200 text/event-stream",
+            "data: {\"error\":{\"message\":\"the GPU command queue failed (timeout); the engine is \
+             reloading, retry shortly\",\"type\":\"server_error\"}}\n\n",
+            "data: [DONE]\n\n",
+            "end",
+        ]
+    );
+    // A started JSON response cannot take an error any more: it just ends.
+    let (mut collected, rx) = sink();
+    collected.start(200, "application/json");
+    answer_failure(&mut collected, false, Some("timeout"), &error);
+    assert_eq!(sent(&rx), ["start 200 application/json", "end"]);
+}
+
+#[test]
+fn a_shutdown_ends_the_response_with_a_503_or_an_error_event() {
+    let (mut before, rx) = sink();
+    error_end(&mut before, false, 503, "the server is shutting down");
+    assert_eq!(
+        sent(&rx),
+        [
+            "start 503 application/json",
+            r#"{"error":{"message":"the server is shutting down","type":"server_error"}}"#,
+        ]
+    );
+    let (mut streaming, rx) = sink();
+    streaming.start(200, "text/event-stream");
+    error_end(&mut streaming, true, 503, "the server is shutting down");
+    assert_eq!(
+        sent(&rx),
+        [
+            "start 200 text/event-stream",
+            "data: {\"error\":{\"message\":\"the server is shutting down\",\"type\":\"server_error\"}}\n\n",
+            "data: [DONE]\n\n",
+        ]
+    );
+}

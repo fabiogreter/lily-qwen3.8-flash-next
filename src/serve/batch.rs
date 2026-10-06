@@ -32,17 +32,15 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, ensure};
 use serde_json::json;
 
-use super::api::{self, Kind, Prepared};
+use super::api::{Kind, Prepared};
 use super::pin::InFlight;
-use super::request::{self, Closing, Facts, Outcome};
-use super::session::{
-    CachedImage, DecodeCheckpoints, Session, boundary_position, last_user_turn,
-};
-use super::stream::{Event, OutputParser, ParserConfig};
-use super::timings::{BatchTimings, Speculation, TimingsEntry};
+use super::request::{self, Admitted, Decoded, Ending, Facts, Opened, Outcome, Output};
+use super::session::{CachedImage, Session, boundary_position, last_user_turn};
+use super::stream::{OutputParser, ParserConfig};
+use super::timings::{BatchTimings, TimingsEntry};
 use super::{
-    Cmd, Collected, Engine, EngineQueue, Job, Sink, call_id, chunk, error_json, now,
-    response_id, text_chunk, user_turn_opener,
+    Cmd, Collected, Engine, EngineQueue, Job, Sink, chunk, error_json, now,
+    response_id, user_turn_opener,
 };
 use crate::engine::{BatchRow, CountsSlot, DecodeStateApi, Draw, LanguageModel};
 use crate::generate::{DecodeCheckpointer, FinishReason, GenerateOptions, Generator};
@@ -222,92 +220,17 @@ impl BatchStats {
 
 // --- rows --------------------------------------------------------------------
 
-type Detokenize<'g> = Box<dyn FnMut(&[u32]) -> Result<String> + 'g>;
-type Parser<'g> = OutputParser<Detokenize<'g>>;
-
-/// Where a request's output goes: SSE chunks or the collected answer.
-struct Output {
-    id: String,
-    created: u64,
-    model: &'static str,
-    kind: Kind,
-    stream: bool,
-    collected: Collected,
-    tool_index: usize,
-}
-
-impl Output {
-    /// `Engine::run`'s `deliver`.
-    fn deliver(&mut self, events: Vec<Event>, sink: &Sink) {
-        let (id, created, model) = (self.id.as_str(), self.created, self.model);
-        for event in events {
-            match event {
-                Event::Reasoning(text) => {
-                    if self.stream {
-                        sink.sse(&chunk(
-                            id,
-                            created,
-                            model,
-                            json!({"reasoning_content": text}),
-                            None,
-                        ));
-                    } else {
-                        self.collected.reasoning.push_str(&text);
-                    }
-                }
-                Event::Content(text) => {
-                    if self.stream {
-                        if self.kind == Kind::Chat {
-                            sink.sse(&chunk(
-                                id,
-                                created,
-                                model,
-                                json!({"content": text}),
-                                None,
-                            ));
-                        } else {
-                            sink.sse(&text_chunk(id, created, model, &text, None));
-                        }
-                    } else {
-                        self.collected.content.push_str(&text);
-                    }
-                }
-                Event::ToolCall(call) => {
-                    if self.stream {
-                        let delta = json!({"tool_calls": [{
-                            "index": self.tool_index,
-                            "id": call_id(id, self.tool_index),
-                            "type": "function",
-                            "function": {"name": call.name, "arguments": call.arguments},
-                        }]});
-                        sink.sse(&chunk(id, created, model, delta, None));
-                    } else {
-                        self.collected.tool_calls.push(call);
-                    }
-                    self.tool_index += 1;
-                }
-            }
-        }
-    }
-}
-
 /// One request in its decode phase.
 struct Row<'g, M: LanguageModel> {
     /// The scheduler's sequence number (for the sharing statistics).
     seq: u64,
-    p: Prepared,
+    /// The request as its admission left it. Its decode checkpoints are
+    /// taken in the single-session loop and between batched steps alike.
+    req: Admitted<'g, M>,
     sink: Sink,
     /// The request is in flight for the weight pin until this drops, after
-    /// its response's end (see `Engine::serve`); taken by whoever ends it.
-    request: Option<InFlight>,
-    session: Session<M>,
-    images: Vec<CachedImage>,
-    facts: Facts,
-    /// Its decode checkpoints, taken in the single-session loop and between
-    /// batched steps alike, counted from the prefill's checkpoint.
-    decode_checkpoints: DecodeCheckpoints<M::State>,
-    parser: Parser<'g>,
-    out: Output,
+    /// its response's end ([`Engine::close`]).
+    in_flight: InFlight,
     /// Every token drawn so far; the last one is not fed into the state yet
     /// (`state.pos() == prompt + generated.len() - 1`) whenever the row is at
     /// rest between steps.
@@ -338,58 +261,15 @@ impl<M: LanguageModel> Row<'_, M> {
             self.finish = Some(FinishReason::StopToken);
             return Ok(());
         }
-        let events = self.parser.push(token)?;
-        self.out.deliver(events, &self.sink);
-        if self.sink.cancelled() || self.parser.stopped || shutdown_cancel {
+        let events = self.req.parser.push(token)?;
+        self.req.out.deliver(events, &self.sink);
+        if self.sink.cancelled() || self.req.parser.stopped || shutdown_cancel {
             self.finish = Some(FinishReason::Callback);
-        } else if self.generated.len() >= self.p.max_tokens {
+        } else if self.generated.len() >= self.req.p.max_tokens {
             self.finish = Some(FinishReason::Length);
         }
         Ok(())
     }
-}
-
-/// A sink that goes nowhere: what the admission leaves behind once the row
-/// took the request's sink.
-fn detached_sink() -> Sink {
-    let (tx, _) = std::sync::mpsc::channel();
-    Sink {
-        tx,
-        cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        started: false,
-    }
-}
-
-/// Answers a request that failed: `Engine::serve`'s error path.
-fn answer_failure(
-    sink: &mut Sink,
-    stream: bool,
-    fault: Option<&str>,
-    error: &anyhow::Error,
-) {
-    let (status, message) = match fault {
-        Some(fault) => {
-            eprintln!("request failed on a GPU fault (the engine reloads): {error:#}");
-            (
-                503,
-                format!(
-                    "the GPU command queue failed ({fault}); the engine is reloading, retry shortly"
-                ),
-            )
-        }
-        None => {
-            eprintln!("request failed: {error:#}");
-            (500, "internal server error".to_owned())
-        }
-    };
-    if !sink.started {
-        sink.start(status, "application/json");
-        sink.send(error_json("server_error", message));
-    } else if stream {
-        sink.sse(&json!({"error": {"message": message, "type": "server_error"}}));
-        sink.send(b"data: [DONE]\n\n".to_vec());
-    }
-    sink.end();
 }
 
 // --- the scheduler -----------------------------------------------------------
@@ -418,7 +298,7 @@ impl<M: LanguageModel> Engine<M> {
             if let Some(job) = held.take() {
                 if self.fits(&job, &rows) {
                     seq += 1;
-                    self.admit(job, seq, &generator, &mut rows, &mut slots);
+                    self.start_row(job, seq, &generator, &mut rows, &mut slots);
                     continue;
                 }
                 held = Some(job);
@@ -439,7 +319,12 @@ impl<M: LanguageModel> Engine<M> {
             }
             if let Some(job) = held.take() {
                 let mut sink = job.sink;
-                answer_failure(&mut sink, job.prepared.stream, Some(fault), &error);
+                request::answer_failure(
+                    &mut sink,
+                    job.prepared.stream,
+                    Some(fault),
+                    &error,
+                );
             }
         }
         debug_assert!(rows.is_empty() && held.is_none() && slots.in_use() == 0);
@@ -478,7 +363,7 @@ impl<M: LanguageModel> Engine<M> {
         let growth = job.prepared.max_tokens.min(ADMIT_GROWTH_TOKENS);
         let tokens = (job.prepared.prompt.len() + growth).min(self.max_seq);
         let estimate = self.model.session_bytes(tokens, 1).unwrap_or(0) as usize;
-        let in_flight = rows.iter().map(|r| r.session.bytes()).sum();
+        let in_flight = rows.iter().map(|r| r.req.session.bytes()).sum();
         admits(
             rows.len(),
             self.max_batch,
@@ -490,7 +375,7 @@ impl<M: LanguageModel> Engine<M> {
 
     /// Bytes of the sessions in `rows`, which the store counts as in flight.
     fn in_flight(rows: &[Row<'_, M>]) -> usize {
-        rows.iter().map(|r| r.session.bytes()).sum()
+        rows.iter().map(|r| r.req.session.bytes()).sum()
     }
 
     /// Runs the one row in the single-session loop until it finishes or, with
@@ -534,8 +419,8 @@ impl<M: LanguageModel> Engine<M> {
             CountsSlot::Engine,
         )?;
         let options = GenerateOptions {
-            max_tokens: row.p.max_tokens,
-            sampling: &row.p.sampling,
+            max_tokens: row.req.p.max_tokens,
+            sampling: &row.req.p.sampling,
             stop_tokens: &[],
             drafts: *drafts,
         };
@@ -543,7 +428,10 @@ impl<M: LanguageModel> Engine<M> {
         let mut preempted = false;
         let resumed = {
             let Row {
-                parser, out, sink, session, generated, decode_checkpoints, ..
+                req: Admitted { parser, out, session, decode_checkpoints, .. },
+                sink,
+                generated,
+                ..
             } = row;
             let mut on_token = |token: u32| -> Result<bool> {
                 let events = parser.push(token)?;
@@ -577,7 +465,7 @@ impl<M: LanguageModel> Engine<M> {
                 // The parked step fed the last draw and drew the next one:
                 // that is the row's next draw, as the loop would have used it.
                 Some(token) => row.take_draw(token, generator, shutdown.cancel())?,
-                None if row.generated.len() >= row.p.max_tokens => {
+                None if row.generated.len() >= row.req.p.max_tokens => {
                     row.finish = Some(FinishReason::Length)
                 }
                 None => {}
@@ -636,7 +524,7 @@ impl<M: LanguageModel> Engine<M> {
     ) -> Result<()> {
         // The GPU is idle between steps: a row at its capacity grows here.
         for row in rows.iter_mut() {
-            let state = &mut row.session.state;
+            let state = &mut row.req.session.state;
             if state.pos() >= state.capacity() {
                 state.ensure_capacity(&self.ctx, state.pos() + 1)?;
             }
@@ -656,9 +544,9 @@ impl<M: LanguageModel> Engine<M> {
                 .iter_mut()
                 .map(|r| BatchRow {
                     token: *r.generated.last().expect("a row has drawn"),
-                    draw: Draw { params: &r.p.sampling, step: r.generated.len() },
+                    draw: Draw { params: &r.req.p.sampling, step: r.generated.len() },
                     slot: r.slot,
-                    state: &mut r.session.state,
+                    state: &mut r.req.session.state,
                 })
                 .collect();
             self.model.decode_rows(&self.ctx, &mut self.scratch, &mut batch)?
@@ -676,9 +564,9 @@ impl<M: LanguageModel> Engine<M> {
             // At rest between steps, holding every draw but the last: a
             // decode checkpoint due here is taken as the single-session loop
             // takes one, only for a row that goes on.
-            let pos = row.session.state.pos();
-            if row.finish.is_none() && row.decode_checkpoints.due(pos) {
-                row.decode_checkpoints.take(&self.ctx, &row.session.state)?;
+            let pos = row.req.session.state.pos();
+            if row.finish.is_none() && row.req.decode_checkpoints.due(pos) {
+                row.req.decode_checkpoints.take(&self.ctx, &row.req.session.state)?;
             }
         }
         Ok(())
@@ -693,20 +581,18 @@ impl<M: LanguageModel> Engine<M> {
         fault: Option<&str>,
         error: &anyhow::Error,
     ) {
-        let Row { mut sink, p, slot, request, .. } = row;
+        let Row { sink, req, slot, in_flight, .. } = row;
         slots.give(slot);
-        self.pin.after_request(Instant::now());
-        answer_failure(&mut sink, p.stream, fault, error);
-        drop(request);
+        self.close(sink, in_flight, req.p.stream, Ending::FailedUnder(error, fault));
     }
 
     // --- admission ----------------------------------------------------------
 
-    /// Admits `job`: everything `Engine::run` does before its decode loop,
-    /// with the prefill interleaved with batched steps of `rows`. The
-    /// request becomes a row, or is answered here when it ends before its
-    /// decode (cancelled, refused, failed, or finished by its first draw).
-    fn admit<'g>(
+    /// Starts `job`: its admission (everything before the decode, with the
+    /// prefill interleaved with batched steps of `rows`), then its first
+    /// draw. The request becomes a row, or is answered here when it ends
+    /// before its decode (cancelled, failed, or finished by its first draw).
+    fn start_row<'g>(
         &mut self,
         job: Job,
         seq: u64,
@@ -714,74 +600,122 @@ impl<M: LanguageModel> Engine<M> {
         rows: &mut Vec<Row<'g, M>>,
         slots: &mut Slots,
     ) {
-        let Job { prepared, mut sink, queued_at } = job;
-        let stream = prepared.stream;
-        // In flight for the pin until the response's end, as in
-        // `Engine::serve`: a row takes the guard, and drops it after its
-        // sink's end; every other path drops it here, after the sink's.
-        let mut request = Some(self.pin.before_request(Instant::now()));
-        let queued = queued_at.elapsed();
+        let Opened { p, mut sink, in_flight, queued } = self.open(job);
+        let stream = p.stream;
         if sink.cancelled() {
-            self.pin.after_request(Instant::now());
-            sink.end();
-            drop(request);
+            self.close(sink, in_flight, stream, Ending::Answered);
             return;
         }
-        match self.try_admit(
-            prepared,
+        let mut stats = BatchStats::default();
+        let admitted = self.try_admit(
+            p,
             &mut sink,
             queued,
-            &mut request,
-            seq,
+            in_flight.pinned(),
             generator,
             rows,
             slots,
-        ) {
-            // The row holds the request's sink and guard now; `sink` is
-            // detached.
-            Ok(Some(row)) => match row.finish {
-                Some(_) => {
-                    let others = Self::in_flight(rows);
-                    self.finish_row(row, slots, others);
-                }
-                None => rows.push(row),
-            },
+            &mut stats,
+        );
+        let mut req = match admitted {
+            Ok(Some(req)) => req,
             // Answered (a cancelled prefill keeps its session, see there).
             Ok(None) => {
-                self.pin.after_request(Instant::now());
-                sink.end();
+                self.close(sink, in_flight, stream, Ending::Answered);
+                return;
             }
             Err(error) => {
-                self.pin.after_request(Instant::now());
-                let fault = self.ctx.fault();
-                answer_failure(&mut sink, stream, fault.as_deref(), &error);
+                self.close(sink, in_flight, stream, Ending::Failed(&error));
+                return;
             }
+        };
+        // The first draw (`Generator::generate`'s start), into the engine's
+        // sampler, whose counts it resets; the row then takes a slot and the
+        // counts go with it. A failed request's session is dropped before
+        // its answer, as everywhere.
+        let n = req.facts.n;
+        let decode_started = Instant::now();
+        let drawn = generator
+            .begin(
+                &self.ctx,
+                &self.model,
+                &mut req.session.state,
+                &mut self.scratch,
+                &req.p.prompt[n - 1..],
+                &req.p.sampling,
+            )
+            .and_then(|first| {
+                let slot = slots.take().ok_or_else(|| {
+                    anyhow::anyhow!("no free batch slot for an admitted request")
+                })?;
+                Ok((first, slot))
+            });
+        let (first, slot) = match drawn {
+            Ok(drawn) => drawn,
+            Err(error) => {
+                drop(req);
+                self.close(sink, in_flight, stream, Ending::Failed(&error));
+                return;
+            }
+        };
+        let mut row = Row {
+            seq,
+            req,
+            sink,
+            in_flight,
+            generated: Vec::with_capacity(256),
+            slot,
+            decode_started,
+            drafted: 0,
+            accepted: 0,
+            stats,
+            finish: None,
+        };
+        let mut taken = row.take_draw(first, generator, self.shutdown.cancel());
+        if taken.is_ok() && row.finish.is_none() {
+            taken = self.model.move_sampler_counts(
+                &self.ctx,
+                &mut self.scratch,
+                CountsSlot::Engine,
+                CountsSlot::Batch(slot),
+            );
         }
-        drop(request);
+        if let Err(error) = taken {
+            slots.give(slot);
+            let Row { req, sink, in_flight, .. } = row;
+            drop(req);
+            self.close(sink, in_flight, stream, Ending::Failed(&error));
+            return;
+        }
+        match row.finish {
+            Some(_) => {
+                let others = Self::in_flight(rows);
+                self.finish_row(row, slots, others);
+            }
+            None => rows.push(row),
+        }
     }
 
-    /// `Engine::run` up to its first draw. A returned row has taken over
-    /// `sink` (a detached one is left behind) and `request`; `None` and
-    /// errors leave both.
+    /// `Engine::run` up to its decode: `None` when the request was answered
+    /// here (its prefill was stopped).
     #[allow(clippy::too_many_arguments)]
     fn try_admit<'g>(
         &mut self,
         p: Prepared,
         sink: &mut Sink,
         queued: Duration,
-        request: &mut Option<InFlight>,
-        seq: u64,
+        pinned: bool,
         generator: &'g Generator,
         rows: &mut Vec<Row<'g, M>>,
         slots: &mut Slots,
-    ) -> Result<Option<Row<'g, M>>> {
+        stats: &mut BatchStats,
+    ) -> Result<Option<Admitted<'g, M>>> {
         ensure!(
             p.prompt.len() < self.max_seq,
             "prompt exceeds the engine context: {} prompt tokens, {} tokens of context",
             p.prompt.len(),
             self.max_seq
         );
-        let pinned = request.as_ref().is_some_and(InFlight::pinned);
         let n = p.prompt.len();
         let images: Vec<CachedImage> =
             p.images.iter().map(|i| CachedImage::new(i.span, i.digest)).collect();
@@ -848,7 +782,6 @@ impl<M: LanguageModel> Engine<M> {
             .as_ref()
             .map(|pos| VisionInput { positions: pos, images: &embeds });
 
-        let mut stats = BatchStats::default();
         let min_tokens = self.sessions.durable_min_tokens();
         // As in `Engine::run`: snapped back to the last user message opened
         // before the agreement.
@@ -887,7 +820,7 @@ impl<M: LanguageModel> Engine<M> {
                     generator,
                     rows,
                     slots,
-                    &mut stats,
+                    stats,
                 )?;
             }
             if prefilled < b || stop() {
@@ -926,7 +859,7 @@ impl<M: LanguageModel> Engine<M> {
                     generator,
                     rows,
                     slots,
-                    &mut stats,
+                    stats,
                 )?;
             }
             if prefilled < n - 1 || stop() {
@@ -981,7 +914,7 @@ impl<M: LanguageModel> Engine<M> {
                 &Outcome {
                     cancelled_by: Some(by),
                     cancelled_at: Some(at),
-                    batch: Some(&stats),
+                    batch: Some(stats),
                     ..Outcome::default()
                 },
                 &released,
@@ -1049,7 +982,7 @@ impl<M: LanguageModel> Engine<M> {
         let created = now();
         let id = response_id(p.kind, created, &mut self.next_id);
         let tokenizer = generator.tokenizer();
-        let detokenize: Detokenize<'g> =
+        let detokenize: request::Detokenize<'g> =
             Box::new(move |ids: &[u32]| tokenizer.decode(ids, false));
         let parser = OutputParser::new(
             detokenize,
@@ -1081,22 +1014,6 @@ impl<M: LanguageModel> Engine<M> {
                 ));
             }
         }
-
-        // The first draw (`Generator::generate`'s start), into the engine's
-        // sampler, whose counts it resets; the row then takes a slot and the
-        // counts go with it.
-        let decode_started = Instant::now();
-        let first = generator.begin(
-            &self.ctx,
-            &self.model,
-            &mut session.state,
-            &mut self.scratch,
-            &p.prompt[n - 1..],
-            &p.sampling,
-        )?;
-        let slot = slots.take().ok_or_else(|| {
-            anyhow::anyhow!("no free batch slot for an admitted request")
-        })?;
         let facts = Facts {
             n,
             reused,
@@ -1123,13 +1040,8 @@ impl<M: LanguageModel> Engine<M> {
             vm_start,
             vm_prefill,
         };
-        // The row takes the request's sink and guard; the caller keeps a
-        // detached sink, and gets both back if the first draw fails.
-        let mut row = Row {
-            seq,
+        Ok(Some(Admitted {
             p,
-            sink: std::mem::replace(sink, detached_sink()),
-            request: request.take(),
             session,
             images,
             facts,
@@ -1137,30 +1049,7 @@ impl<M: LanguageModel> Engine<M> {
             decode_checkpoints: self.sessions.decode_checkpoints(n - 1),
             parser,
             out,
-            generated: Vec::with_capacity(256),
-            slot,
-            decode_started,
-            drafted: 0,
-            accepted: 0,
-            stats,
-            finish: None,
-        };
-        let mut taken = row.take_draw(first, generator, self.shutdown.cancel());
-        if taken.is_ok() && row.finish.is_none() {
-            taken = self.model.move_sampler_counts(
-                &self.ctx,
-                &mut self.scratch,
-                CountsSlot::Engine,
-                CountsSlot::Batch(slot),
-            );
-        }
-        if let Err(error) = taken {
-            slots.give(slot);
-            *sink = std::mem::replace(&mut row.sink, detached_sink());
-            *request = row.request.take();
-            return Err(error);
-        }
-        Ok(Some(row))
+        }))
     }
 
     /// Prefills `tokens` into `session` at its position, stopping early when
@@ -1228,180 +1117,44 @@ impl<M: LanguageModel> Engine<M> {
 
     // --- the answer -----------------------------------------------------------
 
-    /// Answers a row that finished (`Engine::run` after its decode loop):
-    /// the session goes back to the cache, then timings, the log line and
-    /// the response. `in_flight_others` are the bytes of the sessions other
-    /// requests still hold.
+    /// Answers a row that finished ([`Engine::answer`]) and closes it.
+    /// `in_flight_others` are the bytes of the sessions other requests
+    /// still hold.
     fn finish_row(
         &mut self,
-        mut row: Row<'_, M>,
+        row: Row<'_, M>,
         slots: &mut Slots,
         in_flight_others: usize,
     ) {
-        slots.give(row.slot);
-        let stream = row.p.stream;
-        let mut sink = std::mem::replace(&mut row.sink, detached_sink());
-        let request = row.request.take();
-        let result = self.try_finish(row, &mut sink, in_flight_others);
-        self.pin.after_request(Instant::now());
-        match result {
-            Ok(()) => sink.end(),
-            Err(error) => {
-                let fault = self.ctx.fault();
-                answer_failure(&mut sink, stream, fault.as_deref(), &error);
-            }
-        }
-        // After the response's end, as in `Engine::serve`.
-        drop(request);
-    }
-
-    fn try_finish(
-        &mut self,
-        mut row: Row<'_, M>,
-        sink: &mut Sink,
-        in_flight_others: usize,
-    ) -> Result<()> {
-        let final_events = row.parser.finish();
-        row.out.deliver(final_events, sink);
-        let decode_secs = row.decode_started.elapsed().as_secs_f64();
-        let counters_end = crate::stats::counters();
-        let vm_end = crate::stats::vm_counters();
-        let f = &row.facts;
-        let n = f.n;
-        let p = &row.p;
-        let finish = row.finish.unwrap_or(FinishReason::Callback);
-
-        // The state holds the prompt and every draw but the last, or all of
-        // them when a parked step consumed the last one.
-        let pos = row.session.state.pos();
-        let fed_generated = pos
-            .checked_sub(n)
-            .ok_or_else(|| anyhow::anyhow!("decode state did not advance"))?;
-        ensure!(
-            fed_generated + 1 == row.generated.len()
-                || fed_generated == row.generated.len(),
-            "decode state at {pos} for {n} prompt tokens and {} drawn",
-            row.generated.len()
-        );
-        let mut session = row.session;
-        session.tokens.truncate(f.reused);
-        session.tokens.extend_from_slice(&p.prompt[f.reused..]);
-        session.tokens.extend_from_slice(&row.generated[..fed_generated]);
-        ensure!(
-            session.state.pos() == session.tokens.len(),
-            "session token/state position mismatch"
-        );
-        // Every decode checkpoint sits at a point the state passed: a prefix
-        // of the tokens just recorded.
-        let decode_checkpoints_taken = row.decode_checkpoints.taken();
-        let decode_checkpoint_secs = row.decode_checkpoints.secs();
-        session.add_decode_checkpoints(
-            row.decode_checkpoints.into_snapshots(),
-            &row.images,
-        )?;
-        self.sessions.set_in_flight_bytes(in_flight_others);
-        let released = self.sessions.release(
-            &self.ctx,
-            session,
-            &row.images,
-            p.cache_key.as_deref(),
-        );
-
-        let completion_tokens = row.generated.len();
-        let finish_reason = match finish {
-            FinishReason::Length => "length",
-            _ if row.parser.tool_calls_emitted() > 0 => "tool_calls",
-            _ => "stop",
+        let Row {
+            req,
+            mut sink,
+            in_flight,
+            generated,
+            slot,
+            decode_started,
+            drafted,
+            accepted,
+            stats,
+            finish,
+            ..
+        } = row;
+        slots.give(slot);
+        let stream = req.p.stream;
+        let decoded = Decoded {
+            tokens: &generated,
+            finish: finish.unwrap_or(FinishReason::Callback),
+            drafted,
+            accepted,
+            started: decode_started,
+            batch: Some(&stats),
         };
-        let cancelled_by = if sink.cancelled() {
-            Some("client")
-        } else if self.shutdown.cancel() {
-            Some("shutdown")
-        } else {
-            None
+        let result = self.answer(req, &mut sink, decoded, in_flight_others);
+        let ending = match &result {
+            Ok(()) => Ending::Answered,
+            Err(error) => Ending::Failed(error),
         };
-        let outcome = Outcome {
-            generated: completion_tokens,
-            decode_secs,
-            speculation: (self.drafts > 0).then_some(Speculation {
-                drafted: row.drafted,
-                accepted: row.accepted,
-            }),
-            decode_checkpoints: decode_checkpoints_taken,
-            decode_checkpoint_secs,
-            cancelled_by,
-            cancelled_at: None,
-            batch: Some(&row.stats),
-        };
-        let measured = request::timings(
-            f,
-            &outcome,
-            &released,
-            counters_end,
-            vm_end,
-            crate::stats::pressure_level(),
-            crate::stats::task_memory(),
-        );
-        let id = row.out.id.clone();
-        let created = row.out.created;
-        eprintln!(
-            "{}",
-            request::answer_line(
-                &id,
-                f,
-                &outcome,
-                finish_reason,
-                &request::describe_store(&self.sessions),
-                &measured.log_details()
-            )
-        );
-        self.timings.record(TimingsEntry {
-            id: id.clone(),
-            model: M::MODEL_ID,
-            created,
-            timings: measured,
-        });
-        if sink.cancelled() {
-            return Ok(());
-        }
-        if self.shutdown.cancel() {
-            if !sink.started {
-                sink.start(503, "application/json");
-                sink.send(error_json("server_error", "the server is shutting down"));
-            } else if p.stream {
-                sink.sse(&json!({"error": {"message": "the server is shutting down", "type": "server_error"}}));
-                sink.send(b"data: [DONE]\n\n".to_vec());
-            }
-            return Ok(());
-        }
-        let usage = api::usage(
-            n,
-            f.reused,
-            completion_tokens,
-            (p.kind == Kind::Chat).then(|| row.parser.reasoning_tokens()),
-            outcome.speculation.filter(|s| s.drafted > 0),
-        );
-        let closing = Closing {
-            kind: p.kind,
-            id: &id,
-            created,
-            model: M::MODEL_ID,
-            finish_reason,
-            usage,
-            timings: serde_json::to_value(measured)?,
-        };
-        if p.stream {
-            for event in request::stream_end(closing, p.include_usage) {
-                sink.sse(&event);
-            }
-            sink.send(b"data: [DONE]\n\n".to_vec());
-        } else {
-            let body =
-                request::response_body(closing, std::mem::take(&mut row.out.collected));
-            sink.start(200, "application/json");
-            sink.send(serde_json::to_vec(&body)?);
-        }
-        Ok(())
+        self.close(sink, in_flight, stream, ending);
     }
 }
 
