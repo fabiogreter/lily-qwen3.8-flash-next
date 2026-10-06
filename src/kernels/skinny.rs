@@ -24,9 +24,17 @@ const REG_SMALL_M: usize = 8;
 
 /// Simdgroups per register-A threadgroup.
 const REG_SIMDGROUPS_PER_TG: usize = 2;
-/// Weight rows each register-A simdgroup computes; must match
+/// Weight rows each Q8 register-A simdgroup computes; must match
 /// `SKINNY_REG_ROWS` in skinny.metal.
 const REG_ROWS_PER_SG: usize = 2;
+/// Weight rows each Q4 register-A simdgroup computes, by m (index m - 1);
+/// must match the `GEMM_SKINNY_Q4_REG` instantiations in skinny.metal. More
+/// rows share a block's activation work (the bound past m = 2) across more
+/// weight rows. Measured on the M5 Max at the model's shapes, with a barrier
+/// after each projection as in the model's passes: 4 rows beat 2 from m = 2
+/// and beat 8 (which wins only on back-to-back dispatches, see
+/// `skinny_rows_scaling_probe`) at every m.
+const Q4_REG_ROWS_PER_SG: [usize; REG_MAX_M] = [2, 4, 4, 4, 4, 4, 4, 4];
 
 /// Selects register-A when shape and packing constraints hold.
 fn reg_routes(m: usize, n: usize, block_walk_ok: bool) -> bool {
@@ -92,9 +100,9 @@ const Q4_REG_FNS_F32: [&str; REG_MAX_M] = [
     "gemm_skinny_q4_f32_reg_m8",
 ];
 
-fn reg_grid(n: usize, simdgroups: usize) -> Grid {
+fn reg_grid(n: usize, simdgroups: usize, rows_per_sg: usize) -> Grid {
     Grid::Threadgroups {
-        groups: (n.div_ceil(simdgroups * REG_ROWS_PER_SG), 1, 1),
+        groups: (n.div_ceil(simdgroups * rows_per_sg), 1, 1),
         threadgroup: (32 * simdgroups, 1, 1),
     }
 }
@@ -177,6 +185,11 @@ fn dispatch_q4_reg(
     c: &Tensor,
     (m, k, n): (usize, usize, usize),
 ) -> Result<()> {
+    // The kernel addresses code words with 32-bit offsets.
+    ensure!(
+        n * (k / 8) <= u32::MAX as usize,
+        "register-A q4 needs N * K / 8 < 2^32 (n = {n}, k = {k})"
+    );
     let names = if c.dtype() == DType::F32 { &Q4_REG_FNS_F32 } else { &Q4_REG_FNS };
     let pipeline = ctx.pipeline(names[m - 1], SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
@@ -189,7 +202,7 @@ fn dispatch_q4_reg(
             c.binding(),
         ],
         &[&u32_bytes(k), &u32_bytes(n), &u32_bytes(w.group_size)],
-        reg_grid(n, REG_SIMDGROUPS_PER_TG),
+        reg_grid(n, REG_SIMDGROUPS_PER_TG, Q4_REG_ROWS_PER_SG[m - 1]),
     )
 }
 
@@ -237,7 +250,7 @@ pub fn gemm_skinny_q8_nt(
                 c.binding(),
             ],
             &[&u32_bytes(k), &u32_bytes(n), &u32_bytes(w.group_size)],
-            reg_grid(n, REG_SIMDGROUPS_PER_TG),
+            reg_grid(n, REG_SIMDGROUPS_PER_TG, REG_ROWS_PER_SG),
         );
     }
     let fn_name = match (m <= REG_MAX_M, c.dtype()) {

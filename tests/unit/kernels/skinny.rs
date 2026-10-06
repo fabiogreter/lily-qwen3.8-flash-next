@@ -39,14 +39,14 @@ fn gemm_skinny_q4_nt_staged(
 }
 
 /// Test-only register-A variant with an explicit simdgroups-per-threadgroup
-/// width (each simdgroup computes `REG_ROWS_PER_SG` rows).
+/// width (each simdgroup computes `Q4_REG_ROWS_PER_SG[m - 1]` rows).
 fn gemm_skinny_q4_nt_reg(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
     a: &Tensor,
     w: &QuantWeights,
     c: &Tensor,
-    rows_per_tg: usize,
+    simdgroups: usize,
 ) -> Result<()> {
     let (m, k, n) = validate_q4(a, w, c)?;
     ensure!(m <= REG_MAX_M, "register-A kernels cover m <= 8 (m = {m})");
@@ -56,7 +56,7 @@ fn gemm_skinny_q4_nt_reg(
         k,
         w.group_size
     );
-    ensure!((1..=32).contains(&rows_per_tg), "rows_per_tg {rows_per_tg} out of 1..=32");
+    ensure!((1..=32).contains(&simdgroups), "simdgroups {simdgroups} out of 1..=32");
     let pipeline = ctx.pipeline(Q4_REG_FNS[m - 1], SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
@@ -68,7 +68,7 @@ fn gemm_skinny_q4_nt_reg(
             c.binding(),
         ],
         &[&u32_bytes(k), &u32_bytes(n), &u32_bytes(w.group_size)],
-        reg_grid(n, rows_per_tg),
+        reg_grid(n, simdgroups, Q4_REG_ROWS_PER_SG[m - 1]),
     )
 }
 
@@ -1046,18 +1046,21 @@ fn timing_quant(ctx: &MetalContext, n: usize, k: usize, salt: u32) -> QuantWeigh
 /// its row count (`docs/architecture.md`, "Continuous batching"): every row
 /// reads the same weights, so a bandwidth-bound kernel would take about as
 /// long at four rows as at one. Measured 2026-10-06 in the kernel profile,
-/// the register-A skinny GEMM took about 44 % longer at m = 4 than at
-/// m = 1. For Qwen3.8-Flash-Next's Q4 shapes (the GDN input stack, the
-/// attention qkv-and-gate stack, the two output projections, the LM head
-/// with f32 logits), this times each kernel variant at m = 1, 2, 3, 4 and 8
-/// over enough distinct copies of the matrix (1.2 GB and up) that the system
-/// cache does not serve them, best and median of five passes, and prints
-/// the effective weight bandwidth and the time relative to m = 1. Variants:
-/// the shipped route (`gemm_skinny_q4_nt`), register-A with 4 simdgroups per
-/// threadgroup instead of 2, the staged route (activations staged in
-/// threadgroup memory, weights rounded to bf16), and the decode GEMV at
-/// m = 1 as the bandwidth reference. Compare with `gemv_q4_bandwidth_probe`
-/// and `memory_bandwidth_probe`.
+/// the two-row register-A skinny GEMM took about 44 % longer at m = 4 than
+/// at m = 1 (its per-block activation work bound it); the shipped kernel
+/// shares that work across more rows per simdgroup. For Qwen3.8-Flash-Next's
+/// Q4 shapes (the GDN input stack, the attention qkv-and-gate stack, the two
+/// output projections, the LM head with f32 logits), this times each kernel
+/// variant at m = 1..8 over enough distinct copies of the matrix (1.2 GB and
+/// up) that the system cache does not serve them, best and median of five
+/// passes, and prints the effective weight bandwidth and the time relative
+/// to m = 1. Variants: the shipped route (`gemm_skinny_q4_nt`), the two-row
+/// kernel it replaced (`*_previous`, bit-identical results), both again
+/// with a barrier after every dispatch (as in the model's passes), register-A
+/// with 4 simdgroups per threadgroup instead of 2, the staged route
+/// (activations staged in threadgroup memory, weights rounded to bf16), and
+/// the decode GEMV at m = 1 as the bandwidth reference. Compare with
+/// `gemv_q4_bandwidth_probe` and `memory_bandwidth_probe`.
 #[test]
 #[ignore = "timing probe; run with --ignored --nocapture"]
 fn skinny_rows_scaling_probe() {
@@ -1127,7 +1130,7 @@ fn skinny_rows_scaling_probe() {
             });
             report("decode gemv (reference)", 1, t);
         }
-        for m in [1usize, 2, 3, 4, 8] {
+        for m in 1..=REG_MAX_M {
             let a: Vec<f32> = (0..m * k).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
             let ta = Tensor::from_f32_as_bf16(&ctx, &a, &[m, k]).expect("a");
             let cs: Vec<Tensor> = (0..copies)
@@ -1143,6 +1146,31 @@ fn skinny_rows_scaling_probe() {
                 base.set(Some(shipped.0));
             }
             report("shipped route", m, shipped);
+            let previous = time(&|pass| {
+                for (w, c) in weights.iter().zip(&cs) {
+                    gemm_skinny_q4_nt_previous(&ctx, pass, &ta, w, c)?;
+                }
+                Ok(())
+            });
+            report("two-row kernel (previous)", m, previous);
+            // A barrier after every dispatch, as in the model's passes: each
+            // dispatch then fills the GPU on its own and pays its own tail.
+            let shipped_b = time(&|pass| {
+                for (w, c) in weights.iter().zip(&cs) {
+                    gemm_skinny_q4_nt(&ctx, pass, &ta, w, c)?;
+                    pass.level_barrier(&[])?;
+                }
+                Ok(())
+            });
+            report("shipped, barriers", m, shipped_b);
+            let previous_b = time(&|pass| {
+                for (w, c) in weights.iter().zip(&cs) {
+                    gemm_skinny_q4_nt_previous(&ctx, pass, &ta, w, c)?;
+                    pass.level_barrier(&[])?;
+                }
+                Ok(())
+            });
+            report("previous, barriers", m, previous_b);
             if !f32_out {
                 let wide = time(&|pass| {
                     for (w, c) in weights.iter().zip(&cs) {
