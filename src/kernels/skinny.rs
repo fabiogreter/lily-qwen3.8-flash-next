@@ -30,11 +30,12 @@ const REG_ROWS_PER_SG: usize = 2;
 /// Weight rows each Q4 register-A simdgroup computes, by m (index m - 1);
 /// must match the `GEMM_SKINNY_Q4_REG` instantiations in skinny.metal. More
 /// rows share a block's activation work (the bound past m = 2) across more
-/// weight rows. Measured on the M5 Max at the model's shapes, with a barrier
-/// after each projection as in the model's passes: 4 rows beat 2 from m = 2
-/// and beat 8 (which wins only on back-to-back dispatches, see
-/// `skinny_rows_scaling_probe`) at every m.
-const Q4_REG_ROWS_PER_SG: [usize; REG_MAX_M] = [2, 4, 4, 4, 4, 4, 4, 4];
+/// weight rows. Measured on the M5 Max: with a barrier after each projection
+/// as in the model's passes, 4 rows beat 8 (which wins only on back-to-back
+/// dispatches, see `skinny_rows_scaling_probe`) at every m and beat 2 from
+/// m = 3; at m = 2 they sped up the big projections but slowed the
+/// `lily-bench --batch-rows 2` step (16.1 against 15.6 ms), so m = 2 keeps 2.
+const Q4_REG_ROWS_PER_SG: [usize; REG_MAX_M] = [2, 2, 4, 4, 4, 4, 4, 4];
 
 /// Selects register-A when shape and packing constraints hold.
 fn reg_routes(m: usize, n: usize, block_walk_ok: bool) -> bool {

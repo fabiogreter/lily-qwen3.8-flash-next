@@ -213,12 +213,14 @@ static inline float4 skinny_unpack_q8(uint word) {
 // The activation side of a block (loading and converting MB x 32 bf16 values
 // and summing them) does not depend on the weight row; past m = 2 it, not the
 // weight bytes, bounded the two-row kernel (an ALU-bound loop at 1.2x to 2.8x
-// the m = 1 time). A simdgroup therefore takes RR rows to share it: 2 at
-// m = 1 (bandwidth-bound already) and 4 from m = 2. Eight rows share more and
-// win on back-to-back dispatches, but in the model's passes, where a barrier
-// follows nearly every projection, their fewer and longer simdgroups lose
-// more to occupancy and the dispatch tail than they save, and past m = 5
-// their partials outgrow the registers. The code word loop stays rolled past
+// the m = 1 time). A simdgroup therefore takes RR rows to share it: 2 up to
+// m = 2 (bandwidth-bound already; at m = 2 four rows sped up the big
+// projections but slowed the batched step through its small ones, 16.1
+// against 15.6 ms per two-row step) and 4 from m = 3. Eight rows share more
+// and win on back-to-back dispatches, but in the model's passes, where a
+// barrier follows nearly every projection, their fewer and longer
+// simdgroups lose more to occupancy and the dispatch tail than they save,
+// and past m = 5 their partials outgrow the registers. The code word loop stays rolled past
 // RR x MB = 8 (skinny_q4_block): unrolled, the body outgrows the instruction
 // cache and the kernel runs 1.3 to 5x slower.
 //
@@ -606,7 +608,7 @@ GEMM_SKINNY_Q8_REG(gemm_skinny_q8_bf16_reg_m8, 8, bfloat)
     }
 
 GEMM_SKINNY_Q4_REG(gemm_skinny_q4_bf16_reg_m1, 1, 2, bfloat)
-GEMM_SKINNY_Q4_REG(gemm_skinny_q4_bf16_reg_m2, 2, 4, bfloat)
+GEMM_SKINNY_Q4_REG(gemm_skinny_q4_bf16_reg_m2, 2, 2, bfloat)
 GEMM_SKINNY_Q4_REG(gemm_skinny_q4_bf16_reg_m3, 3, 4, bfloat)
 GEMM_SKINNY_Q4_REG(gemm_skinny_q4_bf16_reg_m4, 4, 4, bfloat)
 GEMM_SKINNY_Q4_REG(gemm_skinny_q4_bf16_reg_m5, 5, 4, bfloat)
@@ -614,11 +616,10 @@ GEMM_SKINNY_Q4_REG(gemm_skinny_q4_bf16_reg_m6, 6, 4, bfloat)
 GEMM_SKINNY_Q4_REG(gemm_skinny_q4_bf16_reg_m7, 7, 4, bfloat)
 GEMM_SKINNY_Q4_REG(gemm_skinny_q4_bf16_reg_m8, 8, 4, bfloat)
 GEMM_SKINNY_Q4_REG(gemm_skinny_q4_f32_reg_m1, 1, 2, float)
-GEMM_SKINNY_Q4_REG(gemm_skinny_q4_f32_reg_m2, 2, 4, float)
+GEMM_SKINNY_Q4_REG(gemm_skinny_q4_f32_reg_m2, 2, 2, float)
 GEMM_SKINNY_Q4_REG(gemm_skinny_q4_f32_reg_m3, 3, 4, float)
 GEMM_SKINNY_Q4_REG(gemm_skinny_q4_f32_reg_m4, 4, 4, float)
 GEMM_SKINNY_Q4_REG(gemm_skinny_q4_f32_reg_m5, 5, 4, float)
 GEMM_SKINNY_Q4_REG(gemm_skinny_q4_f32_reg_m6, 6, 4, float)
 GEMM_SKINNY_Q4_REG(gemm_skinny_q4_f32_reg_m7, 7, 4, float)
 GEMM_SKINNY_Q4_REG(gemm_skinny_q4_f32_reg_m8, 8, 4, float)
-

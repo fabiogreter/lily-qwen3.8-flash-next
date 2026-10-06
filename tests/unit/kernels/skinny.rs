@@ -653,14 +653,36 @@ fn bits_quant(ctx: &MetalContext, n: usize, k: usize, salt: u32) -> QuantWeights
 }
 
 /// Activations for the bit-identity sweeps; `wide` spreads the exponents
-/// over 2^-24..2^24 so a changed summation order would round differently.
-fn bits_activations(rng: &mut StdRng, len: usize, wide: bool) -> Vec<f32> {
-    (0..len)
+/// over 2^-24..2^24 so a changed summation order would round differently,
+/// and `zeros` makes whole 32-element blocks -0.0, mixed signed zeros or
+/// values, with the first row (`k` elements) all -0.0, so a sum started
+/// differently would show in the sign of a zero.
+fn bits_activations(
+    rng: &mut StdRng,
+    len: usize,
+    k: usize,
+    wide: bool,
+    zeros: bool,
+) -> Vec<f32> {
+    let mut a: Vec<f32> = (0..len)
         .map(|_| {
             let v = rng.gen_range(-1.0f32..1.0);
             if wide { v * 2f32.powi(rng.gen_range(-24i32..24)) } else { v }
         })
-        .collect()
+        .collect();
+    if zeros {
+        for (bi, block) in a.chunks_mut(32).enumerate() {
+            let pick = if bi * 32 < k { 0 } else { rng.gen_range(0..3) };
+            for v in block.iter_mut() {
+                match pick {
+                    0 => *v = -0.0,
+                    1 => *v = if rng.gen_range(0..2) == 0 { -0.0 } else { 0.0 },
+                    _ => {}
+                }
+            }
+        }
+    }
+    a
 }
 
 /// The register-A Q4 kernels compute bit for bit what they computed before
@@ -668,8 +690,8 @@ fn bits_activations(rng: &mut StdRng, len: usize, wide: bool) -> Vec<f32> {
 /// serve, both output types, the model's projection shapes (the GDN input
 /// stack, the attention qkv-and-gate stack, the output projections, the LM
 /// head with f32 logits), row counts that leave a partial row group, K values
-/// whose last pass splits or does not, and an activation pointer that is not
-/// 16-byte aligned.
+/// whose last pass splits or does not, blocks of signed zeros, and an
+/// activation pointer that is not 16-byte aligned.
 #[test]
 fn gemm_skinny_q4_reg_matches_previous_bits() {
     let ctx = MetalContext::new().expect("metal context");
@@ -693,16 +715,17 @@ fn gemm_skinny_q4_reg_matches_previous_bits() {
     for (si, &(k, n, dtypes)) in shapes.iter().enumerate() {
         let w = bits_quant(&ctx, n, k, si as u32 + 1);
         for m in 1..=REG_MAX_M {
-            for (case, wide, unaligned) in [
-                ("plain", false, false),
-                ("wide", true, false),
-                ("unaligned", true, true),
+            for (case, wide, zeros, unaligned) in [
+                ("plain", false, false, false),
+                ("wide", true, false, false),
+                ("signed zeros", true, true, false),
+                ("unaligned", true, false, true),
             ] {
-                // The large shapes run the plain and wide cases only.
+                // The large shapes skip the unaligned case.
                 if unaligned && n > 4096 {
                     continue;
                 }
-                let a = bits_activations(&mut rng, m * k, wide);
+                let a = bits_activations(&mut rng, m * k, k, wide, zeros);
                 let pad = if unaligned { 2 } else { 0 };
                 let mut padded = vec![0.0f32; pad];
                 padded.extend_from_slice(&a);
