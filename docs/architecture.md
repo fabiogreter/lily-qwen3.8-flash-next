@@ -1537,7 +1537,10 @@ one batched step over all rows per token (`LanguageModel::decode_rows`,
 but is cut at chunk boundaries, with 8 batched steps of the running rows
 between chunks, so they keep producing about 5 tokens a second meanwhile.
 When the batch shrinks to one row, that row goes back to the
-single-session loop and speculates again.
+single-session loop and speculates again. Both ways of serving admit and
+answer a request with the same code (`src/serve/request.rs`); they differ
+only in how the prefill's chunks run (straight through, or between the
+running rows' steps) and in how the decode runs.
 
 The batched step runs everything that touches no per-session state once
 over all rows with the kernels the verify pass already uses at 2 to 4 rows
