@@ -1,16 +1,24 @@
 //! One request's way through the engine, shared by both ways of serving
 //! it: one request at a time ([`Engine::serve`]) and the batch scheduler
 //! ([`Engine::serve_batched`]). A request is taken on ([`Engine::open`]),
-//! decoded by its caller, answered ([`Engine::answer`]) and closed
-//! ([`Engine::close`]). [`Facts`] is what its admission measured;
-//! [`Outcome`] how its decode went. From the two come its `timings`
-//! ([`timings`]), its log line ([`answer_line`], or [`stopped_line`] for a
-//! prefill that was stopped) and the end of its response ([`stream_end`],
-//! [`response_body`]).
+//! admitted ([`Engine::admit`]: everything before its decode, which either
+//! answers it there or hands back an [`Admitted`] request), decoded by its
+//! caller, answered ([`Engine::answer`]) and closed ([`Engine::close`]).
+//! The two ways differ only in how the prefill's chunks run
+//! ([`PrefillChunks`]: straight through, or between batched decode steps
+//! of the requests already decoding) and in how the decode runs (the
+//! production loop, or the scheduler's rows); a change to admission or to
+//! the answer is made here, once.
+//!
+//! [`Facts`] is what admission measured; [`Outcome`] how the decode went.
+//! From the two come the request's `timings` ([`timings`]), its log line
+//! ([`answer_line`], or [`stopped_line`] for a prefill that was stopped)
+//! and the end of its response ([`stream_end`], [`response_body`]).
 
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, ensure};
+use anyhow::{Context as _, Result, ensure};
 use serde_json::{Value, json};
 
 use super::api::{self, Kind, Prepared};
@@ -18,18 +26,20 @@ use super::batch::BatchStats;
 use super::pin::InFlight;
 use super::session::{
     CachedImage, DecodeCheckpoints, Evictions, Session, SessionStore,
+    boundary_position, last_user_turn,
 };
-use super::stream::{Event, OutputParser};
+use super::stream::{Event, OutputParser, ParserConfig};
 use super::timings::{
     EvictionPhase, EvictionTimings, MemoryStats, NgramStats, PrefillParts,
     PrefillPhases, Speculation, Timings, TimingsEntry,
 };
 use super::{
-    Collected, Engine, Job, Sink, call_id, chunk, describe_reuse, error_json,
-    print_kernel_profile, text_chunk,
+    Collected, Engine, Job, Sink, call_id, chunk, describe_reuse, error_json, now,
+    print_kernel_profile, response_id, text_chunk, user_turn_opener,
 };
 use crate::engine::{DecodeStateApi, LanguageModel};
-use crate::generate::FinishReason;
+use crate::generate::{FinishReason, Generator};
+use crate::qwen4exp::{ImageEmbeds, VisionInput, positions_for_prompt};
 use crate::stats::{Counters, TaskMemory, VmCounters};
 
 /// What a request's admission measured, for its timings and log line.
@@ -368,6 +378,468 @@ pub(super) fn response_body(c: Closing<'_>, collected: Collected) -> Value {
             "usage": c.usage,
             "timings": c.timings,
         })
+    }
+}
+
+// --- a request's way in ------------------------------------------------------
+
+/// How admission runs a request's prefill: [`Alone`] for one request at a
+/// time, the batch scheduler's `Interleaved` with batched decode steps of
+/// the requests already decoding between its chunks. Everything else about
+/// admission is the same for both.
+pub(super) trait PrefillChunks<M: LanguageModel> {
+    /// Prefills `tokens` into `session` at its position, stopping early
+    /// when `stop` says so before a chunk; returns the tokens fed.
+    fn prefill(
+        &mut self,
+        engine: &mut Engine<M>,
+        session: &mut Session<M>,
+        tokens: &[u32],
+        vision: Option<&VisionInput<'_>>,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<usize>;
+
+    /// Bytes of the sessions other requests hold checked out, which the
+    /// store cannot evict: it makes room among the others at the acquire
+    /// and at a stopped prefill's release (0 for one request at a time).
+    fn in_flight_bytes(&self) -> usize;
+
+    /// What sharing the GPU did for the request so far, for a stopped
+    /// prefill's timings; `None` without batching.
+    fn batch(&self) -> Option<&BatchStats>;
+}
+
+/// One request at a time: the prefill runs straight through, chunk after
+/// chunk, and no other session is in flight.
+pub(super) struct Alone;
+
+impl<M: LanguageModel> PrefillChunks<M> for Alone {
+    fn prefill(
+        &mut self,
+        engine: &mut Engine<M>,
+        session: &mut Session<M>,
+        tokens: &[u32],
+        vision: Option<&VisionInput<'_>>,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<usize> {
+        engine.model.prefill_until(
+            &engine.ctx,
+            &mut session.state,
+            &mut engine.scratch,
+            tokens,
+            vision,
+            stop,
+        )
+    }
+
+    fn in_flight_bytes(&self) -> usize {
+        0
+    }
+
+    fn batch(&self) -> Option<&BatchStats> {
+        None
+    }
+}
+
+impl<M: LanguageModel> Engine<M> {
+    /// Everything before a request's decode: the session cache lookup, the
+    /// vision tower, the durable prefix entry, the prefill up to the last
+    /// prompt token (its chunks run by `prefill`) and the checkpoint there,
+    /// then the response's id, parser and, when streamed, its first chunk.
+    /// `queued` is how long the request waited for the engine (a reload and
+    /// the pin included), which its timings report next to the prefill,
+    /// with whether the weights were `pinned`.
+    ///
+    /// Returns `None` when the request was answered here: a departed client
+    /// or the end of the shutdown's grace stopped its prefill, and the
+    /// prefix fed so far stays a session for a retry.
+    pub(super) fn admit<'g>(
+        &mut self,
+        p: Prepared,
+        sink: &mut Sink,
+        queued: Duration,
+        pinned: bool,
+        generator: &'g Generator,
+        prefill: &mut impl PrefillChunks<M>,
+    ) -> Result<Option<Admitted<'g, M>>> {
+        // The HTTP thread validated against the same limit; this only guards
+        // the engine's buffers if the two ever disagree.
+        ensure!(
+            p.prompt.len() < self.max_seq,
+            "prompt exceeds the engine context: {} prompt tokens, {} tokens of context",
+            p.prompt.len(),
+            self.max_seq
+        );
+        let n = p.prompt.len();
+        let images: Vec<CachedImage> =
+            p.images.iter().map(|i| CachedImage::new(i.span, i.digest)).collect();
+        let image_tokens: usize = p.images.iter().map(|i| i.span.len).sum();
+        // The diagnostics' samples: the engine thread's counters and the
+        // system's paging counters, here, at the end of the prefill and at
+        // the end of the decode (a few microseconds each).
+        let counters_start = crate::stats::counters();
+        let vm_start = crate::stats::vm_counters();
+        let started = Instant::now();
+        // Sessions other requests hold are checked out: the store makes room
+        // among the others.
+        self.sessions.set_in_flight_bytes(prefill.in_flight_bytes());
+        let acquired = self.sessions.acquire(
+            &self.ctx,
+            &self.model,
+            &p.prompt,
+            &images,
+            p.cache_key.as_deref(),
+        )?;
+        let session_secs = started.elapsed().as_secs_f64();
+        let mut session = acquired.session;
+        let reused = acquired.reused;
+        let agreement = acquired.agreement;
+        ensure!(reused < n, "session cache returned the whole prompt");
+        ensure!(
+            reused <= agreement,
+            "session cache resumed at {reused} past the agreement {agreement}"
+        );
+
+        // Rotary positions are a pure function of the prompt, so every
+        // acquired session takes the prompt's delta here, whatever state it
+        // was restored from (text gives 0). With images, the tower runs for
+        // every image that has rows at or beyond the reused prefix; an image
+        // entirely inside it is already in the caches, span and digest
+        // matched by the cache lookup.
+        let spans: Vec<_> = p.images.iter().map(|i| i.span).collect();
+        let positions = if spans.is_empty() {
+            None
+        } else {
+            Some(positions_for_prompt(&p.prompt, &spans).context("image positions")?)
+        };
+        session
+            .state
+            .set_rope_delta(positions.as_ref().map_or(0, |pos| pos.rope_delta))?;
+        let vision_started = Instant::now();
+        let mut encoded: Vec<(usize, crate::tensor::Tensor)> = Vec::new();
+        for (k, image) in p.images.iter().enumerate() {
+            if image.span.end() > reused {
+                let pixels =
+                    image.rows().with_context(|| format!("image {}", k + 1))?;
+                let rows = self
+                    .model
+                    .encode_image(
+                        &self.ctx,
+                        &mut self.scratch,
+                        &pixels,
+                        image.span.grid_h,
+                        image.span.grid_w,
+                    )
+                    .with_context(|| format!("vision tower over image {}", k + 1))?;
+                encoded.push((k, rows));
+            }
+        }
+        let vision_secs = vision_started.elapsed().as_secs_f64();
+        let encoded_images = encoded.len();
+        let embeds: Vec<ImageEmbeds<'_>> = encoded
+            .iter()
+            .map(|(k, rows)| ImageEmbeds { span: p.images[*k].span, rows })
+            .collect();
+        let vision = positions
+            .as_ref()
+            .map(|pos| VisionInput { positions: pos, images: &embeds });
+
+        // A shared prefix the cache could not resume from becomes a durable
+        // disk entry: prefill up to the boundary, write the caches and the
+        // recurrent state there, then carry on. The prefill is split at the
+        // boundary on purpose: chunks are 4 096 tokens and the kernels are
+        // not row-count invariant, so a later run that resumes at the boundary
+        // must prefill the rest in the same chunks this run did. The snapshot
+        // is dropped, not kept as a checkpoint: durable entries live on disk
+        // only (see the session module).
+        let min_tokens = self.sessions.durable_min_tokens();
+        // The boundary snaps back to the start of the last user message
+        // opened before the agreement (see `boundary_position`).
+        let boundary = self.sessions.disk().and_then(|_| {
+            let user_turn = (min_tokens > 0 && agreement > reused)
+                .then(|| {
+                    let opener = user_turn_opener(generator.tokenizer());
+                    last_user_turn(&p.prompt[..agreement.min(n)], &opener)
+                })
+                .flatten();
+            boundary_position(
+                agreement,
+                reused,
+                n,
+                min_tokens,
+                acquired.cut_back.is_some(),
+                user_turn,
+            )
+        });
+        // A client that went away (or the stop signal's grace running out)
+        // stops the prefill at the next chunk boundary, before that chunk is
+        // committed, instead of holding the engine for the rest of it.
+        let shutdown = self.shutdown.clone();
+        let cancelled = sink.cancelled.clone();
+        let stop = || cancelled.load(Ordering::Relaxed) || shutdown.cancel();
+        let mut cancelled_at: Option<usize> = None;
+        let mut durable: Option<(usize, f64)> = None;
+        let mut durable_secs = 0.0;
+        let mut prefilled = reused;
+        if let Some(b) = boundary {
+            if prefilled < b {
+                prefilled += prefill.prefill(
+                    self,
+                    &mut session,
+                    &p.prompt[prefilled..b],
+                    vision.as_ref(),
+                    &stop,
+                )?;
+            }
+            // A stopped request writes no durable entry: one it never wrote
+            // is one fewer than a finished request would have, never more.
+            if prefilled < b || stop() {
+                cancelled_at = Some(prefilled);
+            } else {
+                let write_started = Instant::now();
+                let snapshot = session.state.snapshot(&self.ctx)?;
+                match self.sessions.store_durable(
+                    &p.prompt[..b],
+                    &images,
+                    p.cache_key.as_deref(),
+                    &session.state,
+                    &snapshot,
+                ) {
+                    Ok(Some(_)) => {
+                        durable = Some((b, write_started.elapsed().as_secs_f64()))
+                    }
+                    Ok(None) => eprintln!(
+                        "session cache: the disk tier did not keep the durable prefix at {b}"
+                    ),
+                    Err(error) => eprintln!(
+                        "session cache: writing the durable prefix at {b} failed: {error:#}"
+                    ),
+                }
+                drop(snapshot);
+                durable_secs = write_started.elapsed().as_secs_f64();
+            }
+        }
+
+        // Prefix up to the last prompt token, then checkpoint there so an
+        // identical or extended prompt can resume without re-feeding it.
+        if cancelled_at.is_none() {
+            if prefilled < n - 1 {
+                prefilled += prefill.prefill(
+                    self,
+                    &mut session,
+                    &p.prompt[prefilled..n - 1],
+                    vision.as_ref(),
+                    &stop,
+                )?;
+            }
+            if prefilled < n - 1 || stop() {
+                cancelled_at = Some(prefilled);
+            }
+        }
+        if let Some(at) = cancelled_at {
+            let prefix_secs = started.elapsed().as_secs_f64();
+            // The prefix fed so far stays an ordinary session whose live end
+            // is the chunk boundary, so a retry of the prompt resumes there.
+            // It is released like any request's session: under the budget
+            // (evictions write ahead or spill as usual), never written ahead
+            // itself while it is the latest, its checkpoints those it had,
+            // all at or below the position it was acquired at (the live end
+            // needs none). An image the stop cut through is left out of the
+            // lineage's spans, so no prompt resumes inside it.
+            session.stop_at(&p.prompt, reused, at)?;
+            self.sessions.set_in_flight_bytes(prefill.in_flight_bytes());
+            let released = self.sessions.release(
+                &self.ctx,
+                session,
+                &images,
+                p.cache_key.as_deref(),
+            );
+            let counters_end = crate::stats::counters();
+            let vm_end = crate::stats::vm_counters();
+            let created = now();
+            let id = response_id(p.kind, created, &mut self.next_id);
+            let by = if sink.cancelled() { "client" } else { "shutdown" };
+            // The prefill ended at the stop: its samples are the stop's.
+            let facts = Facts {
+                n,
+                reused,
+                agreement,
+                cut_back: acquired.cut_back,
+                forked: acquired.forked,
+                from_disk: acquired.from_disk,
+                durable,
+                durable_secs,
+                images: p.images.len(),
+                images_decoded: p.images_decoded,
+                prepare_secs: p.prepare_secs,
+                image_tokens,
+                vision_secs,
+                encoded_images,
+                queued_secs: queued.as_secs_f64(),
+                pinned,
+                session_secs,
+                checkpoint_secs: 0.0,
+                prefix_secs,
+                acquire_evictions: acquired.evictions,
+                counters_start,
+                counters_prefill: counters_end,
+                vm_start,
+                vm_prefill: vm_end,
+            };
+            let measured = timings(
+                &facts,
+                &Outcome {
+                    cancelled_by: Some(by),
+                    cancelled_at: Some(at),
+                    batch: prefill.batch(),
+                    ..Outcome::default()
+                },
+                &released,
+                counters_end,
+                vm_end,
+                crate::stats::pressure_level(),
+                crate::stats::task_memory(),
+            );
+            eprintln!(
+                "{}",
+                stopped_line(
+                    &id,
+                    &facts,
+                    by,
+                    at,
+                    &describe_store(&self.sessions),
+                    &measured.log_details()
+                )
+            );
+            self.timings.record(TimingsEntry {
+                id,
+                model: M::MODEL_ID,
+                created,
+                timings: measured,
+            });
+            if !sink.cancelled() {
+                // Stopped by the server: the client is still there to hear it.
+                sink.start(503, "application/json");
+                sink.send(error_json("server_error", "the server is shutting down"));
+            }
+            return Ok(None);
+        }
+        // The last prompt token is fed by the generator through the text
+        // prefill: it is text after every image, and the state's rope delta
+        // places it. The image rows are no longer needed.
+        drop(embeds);
+        drop(encoded);
+        let checkpoint_started = Instant::now();
+        let snapshot = session.state.snapshot(&self.ctx)?;
+        session.add_checkpoint(snapshot);
+        let checkpoint_secs = checkpoint_started.elapsed().as_secs_f64();
+        let prefix_secs = started.elapsed().as_secs_f64();
+        let counters_prefill = crate::stats::counters();
+        let vm_prefill = crate::stats::vm_counters();
+
+        // A long shared prefix that nothing could resume from: show the seam
+        // once, as the text either side of it in this prompt and what the
+        // cached lineage continued with. This is how a client that renders
+        // the same preamble differently between runs is found at a glance.
+        // Unlike the durable boundary, the threshold here is absolute: a
+        // short fork inside one conversation (a re-rendered tool call, a
+        // re-tokenized answer) is exactly what this line should surface.
+        // An ordinary hit (`agreement == reused`) diverges too, at the user's
+        // message, and says nothing worth a line of prompt text in the log.
+        if min_tokens > 0
+            && agreement >= min_tokens
+            && agreement > reused
+            && agreement < n - 1
+        {
+            let tokenizer = generator.tokenizer();
+            let text = |ids: &[u32]| {
+                tokenizer
+                    .decode(ids, false)
+                    .unwrap_or_else(|e| format!("<undecodable: {e}>"))
+            };
+            let window = 12;
+            eprintln!(
+                "divergence at {agreement}: prompt {:?} | {:?}, cached lineage continued {:?}",
+                text(&p.prompt[agreement.saturating_sub(window)..agreement]),
+                text(&p.prompt[agreement..(agreement + window).min(n)]),
+                text(
+                    &acquired.divergent_tail
+                        [..acquired.divergent_tail.len().min(window)]
+                ),
+            );
+        }
+
+        let created = now();
+        let id = response_id(p.kind, created, &mut self.next_id);
+        let tokenizer = generator.tokenizer();
+        let detokenize: Detokenize<'g> =
+            Box::new(move |ids: &[u32]| tokenizer.decode(ids, false));
+        let parser = OutputParser::new(
+            detokenize,
+            ParserConfig {
+                thinking_open: p.thinking_open,
+                tools: p.tools.clone(),
+                stop_strings: p.stop_strings.clone(),
+                raw: p.kind == Kind::Completion,
+            },
+        );
+        let out = Output {
+            id,
+            created,
+            model: M::MODEL_ID,
+            kind: p.kind,
+            stream: p.stream,
+            collected: Collected::default(),
+            tool_index: 0,
+        };
+        if p.stream {
+            sink.start(200, "text/event-stream");
+            if p.kind == Kind::Chat {
+                sink.sse(&chunk(
+                    &out.id,
+                    created,
+                    M::MODEL_ID,
+                    json!({"role": "assistant", "content": ""}),
+                    None,
+                ));
+            }
+        }
+        let facts = Facts {
+            n,
+            reused,
+            agreement,
+            cut_back: acquired.cut_back,
+            forked: acquired.forked,
+            from_disk: acquired.from_disk,
+            durable,
+            durable_secs,
+            images: p.images.len(),
+            images_decoded: p.images_decoded,
+            prepare_secs: p.prepare_secs,
+            image_tokens,
+            vision_secs,
+            encoded_images,
+            queued_secs: queued.as_secs_f64(),
+            pinned,
+            session_secs,
+            checkpoint_secs,
+            prefix_secs,
+            acquire_evictions: acquired.evictions,
+            counters_start,
+            counters_prefill,
+            vm_start,
+            vm_prefill,
+        };
+        Ok(Some(Admitted {
+            p,
+            session,
+            images,
+            facts,
+            // Counted from the checkpoint the prefill just took.
+            decode_checkpoints: self.sessions.decode_checkpoints(n - 1),
+            parser,
+            out,
+        }))
     }
 }
 

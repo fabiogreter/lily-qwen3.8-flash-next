@@ -18,33 +18,31 @@
 //! head is caught up on every row, so a row that is alone again speculates
 //! with complete head caches.
 //!
-//! Admission and the answer mirror `Engine::run` (session lookup, the
-//! tower, the durable boundary, cancellation, the checkpoint, timings, the
-//! log line, the response). The two are kept separate so that batching off
-//! is the unchanged code; a change to one usually needs the other.
+//! Admission and the answer are the ones `Engine::run` uses
+//! (`serve/request.rs`): [`Engine::admit`] with [`Interleaved`] running the
+//! prefill, which puts batched steps of the running rows between its chunks
+//! where `Engine::run` prefills straight through, and [`Engine::answer`]
+//! and [`Engine::close`] for a row that finished. What is the scheduler's
+//! own is the first draw into a batch slot, the rows' decode, and how a
+//! request shared the GPU (the `batch` object of its timings and the
+//! "batched" group of its log line).
 //! `docs/architecture.md`, "Continuous batching", has the design and what
 //! it was measured to give.
 
 use std::cell::Cell;
 use std::sync::mpsc::Receiver;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use anyhow::{Context as _, Result, ensure};
-use serde_json::json;
+use anyhow::{Result, ensure};
 
-use super::api::{Kind, Prepared};
 use super::pin::InFlight;
-use super::request::{self, Admitted, Decoded, Ending, Facts, Opened, Outcome, Output};
-use super::session::{CachedImage, Session, boundary_position, last_user_turn};
-use super::stream::{OutputParser, ParserConfig};
-use super::timings::{BatchTimings, TimingsEntry};
-use super::{
-    Cmd, Collected, Engine, EngineQueue, Job, Sink, chunk, error_json, now,
-    response_id, user_turn_opener,
-};
+use super::request::{self, Admitted, Decoded, Ending, Opened, PrefillChunks};
+use super::session::Session;
+use super::timings::BatchTimings;
+use super::{Cmd, Engine, EngineQueue, Job, Sink};
 use crate::engine::{BatchRow, CountsSlot, DecodeStateApi, Draw, LanguageModel};
 use crate::generate::{DecodeCheckpointer, FinishReason, GenerateOptions, Generator};
-use crate::qwen4exp::{ImageEmbeds, VisionInput, positions_for_prompt};
+use crate::qwen4exp::VisionInput;
 
 /// Batched decode steps of the running rows between two prefill chunks of a
 /// request being admitted. A chunk is a 1.6 to 1.8 s pass the rows cannot
@@ -269,6 +267,85 @@ impl<M: LanguageModel> Row<'_, M> {
             self.finish = Some(FinishReason::Length);
         }
         Ok(())
+    }
+}
+
+/// The scheduler's prefill: while rows decode, one chunk at a time with
+/// [`DECODE_STEPS_PER_PREFILL_CHUNK`] batched steps of the rows between
+/// chunks (a row that finishes meanwhile is answered there); straight
+/// through once none is left.
+struct Interleaved<'a, 'g, M: LanguageModel> {
+    generator: &'g Generator,
+    rows: &'a mut Vec<Row<'g, M>>,
+    slots: &'a mut Slots,
+    /// The admitted request's sharing statistics so far (the steps between
+    /// its chunks); its row takes them over.
+    stats: BatchStats,
+}
+
+impl<M: LanguageModel> PrefillChunks<M> for Interleaved<'_, '_, M> {
+    /// The chunk grid is that of one call (every call starts a chunk at its
+    /// first token), so the numerics are an uninterleaved prefill's.
+    fn prefill(
+        &mut self,
+        engine: &mut Engine<M>,
+        session: &mut Session<M>,
+        tokens: &[u32],
+        vision: Option<&VisionInput<'_>>,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<usize> {
+        let mut fed = 0;
+        while fed < tokens.len() {
+            if self.rows.is_empty() {
+                fed += engine.model.prefill_until(
+                    &engine.ctx,
+                    &mut session.state,
+                    &mut engine.scratch,
+                    &tokens[fed..],
+                    vision,
+                    stop,
+                )?;
+                break;
+            }
+            // Let exactly one chunk through: the stop is asked before every
+            // chunk, the first included.
+            let first = Cell::new(true);
+            let one_chunk = || stop() || !first.replace(false);
+            let chunk = engine.model.prefill_until(
+                &engine.ctx,
+                &mut session.state,
+                &mut engine.scratch,
+                &tokens[fed..],
+                vision,
+                &one_chunk,
+            )?;
+            fed += chunk;
+            if chunk == 0 || stop() {
+                break;
+            }
+            if fed < tokens.len() {
+                let between = Instant::now();
+                let own = session.bytes();
+                for _ in 0..DECODE_STEPS_PER_PREFILL_CHUNK {
+                    if self.rows.is_empty() {
+                        break;
+                    }
+                    engine.step_rows(self.generator, self.rows, self.slots, own);
+                    self.stats.interleaved_steps += 1;
+                }
+                self.stats.interleaved_secs += between.elapsed().as_secs_f64();
+            }
+        }
+        Ok(fed)
+    }
+
+    /// The running rows' sessions.
+    fn in_flight_bytes(&self) -> usize {
+        Engine::in_flight(self.rows)
+    }
+
+    fn batch(&self) -> Option<&BatchStats> {
+        Some(&self.stats)
     }
 }
 
@@ -606,20 +683,20 @@ impl<M: LanguageModel> Engine<M> {
             self.close(sink, in_flight, stream, Ending::Answered);
             return;
         }
-        let mut stats = BatchStats::default();
-        let admitted = self.try_admit(
+        let mut interleaved =
+            Interleaved { generator, rows, slots, stats: BatchStats::default() };
+        let admitted = self.admit(
             p,
             &mut sink,
             queued,
             in_flight.pinned(),
             generator,
-            rows,
-            slots,
-            &mut stats,
+            &mut interleaved,
         );
+        let Interleaved { stats, .. } = interleaved;
         let mut req = match admitted {
             Ok(Some(req)) => req,
-            // Answered (a cancelled prefill keeps its session, see there).
+            // Answered: its prefill was stopped (see `Engine::admit`).
             Ok(None) => {
                 self.close(sink, in_flight, stream, Ending::Answered);
                 return;
@@ -694,425 +771,6 @@ impl<M: LanguageModel> Engine<M> {
             }
             None => rows.push(row),
         }
-    }
-
-    /// `Engine::run` up to its decode: `None` when the request was answered
-    /// here (its prefill was stopped).
-    #[allow(clippy::too_many_arguments)]
-    fn try_admit<'g>(
-        &mut self,
-        p: Prepared,
-        sink: &mut Sink,
-        queued: Duration,
-        pinned: bool,
-        generator: &'g Generator,
-        rows: &mut Vec<Row<'g, M>>,
-        slots: &mut Slots,
-        stats: &mut BatchStats,
-    ) -> Result<Option<Admitted<'g, M>>> {
-        ensure!(
-            p.prompt.len() < self.max_seq,
-            "prompt exceeds the engine context: {} prompt tokens, {} tokens of context",
-            p.prompt.len(),
-            self.max_seq
-        );
-        let n = p.prompt.len();
-        let images: Vec<CachedImage> =
-            p.images.iter().map(|i| CachedImage::new(i.span, i.digest)).collect();
-        let image_tokens: usize = p.images.iter().map(|i| i.span.len).sum();
-        let counters_start = crate::stats::counters();
-        let vm_start = crate::stats::vm_counters();
-        let started = Instant::now();
-        // The running rows' sessions are checked out: the store makes room
-        // among the others.
-        self.sessions.set_in_flight_bytes(Self::in_flight(rows));
-        let acquired = self.sessions.acquire(
-            &self.ctx,
-            &self.model,
-            &p.prompt,
-            &images,
-            p.cache_key.as_deref(),
-        )?;
-        let session_secs = started.elapsed().as_secs_f64();
-        let mut session = acquired.session;
-        let reused = acquired.reused;
-        let agreement = acquired.agreement;
-        ensure!(reused < n, "session cache returned the whole prompt");
-        ensure!(
-            reused <= agreement,
-            "session cache resumed at {reused} past the agreement {agreement}"
-        );
-
-        // Positions and the tower, as in `Engine::run`.
-        let spans: Vec<_> = p.images.iter().map(|i| i.span).collect();
-        let positions = if spans.is_empty() {
-            None
-        } else {
-            Some(positions_for_prompt(&p.prompt, &spans).context("image positions")?)
-        };
-        session
-            .state
-            .set_rope_delta(positions.as_ref().map_or(0, |pos| pos.rope_delta))?;
-        let vision_started = Instant::now();
-        let mut encoded: Vec<(usize, crate::tensor::Tensor)> = Vec::new();
-        for (k, image) in p.images.iter().enumerate() {
-            if image.span.end() > reused {
-                let pixels =
-                    image.rows().with_context(|| format!("image {}", k + 1))?;
-                let merged = self
-                    .model
-                    .encode_image(
-                        &self.ctx,
-                        &mut self.scratch,
-                        &pixels,
-                        image.span.grid_h,
-                        image.span.grid_w,
-                    )
-                    .with_context(|| format!("vision tower over image {}", k + 1))?;
-                encoded.push((k, merged));
-            }
-        }
-        let vision_secs = vision_started.elapsed().as_secs_f64();
-        let encoded_images = encoded.len();
-        let embeds: Vec<ImageEmbeds<'_>> = encoded
-            .iter()
-            .map(|(k, rows)| ImageEmbeds { span: p.images[*k].span, rows })
-            .collect();
-        let vision = positions
-            .as_ref()
-            .map(|pos| VisionInput { positions: pos, images: &embeds });
-
-        let min_tokens = self.sessions.durable_min_tokens();
-        // As in `Engine::run`: snapped back to the last user message opened
-        // before the agreement.
-        let boundary = self.sessions.disk().and_then(|_| {
-            let user_turn = (min_tokens > 0 && agreement > reused)
-                .then(|| {
-                    let opener = user_turn_opener(generator.tokenizer());
-                    last_user_turn(&p.prompt[..agreement.min(n)], &opener)
-                })
-                .flatten();
-            boundary_position(
-                agreement,
-                reused,
-                n,
-                min_tokens,
-                acquired.cut_back.is_some(),
-                user_turn,
-            )
-        });
-        let shutdown = self.shutdown.clone();
-        let cancelled = sink.cancelled.clone();
-        let stop = || {
-            cancelled.load(std::sync::atomic::Ordering::Relaxed) || shutdown.cancel()
-        };
-        let mut cancelled_at: Option<usize> = None;
-        let mut durable: Option<(usize, f64)> = None;
-        let mut durable_secs = 0.0;
-        let mut prefilled = reused;
-        if let Some(b) = boundary {
-            if prefilled < b {
-                prefilled += self.prefill_interleaved(
-                    &mut session,
-                    &p.prompt[prefilled..b],
-                    vision.as_ref(),
-                    &stop,
-                    generator,
-                    rows,
-                    slots,
-                    stats,
-                )?;
-            }
-            if prefilled < b || stop() {
-                cancelled_at = Some(prefilled);
-            } else {
-                let write_started = Instant::now();
-                let snapshot = session.state.snapshot(&self.ctx)?;
-                match self.sessions.store_durable(
-                    &p.prompt[..b],
-                    &images,
-                    p.cache_key.as_deref(),
-                    &session.state,
-                    &snapshot,
-                ) {
-                    Ok(Some(_)) => {
-                        durable = Some((b, write_started.elapsed().as_secs_f64()))
-                    }
-                    Ok(None) => eprintln!(
-                        "session cache: the disk tier did not keep the durable prefix at {b}"
-                    ),
-                    Err(error) => eprintln!(
-                        "session cache: writing the durable prefix at {b} failed: {error:#}"
-                    ),
-                }
-                drop(snapshot);
-                durable_secs = write_started.elapsed().as_secs_f64();
-            }
-        }
-        if cancelled_at.is_none() {
-            if prefilled < n - 1 {
-                prefilled += self.prefill_interleaved(
-                    &mut session,
-                    &p.prompt[prefilled..n - 1],
-                    vision.as_ref(),
-                    &stop,
-                    generator,
-                    rows,
-                    slots,
-                    stats,
-                )?;
-            }
-            if prefilled < n - 1 || stop() {
-                cancelled_at = Some(prefilled);
-            }
-        }
-        if let Some(at) = cancelled_at {
-            // `Engine::run`'s cancelled prefill: the prefix stays a session.
-            let prefix_secs = started.elapsed().as_secs_f64();
-            session.stop_at(&p.prompt, reused, at)?;
-            self.sessions.set_in_flight_bytes(Self::in_flight(rows));
-            let released = self.sessions.release(
-                &self.ctx,
-                session,
-                &images,
-                p.cache_key.as_deref(),
-            );
-            let counters_end = crate::stats::counters();
-            let vm_end = crate::stats::vm_counters();
-            let created = now();
-            let id = response_id(p.kind, created, &mut self.next_id);
-            let by = if sink.cancelled() { "client" } else { "shutdown" };
-            // The prefill ended at the stop: its samples are the stop's.
-            let facts = Facts {
-                n,
-                reused,
-                agreement,
-                cut_back: acquired.cut_back,
-                forked: acquired.forked,
-                from_disk: acquired.from_disk,
-                durable,
-                durable_secs,
-                images: p.images.len(),
-                images_decoded: p.images_decoded,
-                prepare_secs: p.prepare_secs,
-                image_tokens,
-                vision_secs,
-                encoded_images,
-                queued_secs: queued.as_secs_f64(),
-                pinned,
-                session_secs,
-                checkpoint_secs: 0.0,
-                prefix_secs,
-                acquire_evictions: acquired.evictions,
-                counters_start,
-                counters_prefill: counters_end,
-                vm_start,
-                vm_prefill: vm_end,
-            };
-            let measured = request::timings(
-                &facts,
-                &Outcome {
-                    cancelled_by: Some(by),
-                    cancelled_at: Some(at),
-                    batch: Some(stats),
-                    ..Outcome::default()
-                },
-                &released,
-                counters_end,
-                vm_end,
-                crate::stats::pressure_level(),
-                crate::stats::task_memory(),
-            );
-            eprintln!(
-                "{}",
-                request::stopped_line(
-                    &id,
-                    &facts,
-                    by,
-                    at,
-                    &request::describe_store(&self.sessions),
-                    &measured.log_details()
-                )
-            );
-            self.timings.record(TimingsEntry {
-                id,
-                model: M::MODEL_ID,
-                created,
-                timings: measured,
-            });
-            if !sink.cancelled() {
-                sink.start(503, "application/json");
-                sink.send(error_json("server_error", "the server is shutting down"));
-            }
-            return Ok(None);
-        }
-        drop(embeds);
-        drop(encoded);
-        let checkpoint_started = Instant::now();
-        let snapshot = session.state.snapshot(&self.ctx)?;
-        session.add_checkpoint(snapshot);
-        let checkpoint_secs = checkpoint_started.elapsed().as_secs_f64();
-        let prefix_secs = started.elapsed().as_secs_f64();
-        let counters_prefill = crate::stats::counters();
-        let vm_prefill = crate::stats::vm_counters();
-
-        if min_tokens > 0
-            && agreement >= min_tokens
-            && agreement > reused
-            && agreement < n - 1
-        {
-            let tokenizer = generator.tokenizer();
-            let text = |ids: &[u32]| {
-                tokenizer
-                    .decode(ids, false)
-                    .unwrap_or_else(|e| format!("<undecodable: {e}>"))
-            };
-            let window = 12;
-            eprintln!(
-                "divergence at {agreement}: prompt {:?} | {:?}, cached lineage continued {:?}",
-                text(&p.prompt[agreement.saturating_sub(window)..agreement]),
-                text(&p.prompt[agreement..(agreement + window).min(n)]),
-                text(
-                    &acquired.divergent_tail
-                        [..acquired.divergent_tail.len().min(window)]
-                ),
-            );
-        }
-
-        let created = now();
-        let id = response_id(p.kind, created, &mut self.next_id);
-        let tokenizer = generator.tokenizer();
-        let detokenize: request::Detokenize<'g> =
-            Box::new(move |ids: &[u32]| tokenizer.decode(ids, false));
-        let parser = OutputParser::new(
-            detokenize,
-            ParserConfig {
-                thinking_open: p.thinking_open,
-                tools: p.tools.clone(),
-                stop_strings: p.stop_strings.clone(),
-                raw: p.kind == Kind::Completion,
-            },
-        );
-        let out = Output {
-            id,
-            created,
-            model: M::MODEL_ID,
-            kind: p.kind,
-            stream: p.stream,
-            collected: Collected::default(),
-            tool_index: 0,
-        };
-        if p.stream {
-            sink.start(200, "text/event-stream");
-            if p.kind == Kind::Chat {
-                sink.sse(&chunk(
-                    &out.id,
-                    created,
-                    M::MODEL_ID,
-                    json!({"role": "assistant", "content": ""}),
-                    None,
-                ));
-            }
-        }
-        let facts = Facts {
-            n,
-            reused,
-            agreement,
-            cut_back: acquired.cut_back,
-            forked: acquired.forked,
-            from_disk: acquired.from_disk,
-            durable,
-            durable_secs,
-            image_tokens,
-            vision_secs,
-            encoded_images,
-            images: p.images.len(),
-            images_decoded: p.images_decoded,
-            prepare_secs: p.prepare_secs,
-            queued_secs: queued.as_secs_f64(),
-            pinned,
-            session_secs,
-            checkpoint_secs,
-            prefix_secs,
-            acquire_evictions: acquired.evictions,
-            counters_start,
-            counters_prefill,
-            vm_start,
-            vm_prefill,
-        };
-        Ok(Some(Admitted {
-            p,
-            session,
-            images,
-            facts,
-            // Counted from the checkpoint the prefill just took.
-            decode_checkpoints: self.sessions.decode_checkpoints(n - 1),
-            parser,
-            out,
-        }))
-    }
-
-    /// Prefills `tokens` into `session` at its position, stopping early when
-    /// `stop` says so before a chunk; returns the tokens fed. While `rows`
-    /// decode, the prefill runs one chunk per call with
-    /// [`DECODE_STEPS_PER_PREFILL_CHUNK`] batched steps of the rows between
-    /// chunks. The chunk grid is that of one call (every call starts a chunk
-    /// at its first token), so the numerics are an uninterleaved prefill's.
-    #[allow(clippy::too_many_arguments)]
-    fn prefill_interleaved<'g>(
-        &mut self,
-        session: &mut Session<M>,
-        tokens: &[u32],
-        vision: Option<&VisionInput<'_>>,
-        stop: &dyn Fn() -> bool,
-        generator: &'g Generator,
-        rows: &mut Vec<Row<'g, M>>,
-        slots: &mut Slots,
-        stats: &mut BatchStats,
-    ) -> Result<usize> {
-        let mut fed = 0;
-        while fed < tokens.len() {
-            if rows.is_empty() {
-                fed += self.model.prefill_until(
-                    &self.ctx,
-                    &mut session.state,
-                    &mut self.scratch,
-                    &tokens[fed..],
-                    vision,
-                    stop,
-                )?;
-                break;
-            }
-            // Let exactly one chunk through: the stop is asked before every
-            // chunk, the first included.
-            let first = Cell::new(true);
-            let one_chunk = || stop() || !first.replace(false);
-            let chunk = self.model.prefill_until(
-                &self.ctx,
-                &mut session.state,
-                &mut self.scratch,
-                &tokens[fed..],
-                vision,
-                &one_chunk,
-            )?;
-            fed += chunk;
-            if chunk == 0 || stop() {
-                break;
-            }
-            if fed < tokens.len() {
-                let between = Instant::now();
-                let own = session.bytes();
-                for _ in 0..DECODE_STEPS_PER_PREFILL_CHUNK {
-                    if rows.is_empty() {
-                        break;
-                    }
-                    self.step_rows(generator, rows, slots, own);
-                    stats.interleaved_steps += 1;
-                }
-                stats.interleaved_secs += between.elapsed().as_secs_f64();
-            }
-        }
-        Ok(fed)
     }
 
     // --- the answer -----------------------------------------------------------
