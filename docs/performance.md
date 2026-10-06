@@ -722,7 +722,14 @@ clock state, about 415 GB/s. What got it there:
    item 3 about one percent at 1K and 2.6% at 32K in the matrix above.
 5. **The verify pass's skinny GEMMs** computing two rows per simdgroup with
    each activation block loaded once, 5.80 to 5.46 ms per profiled 3-row
-   pass (the Q8 one 1.41 to 1.14).
+   pass (the Q8 one 1.41 to 1.14). Then four weight rows per simdgroup from
+   m = 3, each activation block converted and summed once for all four (the
+   activation side, not the weight bytes, bounded the two-row kernel past two
+   rows), the last partial pass split between the half-simdgroups, and the
+   arithmetic pinned in safe math to the earlier kernel's order, bit for bit:
+   the model's projections per batched pass 3.72 to 3.31 ms at three rows
+   and 4.49 to 3.82 at four, the LM head 0.73 to 0.63 and 0.91 to 0.69
+   (`shared_weight_kernels_vs_rows_probe`).
 
 ### Speculative decoding
 

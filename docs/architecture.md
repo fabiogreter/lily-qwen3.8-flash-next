@@ -272,6 +272,21 @@ normalization folds into the projection. The up kernel owns a group of output
 columns per simdgroup, applies SiLU in registers and finishes with the mix
 epilogue.
 
+Batched passes (verify, the batched decode step) project their 2 to 8 rows
+through the register-A skinny GEMM instead of the GEMV. Lane `L` of a
+simdgroup owns uint4 blocks `L, L + 32, ...` of a few weight rows and dots
+them against every activation row, with scale and bias applied once per
+block. Past two rows its cost was the activation side (loading, converting
+and summing each row's 32 values per block), not the weight bytes, so a
+simdgroup takes four weight rows from m = 3 and converts each activation
+block once for all of them; see "Continuous batching" for what that gives.
+Its arithmetic is spelled out operation by operation under
+`#pragma METAL fp math_mode(safe)`: the fast-math compiler had chosen the
+summation and fma order of the earlier two-row kernel (recovered by
+emulating its f32 output), the rewrite reproduces that order bit for bit
+(`gemm_skinny_q4_reg_matches_previous_bits` against the kept reference),
+and later edits can no longer move it.
+
 ### Prefill
 
 Prefill runs in chunks of 4 096 tokens (one shorter chunk for a shorter
@@ -1592,6 +1607,32 @@ alternating runs on one binary (2026-10-06, 1 024-token prompts, the
 draft head loaded, token digests identical parked and unparked): 122.0
 to 128.3 tok/s at two rows (+5.1 %), 153.8 to 159.5 at four (+3.7 %),
 and 115.6 to 119.0 at two rows over 8 192-token prompts.
+
+**The shared-weight kernels.** Every row of a batched step (and of a
+verify pass) reads the same weights, so a bandwidth-bound kernel would
+cost about the same at four rows as at one. The register-A skinny GEMM did
+not past two rows: its activation-side work per block, repeated for every
+pair of weight rows, bounded it. It now shares that work across four
+weight rows per simdgroup from m = 3 (see "The kernel set and where time
+goes"), bit-identical to the kernel it replaced. On the full model
+(`shared_weight_kernels_vs_rows_probe`, 2026-10-06, 1/2/3/4 rows) the
+step's projections went from 2.99/3.28/3.72/4.49 to 2.92/2.99/3.31/3.82
+ms and the LM head from 0.60/0.62/0.73/0.91 to 0.61/0.61/0.63/0.69. In the
+step itself much of that overlaps other work of the same level: GPU time
+per step 15.65 to 15.54 ms at two rows and 25.05 to 24.70 at four
+(`--gpu-timing`, two runs each), and over three alternating runs of
+`lily-bench` against 0446016 aggregate decode moved inside the noise at
+two and four rows (127.7 against 128.4 tok/s, 160.5 against 160.2) and
+speculative decoding 102.9 to 103.9 tok/s (101.0 to 103.2 against 103.4
+to 104.1), with every token digest and draft acceptance unchanged. The
+hyper-connection reads are unchanged at 1.70/1.89/2.35/2.91 ms. Their two
+3.3 MB kernels are latency-bound already at one row (about 9 us each,
+under 400 GB/s), and bit-identical rewrites that share the activation work
+across output rows or spread the gate epilogue over the lanes measured 5
+to 10 % per kernel at three and four rows and nothing at one or two, too
+little to carry a second explicit-order copy of each. The Q8 register-A
+kernel (routers, the indexer) showed no growth from one to four rows and
+is unchanged.
 
 **Numerics.** A row never depends on the rows beside it: the same session
 paired with different neighbours, in either position, draws bit-identical
