@@ -31,11 +31,15 @@
 //!   turn after turn; a template that keeps old reasoning
 //!   (`preserve_thinking`) keeps these texts in the history.
 //!
-//! Insertions land only at a line end, never inside a code fence or a tool
-//! call: within the grace window after the threshold the control waits for a
-//! token that ends a line, within a second window it also takes a sentence
-//! end, and after both it forces the close (a nudge that cannot land is
-//! dropped instead). Every inserted text is untested as a prompt: the
+//! Insertions never land inside a code fence or a tool call. A nudge lands
+//! only at a line end, within the grace window after its threshold; a level
+//! that finds none is dropped. The budget's close waits for a line end in
+//! the grace window, also takes a sentence end in a second window, and lands
+//! anywhere after both, but still not inside a fence or a tool call: it
+//! waits for those to end, bounded only by `max_tokens` (a fence the model
+//! never closes means no close). A `<tool_call>` inside a fence (an example
+//! the reasoning quotes) or inside a tool call the block kept does not end
+//! the block either. Every inserted text is untested as a prompt: the
 //! wording is configurable (`--thinking-texts`).
 //!
 //! [`ThinkingControl`] is the state machine: it sees every token the
@@ -248,8 +252,10 @@ impl ThinkingTokens {
 pub struct ThinkingSettings {
     /// The model's tokens in the block before it is closed.
     pub budget: Option<usize>,
-    /// The two waiting windows' length (see the module docs; 0 inserts
-    /// right at the threshold).
+    /// The waiting windows' length (see the module docs): a nudge's one
+    /// window, the close's two. 0 closes right at the budget (outside a
+    /// fence or a tool call) and lets a nudge land only on the threshold's
+    /// own token.
     pub grace: usize,
     /// Nudges before the budget (only with a budget).
     pub nudges: bool,
@@ -292,14 +298,13 @@ pub struct Closed {
     pub thinking_tokens: usize,
 }
 
-/// Where a waiting insertion may land now.
+/// Where a waiting nudge may land now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Place {
     /// Not here; keep waiting.
     Wait,
     Here,
-    /// Both windows are over and this is no place for it (a fence): a
-    /// nudge is dropped.
+    /// Its window is over without a line end it could take: dropped.
     Never,
 }
 
@@ -397,9 +402,20 @@ impl ThinkingControl {
     pub fn may_act_next(&self) -> bool {
         let next = self.counted + 1;
         self.open
-            && ((self.settings.tool_call_ends_thinking && self.trailing_newlines > 0)
+            && (self.tool_call_would_close()
                 || self.settings.budget.is_some_and(|b| next >= b)
                 || self.nudge_at(self.level).is_some_and(|at| next >= at))
+    }
+
+    /// Whether a `<tool_call>` emitted next would end the block: the rule
+    /// is on, it starts a line, and it is neither inside a code fence (an
+    /// example the reasoning quotes) nor inside a tool call the block kept
+    /// (a nested marker).
+    fn tool_call_would_close(&self) -> bool {
+        self.settings.tool_call_ends_thinking
+            && self.trailing_newlines > 0
+            && !self.in_fence
+            && !self.in_tool_call
     }
 
     /// Takes the next token the generation emits (never a stop token) and
@@ -416,10 +432,7 @@ impl ThinkingControl {
             self.open = false;
             return Action::Keep;
         }
-        if token == tokens.tool_call
-            && self.settings.tool_call_ends_thinking
-            && self.trailing_newlines > 0
-        {
+        if token == tokens.tool_call && self.tool_call_would_close() {
             self.open = false;
             self.closed =
                 Some(Closed { by: ClosedBy::ToolCall, thinking_tokens: self.counted });
@@ -435,19 +448,21 @@ impl ThinkingControl {
         let Some(budget) = self.settings.budget else {
             return Action::Keep;
         };
-        let seed = self.settings.seed as usize;
+        // The seed picks a variant; any u64 (a request's `seed: -1` too).
+        let pick = |offset: usize, len: usize| {
+            (self.settings.seed.wrapping_add(offset as u64) % len as u64) as usize
+        };
         if self.counted >= budget {
-            // A close is never dropped: past both windows it lands in a
-            // fence too, though still not inside a tool call.
-            if matches!(self.place(self.counted - budget), Place::Here | Place::Never)
-                && !self.in_tool_call
-            {
+            // A close is never dropped, and never lands inside a code fence
+            // or a tool call: it waits for them to end, bounded only by
+            // `max_tokens` (a fence the model never closes gets no close).
+            if self.close_place(self.counted - budget) {
                 self.open = false;
                 self.closed = Some(Closed {
                     by: ClosedBy::Budget,
                     thinking_tokens: self.counted,
                 });
-                let variant = &tokens.closes[seed % tokens.closes.len()];
+                let variant = &tokens.closes[pick(0, tokens.closes.len())];
                 return Action::After(variant.at(self.trailing_newlines));
             }
             return Action::Keep;
@@ -456,7 +471,7 @@ impl ThinkingControl {
         else {
             return Action::Keep;
         };
-        match self.place(self.counted - at) {
+        match self.nudge_place(self.counted - at) {
             Place::Wait => Action::Keep,
             Place::Never => {
                 self.level += 1;
@@ -464,7 +479,7 @@ impl ThinkingControl {
             }
             Place::Here => {
                 let (_, variants) = &tokens.nudges[self.level];
-                let variant = &variants[(seed + self.level) % variants.len()];
+                let variant = &variants[pick(self.level, variants.len())];
                 let ids = variant.at(self.trailing_newlines);
                 self.level += 1;
                 self.nudged += 1;
@@ -479,22 +494,34 @@ impl ThinkingControl {
         }
     }
 
-    /// Whether an insertion `over` tokens past its threshold may land after
-    /// the token just observed: at a line end in the first window, also at
-    /// a sentence end in the second, anywhere after both; never inside a
-    /// tool call or a code fence ([`Place::Never`] once a fence outlasts
-    /// both windows).
-    fn place(&self, over: usize) -> Place {
+    /// Whether the budget's close, `over` tokens past the budget, lands
+    /// after the token just observed: at a line end in the first grace
+    /// window, also at a sentence end in the second, anywhere after both;
+    /// never inside a tool call or a code fence, however long.
+    fn close_place(&self, over: usize) -> bool {
         let grace = self.settings.grace;
-        if self.in_tool_call {
-            return Place::Wait;
+        if self.in_tool_call || self.in_fence {
+            return false;
         }
-        if self.in_fence {
-            return if over >= 2 * grace { Place::Never } else { Place::Wait };
-        }
-        let line_end = self.trailing_newlines > 0;
-        if over >= 2 * grace || line_end || (over >= grace && self.sentence_end) {
+        over >= 2 * grace
+            || self.trailing_newlines > 0
+            || (over >= grace && self.sentence_end)
+    }
+
+    /// Where a nudge `over` tokens past its threshold goes: only at a line
+    /// end outside a code fence and a tool call, within its window (the
+    /// threshold's token and `grace` more); a level that finds none is
+    /// dropped ([`Place::Never`]). A nudge is optional, unlike the close.
+    fn nudge_place(&self, over: usize) -> Place {
+        let grace = self.settings.grace;
+        if over <= grace
+            && self.trailing_newlines > 0
+            && !self.in_fence
+            && !self.in_tool_call
+        {
             Place::Here
+        } else if over >= self.settings.grace {
+            Place::Never
         } else {
             Place::Wait
         }

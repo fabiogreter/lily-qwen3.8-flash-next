@@ -65,6 +65,7 @@ const TABLE: &[&str] = &[
     "The answer",
     "<tool",
     "_call>",
+    "```",
 ];
 
 #[test]
@@ -334,4 +335,28 @@ fn a_tool_call_stays_reasoning_mid_line_or_with_the_rule_off() {
     let (reasoning, _, calls) = text_of(&run(&mut p, &[0, 5, 7, 10, 6]));
     assert!(reasoning.starts_with("Hello<tool_call>"), "{reasoning:?}");
     assert_eq!(calls.len(), 0);
+}
+
+#[test]
+fn a_tool_call_quoted_in_a_fence_or_nested_in_a_kept_call_stays_reasoning() {
+    // "```\n<tool_call>\n<function=f>\n</function>\n</tool_call>\n```\n"
+    // then a real one at a line start outside the fence.
+    let quoted = [19, 2, 5, 2, 7, 2, 10, 2, 6, 2, 19, 2];
+    let real = [5, 7, 10, 6];
+    let ids: Vec<u32> = quoted.iter().chain(&real).copied().collect();
+    let mut p = OutputParser::new(detok(TABLE), reasoning_with_tools(true));
+    let (reasoning, _, calls) = text_of(&run(&mut p, &ids));
+    assert_eq!(
+        reasoning, "```\n<tool_call>\n<function=f>\n</function>\n</tool_call>\n```",
+        "the fenced example is reasoning"
+    );
+    assert_eq!(calls.len(), 1, "the call after the fence ends the block");
+
+    // A call kept mid-line, with a marker at a line start nested inside it.
+    // "Hello<tool_call>\n<tool_call>\n</tool_call>\n<tool_call>..."
+    let ids = [0, 5, 2, 5, 2, 6, 2, 5, 7, 10, 6];
+    let mut p = OutputParser::new(detok(TABLE), reasoning_with_tools(true));
+    let (reasoning, _, calls) = text_of(&run(&mut p, &ids));
+    assert_eq!(reasoning, "Hello<tool_call>\n<tool_call>\n</tool_call>");
+    assert_eq!(calls.len(), 1, "only the call after the kept one closes");
 }

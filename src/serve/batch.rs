@@ -187,6 +187,41 @@ pub(super) fn park_next(
         })
 }
 
+/// Why the single-session loop's token callback stopped a row: to yield to
+/// an arriving job (the row goes on, batched or alone, later) or for good
+/// (the client left, a stop string, the end of the shutdown grace). A
+/// group of tokens a thinking control inserted is emitted whole, calling
+/// back after the first stop ([`crate::generate::push_group`]), so a
+/// terminal reason that shows up later in the group must win over a yield
+/// recorded earlier.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct SoloStop {
+    yielded: bool,
+    terminal: bool,
+}
+
+impl SoloStop {
+    /// Records one callback (`terminal`: a reason to end the row now;
+    /// `waiting`: a job waits and the row may be preempted) and returns
+    /// whether the loop goes on.
+    pub(super) fn observe(&mut self, terminal: bool, waiting: bool) -> bool {
+        if terminal {
+            self.terminal = true;
+            false
+        } else if waiting {
+            self.yielded = true;
+            false
+        } else {
+            true
+        }
+    }
+
+    /// The loop stopped only to yield: the row is not finished.
+    pub(super) fn yielded_only(&self) -> bool {
+        self.yielded && !self.terminal
+    }
+}
+
 /// How one request shared the GPU with others, for its timings and log line.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct BatchStats {
@@ -715,7 +750,7 @@ impl<M: LanguageModel> Engine<M> {
             CountsSlot::Engine,
         )?;
         let before = row.generated.len();
-        let mut preempted = false;
+        let mut stop = SoloStop::default();
         let resumed = {
             let Row {
                 req:
@@ -736,14 +771,8 @@ impl<M: LanguageModel> Engine<M> {
             let mut on_token = |token: u32| -> Result<bool> {
                 let events = parser.push(token)?;
                 out.deliver(events, sink);
-                if sink.cancelled() || parser.stopped || shutdown.cancel() {
-                    return Ok(false);
-                }
-                if preempt && queue.has_waiting() {
-                    preempted = true;
-                    return Ok(false);
-                }
-                Ok(true)
+                let terminal = sink.cancelled() || parser.stopped || shutdown.cancel();
+                Ok(stop.observe(terminal, preempt && queue.has_waiting()))
             };
             generator.resume(
                 ctx,
@@ -759,7 +788,7 @@ impl<M: LanguageModel> Engine<M> {
         row.drafted += resumed.drafted;
         row.accepted += resumed.accepted;
         row.stats.solo_tokens += row.generated.len() - before;
-        if preempted && resumed.finish == FinishReason::Callback {
+        if stop.yielded_only() && resumed.finish == FinishReason::Callback {
             row.stats.preemptions += 1;
             match resumed.parked_draw {
                 // The parked step fed the last draw and drew the next one:

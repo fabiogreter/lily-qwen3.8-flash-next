@@ -142,8 +142,6 @@ impl SamplerScratch {
         })
     }
 
-    /// Clears the emission histogram at the start of a request. The GPU must
-    /// be idle on this scratch.
     /// Undoes one count of `token` (a draw that was discarded). No committed
     /// pass may touch the counts (greedy draft passes never bind them).
     pub fn uncount(&self, token: u32) {
@@ -158,6 +156,8 @@ impl SamplerScratch {
         }
     }
 
+    /// Clears the emission histogram at the start of a request. The GPU must
+    /// be idle on this scratch.
     pub fn reset_counts(&self) {
         self.counts.zero_fill();
     }

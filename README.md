@@ -64,12 +64,15 @@ opencode. The differences:
   - `thinking_budget` (tokens; negative turns a server default off): once
     the reasoning block holds that many of the model's tokens it is closed
     at the next line end (after a grace window also a sentence end, after
-    a second one anywhere), never inside a code fence or a tool call, with
-    a short preface and `</think>`.
+    a second one anywhere), never inside a code fence or a tool call (it
+    waits for them to end; a fence never closed means no close), with a
+    short preface and `</think>`.
   - `thinking_nudges` (bool, with a budget): sentences of increasingly firm
-    wording inserted into the reasoning at 50, 75 and 90 % of the budget.
+    wording inserted into the reasoning at 50, 75 and 90 % of the budget,
+    each only at a line end within the grace window (otherwise skipped).
   - `tool_call_ends_thinking` (bool, chat requests with tools): a
-    `<tool_call>` at a line start inside the reasoning block ends it, with
+    `<tool_call>` at a line start inside the reasoning block, outside a
+    code fence and outside a tool call the block kept, ends it, with
     `</think>` inserted in front of it.
 
   Inserted tokens are fed to the model like generated ones, appear in the

@@ -184,13 +184,20 @@ fn nothing_lands_inside_a_code_fence_or_a_tool_call() {
     assert_eq!(word(&mut c, "`\n"), Action::Keep, "inside the fence now");
     assert_eq!(word(&mut c, "x\n"), Action::Keep);
 
-    // A fence that outlasts both windows: the close lands there anyway.
+    // A fence that outlasts both windows: the close still waits for it to
+    // end, then lands at once (both windows are over).
     let mut c = control(budget(1, 2));
     assert_eq!(word(&mut c, "```\n"), Action::Keep);
-    for _ in 0..3 {
+    for _ in 0..50 {
         assert_eq!(word(&mut c, "code\n"), Action::Keep);
     }
-    assert!(matches!(word(&mut c, "code\n"), Action::After(_)));
+    assert!(c.is_open() && c.may_act_next());
+    assert!(matches!(word(&mut c, "```"), Action::After(_)), "right after the fence");
+    // Grace 0 does not make it land in a fence either.
+    let mut c = control(budget(2, 0));
+    assert_eq!(word(&mut c, "```\n"), Action::Keep);
+    assert_eq!(word(&mut c, "x"), Action::Keep);
+    assert_eq!(word(&mut c, "\n"), Action::Keep);
 
     // A tool call kept in the block (the rule off) holds the close back
     // until it ends, however long; past both windows it comes right after.
@@ -250,12 +257,15 @@ fn nudge_variants_rotate_with_the_seed() {
     let first_nudge = |seed: u64| {
         let mut c = control(ThinkingSettings { nudges: true, seed, ..budget(4, 0) });
         assert_eq!(word(&mut c, "x"), Action::Keep);
-        let Action::After(ids) = word(&mut c, "y") else { panic!("no nudge at 2") };
+        let Action::After(ids) = word(&mut c, "y\n") else { panic!("no nudge at 2") };
         text(&ids)
     };
-    assert_eq!(first_nudge(0), "\n\nHalf.\n\n");
-    assert_eq!(first_nudge(1), "\n\nHalfway.\n\n");
-    assert_eq!(first_nudge(2), "\n\nHalf.\n\n");
+    assert_eq!(first_nudge(0), "\nHalf.\n\n");
+    assert_eq!(first_nudge(1), "\nHalfway.\n\n");
+    assert_eq!(first_nudge(2), "\nHalf.\n\n");
+    // A request's `seed: -1` is u64::MAX: the pick wraps instead of
+    // overflowing.
+    assert_eq!(first_nudge(u64::MAX), "\nHalfway.\n\n");
     let close = |seed: u64| {
         let mut c = control(ThinkingSettings { seed, ..budget(1, 0) });
         let Action::After(ids) = word(&mut c, "x\n\n") else { panic!("no close") };
@@ -263,6 +273,61 @@ fn nudge_variants_rotate_with_the_seed() {
     };
     assert_eq!(close(0), "Act now.\n</think>\n\n");
     assert_eq!(close(1), "Go.\n</think>\n\n");
+    assert_eq!(close(u64::MAX), "Go.\n</think>\n\n");
+    // The second level's pick is seed + 1: u64::MAX wraps to 0.
+    let mut c =
+        control(ThinkingSettings { nudges: true, seed: u64::MAX, ..budget(4, 0) });
+    assert_eq!(word(&mut c, "x"), Action::Keep);
+    assert!(matches!(word(&mut c, "y\n"), Action::After(_)));
+    let Action::After(ids) = word(&mut c, "z\n") else { panic!("no nudge at 3") };
+    assert_eq!(text(&ids), "\nThree quarters.\n\n");
+}
+
+#[test]
+fn a_nudge_lands_only_at_a_line_end_within_its_window() {
+    // Levels at 10 and 15 of 20, grace 2 (a window of tokens 10..=12 for
+    // the first). The first finds no line end there (sentence ends do not
+    // count for a nudge) and is dropped; the second lands at the line end
+    // on token 16.
+    let mut c = control(ThinkingSettings { nudges: true, ..budget(20, 2) });
+    for _ in 0..9 {
+        assert_eq!(word(&mut c, "w"), Action::Keep);
+    }
+    for _ in 0..3 {
+        assert_eq!(word(&mut c, " end."), Action::Keep);
+    }
+    assert_eq!(word(&mut c, "\n"), Action::Keep, "token 13: too late for level 1");
+    assert_eq!(c.nudged(), 0);
+    assert_eq!(word(&mut c, "a"), Action::Keep);
+    assert_eq!(word(&mut c, "b"), Action::Keep, "15: level 2 due, mid-line");
+    let Action::After(ids) = word(&mut c, "c\n") else { panic!("no nudge at 16") };
+    assert_eq!(text(&ids), "\nThree quarters.\n\n");
+    assert_eq!(c.nudged(), 1);
+}
+
+#[test]
+fn a_tool_call_in_a_fence_or_inside_a_kept_call_does_not_end_thinking() {
+    let on = ThinkingSettings { tool_call_ends_thinking: true, ..Default::default() };
+    // An example the reasoning quotes in a fence.
+    let mut c = control(on);
+    assert_eq!(word(&mut c, "```xml\n"), Action::Keep);
+    assert!(!c.may_act_next(), "a line start inside a fence");
+    assert_eq!(c.decide(TOOL_CALL, "<tool_call>"), Action::Keep);
+    assert_eq!(c.decide(TOOL_CALL_END, "</tool_call>"), Action::Keep);
+    assert_eq!(word(&mut c, "\n```\n"), Action::Keep);
+    assert!(c.is_open() && c.may_act_next(), "out of the fence");
+    assert!(matches!(c.decide(TOOL_CALL, "<tool_call>"), Action::Before(_)));
+
+    // A call the block kept (mid-line), and a nested marker inside it.
+    let mut c = control(on);
+    assert_eq!(word(&mut c, "Like "), Action::Keep);
+    assert_eq!(c.decide(TOOL_CALL, "<tool_call>"), Action::Keep);
+    assert_eq!(word(&mut c, "\n"), Action::Keep);
+    assert!(!c.may_act_next(), "a line start inside a kept call");
+    assert_eq!(c.decide(TOOL_CALL, "<tool_call>"), Action::Keep);
+    assert_eq!(c.decide(TOOL_CALL_END, "</tool_call>"), Action::Keep);
+    assert_eq!(word(&mut c, "\n"), Action::Keep);
+    assert!(matches!(c.decide(TOOL_CALL, "<tool_call>"), Action::Before(_)));
 }
 
 #[test]

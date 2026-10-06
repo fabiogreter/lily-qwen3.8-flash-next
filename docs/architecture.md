@@ -1554,9 +1554,13 @@ tokens are drawn: a tool call at a line start ends the block
 for a reasoned call, as vLLM's Qwen3 reasoning parser reads it), a budget
 closes the block at the next line end with a short preface (llama.cpp's
 reasoning budget, Qwen's own Qwen3 recipe), and nudges insert firmer
-sentences at fractions of the budget. The output parser treats a
-`<tool_call>` at a line start in the block as its end too, as a safety
-net for text the decode-time rule did not see. None of it exists for a
+sentences at fractions of the budget. Nothing is inserted inside a code
+fence or a tool call the block kept, and a `<tool_call>` there (an
+example the reasoning quotes, a nested marker) does not end the block;
+the close waits for a fence to end however long it runs. The output
+parser treats a `<tool_call>` at a line start in the block (outside
+those) as its end too, as a safety net for text the decode-time rule did
+not see. None of it exists for a
 request that asks for nothing: no control is made, and the decode is the
 one without them.
 

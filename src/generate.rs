@@ -73,6 +73,14 @@ pub struct GenerateOptions<'a> {
     /// them. Behind a `RefCell` because the control outlives one loop: a
     /// batch row moves between the single-session loop and batched steps
     /// with the same control.
+    ///
+    /// A draw is keyed by `(seed, index)`, and the index is the token's
+    /// place in the generation, inserted tokens included: an insertion of
+    /// `n` tokens skips `n` indices of the seed's stream. Every loop (plain,
+    /// speculative, batched) counts the same way, so a seeded request with
+    /// the same controls draws the same tokens whichever loop runs it; it
+    /// draws differently from the same request without them past the first
+    /// insertion, as it should.
     pub thinking: Option<&'a RefCell<ThinkingControl>>,
 }
 

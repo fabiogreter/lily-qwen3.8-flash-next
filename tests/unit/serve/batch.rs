@@ -1,4 +1,6 @@
-use super::{BatchStats, Next, RowAhead, Slots, admits, next_action, park_next};
+use super::{
+    BatchStats, Next, RowAhead, Slots, SoloStop, admits, next_action, park_next,
+};
 
 #[test]
 fn slots_hand_out_the_lowest_free_one_and_take_them_back() {
@@ -127,4 +129,30 @@ fn the_next_step_parks_only_with_room_for_it_and_the_step_after_it() {
     assert!(!park_next(&[at(1023)], true, false, false), "the step after needs room");
     assert!(!park_next(&[at(1024)], true, false, false), "no room for the parked step");
     assert!(!park_next(&[going_on(10), at(1023)], true, false, false), "any row");
+}
+
+/// A preemption seen on the first token of an inserted group, then a stop
+/// string on a later one: the row ends; it is not left runnable as if it
+/// had only yielded.
+#[test]
+fn a_terminal_stop_later_in_an_inserted_group_wins_over_a_yield() {
+    use crate::generate::{FinishReason, push_group};
+    let mut stop = SoloStop::default();
+    // Token 7: a job waits. Token 8: the parser matched a stop string.
+    let mut on_token = |t: u32| Ok(stop.observe(t == 8, true));
+    let mut tokens = Vec::new();
+    let end = push_group(&mut tokens, &[7, 8, 9], 100, &mut on_token).unwrap();
+    assert_eq!(end, Some(FinishReason::Callback));
+    assert!(!stop.yielded_only(), "the stop string ends the row");
+
+    // Only a yield: the row goes on later.
+    let mut stop = SoloStop::default();
+    let mut on_token = |_| Ok(stop.observe(false, true));
+    push_group(&mut Vec::new(), &[7, 8], 100, &mut on_token).unwrap();
+    assert!(stop.yielded_only());
+
+    // Nothing stopped it.
+    let mut stop = SoloStop::default();
+    assert!(stop.observe(false, false));
+    assert!(!stop.yielded_only());
 }
