@@ -32,7 +32,8 @@
 //! depends on the rows beside it: that is exact, and tested.
 
 use super::*;
-use crate::engine::{BatchRow, CountsSlot};
+use crate::engine::{BatchRow, CountsSlot, RowsStepTiming};
+use crate::metal::host_secs;
 
 /// Per-slot and per-row buffers of a batched decode step, allocated by the
 /// first one.
@@ -164,13 +165,19 @@ impl Qwen4ExpModel {
         }
     }
 
-    /// See [`crate::engine::LanguageModel::decode_rows`].
+    /// See [`crate::engine::LanguageModel::decode_rows`]; with `timed`, also
+    /// [`crate::engine::LanguageModel::decode_rows_timed`]'s breakdown (the
+    /// host marks cost a clock read each; the completed pass is kept to read
+    /// its GPU span, which is the only difference in the work done).
     pub(super) fn decode_session_rows(
         &self,
         ctx: &MetalContext,
         s: &mut Scratch,
         rows: &mut [BatchRow<'_, DecodeState>],
-    ) -> Result<Vec<u32>> {
+        timed: bool,
+    ) -> Result<(Vec<u32>, Option<RowsStepTiming>)> {
+        let mark = || if timed { host_secs() } else { 0.0 };
+        let began = mark();
         let m = rows.len();
         let slots = self.batch_rows();
         ensure!(
@@ -226,6 +233,7 @@ impl Qwen4ExpModel {
                 .ok_or_else(|| anyhow::anyhow!("PLE weights without PLE state"))?;
             self.stage_ngram_rows(w, p, &tokens, &hists)?;
         }
+        let staged = mark();
         // TODO(batch): park the next batched step like the decode loop does
         // (commit it before its n-gram rows are staged): its row set is only
         // known once this step's draws are, so for now every step pays the
@@ -233,7 +241,16 @@ impl Qwen4ExpModel {
         let pass = self.begin_batched(ctx, m)?;
         pass.set_label("decode rows");
         self.encode_rows(ctx, &pass, rows, s, &ps, bs)?;
-        pass.commit()?.wait()?;
+        let encoded = mark();
+        let pending = pass.commit()?;
+        let committed = mark();
+        let completed = if timed {
+            Some(pending.wait_retain()?)
+        } else {
+            pending.wait()?;
+            None
+        };
+        let woke = mark();
         for row in rows.iter_mut() {
             let state = &mut *row.state;
             state.pos += 1;
@@ -241,7 +258,24 @@ impl Qwen4ExpModel {
                 pst.hist = NgramHasher::advance(pst.hist, &[row.token]);
             }
         }
-        bs.tokens.view(0, &[m])?.to_u32()
+        let draws = bs.tokens.view(0, &[m])?.to_u32()?;
+        let ended = mark();
+        // Read after the step's marks: waiting for the commit feedback is
+        // not part of the step.
+        let timing = completed
+            .map(|c| -> Result<RowsStepTiming> {
+                Ok(RowsStepTiming {
+                    began,
+                    staged,
+                    encoded,
+                    committed,
+                    gpu: c.timing()?,
+                    woke,
+                    ended,
+                })
+            })
+            .transpose()?;
+        Ok((draws, timing))
     }
 
     /// The batched decode graph over `rows` (their tokens already in

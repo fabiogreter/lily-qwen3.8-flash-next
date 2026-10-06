@@ -6,7 +6,10 @@ use std::time::Instant;
 
 use anyhow::{Result, ensure};
 use clap::Parser;
-use lily::engine::{DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi};
+use lily::engine::{
+    BatchRow, DecodeStateApi, Draw, LanguageModel, LoadOptions, RowsStepPhases,
+    ScratchApi,
+};
 use lily::generate::speculate;
 use lily::kernels::attention::MAX_SEQ;
 use lily::kernels::sample::SamplingParams;
@@ -61,6 +64,15 @@ struct Cli {
     /// prefers that file over the shipped ranking); nothing by default.
     #[arg(long)]
     expert_usage_out: Option<PathBuf>,
+    /// Measures the server's batched decode step instead
+    /// (`LanguageModel::decode_rows`): this many sessions, each with its own
+    /// prompt of `--prompt-len` tokens (the synthetic sequence at a different
+    /// offset per row, or consecutive slices of `--prompt-text`), decode
+    /// `--decode-steps` steps together. With `--gpu-timing`, every step
+    /// reports where its wall time went. `--drafts` then only loads the draft
+    /// head, which the server's batched step catches up on every row.
+    #[arg(long)]
+    batch_rows: Option<usize>,
     #[arg(long)]
     json_out: PathBuf,
 }
@@ -68,31 +80,35 @@ struct Cli {
 /// The prompt: the synthetic sequence (token `i` is `i * 2654435761 mod
 /// vocab`) or the first `prompt_len` tokens of `--prompt-text`.
 fn prompt_tokens(cli: &Cli, vocab: u32) -> Result<Vec<u32>> {
+    prompt_tokens_of(cli, vocab, cli.prompt_len)
+}
+
+/// [`prompt_tokens`] for `len` tokens.
+fn prompt_tokens_of(cli: &Cli, vocab: u32, len: usize) -> Result<Vec<u32>> {
     let Some(path) = &cli.prompt_text else {
         let token = |index: usize| (index as u32).wrapping_mul(2_654_435_761) % vocab;
-        return Ok((0..cli.prompt_len).map(token).collect());
+        return Ok((0..len).map(token).collect());
     };
     let text = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
     let tokenizer = lily::tokenizer::Tokenizer::from_model_dir(&cli.model)?;
     // Tokenize a prefix long enough for the prompt (about four bytes per
     // token in code and prose), growing it if the estimate falls short.
-    let mut bytes = (cli.prompt_len * 6).min(text.len());
+    let mut bytes = (len * 6).min(text.len());
     loop {
         while bytes < text.len() && !text.is_char_boundary(bytes) {
             bytes += 1;
         }
         let mut ids = tokenizer.encode(&text[..bytes])?;
-        if ids.len() >= cli.prompt_len {
-            ids.truncate(cli.prompt_len);
+        if ids.len() >= len {
+            ids.truncate(len);
             return Ok(ids);
         }
         ensure!(
             bytes < text.len(),
-            "{} holds {} tokens, fewer than --prompt-len {}",
+            "{} holds {} tokens, fewer than the {len} needed",
             path.display(),
             ids.len(),
-            cli.prompt_len
         );
         bytes = (bytes * 2).min(text.len());
     }
@@ -350,6 +366,9 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
             ..LoadOptions::default()
         },
     )?;
+    if let Some(rows) = cli.batch_rows {
+        return bench_batched(cli, &ctx, &model, rows);
+    }
     if cli.drafts > 0 {
         return bench_speculative(cli, &ctx, &model);
     }
@@ -702,5 +721,183 @@ fn bench_speculative<M: LanguageModel>(
         drafted,
         100.0 * accepted as f64 / drafted.max(1) as f64,
     );
+    Ok(())
+}
+
+/// The median of `values` (0 for none).
+fn median(mut values: Vec<f64>) -> f64 {
+    values.sort_by(f64::total_cmp);
+    values.get(values.len() / 2).copied().unwrap_or(0.0)
+}
+
+/// The server's batched decode step over `rows` sessions
+/// (`--batch-rows`): prefill each, then `--decode-steps` steps of all rows
+/// together, greedy or `--sample`d, each step waited for as the server's
+/// scheduler does. Reports aggregate and per-row tokens per second, the
+/// per-step wall time and, with `--gpu-timing`, the median of every phase
+/// of a step (`RowsStepPhases`); with `--kernel-profile`, the per-kernel
+/// table of the `decode rows` pass.
+fn bench_batched<M: LanguageModel>(
+    cli: &Cli,
+    ctx: &MetalContext,
+    model: &M,
+    rows: usize,
+) -> Result<()> {
+    ensure!(
+        (1..=model.max_batch_rows()).contains(&rows),
+        "--batch-rows takes 1 to {} for this model",
+        model.max_batch_rows()
+    );
+    if cli.ngram_preload {
+        let started = Instant::now();
+        let bytes = model.warm_storage(false)?;
+        eprintln!(
+            "paged weights: {:.1} GB resident after preload in {:.1}s",
+            bytes as f64 / 1e9,
+            started.elapsed().as_secs_f64()
+        );
+    }
+    let max_seq = cli.prompt_len + cli.decode_steps + 2;
+    let vocab = u32::try_from(model.vocab_size())?;
+    // Row `r`'s prompt: tokens `r * prompt_len ..` of one long sequence.
+    let all = prompt_tokens_of(cli, vocab, cli.prompt_len * rows)?;
+    let prompts: Vec<&[u32]> = all.chunks(cli.prompt_len).collect();
+    let mut scratch = model.new_scratch_with_capacity(ctx, max_seq)?;
+    // Each prefill draws into next_token[0]: read it before the next one.
+    let prefill_all =
+        |scratch: &mut M::Scratch| -> Result<(Vec<M::State>, Vec<u32>, f64)> {
+            let started = Instant::now();
+            let mut states = Vec::with_capacity(rows);
+            let mut firsts = Vec::with_capacity(rows);
+            for prompt in &prompts {
+                let mut state = model.new_state(ctx, max_seq)?;
+                model.prefill(ctx, &mut state, scratch, prompt, Some(draw(0)))?;
+                firsts.push(scratch.next_token().view(0, &[1])?.to_u32()?[0]);
+                states.push(state);
+            }
+            Ok((states, firsts, started.elapsed().as_secs_f64()))
+        };
+    let step = |scratch: &mut M::Scratch,
+                states: &mut [M::State],
+                tokens: &mut [Vec<u32>]|
+     -> Result<Option<lily::engine::RowsStepTiming>> {
+        let mut batch: Vec<BatchRow<'_, M::State>> = states
+            .iter_mut()
+            .zip(tokens.iter())
+            .enumerate()
+            .map(|(slot, (state, drawn))| BatchRow {
+                state,
+                token: *drawn.last().expect("a row has drawn"),
+                draw: draw(drawn.len()),
+                slot,
+            })
+            .collect();
+        let (draws, timing) = if cli.gpu_timing {
+            model.decode_rows_timed(ctx, scratch, &mut batch)?
+        } else {
+            (model.decode_rows(ctx, scratch, &mut batch)?, None)
+        };
+        for (drawn, token) in tokens.iter_mut().zip(draws) {
+            drawn.push(token);
+        }
+        Ok(timing)
+    };
+
+    // Warm-up: the same row count compiles every shape the steps use.
+    {
+        let (mut states, firsts, _) = prefill_all(&mut scratch)?;
+        let mut tokens: Vec<Vec<u32>> = firsts.into_iter().map(|t| vec![t]).collect();
+        for _ in 0..2 {
+            step(&mut scratch, &mut states, &mut tokens)?;
+        }
+    }
+    if ctx.profiling() {
+        profile::take();
+    }
+
+    let (mut states, firsts, prefill_secs) = prefill_all(&mut scratch)?;
+    let mut tokens: Vec<Vec<u32>> = firsts.into_iter().map(|t| vec![t]).collect();
+    let mut step_wall = Vec::with_capacity(cli.decode_steps);
+    let mut timings = Vec::new();
+    let decode_start = Instant::now();
+    for _ in 0..cli.decode_steps {
+        let started = Instant::now();
+        if let Some(timing) = step(&mut scratch, &mut states, &mut tokens)? {
+            timings.push(timing);
+        }
+        step_wall.push(started.elapsed().as_secs_f64());
+    }
+    let decode_secs = decode_start.elapsed().as_secs_f64();
+    let kernel_profile =
+        ctx.profiling().then(|| kernel_profile_report(&profile::take()));
+
+    let generated = rows * cli.decode_steps;
+    let phases: Vec<RowsStepPhases> = timings.iter().map(|t| t.phases()).collect();
+    let med = |f: fn(&RowsStepPhases) -> f64| median(phases.iter().map(f).collect());
+    // Host time between one step's end and the next one's start (the
+    // scheduler's own bookkeeping, here the loop's).
+    let between_ms =
+        median(timings.windows(2).map(|w| (w[1].began - w[0].ended) * 1e3).collect());
+    let phase_medians = (!phases.is_empty()).then(|| {
+        serde_json::json!({
+            "stage_ms": med(|p| p.stage_ms),
+            "encode_ms": med(|p| p.encode_ms),
+            "commit_ms": med(|p| p.commit_ms),
+            "submit_ms": med(|p| p.submit_ms),
+            "gpu_ms": med(|p| p.gpu_ms),
+            "wake_ms": med(|p| p.wake_ms),
+            "finish_ms": med(|p| p.finish_ms),
+            "between_steps_ms": between_ms,
+            "step_wall_ms": median(timings.iter().map(|t| t.wall_ms()).collect()),
+        })
+    });
+    let digests: Vec<String> =
+        tokens.iter().map(|t| format!("{:016x}", fnv1a(&t[1..]))).collect();
+    let report = serde_json::json!({
+        "schema_version": 1,
+        "meta": {"engine": "lily", "model_id": M::MODEL_ID, "harness": "src/bin/lily-bench.rs", "crate_version": env!("CARGO_PKG_VERSION")},
+        "workload": {
+            "prompt_len": cli.prompt_len,
+            "prompt": cli.prompt_text.as_ref().map_or("synthetic".to_string(), |p| p.display().to_string()),
+            "decode_steps": cli.decode_steps,
+            "decode_mode": "batched_rows",
+            "batch_rows": rows,
+            "draft_head_loaded": cli.drafts > 0,
+            "sampling": if cli.sample { "server_defaults" } else { "greedy" },
+            "seed": cli.seed,
+            "gpu_timing_diagnostic": cli.gpu_timing,
+            "kernel_profile_diagnostic": ctx.profiling(),
+        },
+        "results": {
+            "prefill": {"wall_secs": prefill_secs, "tok_s": (cli.prompt_len * rows) as f64 / prefill_secs},
+            "decode": {
+                "wall_secs": decode_secs,
+                "tokens": generated,
+                "tok_s": generated as f64 / decode_secs,
+                "tok_s_per_row": cli.decode_steps as f64 / decode_secs,
+                "step_wall_secs": step_wall,
+                "step_phases_median": phase_medians,
+                "step_phases": phases.iter().map(|p| serde_json::json!({
+                    "stage_ms": p.stage_ms, "encode_ms": p.encode_ms, "commit_ms": p.commit_ms,
+                    "submit_ms": p.submit_ms, "gpu_ms": p.gpu_ms, "wake_ms": p.wake_ms,
+                    "finish_ms": p.finish_ms,
+                })).collect::<Vec<_>>(),
+                "token_digests": digests,
+                "kernel_profile": kernel_profile,
+            },
+        },
+    });
+    std::fs::write(&cli.json_out, serde_json::to_vec_pretty(&report)?)?;
+    eprintln!(
+        "batched decode: {rows} rows x {} steps in {decode_secs:.3}s = {:.1} tok/s ({:.1} per row), step median {:.3} ms | digests {}",
+        cli.decode_steps,
+        generated as f64 / decode_secs,
+        cli.decode_steps as f64 / decode_secs,
+        median(step_wall.clone()) * 1e3,
+        digests.join(","),
+    );
+    if let Some(m) = &phase_medians {
+        eprintln!("step phases (median ms): {m}");
+    }
     Ok(())
 }

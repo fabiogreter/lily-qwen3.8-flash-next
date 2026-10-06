@@ -44,3 +44,34 @@ fn a_cancelled_layout_stops_between_pieces() {
     let error = written(&[Segment::host(&rows)], Some(&cancel)).expect_err("cancelled");
     assert_eq!(error.to_string(), "cancelled");
 }
+
+/// A batched step's phases are consecutive intervals between its marks, so
+/// they add up to its wall time; the GPU's marks sit between `committed`
+/// and `woke`.
+#[test]
+fn a_batched_steps_phases_cover_its_wall_time() {
+    let t = RowsStepTiming {
+        began: 10.0,
+        staged: 10.0002,
+        encoded: 10.0012,
+        committed: 10.0013,
+        gpu: PassTiming { gpu_start_secs: 10.0016, gpu_end_secs: 10.0206 },
+        woke: 10.0207,
+        ended: 10.0208,
+    };
+    let p = t.phases();
+    let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
+    assert!(
+        close(p.stage_ms, 0.2) && close(p.encode_ms, 1.0) && close(p.commit_ms, 0.1)
+    );
+    assert!(close(p.submit_ms, 0.3) && close(p.gpu_ms, 19.0) && close(p.wake_ms, 0.1));
+    assert!(close(p.finish_ms, 0.1));
+    let sum = p.stage_ms
+        + p.encode_ms
+        + p.commit_ms
+        + p.submit_ms
+        + p.gpu_ms
+        + p.wake_ms
+        + p.finish_ms;
+    assert!(close(sum, t.wall_ms()), "{sum} vs {}", t.wall_ms());
+}

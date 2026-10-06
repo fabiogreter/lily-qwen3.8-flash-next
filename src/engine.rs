@@ -8,7 +8,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::kernels::sample::SamplingParams;
-use crate::metal::{EncodedPass, MetalContext, PendingPass, SharedEvent};
+use crate::metal::{EncodedPass, MetalContext, PassTiming, PendingPass, SharedEvent};
 use crate::tensor::Tensor;
 
 /// One piece of a persisted layout (a disk-tier file): bytes the layout
@@ -360,6 +360,70 @@ pub struct Draw<'p> {
     pub step: usize,
 }
 
+/// Where the wall time of one batched decode step went
+/// ([`LanguageModel::decode_rows_timed`]): host marks in the order the step
+/// passes them and the pass's GPU span, all in seconds on the clock of
+/// [`crate::metal::host_secs`], so marks and GPU times subtract. A
+/// diagnostic for `lily-bench --batch-rows`; the server never asks for it.
+#[derive(Clone, Copy, Debug)]
+pub struct RowsStepTiming {
+    /// The step began (before any host input was written).
+    pub began: f64,
+    /// The rows' token ids and n-gram inputs were staged.
+    pub staged: f64,
+    /// The pass was encoded.
+    pub encoded: f64,
+    /// The pass was committed.
+    pub committed: f64,
+    pub gpu: PassTiming,
+    /// The host woke from the wait for the pass.
+    pub woke: f64,
+    /// The draws were read back and the states advanced: the step is over.
+    pub ended: f64,
+}
+
+/// [`RowsStepTiming`] as consecutive durations in milliseconds. Each phase
+/// is one interval of the step, so they add up to its wall time, except
+/// that the submission gap and the wake-up are measured against the GPU's
+/// clock marks and come out slightly negative when the GPU started before
+/// `commit` returned.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RowsStepPhases {
+    /// Writing the ids and staging the n-gram rows (paged: copied by the
+    /// host out of the page cache).
+    pub stage_ms: f64,
+    /// Encoding the pass on the host (serial: nothing runs on the GPU).
+    pub encode_ms: f64,
+    pub commit_ms: f64,
+    /// From `commit` returning to the GPU starting the pass.
+    pub submit_ms: f64,
+    pub gpu_ms: f64,
+    /// From the GPU's end to the host waking.
+    pub wake_ms: f64,
+    /// Reading the draws back and advancing the states.
+    pub finish_ms: f64,
+}
+
+impl RowsStepTiming {
+    pub fn phases(&self) -> RowsStepPhases {
+        let ms = |from: f64, to: f64| (to - from) * 1e3;
+        RowsStepPhases {
+            stage_ms: ms(self.began, self.staged),
+            encode_ms: ms(self.staged, self.encoded),
+            commit_ms: ms(self.encoded, self.committed),
+            submit_ms: ms(self.committed, self.gpu.gpu_start_secs),
+            gpu_ms: ms(self.gpu.gpu_start_secs, self.gpu.gpu_end_secs),
+            wake_ms: ms(self.gpu.gpu_end_secs, self.woke),
+            finish_ms: ms(self.woke, self.ended),
+        }
+    }
+
+    /// The step's wall time in milliseconds, `began` to `ended`.
+    pub fn wall_ms(&self) -> f64 {
+        (self.ended - self.began) * 1e3
+    }
+}
+
 /// One session's row of a batched decode step
 /// ([`LanguageModel::decode_rows`]): its state, the token the step feeds
 /// at the state's position (drawn by the row's previous step, not yet fed)
@@ -652,6 +716,19 @@ pub trait LanguageModel: Sized {
     ) -> Result<Vec<u32>> {
         let _ = (ctx, scratch, rows);
         anyhow::bail!("this model cannot batch decode steps across sessions")
+    }
+
+    /// [`Self::decode_rows`], also reporting where the step's wall time went
+    /// when the model can measure it (`None` otherwise). It keeps the
+    /// completed pass to read its GPU span, which the server's path does not
+    /// pay for; a benchmark diagnostic only.
+    fn decode_rows_timed(
+        &self,
+        ctx: &MetalContext,
+        scratch: &mut Self::Scratch,
+        rows: &mut [BatchRow<'_, Self::State>],
+    ) -> Result<(Vec<u32>, Option<RowsStepTiming>)> {
+        Ok((self.decode_rows(ctx, scratch, rows)?, None))
     }
 
     /// Copies a request's penalty counts from one sampler to another (a

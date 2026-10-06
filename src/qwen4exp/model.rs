@@ -16,8 +16,8 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::engine::{
-    BatchRow, CountsSlot, DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi,
-    Segment, SnapshotApi, VisionMode, VisionTower,
+    BatchRow, CountsSlot, DecodeStateApi, Draw, LanguageModel, LoadOptions,
+    RowsStepTiming, ScratchApi, Segment, SnapshotApi, VisionMode, VisionTower,
 };
 use crate::kernels::attention::{
     MAX_SEQ, k_norm_rope_scatter_decode, q_norm_rope_split_decode, rope_neox,
@@ -4184,7 +4184,16 @@ impl LanguageModel for Qwen4ExpModel {
         scratch: &mut Scratch,
         rows: &mut [BatchRow<'_, DecodeState>],
     ) -> Result<Vec<u32>> {
-        self.decode_session_rows(ctx, scratch, rows)
+        Ok(self.decode_session_rows(ctx, scratch, rows, false)?.0)
+    }
+
+    fn decode_rows_timed(
+        &self,
+        ctx: &MetalContext,
+        scratch: &mut Scratch,
+        rows: &mut [BatchRow<'_, DecodeState>],
+    ) -> Result<(Vec<u32>, Option<RowsStepTiming>)> {
+        self.decode_session_rows(ctx, scratch, rows, true)
     }
 
     fn move_sampler_counts(
