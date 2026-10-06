@@ -17,7 +17,8 @@ use std::rc::Rc;
 
 use crate::engine::{
     BatchRow, CountsSlot, DecodeStateApi, Draw, LanguageModel, LoadOptions,
-    RowsStepTiming, ScratchApi, Segment, SnapshotApi, VisionMode, VisionTower,
+    RowsInFlight, RowsStepTiming, ScratchApi, Segment, SnapshotApi, VisionMode,
+    VisionTower,
 };
 use crate::kernels::attention::{
     MAX_SEQ, k_norm_rope_scatter_decode, q_norm_rope_split_decode, rope_neox,
@@ -292,6 +293,11 @@ impl StepSync {
         self.last.set(value);
         self.armed.set(value);
         Ok(value)
+    }
+
+    /// The value the outstanding parked pass waits for; 0 when none.
+    pub(super) fn armed(&self) -> u64 {
+        self.armed.get()
     }
 
     /// Releases the parked pass, if any.
@@ -4178,22 +4184,46 @@ impl LanguageModel for Qwen4ExpModel {
         self.batch_rows()
     }
 
-    fn decode_rows(
+    fn commit_rows<'a>(
         &self,
-        ctx: &MetalContext,
+        ctx: &'a MetalContext,
         scratch: &mut Scratch,
         rows: &mut [BatchRow<'_, DecodeState>],
-    ) -> Result<Vec<u32>> {
-        Ok(self.decode_session_rows(ctx, scratch, rows, false)?.0)
+        timed: bool,
+    ) -> Result<RowsInFlight<'a>> {
+        self.commit_session_rows(ctx, scratch, rows, timed)
     }
 
-    fn decode_rows_timed(
+    fn finish_rows(
         &self,
-        ctx: &MetalContext,
-        scratch: &mut Scratch,
-        rows: &mut [BatchRow<'_, DecodeState>],
+        scratch: &Scratch,
+        step: RowsInFlight<'_>,
     ) -> Result<(Vec<u32>, Option<RowsStepTiming>)> {
-        self.decode_session_rows(ctx, scratch, rows, true)
+        self.finish_session_rows(scratch, step)
+    }
+
+    fn supports_rows_parking(&self) -> bool {
+        true
+    }
+
+    fn park_rows<'a>(
+        &self,
+        ctx: &'a MetalContext,
+        scratch: &Scratch,
+        rows: &mut [BatchRow<'_, DecodeState>],
+        after: &RowsInFlight<'a>,
+        timed: bool,
+    ) -> Result<RowsInFlight<'a>> {
+        self.park_session_rows(ctx, scratch, rows, after, timed)
+    }
+
+    fn release_rows(
+        &self,
+        scratch: &Scratch,
+        step: &mut RowsInFlight<'_>,
+        rows: &mut [BatchRow<'_, DecodeState>],
+    ) -> Result<()> {
+        self.release_session_rows(scratch, step, rows)
     }
 
     fn move_sampler_counts(

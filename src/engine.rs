@@ -361,15 +361,23 @@ pub struct Draw<'p> {
 }
 
 /// Where the wall time of one batched decode step went
-/// ([`LanguageModel::decode_rows_timed`]): host marks in the order the step
-/// passes them and the pass's GPU span, all in seconds on the clock of
+/// ([`LanguageModel::decode_rows_timed`], or a step committed with `timed`
+/// set): host marks and the pass's GPU span, all in seconds on the clock of
 /// [`crate::metal::host_secs`], so marks and GPU times subtract. A
 /// diagnostic for `lily-bench --batch-rows`; the server never asks for it.
+///
+/// A step committed unparked passes the marks in field order. A parked step
+/// ([`LanguageModel::park_rows`]) is encoded and committed (`began` to
+/// `committed`) while the step before it runs, and its n-gram rows are
+/// staged only once that step's draws were read (`parked_staging` to
+/// `staged`, the release).
 #[derive(Clone, Copy, Debug)]
 pub struct RowsStepTiming {
-    /// The step began (before any host input was written).
+    /// The step began (before any host input was written; for a parked
+    /// step, before it was encoded).
     pub began: f64,
-    /// The rows' token ids and n-gram inputs were staged.
+    /// The rows' token ids and n-gram inputs were staged; for a parked step,
+    /// its n-gram rows were staged and it was released.
     pub staged: f64,
     /// The pass was encoded.
     pub encoded: f64,
@@ -378,49 +386,161 @@ pub struct RowsStepTiming {
     pub gpu: PassTiming,
     /// The host woke from the wait for the pass.
     pub woke: f64,
-    /// The draws were read back and the states advanced: the step is over.
+    /// The draws were read back: the step is over.
     pub ended: f64,
+    /// A parked step only: the host began staging its n-gram rows (after
+    /// reading the previous step's draws). `None` for an unparked step.
+    pub parked_staging: Option<f64>,
 }
 
-/// [`RowsStepTiming`] as consecutive durations in milliseconds. Each phase
-/// is one interval of the step, so they add up to its wall time, except
-/// that the submission gap and the wake-up are measured against the GPU's
-/// clock marks and come out slightly negative when the GPU started before
-/// `commit` returned.
+/// [`RowsStepTiming`] as durations in milliseconds. For an unparked step
+/// each phase is one interval of the step, so they add up to its wall time,
+/// except that the submission gap and the wake-up are measured against the
+/// GPU's clock marks and come out slightly negative when the GPU started
+/// before `commit` returned. For a parked step the encoding and the commit
+/// overlap the step before it, so the phases do not add up to anything.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RowsStepPhases {
     /// Writing the ids and staging the n-gram rows (paged: copied by the
-    /// host out of the page cache).
+    /// host out of the page cache); for a parked step, staging its n-gram
+    /// rows and releasing it.
     pub stage_ms: f64,
-    /// Encoding the pass on the host (serial: nothing runs on the GPU).
+    /// Encoding the pass on the host (serial: nothing runs on the GPU
+    /// unless a step is in flight ahead of it).
     pub encode_ms: f64,
     pub commit_ms: f64,
-    /// From `commit` returning to the GPU starting the pass.
+    /// From `commit` returning to the GPU starting the pass. For a parked
+    /// step, from its release to the GPU starting it: negative, since the
+    /// pass starts once the step ahead of it ends and runs up to its wait
+    /// while the host reads that step's draws and stages.
     pub submit_ms: f64,
+    /// The pass's GPU span; for a parked step it includes any time it
+    /// waited for its release.
     pub gpu_ms: f64,
     /// From the GPU's end to the host waking.
     pub wake_ms: f64,
-    /// Reading the draws back and advancing the states.
+    /// Reading the draws back.
     pub finish_ms: f64,
 }
 
 impl RowsStepTiming {
     pub fn phases(&self) -> RowsStepPhases {
         let ms = |from: f64, to: f64| (to - from) * 1e3;
+        let (stage_ms, encode_ms, submit_ms) = match self.parked_staging {
+            None => (
+                ms(self.began, self.staged),
+                ms(self.staged, self.encoded),
+                ms(self.committed, self.gpu.gpu_start_secs),
+            ),
+            Some(staging) => (
+                ms(staging, self.staged),
+                ms(self.began, self.encoded),
+                ms(self.staged, self.gpu.gpu_start_secs),
+            ),
+        };
         RowsStepPhases {
-            stage_ms: ms(self.began, self.staged),
-            encode_ms: ms(self.staged, self.encoded),
+            stage_ms,
+            encode_ms,
             commit_ms: ms(self.encoded, self.committed),
-            submit_ms: ms(self.committed, self.gpu.gpu_start_secs),
+            submit_ms,
             gpu_ms: ms(self.gpu.gpu_start_secs, self.gpu.gpu_end_secs),
             wake_ms: ms(self.gpu.gpu_end_secs, self.woke),
             finish_ms: ms(self.woke, self.ended),
         }
     }
 
-    /// The step's wall time in milliseconds, `began` to `ended`.
+    /// The step's wall time in milliseconds, `began` to `ended` (for a
+    /// parked step this overlaps the step before it).
     pub fn wall_ms(&self) -> f64 {
         (self.ended - self.began) * 1e3
+    }
+}
+
+/// A batched decode step committed and not yet waited for
+/// ([`LanguageModel::commit_rows`], [`LanguageModel::park_rows`]); hand it
+/// to [`LanguageModel::finish_rows`]. A parked step must be released
+/// ([`LanguageModel::release_rows`]) first.
+///
+/// Dropping one waits for its pass. A parked step that is dropped
+/// unreleased (an error path) is released first, without its inputs, so the
+/// queue never waits for it forever; the model's own bookkeeping of the
+/// parked step is then cleared by [`LanguageModel::release_parked`].
+pub struct RowsInFlight<'a> {
+    /// The pass, committed; taken by [`LanguageModel::finish_rows`]. Fields
+    /// drop after `Drop::drop` ran, so a parked pass is released before its
+    /// own drop waits for it.
+    pub(crate) pass: Option<PendingPass<'a>>,
+    /// The draw buffer the step writes (models ping-pong between two so the
+    /// next step can be committed before this one's draws are read).
+    pub(crate) out: usize,
+    /// The rows, in order: what the next step over them is checked against.
+    pub(crate) rows: Vec<RowKey>,
+    /// The event and value a parked step waits for; `None` once released
+    /// (or for an unparked step).
+    pub(crate) park: Option<(SharedEvent, u64)>,
+    /// The host marks so far when the step is timed.
+    pub(crate) marks: Option<RowsStepTiming>,
+}
+
+/// Which row a [`RowsInFlight`] step ran: the state (by address), its
+/// position once the step's token is fed, and its batch slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RowKey {
+    pub(crate) state: usize,
+    pub(crate) pos: usize,
+    pub(crate) slot: usize,
+}
+
+impl RowKey {
+    /// `row`'s key once its state has advanced past the step's token.
+    pub(crate) fn of<S: DecodeStateApi>(row: &BatchRow<'_, S>) -> Self {
+        Self {
+            state: std::ptr::from_ref::<S>(&*row.state) as usize,
+            pos: row.state.pos(),
+            slot: row.slot,
+        }
+    }
+}
+
+impl RowsInFlight<'_> {
+    /// Rows the step runs.
+    pub fn rows(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether the step still waits for its release.
+    pub fn is_parked(&self) -> bool {
+        self.park.is_some()
+    }
+
+    /// Checks that `rows` are the step's rows, in order, with their states
+    /// where the step left them.
+    pub(crate) fn check_rows<S: DecodeStateApi>(
+        &self,
+        rows: &[BatchRow<'_, S>],
+    ) -> Result<()> {
+        anyhow::ensure!(
+            rows.len() == self.rows.len(),
+            "{} rows for a step of {}",
+            rows.len(),
+            self.rows.len()
+        );
+        for (r, (row, key)) in rows.iter().zip(&self.rows).enumerate() {
+            anyhow::ensure!(
+                RowKey::of(row) == *key,
+                "row {r} is not the step's row {key:?}: {:?}",
+                RowKey::of(row)
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RowsInFlight<'_> {
+    fn drop(&mut self) {
+        if let Some((event, value)) = self.park.take() {
+            event.signal(value);
+        }
     }
 }
 
@@ -707,15 +827,16 @@ pub trait LanguageModel: Sized {
     /// row order. Every state must be at rest (no pending speculative step,
     /// nothing parked) with room for one more token. With a draft head
     /// loaded the head is caught up on every row, so a row can return to
-    /// speculative decoding afterwards.
+    /// speculative decoding afterwards. [`Self::commit_rows`] followed by
+    /// [`Self::finish_rows`].
     fn decode_rows(
         &self,
         ctx: &MetalContext,
         scratch: &mut Self::Scratch,
         rows: &mut [BatchRow<'_, Self::State>],
     ) -> Result<Vec<u32>> {
-        let _ = (ctx, scratch, rows);
-        anyhow::bail!("this model cannot batch decode steps across sessions")
+        let step = self.commit_rows(ctx, scratch, rows, false)?;
+        Ok(self.finish_rows(scratch, step)?.0)
     }
 
     /// [`Self::decode_rows`], also reporting where the step's wall time went
@@ -728,7 +849,79 @@ pub trait LanguageModel: Sized {
         scratch: &mut Self::Scratch,
         rows: &mut [BatchRow<'_, Self::State>],
     ) -> Result<(Vec<u32>, Option<RowsStepTiming>)> {
-        Ok((self.decode_rows(ctx, scratch, rows)?, None))
+        let step = self.commit_rows(ctx, scratch, rows, true)?;
+        self.finish_rows(scratch, step)
+    }
+
+    /// The first half of [`Self::decode_rows`]: stages the rows' host
+    /// inputs, encodes and commits the step, and advances every state by one
+    /// (the step's token counts as fed once committed), without waiting.
+    /// Nothing may be in flight; every state must be at rest with room for
+    /// one more token. With `timed`, [`Self::finish_rows`] reports the
+    /// step's [`RowsStepTiming`].
+    fn commit_rows<'a>(
+        &self,
+        ctx: &'a MetalContext,
+        scratch: &mut Self::Scratch,
+        rows: &mut [BatchRow<'_, Self::State>],
+        timed: bool,
+    ) -> Result<RowsInFlight<'a>> {
+        let _ = (ctx, scratch, rows, timed);
+        anyhow::bail!("this model cannot batch decode steps across sessions")
+    }
+
+    /// Waits for a step [`Self::commit_rows`] or [`Self::park_rows`]
+    /// committed (a parked one must have been released) and returns its
+    /// draws in row order, with its timing when it was committed `timed`.
+    fn finish_rows(
+        &self,
+        scratch: &Self::Scratch,
+        step: RowsInFlight<'_>,
+    ) -> Result<(Vec<u32>, Option<RowsStepTiming>)> {
+        let _ = (scratch, step);
+        anyhow::bail!("this model cannot batch decode steps across sessions")
+    }
+
+    /// Whether [`Self::park_rows`] is available.
+    fn supports_rows_parking(&self) -> bool {
+        false
+    }
+
+    /// Encodes and commits the batched step that follows `after` over the
+    /// same rows, before `after`'s draws are known: the batched counterpart
+    /// of [`Self::encode_parked_step`]. `rows` are `after`'s rows in the
+    /// same order and slots, their states where `after` left them (advanced
+    /// past its token); each row's `draw` is this step's, and its `token`
+    /// is not read: the step feeds `after`'s draws, read on the GPU. The
+    /// pass parks where it first reads host-staged inputs until
+    /// [`Self::release_rows`], which needs `after`'s draws. Every state
+    /// advances by one; each must have room for this step's token, and the
+    /// caller must not grow a cache, take a checkpoint or run anything else
+    /// on the GPU, the scratch or the states until the step finished. One
+    /// parked step at a time (batched or not).
+    fn park_rows<'a>(
+        &self,
+        ctx: &'a MetalContext,
+        scratch: &Self::Scratch,
+        rows: &mut [BatchRow<'_, Self::State>],
+        after: &RowsInFlight<'a>,
+        timed: bool,
+    ) -> Result<RowsInFlight<'a>> {
+        let _ = (ctx, scratch, rows, after, timed);
+        anyhow::bail!("this model cannot park batched decode steps")
+    }
+
+    /// Stages a parked step's per-token host inputs and lets it run. `rows`
+    /// are its rows, each with `token` set to what the step feeds: the draw
+    /// of the step before it, which must have finished.
+    fn release_rows(
+        &self,
+        scratch: &Self::Scratch,
+        step: &mut RowsInFlight<'_>,
+        rows: &mut [BatchRow<'_, Self::State>],
+    ) -> Result<()> {
+        let _ = (scratch, step, rows);
+        anyhow::bail!("this model cannot park batched decode steps")
     }
 
     /// Copies a request's penalty counts from one sampler to another (a

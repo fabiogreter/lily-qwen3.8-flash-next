@@ -178,3 +178,294 @@ fn a_batched_row_agrees_with_the_decode_step() {
     );
     assert!(agree >= 2, "the first batched draw differs from the decode step's");
 }
+
+/// The server's sampling defaults with a presence penalty: draws that depend
+/// on the draw index (the RNG counter) and on each slot's penalty counts.
+const SAMPLED: SamplingParams = SamplingParams {
+    temperature: 1.0,
+    top_k: 20,
+    top_p: 0.95,
+    presence_penalty: 1.5,
+    seed: 7,
+    ..SamplingParams::greedy()
+};
+
+/// The rows of a step over `states`, row `r` in slot `slots[r]`, feeding
+/// each row's last draw and drawing its next one; `ahead` more for a step
+/// parked behind the one whose draws are not taken yet (its token is then
+/// not read).
+fn rows_of<'r>(
+    states: &'r mut [DecodeState],
+    drawn: &[Vec<u32>],
+    slots: &[usize],
+    params: &'r SamplingParams,
+    ahead: usize,
+) -> Vec<BatchRow<'r, DecodeState>> {
+    states
+        .iter_mut()
+        .zip(drawn)
+        .zip(slots)
+        .map(|((state, d), &slot)| BatchRow {
+            token: *d.last().expect("drawn"),
+            draw: Draw { params, step: d.len() + ahead },
+            slot,
+            state,
+        })
+        .collect()
+}
+
+/// One way of running batched steps: `steps` of them over `states`, each
+/// draw appended to its row.
+type Runner = fn(
+    &MetalContext,
+    &Qwen4ExpModel,
+    &mut Scratch,
+    &mut [DecodeState],
+    &mut [Vec<u32>],
+    &[usize],
+    &SamplingParams,
+    usize,
+);
+
+/// `steps` unparked batched steps (`decode_rows`, one at a time).
+#[allow(clippy::too_many_arguments)]
+fn run_unparked(
+    ctx: &MetalContext,
+    model: &Qwen4ExpModel,
+    s: &mut Scratch,
+    states: &mut [DecodeState],
+    drawn: &mut [Vec<u32>],
+    slots: &[usize],
+    params: &SamplingParams,
+    steps: usize,
+) {
+    for _ in 0..steps {
+        let mut rows = rows_of(states, drawn, slots, params, 0);
+        let draws = model.decode_rows(ctx, s, &mut rows).expect("step");
+        for (d, token) in drawn.iter_mut().zip(draws) {
+            d.push(token);
+        }
+    }
+}
+
+/// `steps` batched steps as the scheduler runs them parked: the first
+/// committed unparked, every later one committed behind the step before it
+/// and released once that step's draws were taken. The last step is not
+/// followed by a parked one, so the GPU is idle on return.
+#[allow(clippy::too_many_arguments)]
+fn run_parked(
+    ctx: &MetalContext,
+    model: &Qwen4ExpModel,
+    s: &mut Scratch,
+    states: &mut [DecodeState],
+    drawn: &mut [Vec<u32>],
+    slots: &[usize],
+    params: &SamplingParams,
+    steps: usize,
+) {
+    let mut current = model
+        .commit_rows(ctx, s, &mut rows_of(states, drawn, slots, params, 0), false)
+        .expect("commit");
+    for i in 0..steps {
+        let next = (i + 1 < steps).then(|| {
+            model
+                .park_rows(
+                    ctx,
+                    s,
+                    &mut rows_of(states, drawn, slots, params, 1),
+                    &current,
+                    false,
+                )
+                .expect("park")
+        });
+        let (draws, _) = model.finish_rows(s, current).expect("finish");
+        for (d, token) in drawn.iter_mut().zip(draws) {
+            d.push(token);
+        }
+        let Some(mut next) = next else { break };
+        model
+            .release_rows(s, &mut next, &mut rows_of(states, drawn, slots, params, 0))
+            .expect("release");
+        current = next;
+    }
+}
+
+/// Prefilled states for `prompts` (each with its first draw) on a fresh
+/// scratch.
+fn prefilled_all(
+    ctx: &MetalContext,
+    model: &Qwen4ExpModel,
+    prompts: &[Vec<u32>],
+) -> (Scratch, Vec<DecodeState>, Vec<Vec<u32>>) {
+    let mut s = model.new_scratch_with_capacity(ctx, 256).expect("scratch");
+    let (states, drawn) = prompts
+        .iter()
+        .map(|p| {
+            let (state, first) = prefilled(ctx, model, &mut s, p);
+            (state, vec![first])
+        })
+        .unzip();
+    (s, states, drawn)
+}
+
+/// Parking changes when the host stages a step's inputs, never what the
+/// step computes: 2 and 4 rows (different prompt lengths, so different
+/// positions and indexer blocks completing at different steps), greedy and
+/// sampled with a presence penalty, decoded parked and unparked from the
+/// same states draw bit-identical tokens and leave bit-identical caches and
+/// recurrent state, the draft head's included.
+#[test]
+#[ignore = "requires LILY_MODEL_DIR_FLASH"]
+fn a_parked_batched_step_computes_what_an_unparked_one_does() {
+    let ctx = MetalContext::new().expect("metal context");
+    let Some(model) = load(&ctx) else { return };
+    let steps = 24;
+    let all = [prompt(41, 1), prompt(70, 2), prompt(23, 3), prompt(56, 4)];
+    for m in [2, 4] {
+        for params in [&GREEDY, &SAMPLED] {
+            let prompts = &all[..m];
+            let slots: Vec<usize> = (0..m).collect();
+            let run = |go: Runner| {
+                let (mut s, mut states, mut drawn) =
+                    prefilled_all(&ctx, &model, prompts);
+                go(
+                    &ctx,
+                    &model,
+                    &mut s,
+                    &mut states,
+                    &mut drawn,
+                    &slots,
+                    params,
+                    steps,
+                );
+                let prints: Vec<Fingerprint> =
+                    states.iter().map(|st| fingerprint(&ctx, st)).collect();
+                (drawn, prints)
+            };
+            let (drawn_u, prints_u) = run(run_unparked);
+            let (drawn_p, prints_p) = run(run_parked);
+            let sampled = !params.is_greedy();
+            assert_eq!(drawn_u, drawn_p, "{m} rows (sampled {sampled}): draws differ");
+            for (r, (u, p)) in prints_u.iter().zip(&prints_p).enumerate() {
+                assert!(
+                    u == p,
+                    "{m} rows (sampled {sampled}): row {r}'s caches or state differ"
+                );
+            }
+        }
+    }
+}
+
+/// A row that finishes on what step `k` drew while step `k + 1` is already
+/// parked: the parked step runs anyway, released with every row's draw, so
+/// the finished row's state holds its final token (fed == drawn, as after a
+/// parked single-session step) and its extra draw is dropped; the other rows
+/// take theirs as an ordinary step and go on (parked again) without it.
+/// Against the same schedule unparked, with the finishing row taking part
+/// in step `k + 1`: the finished row's state and every other row's draws,
+/// caches and state are bit-identical.
+#[test]
+#[ignore = "requires LILY_MODEL_DIR_FLASH"]
+fn a_row_finishing_under_a_parked_step_keeps_its_final_token() {
+    let ctx = MetalContext::new().expect("metal context");
+    let Some(model) = load(&ctx) else { return };
+    // Row 0 finishes on step k's draw; rows 1 and 2 decode `more` steps
+    // after the drain.
+    let (k, more) = (9, 10);
+    let prompts = [prompt(41, 1), prompt(70, 2), prompt(23, 3)];
+    let slots = [0, 1, 2];
+    let params = &GREEDY;
+
+    // Unparked: k + 2 steps of all three rows (the last feeds row 0's final
+    // token), then the other two alone.
+    let (mut s, mut states, mut drawn) = prefilled_all(&ctx, &model, &prompts);
+    run_unparked(&ctx, &model, &mut s, &mut states, &mut drawn, &slots, params, k + 2);
+    let (finished_draws, finished_print) =
+        (drawn[0].clone(), fingerprint(&ctx, &states[0]));
+    run_unparked(
+        &ctx,
+        &model,
+        &mut s,
+        &mut states[1..],
+        &mut drawn[1..],
+        &slots[1..],
+        params,
+        more,
+    );
+    let rest_u: Vec<(Vec<u32>, Fingerprint)> = states[1..]
+        .iter()
+        .zip(&drawn[1..])
+        .map(|(st, d)| (d.clone(), fingerprint(&ctx, st)))
+        .collect();
+
+    // Parked: steps 0 to k - 1, then step k with step k + 1 parked behind
+    // it. Row 0 finishes on step k's draw; step k + 1 is released with row
+    // 0's final token and drained, row 0's extra draw dropped; then a new
+    // parked stretch of the other two.
+    let (mut s, mut states, mut drawn) = prefilled_all(&ctx, &model, &prompts);
+    run_parked(&ctx, &model, &mut s, &mut states, &mut drawn, &slots, params, k);
+    let step_k = model
+        .commit_rows(
+            &ctx,
+            &mut s,
+            &mut rows_of(&mut states, &drawn, &slots, params, 0),
+            false,
+        )
+        .expect("commit step k");
+    let mut parked = model
+        .park_rows(
+            &ctx,
+            &s,
+            &mut rows_of(&mut states, &drawn, &slots, params, 1),
+            &step_k,
+            false,
+        )
+        .expect("park step k + 1");
+    let (draws, _) = model.finish_rows(&s, step_k).expect("finish step k");
+    for (d, token) in drawn.iter_mut().zip(draws) {
+        d.push(token);
+    }
+    // Row 0 is done; the parked step still feeds its final draw.
+    model
+        .release_rows(
+            &s,
+            &mut parked,
+            &mut rows_of(&mut states, &drawn, &slots, params, 0),
+        )
+        .expect("release step k + 1");
+    let (draws, _) = model.finish_rows(&s, parked).expect("drain step k + 1");
+    for (d, token) in drawn[1..].iter_mut().zip(&draws[1..]) {
+        d.push(*token);
+    }
+    assert_eq!(
+        states[0].pos(),
+        prompts[0].len() + drawn[0].len(),
+        "the finished row's state holds every draw, the final one included"
+    );
+    assert_eq!(drawn[0], finished_draws[..drawn[0].len()], "row 0's draws");
+    assert_eq!(
+        draws[0],
+        finished_draws[drawn[0].len()],
+        "the dropped draw is what the unparked step drew"
+    );
+    assert!(
+        fingerprint(&ctx, &states[0]) == finished_print,
+        "row 0's caches or state differ from the unparked run's"
+    );
+    run_parked(
+        &ctx,
+        &model,
+        &mut s,
+        &mut states[1..],
+        &mut drawn[1..],
+        &slots[1..],
+        params,
+        more,
+    );
+    for (r, ((st, d), (du, pu))) in
+        states[1..].iter().zip(&drawn[1..]).zip(&rest_u).enumerate()
+    {
+        assert_eq!(d, du, "row {}'s draws", r + 1);
+        assert!(fingerprint(&ctx, st) == *pu, "row {}'s caches or state", r + 1);
+    }
+}

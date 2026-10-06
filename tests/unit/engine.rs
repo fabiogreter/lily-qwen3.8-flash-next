@@ -58,6 +58,7 @@ fn a_batched_steps_phases_cover_its_wall_time() {
         gpu: PassTiming { gpu_start_secs: 10.0016, gpu_end_secs: 10.0206 },
         woke: 10.0207,
         ended: 10.0208,
+        parked_staging: None,
     };
     let p = t.phases();
     let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
@@ -74,4 +75,29 @@ fn a_batched_steps_phases_cover_its_wall_time() {
         + p.wake_ms
         + p.finish_ms;
     assert!(close(sum, t.wall_ms()), "{sum} vs {}", t.wall_ms());
+}
+
+/// A parked step is encoded and committed while the step before it runs and
+/// staged only after that step's draws were read: its staging phase is the
+/// release (`parked_staging` to `staged`), its encoding counts from `began`,
+/// and its submission gap from the release, negative when the GPU started
+/// the pass (running it up to its wait) before the host released it.
+#[test]
+fn a_parked_steps_phases_measure_its_release() {
+    let t = RowsStepTiming {
+        began: 10.0,
+        encoded: 10.0010,
+        committed: 10.0011,
+        parked_staging: Some(10.0153),
+        staged: 10.0155,
+        gpu: PassTiming { gpu_start_secs: 10.0150, gpu_end_secs: 10.0300 },
+        woke: 10.0301,
+        ended: 10.0302,
+    };
+    let p = t.phases();
+    let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
+    assert!(close(p.encode_ms, 1.0) && close(p.commit_ms, 0.1), "{p:?}");
+    assert!(close(p.stage_ms, 0.2) && close(p.submit_ms, -0.5), "{p:?}");
+    assert!(close(p.gpu_ms, 15.0) && close(p.wake_ms, 0.1), "{p:?}");
+    assert!(close(p.finish_ms, 0.1), "{p:?}");
 }

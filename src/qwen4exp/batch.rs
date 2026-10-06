@@ -25,15 +25,29 @@
 //! chunk), so a session can return to speculative decoding afterwards with
 //! complete head caches.
 //!
+//! A step is committed without waiting (`commit_rows`) and finished later
+//! (`finish_rows`). The next step over the same rows can be committed in
+//! between, parked (`park_rows`), as the single-session loop parks its next
+//! step: it reads the previous step's draws as its token ids on the GPU (the
+//! draws ping-pong between two buffers, so the host can still read the
+//! previous step's while it runs), its positions and draw indices are known
+//! in advance, and it waits on the step sync right before the first n-gram
+//! gather until the host, having read the previous step's draws, stages the
+//! rows' n-gram inputs and releases it (`release_rows`). The submission and
+//! the encoding then overlap the previous step's GPU time instead of
+//! following it.
+//!
 //! Numerics: the batched kernels reduce in a different order than the
 //! decode step's GEMVs, so a row agrees with the same session decoded alone
 //! up to bf16 rounding, as a verify row does (`docs/architecture.md`,
 //! "Speculative decoding"; measured in "Continuous batching"). A row never
-//! depends on the rows beside it: that is exact, and tested.
+//! depends on the rows beside it: that is exact, and tested. A parked step
+//! runs the same kernels in the same order as an unparked one; only where
+//! its token ids come from and the wait differ, so it is bit-identical.
 
 use super::*;
-use crate::engine::{BatchRow, CountsSlot, RowsStepTiming};
-use crate::metal::host_secs;
+use crate::engine::{BatchRow, CountsSlot, RowKey, RowsInFlight, RowsStepTiming};
+use crate::metal::{PassTiming, host_secs};
 
 /// Per-slot and per-row buffers of a batched decode step, allocated by the
 /// first one.
@@ -44,8 +58,11 @@ pub(in crate::qwen4exp) struct BatchScratch {
     rows: Vec<RowScratch>,
     /// F32 `[slots, vocab]`: the rows' logits.
     logits: Tensor,
-    /// U32 `[slots]`: the rows' draws.
-    tokens: Tensor,
+    /// Two U32 `[slots]` buffers for the rows' draws, used in turn by
+    /// consecutive steps: a step parked behind another reads that step's
+    /// draws as its token ids and writes its own into the other buffer, so
+    /// the host can still read the first step's draws while it runs.
+    draws: [Tensor; 2],
 }
 
 struct RowScratch {
@@ -109,7 +126,10 @@ impl Qwen4ExpModel {
         s.batch = Some(BatchScratch {
             rows,
             logits: Tensor::zeros(ctx, &[slots, cfg.vocab_size], DType::F32)?,
-            tokens: Tensor::zeros(ctx, &[slots], DType::U32)?,
+            draws: [
+                Tensor::zeros(ctx, &[slots], DType::U32)?,
+                Tensor::zeros(ctx, &[slots], DType::U32)?,
+            ],
         });
         Ok(())
     }
@@ -165,19 +185,10 @@ impl Qwen4ExpModel {
         }
     }
 
-    /// See [`crate::engine::LanguageModel::decode_rows`]; with `timed`, also
-    /// [`crate::engine::LanguageModel::decode_rows_timed`]'s breakdown (the
-    /// host marks cost a clock read each; the completed pass is kept to read
-    /// its GPU span, which is the only difference in the work done).
-    pub(super) fn decode_session_rows(
-        &self,
-        ctx: &MetalContext,
-        s: &mut Scratch,
-        rows: &mut [BatchRow<'_, DecodeState>],
-        timed: bool,
-    ) -> Result<(Vec<u32>, Option<RowsStepTiming>)> {
-        let mark = || if timed { host_secs() } else { 0.0 };
-        let began = mark();
+    /// What every batched step checks of its rows: within the slot count,
+    /// at rest (no pending speculative step), in range, distinct slots, and
+    /// a draft head state exactly when the model has a head.
+    fn check_batch_rows(&self, rows: &[BatchRow<'_, DecodeState>]) -> Result<()> {
         let m = rows.len();
         let slots = self.batch_rows();
         ensure!(
@@ -213,19 +224,39 @@ impl Qwen4ExpModel {
                 "row {r}: draft head state does not match the model"
             );
         }
-        self.ensure_prefill_scratch(ctx, s, m)?;
-        self.ensure_batch_scratch(ctx, s)?;
-        let s = &*s;
+        Ok(())
+    }
+
+    /// The scratch views of an `m`-row step, which must exist already: a
+    /// step that can be in flight beside another never allocates (a grown
+    /// scratch frees the buffers the other one reads).
+    fn batch_views<'s>(
+        &self,
+        s: &'s Scratch,
+        m: usize,
+    ) -> Result<(PrefillScratch, &'s BatchScratch)> {
         let capacity = s
             .prefill
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("prefill scratch missing after growth"))?;
-        let bs = s.batch.as_ref().expect("allocated above");
-        let ps = capacity.rows(m)?;
-        let tokens: Vec<u32> = rows.iter().map(|r| r.token).collect();
-        ps.ids.write_bytes(bytemuck::cast_slice(&tokens))?;
+            .ok_or_else(|| anyhow::anyhow!("batched step without prefill scratch"))?;
+        let bs = s
+            .batch
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("batched step without batch scratch"))?;
+        Ok((capacity.rows(m)?, bs))
+    }
+
+    /// Stages the rows' n-gram inputs for the step that feeds each row's
+    /// `token` (see [`Self::stage_ngram_rows`]) and advances their hash
+    /// histories past it, as `prepare_step_inputs` does for one session.
+    fn stage_batch_rows(
+        &self,
+        ps: &PrefillScratch,
+        rows: &mut [BatchRow<'_, DecodeState>],
+    ) -> Result<()> {
         let ple_w = self.weights.layers.iter().find_map(|l| l.ple.as_deref());
         if let (Some(w), Some(p)) = (ple_w, &ps.ple) {
+            let tokens: Vec<u32> = rows.iter().map(|r| r.token).collect();
             let hists = rows
                 .iter()
                 .map(|r| r.state.ple.as_ref().map(|pst| pst.hist))
@@ -233,54 +264,211 @@ impl Qwen4ExpModel {
                 .ok_or_else(|| anyhow::anyhow!("PLE weights without PLE state"))?;
             self.stage_ngram_rows(w, p, &tokens, &hists)?;
         }
-        let staged = mark();
-        // TODO(batch): park the next batched step like the decode loop does
-        // (commit it before its n-gram rows are staged): its row set is only
-        // known once this step's draws are, so for now every step pays the
-        // host round trip (0.4 to 0.6 ms).
-        let pass = self.begin_batched(ctx, m)?;
-        pass.set_label("decode rows");
-        self.encode_rows(ctx, &pass, rows, s, &ps, bs)?;
-        let encoded = mark();
-        let pending = pass.commit()?;
-        let committed = mark();
-        let completed = if timed {
-            Some(pending.wait_retain()?)
-        } else {
-            pending.wait()?;
-            None
-        };
-        let woke = mark();
         for row in rows.iter_mut() {
-            let state = &mut *row.state;
-            state.pos += 1;
-            if let Some(pst) = &mut state.ple {
+            if let Some(pst) = &mut row.state.ple {
                 pst.hist = NgramHasher::advance(pst.hist, &[row.token]);
             }
         }
-        let draws = bs.tokens.view(0, &[m])?.to_u32()?;
+        Ok(())
+    }
+
+    /// See [`crate::engine::LanguageModel::commit_rows`]. With `timed` the
+    /// step records host marks (a clock read each) and keeps its completed
+    /// pass to read the GPU span, which is the only difference in the work
+    /// done.
+    pub(super) fn commit_session_rows<'a>(
+        &self,
+        ctx: &'a MetalContext,
+        s: &mut Scratch,
+        rows: &mut [BatchRow<'_, DecodeState>],
+        timed: bool,
+    ) -> Result<RowsInFlight<'a>> {
+        let mark = || if timed { host_secs() } else { 0.0 };
+        let began = mark();
+        let m = rows.len();
+        self.check_batch_rows(rows)?;
+        self.ensure_prefill_scratch(ctx, s, m)?;
+        self.ensure_batch_scratch(ctx, s)?;
+        let s = &*s;
+        let (ps, bs) = self.batch_views(s, m)?;
+        let tokens: Vec<u32> = rows.iter().map(|r| r.token).collect();
+        ps.ids.write_bytes(bytemuck::cast_slice(&tokens))?;
+        self.stage_batch_rows(&ps, rows)?;
+        let staged = mark();
+        // Nothing is in flight, so either draw buffer is free.
+        let out = 0;
+        let pass = self.begin_batched(ctx, m)?;
+        pass.set_label("decode rows");
+        let draws = bs.draws[out].view(0, &[m])?;
+        self.encode_rows(ctx, &pass, rows, s, &ps, bs, &ps.ids, &draws, None)?;
+        let encoded = mark();
+        let pending = pass.commit()?;
+        let committed = mark();
+        for row in rows.iter_mut() {
+            row.state.pos += 1;
+        }
+        Ok(RowsInFlight {
+            pass: Some(pending),
+            out,
+            rows: rows.iter().map(RowKey::of).collect(),
+            park: None,
+            marks: timed.then_some(RowsStepTiming {
+                began,
+                staged,
+                encoded,
+                committed,
+                gpu: PassTiming { gpu_start_secs: 0.0, gpu_end_secs: 0.0 },
+                woke: 0.0,
+                ended: 0.0,
+                parked_staging: None,
+            }),
+        })
+    }
+
+    /// See [`crate::engine::LanguageModel::park_rows`]: the step after
+    /// `after`, reading `after`'s draws as its token ids and parked on the
+    /// step sync right before the first n-gram gather, exactly where the
+    /// single-session parked step waits. Same graph, kernels and order as
+    /// an unparked step over the same inputs; only the ids' buffer and the
+    /// wait differ, so the two compute bit-identical results.
+    pub(super) fn park_session_rows<'a>(
+        &self,
+        ctx: &'a MetalContext,
+        s: &Scratch,
+        rows: &mut [BatchRow<'_, DecodeState>],
+        after: &RowsInFlight<'a>,
+        timed: bool,
+    ) -> Result<RowsInFlight<'a>> {
+        let mark = || if timed { host_secs() } else { 0.0 };
+        let began = mark();
+        let m = rows.len();
+        after.check_rows(rows)?;
+        self.check_batch_rows(rows)?;
+        let (ps, bs) = self.batch_views(s, m)?;
+        let ids = bs.draws[after.out].view(0, &[m])?;
+        let out = 1 - after.out;
+        let draws = bs.draws[out].view(0, &[m])?;
+        let value = s.sync.arm()?;
+        let encoded = (|| {
+            let pass = self.begin_batched(ctx, m)?;
+            pass.set_label("decode rows");
+            self.encode_rows(ctx, &pass, rows, s, &ps, bs, &ids, &draws, Some(value))?;
+            pass.end()
+        })();
+        let encoded_at = mark();
+        let committed = encoded.and_then(|pass| pass.commit());
+        let pending = match committed {
+            Ok(pending) => pending,
+            Err(e) => {
+                // Nothing was submitted: free the claimed value.
+                s.sync.release()?;
+                return Err(e);
+            }
+        };
+        let committed = mark();
+        for row in rows.iter_mut() {
+            row.state.pos += 1;
+        }
+        Ok(RowsInFlight {
+            pass: Some(pending),
+            out,
+            rows: rows.iter().map(RowKey::of).collect(),
+            park: Some((s.sync.event.clone(), value)),
+            marks: timed.then_some(RowsStepTiming {
+                began,
+                // Set by the release.
+                staged: 0.0,
+                encoded: encoded_at,
+                committed,
+                gpu: PassTiming { gpu_start_secs: 0.0, gpu_end_secs: 0.0 },
+                woke: 0.0,
+                ended: 0.0,
+                parked_staging: Some(0.0),
+            }),
+        })
+    }
+
+    /// See [`crate::engine::LanguageModel::release_rows`]. The step is
+    /// released even when staging fails (the error is returned after), so
+    /// it never holds the queue.
+    pub(super) fn release_session_rows(
+        &self,
+        s: &Scratch,
+        step: &mut RowsInFlight<'_>,
+        rows: &mut [BatchRow<'_, DecodeState>],
+    ) -> Result<()> {
+        let timed = step.marks.is_some();
+        let mark = || if timed { host_secs() } else { 0.0 };
+        let staging = mark();
+        let (_, value) = step.park.clone().ok_or_else(|| {
+            anyhow::anyhow!("releasing a batched step that is not parked")
+        })?;
+        ensure!(
+            s.sync.armed() == value,
+            "the parked batched step waits for {value}, the step sync holds {}",
+            s.sync.armed()
+        );
+        let staged = step
+            .check_rows(rows)
+            .and_then(|()| self.batch_views(s, rows.len()))
+            .and_then(|(ps, _)| self.stage_batch_rows(&ps, rows));
+        step.park = None;
+        s.sync.release()?;
+        staged?;
+        if let Some(marks) = &mut step.marks {
+            marks.parked_staging = Some(staging);
+            marks.staged = mark();
+        }
+        Ok(())
+    }
+
+    /// See [`crate::engine::LanguageModel::finish_rows`].
+    pub(super) fn finish_session_rows(
+        &self,
+        s: &Scratch,
+        mut step: RowsInFlight<'_>,
+    ) -> Result<(Vec<u32>, Option<RowsStepTiming>)> {
+        ensure!(
+            !step.is_parked(),
+            "a parked batched step waited for before its release"
+        );
+        let pass = step
+            .pass
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("a batched step finished twice"))?;
+        let timed = step.marks.is_some();
+        let mark = || if timed { host_secs() } else { 0.0 };
+        let completed = if timed {
+            Some(pass.wait_retain()?)
+        } else {
+            pass.wait()?;
+            None
+        };
+        let woke = mark();
+        let bs = s
+            .batch
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("batched step without batch scratch"))?;
+        let draws = bs.draws[step.out].view(0, &[step.rows()])?.to_u32()?;
         let ended = mark();
         // Read after the step's marks: waiting for the commit feedback is
         // not part of the step.
-        let timing = completed
-            .map(|c| -> Result<RowsStepTiming> {
-                Ok(RowsStepTiming {
-                    began,
-                    staged,
-                    encoded,
-                    committed,
-                    gpu: c.timing()?,
-                    woke,
-                    ended,
-                })
-            })
-            .transpose()?;
+        let timing = match (step.marks.take(), completed) {
+            (Some(marks), Some(c)) => {
+                Some(RowsStepTiming { gpu: c.timing()?, woke, ended, ..marks })
+            }
+            _ => None,
+        };
         Ok((draws, timing))
     }
 
-    /// The batched decode graph over `rows` (their tokens already in
-    /// `ps.ids`, their n-gram rows staged): the trunk, the LM head, a draw
-    /// per row into `bs.tokens[r]`, then the draft head's catch-up.
+    /// The batched decode graph over `rows`: the trunk, the LM head, a draw
+    /// per row into `draws[r]`, then the draft head's catch-up. The rows'
+    /// token ids are read from `ids` (`ps.ids` written by the host, or the
+    /// previous step's draws). Without `park` their n-gram rows are staged
+    /// already; with `park` (a value from the step sync's `arm`) the pass
+    /// waits for the host's release right before the first n-gram gather.
+    #[allow(clippy::too_many_arguments)]
     fn encode_rows(
         &self,
         ctx: &MetalContext,
@@ -289,19 +477,35 @@ impl Qwen4ExpModel {
         s: &Scratch,
         ps: &PrefillScratch,
         bs: &BatchScratch,
+        ids: &Tensor,
+        draws: &Tensor,
+        park: Option<u64>,
     ) -> Result<()> {
         let cfg = &self.config;
         let (h, g) = (cfg.hidden_size, cfg.hc_count);
         let m = rows.len();
         let vocab = cfg.vocab_size;
+        ensure!(
+            ids.shape() == [m] && draws.shape() == [m],
+            "batched step ids {:?} and draws {:?} for {m} rows",
+            ids.shape(),
+            draws.shape()
+        );
 
-        quant::gather_rows_q4(ctx, pass, &self.weights.embed_tokens, &ps.ids, &ps.x)?;
+        quant::gather_rows_q4(ctx, pass, &self.weights.embed_tokens, ids, &ps.x)?;
         pass.level_barrier(&[&ps.x])?;
         hc_broadcast_bf16(ctx, pass, &ps.x, &ps.hyper, h, g)?;
         pass.level_barrier(&[&ps.hyper])?;
 
+        let mut park = park;
         for (li, layer) in self.weights.layers.iter().enumerate() {
             if let (Some(w), Some(p)) = (&layer.ple, &ps.ple) {
+                if let Some(value) = park.take() {
+                    // First use of host-staged data: the n-gram rows. The
+                    // embedding and the layers above ran while the host read
+                    // the previous step's draws and staged them.
+                    s.sync.encode_wait(pass, value)?;
+                }
                 self.ple_rows(ctx, pass, w, p, rows, &ps.hyper, s)?;
             }
             self.hc_read_batched(ctx, pass, &layer.attn_hc, &ps.hyper, s, ps)?;
@@ -378,13 +582,13 @@ impl Qwen4ExpModel {
                 &bs.rows[row.slot].sampler,
                 row.draw.params,
                 row.draw.step,
-                &bs.tokens.view(r, &[1])?,
+                &draws.view(r, &[1])?,
             )?;
         }
-        pass.level_barrier(&[&bs.tokens])?;
+        pass.level_barrier(&[draws])?;
 
         if let Some(mtp) = &self.weights.mtp {
-            self.mtp_rows(ctx, pass, mtp, rows, s, ps, bs)?;
+            self.mtp_rows(ctx, pass, mtp, rows, s, ps, bs, ids)?;
         }
         Ok(())
     }
@@ -767,7 +971,7 @@ impl Qwen4ExpModel {
     /// head position `pos - 1` against the session's head caches, and the
     /// state's hidden becomes this step's trunk hidden: what
     /// `mtp_catch_up` does for a one-token chunk. `mtp_block` with the
-    /// attention per row.
+    /// attention per row. `ids` are the fed tokens, as the trunk read them.
     #[allow(clippy::too_many_arguments)]
     fn mtp_rows(
         &self,
@@ -778,6 +982,7 @@ impl Qwen4ExpModel {
         s: &Scratch,
         ps: &PrefillScratch,
         bs: &BatchScratch,
+        ids: &Tensor,
     ) -> Result<()> {
         let cfg = &self.config;
         let (h, g, eps) = (cfg.hidden_size, cfg.hc_count, cfg.rms_norm_eps);
@@ -819,7 +1024,7 @@ impl Qwen4ExpModel {
             eps,
             NORM_WEIGHT_BIAS,
         )?;
-        quant::gather_rows_q4(ctx, pass, &self.weights.embed_tokens, &ps.ids, &ps.x)?;
+        quant::gather_rows_q4(ctx, pass, &self.weights.embed_tokens, ids, &ps.x)?;
         pass.level_barrier(&[&ps.hc.hn, &ps.x])?;
         let hn_streams = ps.hc.hn.view(0, &[m * g, h])?;
         let hyper_streams = hyper.view(0, &[m * g, h])?;
