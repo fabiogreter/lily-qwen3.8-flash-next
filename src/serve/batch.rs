@@ -282,7 +282,8 @@ struct Row<'g, M: LanguageModel> {
     in_flight: InFlight,
     /// Every token drawn so far; the last one is not fed into the state yet
     /// (`state.pos() == prompt + generated.len() - 1`) whenever the row is at
-    /// rest between steps.
+    /// rest between steps. A row that finished while the next step was
+    /// parked has fed them all (that step fed its final draw).
     generated: Vec<u32>,
     /// Its batch slot; the slot's sampler holds its penalty counts except
     /// while it runs the single-session loop.
