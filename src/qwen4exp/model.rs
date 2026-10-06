@@ -3021,6 +3021,13 @@ impl Qwen4ExpModel {
     /// token is `pos+j`; when that is an image placeholder the head is fed
     /// the image's row instead of the placeholder's embedding (`images`), as
     /// the trunk was.
+    ///
+    /// Only the head's cache writes are ever read again: the state's hidden
+    /// is overwritten with the trunk's right after, and the speculative
+    /// step's head work runs its own full block. So the catch-up stops after
+    /// them ([`Self::mtp_block_caches`]): no query, attention, output
+    /// projection, injects or MoE. The caches come out bit-identical to the
+    /// full block's (measured 2 to 4 % less prefill wall time, 2026-10).
     #[allow(clippy::too_many_arguments)]
     fn mtp_catch_up(
         &self,
@@ -3069,18 +3076,9 @@ impl Qwen4ExpModel {
                 row_overrides(images, first_token, rows, self.config.hidden_size)?;
             pass.level_barrier(&[hidden_in])?;
             let ps_rows = ps.rows(rows)?;
-            self.mtp_block(
-                ctx,
-                pass,
-                mtp,
-                mst,
-                &hidden_in.view(0, &[rows, wide])?,
-                &ids,
-                AttnPos::host(pos0),
-                s,
-                &ps_rows,
-                rope,
-                &overrides,
+            let hidden = hidden_in.view(0, &[rows, wide])?;
+            self.mtp_block_caches(
+                ctx, pass, mtp, mst, &hidden, &ids, pos0, s, &ps_rows, rope, &overrides,
             )?;
         }
         // The chunk's last trunk hidden pairs with the next token, whenever
@@ -3112,6 +3110,72 @@ impl Qwen4ExpModel {
         overrides: &[RowOverride],
     ) -> Result<()> {
         let cfg = &self.config;
+        let (h, g) = (cfg.hidden_size, cfg.hc_count);
+        let hyper = self.mtp_input(ctx, pass, mtp, hidden, ids, s, ps, overrides)?;
+        let theta = self.mtp_theta();
+
+        // The block itself: a trunk-style attention layer with its own RoPE base.
+        let Mixer::Attn(w) = &mtp.layer.mixer else {
+            anyhow::bail!("draft head block is not attention")
+        };
+        let LayerState::Attn { k_cache, v_cache, idx_keys, blk_keys } = &mst.layer
+        else {
+            anyhow::bail!("draft head state is not attention")
+        };
+        self.hc_read_batched(ctx, pass, &mtp.layer.attn_hc, hyper, s, ps)?;
+        self.attn_batched_theta(
+            ctx, pass, w, s, ps, k_cache, v_cache, idx_keys, blk_keys, pos0, theta,
+            rope,
+        )?;
+        pass.level_barrier(&[&ps.branch_out])?;
+        hc_inject_bf16(ctx, pass, hyper, &ps.branch_out, &ps.hc.inj, h, g)?;
+        pass.level_barrier(&[hyper])?;
+        self.hc_read_batched(ctx, pass, &mtp.layer.mlp_hc, hyper, s, ps)?;
+        prefill_moe(
+            ctx,
+            pass,
+            &moe_dims(cfg),
+            &mtp.layer.ffn,
+            &PrefillMoeIo {
+                x: &ps.hc.mixed,
+                out: &ps.branch_out,
+                stack: &ps.stack,
+                mlp_gate: &ps.mlp_gate,
+                mlp_up: &ps.mlp_up,
+                mlp_act: &ps.mlp_act,
+                dequant: &s.dequant,
+            },
+            &ps.moe,
+        )?;
+        pass.level_barrier(&[&ps.branch_out])?;
+        hc_inject_bf16(ctx, pass, hyper, &ps.branch_out, &ps.hc.inj, h, g)?;
+        pass.level_barrier(&[hyper])
+    }
+
+    /// The draft head's RoPE base (its own when the config declares one).
+    pub(super) fn mtp_theta(&self) -> f32 {
+        let cfg = &self.config;
+        cfg.mtp.map_or(cfg.rope_parameters.rope_theta, |m| m.rope_theta)
+    }
+
+    /// The draft head's input over `ps.m` rows: `hidden` (`[rows, G*H]`)
+    /// and `ids` become the residual (per stream `fc_hidden(norm(stream))`
+    /// plus the broadcast `fc_embedding(norm(embed(id)))`) in
+    /// `ps.mtp_hyper`, which is returned ordered. `overrides` replace
+    /// placeholder rows' embeddings.
+    #[allow(clippy::too_many_arguments)]
+    fn mtp_input<'p>(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        mtp: &MtpWeights,
+        hidden: &Tensor,
+        ids: &Tensor,
+        s: &Scratch,
+        ps: &'p PrefillScratch,
+        overrides: &[RowOverride],
+    ) -> Result<&'p Tensor> {
+        let cfg = &self.config;
         let (h, g, eps) = (cfg.hidden_size, cfg.hc_count, cfg.rms_norm_eps);
         let rows = ps.m;
         ensure!(
@@ -3122,7 +3186,6 @@ impl Qwen4ExpModel {
             .mtp_hyper
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("draft head without scratch"))?;
-        let theta = cfg.mtp.map_or(cfg.rope_parameters.rope_theta, |m| m.rope_theta);
 
         // Per stream: fc_hidden(norm(stream)); shared: fc_embedding(norm(emb)).
         rmsnorm_grouped_bf16(
@@ -3168,43 +3231,127 @@ impl Qwen4ExpModel {
         pass.level_barrier(&[&ps.hc.up])?;
         add_bf16(ctx, pass, hyper, &ps.hc.up, hyper)?;
         pass.level_barrier(&[hyper])?;
+        Ok(hyper)
+    }
 
-        // The block itself: a trunk-style attention layer with its own RoPE base.
+    /// The catch-up's block: what [`Self::mtp_block`]
+    /// writes into the head's caches at sequence indices `pos0..pos0+ps.m`,
+    /// and nothing else. The head's input and its attention read run as in
+    /// the full block (they produce the attention layer's input), then
+    /// [`Self::attn_cache_writes`]. The residual left in `ps.mtp_hyper` is
+    /// the block's input, not its output, so only a catch-up, which never
+    /// reads it, may call this.
+    #[allow(clippy::too_many_arguments)]
+    fn mtp_block_caches(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        mtp: &MtpWeights,
+        mst: &MtpState,
+        hidden: &Tensor,
+        ids: &Tensor,
+        pos0: usize,
+        s: &Scratch,
+        ps: &PrefillScratch,
+        rope: Rope<'_>,
+        overrides: &[RowOverride],
+    ) -> Result<()> {
+        let hyper = self.mtp_input(ctx, pass, mtp, hidden, ids, s, ps, overrides)?;
         let Mixer::Attn(w) = &mtp.layer.mixer else {
             anyhow::bail!("draft head block is not attention")
         };
-        let LayerState::Attn { k_cache, v_cache, idx_keys, blk_keys } = &mst.layer
-        else {
+        self.hc_read_batched(ctx, pass, &mtp.layer.attn_hc, hyper, s, ps)?;
+        self.attn_cache_writes(ctx, pass, w, s, ps, &mst.layer, pos0, rope)
+    }
+
+    /// The cache writes of [`Self::attn_batched_theta`] over `ps.hc.mixed`
+    /// at sequence indices `pos..pos+m` and the draft head's RoPE base, with
+    /// the same kernels on the same inputs: K and V projected (their slices
+    /// of `qkv_proj`; the fused stack is taken only when every slice picks
+    /// the stack's skinny variant, so a slice alone reduces exactly as in
+    /// the stack), K normed and roped, both scattered into the caches, the
+    /// indexer's raw keys scattered and the block keys of every block the
+    /// rows complete. No query, attention, output gate or output
+    /// projection: `ps.branch_out` is not written. Leaves the caches
+    /// ordered.
+    #[allow(clippy::too_many_arguments)]
+    fn attn_cache_writes(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        w: &AttnWeights,
+        s: &Scratch,
+        ps: &PrefillScratch,
+        layer: &LayerState,
+        pos: usize,
+        rope: Rope<'_>,
+    ) -> Result<()> {
+        let cfg = &self.config;
+        let eps = cfg.rms_norm_eps;
+        let rot = cfg.rotary_dim();
+        let m = ps.m;
+        let idx = &cfg.indexer;
+        let theta = self.mtp_theta();
+        let LayerState::Attn { k_cache, v_cache, idx_keys, blk_keys } = layer else {
             anyhow::bail!("draft head state is not attention")
         };
-        self.hc_read_batched(ctx, pass, &mtp.layer.attn_hc, hyper, s, ps)?;
-        self.attn_batched_theta(
-            ctx, pass, w, s, ps, k_cache, v_cache, idx_keys, blk_keys, pos0, theta,
-            rope,
-        )?;
-        pass.level_barrier(&[&ps.branch_out])?;
-        hc_inject_bf16(ctx, pass, hyper, &ps.branch_out, &ps.hc.inj, h, g)?;
-        pass.level_barrier(&[hyper])?;
-        self.hc_read_batched(ctx, pass, &mtp.layer.mlp_hc, hyper, s, ps)?;
-        prefill_moe(
+
+        project_mat(ctx, pass, &ps.hc.mixed, &w.k_proj, &ps.k_new, &s.dequant)?;
+        project_mat(ctx, pass, &ps.hc.mixed, &w.v_proj, &ps.v_new, &s.dequant)?;
+        project_mat(
             ctx,
             pass,
-            &moe_dims(cfg),
-            &mtp.layer.ffn,
-            &PrefillMoeIo {
-                x: &ps.hc.mixed,
-                out: &ps.branch_out,
-                stack: &ps.stack,
-                mlp_gate: &ps.mlp_gate,
-                mlp_up: &ps.mlp_up,
-                mlp_act: &ps.mlp_act,
-                dequant: &s.dequant,
-            },
-            &ps.moe,
+            &ps.hc.mixed,
+            &w.indexer.qk_proj,
+            &ps.idx_qk,
+            &s.dequant,
         )?;
-        pass.level_barrier(&[&ps.branch_out])?;
-        hc_inject_bf16(ctx, pass, hyper, &ps.branch_out, &ps.hc.inj, h, g)?;
-        pass.level_barrier(&[hyper])
+        pass.level_barrier(&[&ps.k_new, &ps.v_new, &ps.idx_qk])?;
+        rmsnorm_bf16(
+            ctx,
+            pass,
+            &ps.k_new,
+            &w.k_norm,
+            &ps.k_new,
+            eps,
+            NORM_WEIGHT_BIAS,
+        )?;
+        qsa::qsa_scatter_keys(ctx, pass, &ps.idx_qk, idx_keys, idx.n_heads, pos)?;
+        pass.level_barrier(&[&ps.k_new, idx_keys])?;
+        rope_neox(
+            ctx,
+            pass,
+            &ps.k_new,
+            cfg.num_key_value_heads,
+            rot,
+            pos,
+            theta,
+            rope,
+        )?;
+        // Block keys for every block this chunk completes.
+        let ratio = idx.compress_ratio;
+        let first_block = pos / ratio;
+        let complete = (pos + m) / ratio;
+        if complete > first_block {
+            qsa::qsa_block_keys(
+                ctx,
+                pass,
+                idx_keys,
+                &w.indexer.k_norm,
+                blk_keys,
+                ratio,
+                first_block,
+                complete - first_block,
+                rot,
+                theta,
+                eps,
+                rope,
+            )?;
+        }
+        pass.level_barrier(&[&ps.k_new, blk_keys])?;
+        scatter_kv(ctx, pass, k_cache, &ps.k_new, pos)?;
+        scatter_kv(ctx, pass, v_cache, &ps.v_new, pos)?;
+        pass.level_barrier(&[k_cache, v_cache])
     }
 
     // --- decode -------------------------------------------------------------

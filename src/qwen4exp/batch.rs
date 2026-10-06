@@ -588,7 +588,7 @@ impl Qwen4ExpModel {
         pass.level_barrier(&[draws])?;
 
         if let Some(mtp) = &self.weights.mtp {
-            self.mtp_rows(ctx, pass, mtp, rows, s, ps, bs, ids)?;
+            self.mtp_rows(ctx, pass, mtp, rows, s, ps, ids)?;
         }
         Ok(())
     }
@@ -966,12 +966,109 @@ impl Qwen4ExpModel {
         project_mat(ctx, pass, &ps.attn_gated, &w.o_proj, &ps.branch_out, &s.dequant)
     }
 
+    /// The cache writes of [`Self::attn_rows`] (the draft head's catch-up),
+    /// with the same kernels on the same inputs: K
+    /// and V projected (their slices of `qkv_proj`, which reduce exactly as
+    /// the fused stack does, see `attn_cache_writes`), each row's K normed,
+    /// roped and scattered, its V and its raw indexer key scattered, and the
+    /// block keys of rows that complete a block. No query, attention, output
+    /// gate or output projection: `ps.branch_out` is not written. Leaves the
+    /// caches ordered.
+    #[allow(clippy::too_many_arguments)]
+    fn attn_rows_cache_writes(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        w: &AttnWeights,
+        rows: &[AttnRow<'_>],
+        theta: f32,
+        s: &Scratch,
+        ps: &PrefillScratch,
+    ) -> Result<()> {
+        let cfg = &self.config;
+        let eps = cfg.rms_norm_eps;
+        let rot = cfg.rotary_dim();
+        let idx = &cfg.indexer;
+        let ratio = idx.compress_ratio;
+        let (nkv, hd) = (cfg.num_key_value_heads, cfg.head_dim);
+        let nh = idx.n_heads;
+        let qk_width = (nh + 1) * INDEXER_D;
+
+        project_mat(ctx, pass, &ps.hc.mixed, &w.k_proj, &ps.k_new, &s.dequant)?;
+        project_mat(ctx, pass, &ps.hc.mixed, &w.v_proj, &ps.v_new, &s.dequant)?;
+        project_mat(
+            ctx,
+            pass,
+            &ps.hc.mixed,
+            &w.indexer.qk_proj,
+            &ps.idx_qk,
+            &s.dequant,
+        )?;
+        pass.level_barrier(&[&ps.k_new, &ps.v_new, &ps.idx_qk])?;
+        for (r, a) in rows.iter().enumerate() {
+            ensure!(
+                a.pos as i64 + a.rope_delta >= 0,
+                "rotary position {} + {} is negative",
+                a.pos,
+                a.rope_delta
+            );
+            k_norm_rope_scatter_decode(
+                ctx,
+                pass,
+                &ps.k_new.view(r * nkv * hd, &[nkv, hd])?,
+                &w.k_norm,
+                a.k_cache,
+                rot,
+                a.pos,
+                theta,
+                eps,
+                a.rope_delta,
+            )?;
+            scatter_kv(
+                ctx,
+                pass,
+                a.v_cache,
+                &ps.v_new.view(r * nkv * hd, &[nkv, hd])?,
+                a.pos,
+            )?;
+            let idx_qk = ps.idx_qk.view(r * qk_width, &[qk_width])?;
+            qsa::qsa_scatter_keys(ctx, pass, &idx_qk, a.idx_keys, nh, a.pos)?;
+        }
+        pass.level_barrier(&[])?;
+        let mut completes = false;
+        for a in rows {
+            let len = a.pos + 1;
+            if len.is_multiple_of(ratio) {
+                qsa::qsa_block_keys(
+                    ctx,
+                    pass,
+                    a.idx_keys,
+                    &w.indexer.k_norm,
+                    a.blk_keys,
+                    ratio,
+                    len / ratio - 1,
+                    1,
+                    rot,
+                    theta,
+                    eps,
+                    Rope::Delta(a.rope_delta),
+                )?;
+                completes = true;
+            }
+        }
+        if completes {
+            pass.level_barrier(&[])?;
+        }
+        Ok(())
+    }
+
     /// The draft head's catch-up over the rows: row `r` pairs the session's
     /// previous trunk hidden (the state's) with the token this step fed, at
     /// head position `pos - 1` against the session's head caches, and the
     /// state's hidden becomes this step's trunk hidden: what
-    /// `mtp_catch_up` does for a one-token chunk. `mtp_block` with the
-    /// attention per row. `ids` are the fed tokens, as the trunk read them.
+    /// `mtp_catch_up` does for a one-token chunk: `mtp_block`'s input and
+    /// attention read, then only the head caches' writes, per row. `ids` are
+    /// the fed tokens, as the trunk read them.
     #[allow(clippy::too_many_arguments)]
     fn mtp_rows(
         &self,
@@ -981,7 +1078,6 @@ impl Qwen4ExpModel {
         rows: &[BatchRow<'_, DecodeState>],
         s: &Scratch,
         ps: &PrefillScratch,
-        bs: &BatchScratch,
         ids: &Tensor,
     ) -> Result<()> {
         let cfg = &self.config;
@@ -1009,7 +1105,7 @@ impl Qwen4ExpModel {
             copy_words(ctx, pass, &mst.hidden, &hidden_in.view(r * wide, &[wide])?)?;
         }
         pass.level_barrier(&[hidden_in])?;
-        let theta = cfg.mtp.map_or(cfg.rope_parameters.rope_theta, |m| m.rope_theta);
+        let theta = self.mtp_theta();
 
         // `mtp_block`'s input: per stream fc_hidden(norm(stream)), shared
         // fc_embedding(norm(embed(token))).
@@ -1064,30 +1160,8 @@ impl Qwen4ExpModel {
             })
             .collect::<Result<Vec<_>>>()?;
         self.hc_read_batched(ctx, pass, &mtp.layer.attn_hc, hyper, s, ps)?;
-        self.attn_rows(ctx, pass, w, &attn, theta, s, ps, bs)?;
-        pass.level_barrier(&[&ps.branch_out])?;
-        hc_inject_bf16(ctx, pass, hyper, &ps.branch_out, &ps.hc.inj, h, g)?;
-        pass.level_barrier(&[hyper])?;
-        self.hc_read_batched(ctx, pass, &mtp.layer.mlp_hc, hyper, s, ps)?;
-        prefill_moe(
-            ctx,
-            pass,
-            &moe_dims(cfg),
-            &mtp.layer.ffn,
-            &PrefillMoeIo {
-                x: &ps.hc.mixed,
-                out: &ps.branch_out,
-                stack: &ps.stack,
-                mlp_gate: &ps.mlp_gate,
-                mlp_up: &ps.mlp_up,
-                mlp_act: &ps.mlp_act,
-                dequant: &s.dequant,
-            },
-            &ps.moe,
-        )?;
-        pass.level_barrier(&[&ps.branch_out])?;
-        hc_inject_bf16(ctx, pass, hyper, &ps.branch_out, &ps.hc.inj, h, g)?;
-        pass.level_barrier(&[hyper])?;
+        // Only the cache writes are read again (see `mtp_catch_up`).
+        self.attn_rows_cache_writes(ctx, pass, w, &attn, theta, s, ps)?;
 
         // This step's trunk hidden pairs with the session's next token.
         for (r, mst) in msts.iter().enumerate() {

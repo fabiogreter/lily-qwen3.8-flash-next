@@ -88,7 +88,13 @@ hidden state. Its input is built per hyper-connection stream:
 then runs like a trunk attention layer, with its own KV and indexer caches at
 trunk positions, and its mixer feeds the shared LM head. During prefill the
 head runs over the chunk paired with the next token so its caches keep up
-with the trunk; that catch-up costs about 4.7% of prefill time.
+with the trunk, and the batched decode step does the same per row. That
+catch-up stops once the head's caches are written: its residual is never
+read again (the state then takes the trunk's hidden, and a speculative step
+runs its own full block), so the query, attention, output projection and MoE
+are skipped. The caches come out bit-identical to the full block's, for 2 to
+4% less prefill time and about 1.5% less GPU time per batched step than the
+full block, which cost about 4.7% of prefill time.
 
 The head drives speculative decoding. It is optional: `--mtp-drafts 0`, or a
 conversion made with `--no-mtp`, runs the single-token decode graph.
