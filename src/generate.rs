@@ -520,8 +520,6 @@ impl Generator {
             Ok(scratch.next_token().view(slot, &[1])?.to_u32()?[0])
         };
         let parking = model.supports_parking();
-        // On any error a parked pass must not be left blocking the queue.
-        let _release = ReleaseOnExit { model, scratch };
         // The slot holding the next step's input token.
         let mut slot_in = 0usize;
         // A step encoded ahead of time (reads `slot_in`, writes the other
@@ -529,6 +527,10 @@ impl Generator {
         // merely encoded.
         let mut parked: Option<PendingPass<'_>> = None;
         let mut ahead: Option<EncodedPass<'_>> = None;
+        // On any error a parked pass must not be left blocking the queue.
+        // Declared after `parked` so that it drops first: dropping a pending
+        // pass waits for it, and a parked one never finishes unreleased.
+        let _release = ReleaseOnExit { model, scratch };
         // Sleep-then-poll waits: the step interval is regular enough to
         // predict, and polling wakes ~0.1 ms sooner than a blocked thread.
         let mut pacer = Pacer::default();
@@ -563,8 +565,11 @@ impl Generator {
             let step = tokens.len();
             let pending = match parked.take() {
                 Some(pass) => {
-                    model.prepare_step_inputs(state, scratch, input)?;
+                    // Released before a staging error propagates: `pass`
+                    // would wait for itself when dropped.
+                    let staged = model.prepare_step_inputs(state, scratch, input);
                     model.release_parked(scratch)?;
+                    staged?;
                     pass
                 }
                 None => {
@@ -642,9 +647,11 @@ impl Generator {
             if let Some(finish) = finish {
                 if let Some(pass) = parked.take() {
                     // Already committed and counted as fed: let it consume
-                    // the final token rather than leave the queue blocked.
-                    model.prepare_step_inputs(state, scratch, drawn)?;
+                    // the final token rather than leave the queue blocked
+                    // (released before a staging error propagates, as above).
+                    let staged = model.prepare_step_inputs(state, scratch, drawn);
                     model.release_parked(scratch)?;
+                    staged?;
                     pass.wait()?;
                     // It drew the token after `drawn` (draw `tokens.len()`)
                     // into the other slot: a caller that continues the
