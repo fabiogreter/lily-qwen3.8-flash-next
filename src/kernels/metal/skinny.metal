@@ -144,7 +144,9 @@ static void gemm_skinny_q8_body(device const uint* codes,
 
         if (row < N) {
             for (uint col = lane * 8; col < kc; col += 256) {
-                const uint wi = (ulong)row * words + (k0 + col) / 4;
+                // 64-bit like the Q4 body: a Q8 LM head (`--q8-dense`)
+                // is the widest weight this kernel sees.
+                const ulong wi = (ulong)row * words + (k0 + col) / 4;
                 const uint w0 = codes[wi];
                 const uint w1 = codes[wi + 1];
                 uint g = (k0 + col) / GS;
@@ -587,6 +589,16 @@ GEMM_SKINNY_Q8_REG(gemm_skinny_q8_bf16_reg_m5, 5, bfloat)
 GEMM_SKINNY_Q8_REG(gemm_skinny_q8_bf16_reg_m6, 6, bfloat)
 GEMM_SKINNY_Q8_REG(gemm_skinny_q8_bf16_reg_m7, 7, bfloat)
 GEMM_SKINNY_Q8_REG(gemm_skinny_q8_bf16_reg_m8, 8, bfloat)
+// f32 output: the `--q8-dense` LM head's logits (skinny.rs routes only wide
+// outputs here, so the 8-bit routers keep their staged f32 kernels).
+GEMM_SKINNY_Q8_REG(gemm_skinny_q8_f32_reg_m1, 1, float)
+GEMM_SKINNY_Q8_REG(gemm_skinny_q8_f32_reg_m2, 2, float)
+GEMM_SKINNY_Q8_REG(gemm_skinny_q8_f32_reg_m3, 3, float)
+GEMM_SKINNY_Q8_REG(gemm_skinny_q8_f32_reg_m4, 4, float)
+GEMM_SKINNY_Q8_REG(gemm_skinny_q8_f32_reg_m5, 5, float)
+GEMM_SKINNY_Q8_REG(gemm_skinny_q8_f32_reg_m6, 6, float)
+GEMM_SKINNY_Q8_REG(gemm_skinny_q8_f32_reg_m7, 7, float)
+GEMM_SKINNY_Q8_REG(gemm_skinny_q8_f32_reg_m8, 8, float)
 
 // Register-A variants require M to match the kernel suffix; RR (weight rows
 // per simdgroup) must match Q4_REG_ROWS_PER_SG in skinny.rs.

@@ -21,7 +21,7 @@ use super::expert_cache::ExpertCache;
 use super::expert_store::{ExpertStore, LiveUsage, SlotPolicy, UsageRanking};
 use crate::weights::{LinearWeights, Loader, MlpWeights, MoeWeights, expect_shape};
 
-use super::config::{LayerType, Qwen4ExpConfig, VISION_PREFIX};
+use super::config::{LayerType, Qwen4ExpConfig, StoragePolicy, VISION_PREFIX};
 use super::ngram::{self, NgramStorage, NgramTable, PagedTable};
 use super::vision_weights::{self, VisionWeights};
 
@@ -168,9 +168,15 @@ pub struct SessionContext {
 }
 
 /// The converter's storage policy: routers, gates and the small mixing
-/// projections are 8-bit, everything else 4-bit.
-fn expected_bits(bases: &[&str]) -> usize {
-    let q8 = bases.len() == 1 && {
+/// projections are always 8-bit; the dense projections (with `lm_head`) and
+/// `embed_tokens` are whatever the checkpoint's config records
+/// (`StoragePolicy`, 4-bit unless converted with `--q8-dense` /
+/// `--q8-embed`); the routed experts are 4-bit. A fused stack (q|k|v,
+/// the GDN `in_proj_*`, the shared gate|up) is one width: every base must be
+/// a dense projection, and the loader's row concatenation rejects slices of
+/// different packed widths anyway.
+fn expected_bits(storage: StoragePolicy, bases: &[&str]) -> usize {
+    let fixed_q8 = bases.len() == 1 && {
         let b = bases[0];
         b.ends_with(".mlp.gate")
             || b.ends_with(".mlp.shared_expert_gate")
@@ -183,7 +189,35 @@ fn expected_bits(bases: &[&str]) -> usize {
             || b == "mtp.fc_embedding"
             || b == "mtp.fc_hidden"
     };
-    if q8 { 8 } else { 4 }
+    if fixed_q8 {
+        return 8;
+    }
+    if bases == [format!("{PREFIX}embed_tokens").as_str()] {
+        return storage.embed_bits;
+    }
+    if bases.iter().all(|b| is_dense_projection(b)) {
+        return storage.dense_bits;
+    }
+    4
+}
+
+/// The projections `StoragePolicy::dense_bits` governs, by tensor base.
+fn is_dense_projection(base: &str) -> bool {
+    const SUFFIXES: &[&str] = &[
+        ".self_attn.q_proj",
+        ".self_attn.k_proj",
+        ".self_attn.v_proj",
+        ".self_attn.o_proj",
+        ".linear_attn.in_proj_qkv",
+        ".linear_attn.in_proj_z",
+        ".linear_attn.in_proj_a",
+        ".linear_attn.in_proj_b",
+        ".linear_attn.out_proj",
+        ".mlp.shared_expert.gate_proj",
+        ".mlp.shared_expert.up_proj",
+        ".mlp.shared_expert.down_proj",
+    ];
+    base == "lm_head" || SUFFIXES.iter().any(|s| base.ends_with(s))
 }
 
 fn load_mtp(loader: &Loader<'_>, config: &Qwen4ExpConfig) -> Result<MtpWeights> {
@@ -644,7 +678,14 @@ pub fn load(
     let load_vision = with_vision && config.vision.is_some();
     let skip =
         if load_vision { SKIP_PREFIXES_WITH_VISION } else { SKIP_PREFIXES_TEXT_ONLY };
-    let loader = Loader::new(ctx, ckpt, config.quantization, skip, expected_bits);
+    let policy = config.storage;
+    let loader = Loader::new(
+        ctx,
+        ckpt,
+        config.quantization,
+        skip,
+        Box::new(move |bases| expected_bits(policy, bases)),
+    );
     let h = config.hidden_size;
 
     let embed_tokens = loader.linear(&[&format!("{PREFIX}embed_tokens")], h)?;

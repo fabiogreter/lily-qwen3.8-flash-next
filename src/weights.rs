@@ -20,9 +20,10 @@ use crate::tensor::{DType, Tensor};
 
 /// One linear layer's weights in MLX affine form: `codes` packs `32 / bits`
 /// elements per u32 along the input dim (low element first), dequantized per
-/// `group_size` input elements as `w = scale * q + bias`. `bits` is 4 for
-/// everything except MoE routers and shared-expert gates, which mlx keeps at
-/// 8 bits.
+/// `group_size` input elements as `w = scale * q + bias`. `bits` is 4 or 8,
+/// per tensor as the checkpoint stores it (the routers, gates and mixers are
+/// always 8-bit; a `--q8-dense` conversion makes the dense projections 8-bit
+/// too).
 pub struct QuantWeights {
     /// U32 `[out, in * bits / 32]`.
     pub codes: Tensor,
@@ -124,8 +125,9 @@ fn to_dtype(dtype: &SafetensorsDType) -> Result<DType> {
 }
 
 /// The bit width a projection is expected to be stored at, keyed by the
-/// tensor bases being loaded. Each model layout has its own policy.
-pub(crate) type BitsPolicy = fn(&[&str]) -> usize;
+/// tensor bases being loaded. Each model layout has its own policy, which
+/// may depend on what the checkpoint's config records (a closure over it).
+pub(crate) type BitsPolicy<'a> = Box<dyn Fn(&[&str]) -> usize + 'a>;
 
 /// Checkpoint access that records every consumed tensor name so `finish` can
 /// verify nothing in the file was silently ignored.
@@ -134,7 +136,7 @@ pub(crate) struct Loader<'a> {
     ckpt: Checkpoint,
     quant: QuantizationConfig,
     skip_prefixes: &'static [&'static str],
-    expected_bits: BitsPolicy,
+    expected_bits: BitsPolicy<'a>,
     consumed: RefCell<HashSet<String>>,
 }
 
@@ -144,7 +146,7 @@ impl<'a> Loader<'a> {
         ckpt: Checkpoint,
         quant: QuantizationConfig,
         skip_prefixes: &'static [&'static str],
-        expected_bits: BitsPolicy,
+        expected_bits: BitsPolicy<'a>,
     ) -> Self {
         Self {
             ctx,

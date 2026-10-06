@@ -492,7 +492,7 @@ impl Qwen4ExpModel {
             draws.shape()
         );
 
-        quant::gather_rows_q4(ctx, pass, &self.weights.embed_tokens, ids, &ps.x)?;
+        quant::gather_rows_quant(ctx, pass, &self.weights.embed_tokens, ids, &ps.x)?;
         pass.level_barrier(&[&ps.x])?;
         hc_broadcast_bf16(ctx, pass, &ps.x, &ps.hyper, h, g)?;
         pass.level_barrier(&[&ps.hyper])?;
@@ -1120,7 +1120,7 @@ impl Qwen4ExpModel {
             eps,
             NORM_WEIGHT_BIAS,
         )?;
-        quant::gather_rows_q4(ctx, pass, &self.weights.embed_tokens, ids, &ps.x)?;
+        quant::gather_rows_quant(ctx, pass, &self.weights.embed_tokens, ids, &ps.x)?;
         pass.level_barrier(&[&ps.hc.hn, &ps.x])?;
         let hn_streams = ps.hc.hn.view(0, &[m * g, h])?;
         let hyper_streams = hyper.view(0, &[m * g, h])?;

@@ -38,19 +38,38 @@ pub(crate) fn project_stack_fused(
 ) -> Result<Option<Tensor>> {
     let m = a.shape()[0];
     let n_total = stack_w.out_features();
-    let walk_ok = skinny::q4_block_walk_ok(stack_w.in_features(), stack_w.group_size);
-    let fused = widths.iter().sum::<usize>() == n_total
-        && stack_w.bits == 4
-        && skinny::dense_smallm_routes(m)
-        && skinny::stack_route_uniform(m, n_total, widths, walk_ok);
-    if !fused {
+    if widths.iter().sum::<usize>() != n_total || !skinny::dense_smallm_routes(m) {
         return Ok(None);
     }
     // Fusing is bit-identical only when the stack and every slice choose
     // the same skinny variant; staged and register-A reduce in different
     // f32 orders.
+    let fused = match stack_w.bits {
+        4 => {
+            let walk_ok =
+                skinny::q4_block_walk_ok(stack_w.in_features(), stack_w.group_size);
+            skinny::stack_route_uniform(m, n_total, widths, walk_ok)
+        }
+        // A `--q8-dense` stack: the Q8 kernel's choice for a bf16 output
+        // depends on m and the packing only, never on the width, so the
+        // stack and its slices always take the same variant (the per-slice
+        // `project_mat` route, whose packing condition this repeats).
+        8 => {
+            stack_w.group_size.is_multiple_of(8)
+                && stack_w.in_features().is_multiple_of(8)
+                && stack_c.dtype() == DType::BF16
+        }
+        _ => false,
+    };
+    if !fused {
+        return Ok(None);
+    }
     let c = stack_c.view(0, &[m, n_total])?;
-    skinny::gemm_skinny_q4_nt(ctx, pass, a, stack_w, &c)?;
+    if stack_w.bits == 4 {
+        skinny::gemm_skinny_q4_nt(ctx, pass, a, stack_w, &c)?;
+    } else {
+        skinny::gemm_skinny_q8_nt(ctx, pass, a, stack_w, &c)?;
+    }
     Ok(Some(c))
 }
 

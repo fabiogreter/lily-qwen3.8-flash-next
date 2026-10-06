@@ -1,4 +1,4 @@
-//! Small-M Q4 GEMMs with staged-A and register-A variants.
+//! Small-M Q4 and Q8 GEMMs with staged-A and register-A variants.
 
 use anyhow::{Result, ensure};
 
@@ -89,6 +89,16 @@ const Q8_REG_FNS: [&str; REG_MAX_M] = [
     "gemm_skinny_q8_bf16_reg_m6",
     "gemm_skinny_q8_bf16_reg_m7",
     "gemm_skinny_q8_bf16_reg_m8",
+];
+const Q8_REG_FNS_F32: [&str; REG_MAX_M] = [
+    "gemm_skinny_q8_f32_reg_m1",
+    "gemm_skinny_q8_f32_reg_m2",
+    "gemm_skinny_q8_f32_reg_m3",
+    "gemm_skinny_q8_f32_reg_m4",
+    "gemm_skinny_q8_f32_reg_m5",
+    "gemm_skinny_q8_f32_reg_m6",
+    "gemm_skinny_q8_f32_reg_m7",
+    "gemm_skinny_q8_f32_reg_m8",
 ];
 const Q4_REG_FNS_F32: [&str; REG_MAX_M] = [
     "gemm_skinny_q4_f32_reg_m1",
@@ -208,9 +218,13 @@ fn dispatch_q4_reg(
 }
 
 /// Small-M affine-Q8 GEMM (the 8-bit tensors are the narrow routers, gates
-/// and stream mixers). The staged kernels have the numerics of the bf16
-/// dequant + GEMM fallback they replace; register-A (`m <= 8`, bf16 out)
-/// dots the raw codes like the decode GEMV.
+/// and stream mixers, plus every dense projection and the LM head of a
+/// `--q8-dense` checkpoint). The staged kernels have the numerics of the
+/// bf16 dequant + GEMM fallback they replace; register-A (`m <= 8`, bf16
+/// out, or f32 out at least `WIDE_N_MIN` wide: the LM head) dots the raw
+/// codes like the decode GEMV, so verify logits match decode's numerics as
+/// the Q4 head's do. The narrow f32 outputs (the routers) stay staged, as
+/// every checkpoint has always run them.
 pub fn gemm_skinny_q8_nt(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
@@ -235,12 +249,17 @@ pub fn gemm_skinny_q8_nt(
     ensure!(a.dtype() == DType::BF16, "skinny q8 GEMM input must be BF16");
     // Register-A for small m (no threadgroup staging or barriers: the
     // narrow, deep mixers and routers are latency-bound in the staged walk).
-    if m <= REG_MAX_M
-        && c.dtype() == DType::BF16
+    let reg_names = match c.dtype() {
+        DType::BF16 => Some(&Q8_REG_FNS),
+        DType::F32 if n >= WIDE_N_MIN => Some(&Q8_REG_FNS_F32),
+        _ => None,
+    };
+    if let Some(names) = reg_names
+        && m <= REG_MAX_M
         && w.group_size.is_multiple_of(16)
         && k.is_multiple_of(16)
     {
-        let pipeline = ctx.pipeline(Q8_REG_FNS[m - 1], SOURCE, MslVersion::V3_1)?;
+        let pipeline = ctx.pipeline(names[m - 1], SOURCE, MslVersion::V3_1)?;
         return pass.dispatch_at(
             &pipeline,
             &[

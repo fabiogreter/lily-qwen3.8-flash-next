@@ -14,6 +14,58 @@ fn plan(ram: u64, session: u64) -> Option<usize> {
 }
 
 #[test]
+fn the_storage_policy_moves_only_the_dense_projections_and_the_tables() {
+    let l = "model.language_model.layers.3.";
+    let dense: Vec<String> = [
+        "self_attn.o_proj",
+        "linear_attn.in_proj_qkv",
+        "linear_attn.out_proj",
+        "mlp.shared_expert.down_proj",
+    ]
+    .iter()
+    .map(|s| format!("{l}{s}"))
+    .collect();
+    let qkv: Vec<String> = ["q_proj", "k_proj", "v_proj"]
+        .iter()
+        .map(|s| format!("{l}self_attn.{s}"))
+        .collect();
+    let qkv: Vec<&str> = qkv.iter().map(String::as_str).collect();
+    let mtp_gate_up = [
+        "mtp.layers.0.mlp.shared_expert.gate_proj",
+        "mtp.layers.0.mlp.shared_expert.up_proj",
+    ];
+    let embed = "model.language_model.embed_tokens";
+    let fixed_q8 = [
+        format!("{l}mlp.gate"),
+        format!("{l}self_attn.indexer.index_qk_proj"),
+        "mtp.fc_hidden".to_string(),
+    ];
+    let experts = format!("{l}mlp.experts.gate_proj");
+    let q8 = StoragePolicy { dense_bits: 8, embed_bits: 8 };
+    for (policy, dense_bits, embed_bits) in [
+        (StoragePolicy::Q4, 4, 4),
+        (StoragePolicy { dense_bits: 8, embed_bits: 4 }, 8, 4),
+        (q8, 8, 8),
+    ] {
+        for b in &dense {
+            assert_eq!(expected_bits(policy, &[b]), dense_bits, "{b}");
+        }
+        assert_eq!(expected_bits(policy, &qkv), dense_bits, "fused qkv");
+        assert_eq!(
+            expected_bits(policy, &mtp_gate_up),
+            dense_bits,
+            "draft head gate|up"
+        );
+        assert_eq!(expected_bits(policy, &["lm_head"]), dense_bits, "lm_head");
+        assert_eq!(expected_bits(policy, &[embed]), embed_bits, "embed_tokens");
+        for b in &fixed_q8 {
+            assert_eq!(expected_bits(policy, &[b]), 8, "{b}");
+        }
+        assert_eq!(expected_bits(policy, &[&experts]), 4, "experts");
+    }
+}
+
+#[test]
 fn a_machine_that_holds_the_checkpoint_plans_nothing_whatever_the_session() {
     assert_eq!(plan(128 * GB, 0), None);
     // The session reserve does not decide whether the checkpoint fits: a

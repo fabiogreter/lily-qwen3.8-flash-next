@@ -2225,7 +2225,13 @@ impl Qwen4ExpModel {
             None => Rope::Delta(state.rope_delta),
         };
 
-        quant::gather_rows_q4(ctx, &pass, &self.weights.embed_tokens, &ps.ids, &ps.x)?;
+        quant::gather_rows_quant(
+            ctx,
+            &pass,
+            &self.weights.embed_tokens,
+            &ps.ids,
+            &ps.x,
+        )?;
         if let Some(v) = vision {
             // The images' merged rows replace the placeholders' embeddings
             // before the streams are initialised from them (the reference's
@@ -3212,7 +3218,7 @@ impl Qwen4ExpModel {
             eps,
             NORM_WEIGHT_BIAS,
         )?;
-        quant::gather_rows_q4(ctx, pass, &self.weights.embed_tokens, ids, &ps.x)?;
+        quant::gather_rows_quant(ctx, pass, &self.weights.embed_tokens, ids, &ps.x)?;
         if !overrides.is_empty() {
             pass.level_barrier(&[&ps.x])?;
             override_rows(ctx, pass, &ps.x, overrides, h)?;
@@ -3390,7 +3396,7 @@ impl Qwen4ExpModel {
         let conv_slot = state.conv_slot;
 
         let ids = s.next_token.view(slot_in, &[1])?;
-        quant::gather_rows_q4(ctx, pass, &self.weights.embed_tokens, &ids, &s.x)?;
+        quant::gather_rows_quant(ctx, pass, &self.weights.embed_tokens, &ids, &s.x)?;
         pass.level_barrier(&[&s.x])?;
         hc_broadcast_bf16(ctx, pass, &s.x, &s.hyper, h, g)?;
         pass.level_barrier(&[&s.hyper])?;

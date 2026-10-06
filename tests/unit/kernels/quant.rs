@@ -365,49 +365,61 @@ fn dequant_q4_matches_cpu_exactly() {
     }
 }
 
+/// [`random_quant`] at 8 bits: a random affine-Q8 weight and its f32
+/// dequantization.
+fn random_quant_q8(
+    ctx: &MetalContext,
+    rng: &mut StdRng,
+    n: usize,
+    k: usize,
+) -> (QuantWeights, Vec<f32>) {
+    let words = k / 4;
+    let groups = k / GROUP_SIZE;
+    let codes: Vec<u32> = (0..n * words).map(|_| rng.r#gen()).collect();
+    let scales: Vec<f32> = (0..n * groups)
+        .map(|_| bf16::from_f32(rng.gen_range(0.005f32..0.1)).to_f32())
+        .collect();
+    let biases: Vec<f32> = (0..n * groups)
+        .map(|_| bf16::from_f32(rng.gen_range(-1.0f32..0.0)).to_f32())
+        .collect();
+    let dequant =
+        cpu_ref::dequant_affine(&codes, &scales, &biases, n, k, GROUP_SIZE, 8);
+    let to_bf16 =
+        |v: &[f32]| -> Vec<bf16> { v.iter().map(|&x| bf16::from_f32(x)).collect() };
+    let w = QuantWeights {
+        codes: Tensor::from_bytes(
+            ctx,
+            bytemuck::cast_slice(&codes),
+            &[n, words],
+            DType::U32,
+        )
+        .expect("codes"),
+        scales: Tensor::from_bytes(
+            ctx,
+            bytemuck::cast_slice(&to_bf16(&scales)),
+            &[n, groups],
+            DType::BF16,
+        )
+        .expect("scales"),
+        biases: Tensor::from_bytes(
+            ctx,
+            bytemuck::cast_slice(&to_bf16(&biases)),
+            &[n, groups],
+            DType::BF16,
+        )
+        .expect("biases"),
+        group_size: GROUP_SIZE,
+        bits: 8,
+    };
+    (w, dequant)
+}
+
 #[test]
 fn gemv_q8_matches_cpu() {
     let ctx = MetalContext::new().expect("metal context");
     let mut rng = StdRng::seed_from_u64(14);
     for (n, k) in [(8, 128), (256, 2048)] {
-        let words = k / 4;
-        let groups = k / GROUP_SIZE;
-        let codes: Vec<u32> = (0..n * words).map(|_| rng.r#gen()).collect();
-        let scales: Vec<f32> = (0..n * groups)
-            .map(|_| bf16::from_f32(rng.gen_range(0.005f32..0.1)).to_f32())
-            .collect();
-        let biases: Vec<f32> = (0..n * groups)
-            .map(|_| bf16::from_f32(rng.gen_range(-1.0f32..0.0)).to_f32())
-            .collect();
-        let dequant =
-            cpu_ref::dequant_affine(&codes, &scales, &biases, n, k, GROUP_SIZE, 8);
-        let to_bf16 =
-            |v: &[f32]| -> Vec<bf16> { v.iter().map(|&x| bf16::from_f32(x)).collect() };
-        let w = QuantWeights {
-            codes: Tensor::from_bytes(
-                &ctx,
-                bytemuck::cast_slice(&codes),
-                &[n, words],
-                DType::U32,
-            )
-            .expect("codes"),
-            scales: Tensor::from_bytes(
-                &ctx,
-                bytemuck::cast_slice(&to_bf16(&scales)),
-                &[n, groups],
-                DType::BF16,
-            )
-            .expect("scales"),
-            biases: Tensor::from_bytes(
-                &ctx,
-                bytemuck::cast_slice(&to_bf16(&biases)),
-                &[n, groups],
-                DType::BF16,
-            )
-            .expect("biases"),
-            group_size: GROUP_SIZE,
-            bits: 8,
-        };
+        let (w, dequant) = random_quant_q8(&ctx, &mut rng, n, k);
         let x: Vec<f32> = (0..k).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
         let tx = Tensor::from_f32_as_bf16(&ctx, &x, &[k]).expect("x");
         let expected = cpu_ref::gemm_nt(&cpu_ref::round_bf16(&x), &dequant, 1, k, n);
@@ -465,24 +477,35 @@ fn gather_kernels_match_dequant() {
     let ctx = MetalContext::new().expect("metal context");
     let mut rng = StdRng::seed_from_u64(13);
     let (vocab, k) = (50, 128);
-    let (w, dequant) = random_quant(&ctx, &mut rng, vocab, k);
     let round = |v: &[f32]| -> Vec<f32> {
         v.iter().map(|&x| bf16::from_f32(x).to_f32()).collect()
     };
+    // The 4-bit table every checkpoint has, and the `--q8-embed` one.
+    let tables = [
+        random_quant(&ctx, &mut rng, vocab, k),
+        random_quant_q8(&ctx, &mut rng, vocab, k),
+    ];
 
     let ids: Vec<u32> = vec![3, 49, 0, 7];
     let tids =
         Tensor::from_bytes(&ctx, bytemuck::cast_slice(&ids), &[ids.len()], DType::U32)
             .expect("ids");
-    let out = Tensor::zeros(&ctx, &[ids.len(), k], DType::BF16).expect("out");
-    let pass = ctx.begin().expect("pass");
-    gather_rows_q4(&ctx, &pass, &w, &tids, &out).expect("gather rows");
-    pass.commit_wait().expect("commit");
+    for (w, dequant) in &tables {
+        let out = Tensor::zeros(&ctx, &[ids.len(), k], DType::BF16).expect("out");
+        let pass = ctx.begin().expect("pass");
+        gather_rows_quant(&ctx, &pass, w, &tids, &out).expect("gather rows");
+        pass.commit_wait().expect("commit");
 
-    let got = out.to_f32().expect("read");
-    for (i, &id) in ids.iter().enumerate() {
-        let expected = round(&dequant[id as usize * k..(id as usize + 1) * k]);
-        assert_eq!(&got[i * k..(i + 1) * k], &expected[..], "row {id}");
+        let got = out.to_f32().expect("read");
+        for (i, &id) in ids.iter().enumerate() {
+            let expected = round(&dequant[id as usize * k..(id as usize + 1) * k]);
+            assert_eq!(
+                &got[i * k..(i + 1) * k],
+                &expected[..],
+                "{}-bit row {id}",
+                w.bits
+            );
+        }
     }
 }
 

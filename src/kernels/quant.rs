@@ -270,8 +270,9 @@ pub fn gemm_q4_grouped_nt(
     )
 }
 
-/// `out[M, K]` = dequantized embedding rows for `ids` (batched prefill gather).
-pub fn gather_rows_q4(
+/// `out[M, K]` = dequantized embedding rows for `ids` (batched prefill
+/// gather), from a 4-bit table or an 8-bit one (`--q8-embed`).
+pub fn gather_rows_quant(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
     w: &QuantWeights,
@@ -279,14 +280,15 @@ pub fn gather_rows_q4(
     out: &Tensor,
 ) -> Result<()> {
     let (_, k) = check_quant(w)?;
-    ensure!(w.bits == 4, "embedding gathers are 4-bit only");
     let m = ids.numel();
     ensure!(ids.dtype() == DType::U32, "ids must be U32");
     ensure!(
         out.numel() == m * k && out.dtype() == DType::BF16,
         "gather out must be BF16 [{m}, {k}]"
     );
-    let pipeline = ctx.pipeline("gather_rows_q4_bf16", SOURCE, MslVersion::V3_1)?;
+    let fn_name =
+        if w.bits == 4 { "gather_rows_q4_bf16" } else { "gather_rows_q8_bf16" };
+    let pipeline = ctx.pipeline(fn_name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
         &[
@@ -297,7 +299,8 @@ pub fn gather_rows_q4(
             out.binding(),
         ],
         &[&u32_bytes(k), &u32_bytes(w.group_size)],
-        Grid::Threads { grid: (k / 8, m, 1), threadgroup: (32, 1, 1) },
+        // One thread per code word: 32 / bits elements each.
+        Grid::Threads { grid: (k / (32 / w.bits), m, 1), threadgroup: (32, 1, 1) },
     )
 }
 

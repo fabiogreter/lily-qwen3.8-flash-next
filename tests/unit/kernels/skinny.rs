@@ -912,6 +912,50 @@ fn gemm_skinny_q8_matches_reference() {
     }
 }
 
+/// A `--q8-dense` LM head: f32 output at least `WIDE_N_MIN` wide takes the
+/// Q8 register-A kernel for m <= 8, which dots the unrounded weights like
+/// the decode GEMV (so verify logits carry decode's numerics); m = 1 is
+/// checked against that GEMV directly.
+#[test]
+fn gemm_skinny_q8_wide_f32_takes_register_a() {
+    use crate::kernels::quant::gemv_quant;
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(79);
+    let (n, k) = (WIDE_N_MIN + 4, 128);
+    let w = random_quant_bits(&ctx, &mut rng, n, k, GROUP_SIZE, 8);
+    let codes = w.codes.to_u32().expect("codes");
+    let scales = w.scales.to_f32().expect("scales");
+    let biases = w.biases.to_f32().expect("biases");
+    let dequant =
+        cpu_ref::dequant_affine(&codes, &scales, &biases, n, k, GROUP_SIZE, 8);
+    for m in [1usize, 2, 5, 8, 11] {
+        let a = random_vec(&mut rng, m * k);
+        let ta = Tensor::from_f32_as_bf16(&ctx, &a, &[m, k]).expect("a");
+        let c = Tensor::zeros(&ctx, &[m, n], DType::F32).expect("c");
+        let pass = ctx.begin().expect("pass");
+        gemm_skinny_q8_nt(&ctx, &pass, &ta, &w, &c).expect("q8 f32");
+        pass.commit_wait().expect("commit");
+        let a_r = cpu_ref::round_bf16(&a);
+        let got = c.to_f32().expect("read");
+        if m <= REG_MAX_M {
+            let expected = cpu_ref::gemm_nt(&a_r, &dequant, m, k, n);
+            cpu_ref::assert_close(&got, &expected, ATOL_REG, RTOL_REG);
+        } else {
+            let expected =
+                cpu_ref::gemm_nt(&a_r, &cpu_ref::round_bf16(&dequant), m, k, n);
+            cpu_ref::assert_close(&got, &expected, ATOL, RTOL);
+        }
+        if m == 1 {
+            let tx = Tensor::from_f32_as_bf16(&ctx, &a, &[k]).expect("x");
+            let y = Tensor::zeros(&ctx, &[n], DType::F32).expect("y");
+            let pass = ctx.begin().expect("pass");
+            gemv_quant(&ctx, &pass, &w, &tx, &y).expect("gemv");
+            pass.commit_wait().expect("commit");
+            cpu_ref::assert_close(&got, &y.to_f32().expect("y"), ATOL_REG, RTOL_REG);
+        }
+    }
+}
+
 /// The verify-pass question of the optimization notes (§ 2.2): the same
 /// dense bytes through the m-row register-A kernel against the decode
 /// GEMV. Streams 64 weight sets per shape (past the SLC) and prints µs per

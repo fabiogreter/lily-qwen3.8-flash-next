@@ -255,6 +255,32 @@ kernel void gather_rows_q4_bf16(device const uint*   codes  [[buffer(0)]],
     store_word_q4(word, s, b, (device bfloat4*)(out + (ulong)gid.y * K), w);
 }
 
+// 8-bit embedding gather (`--q8-embed` checkpoints): one thread per code
+// word of four elements, the dequant of `dequant_q8_bf16`.
+kernel void gather_rows_q8_bf16(device const uint*   codes  [[buffer(0)]],
+                                device const bfloat* scales [[buffer(1)]],
+                                device const bfloat* biases [[buffer(2)]],
+                                device const uint*   ids    [[buffer(3)]],
+                                device bfloat*       out    [[buffer(4)]],
+                                constant uint&       K      [[buffer(5)]],
+                                constant uint&       GS     [[buffer(6)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    const uint words = K / 4;
+    const uint w = gid.x;
+    if (w >= words) {
+        return;
+    }
+    const uint row = ids[gid.y];
+    const uint groups = K / GS;
+    uint g = w / (GS / 4);
+    float s = float(scales[row * groups + g]);
+    float b = float(biases[row * groups + g]);
+    uint word = codes[(ulong)row * words + w];
+    float4 q = float4(float(word & 0xFF), float((word >> 8) & 0xFF),
+                      float((word >> 16) & 0xFF), float((word >> 24) & 0xFF));
+    ((device bfloat4*)(out + (ulong)gid.y * K))[w] = bfloat4(q * s + b);
+}
+
 // Dequantizes one Q4 word into a threadgroup B tile.
 static inline void store_word_q4_tg(uint word, float s, float b,
                                     threadgroup bfloat4* out, uint w) {

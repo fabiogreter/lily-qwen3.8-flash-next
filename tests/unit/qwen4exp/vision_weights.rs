@@ -121,7 +121,7 @@ fn loader<'a>(ctx: &'a MetalContext, dir: &std::path::Path) -> Loader<'a> {
         Checkpoint::open(dir).expect("checkpoint"),
         QuantizationConfig { group_size: 64, bits: 4 },
         &[],
-        |_| 4,
+        Box::new(|_| 4),
     )
 }
 

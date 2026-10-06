@@ -14,6 +14,14 @@ bit-identical to what lily's Q4/Q8 Metal kernels consume.
 `mlx` needs a Metal device even for CPU arrays, so a real conversion must run
 outside any GPU-less sandbox; `--dry-run` never imports it.
 
+`--q8-dense` stores the dense projections at Q8 group 64 instead of Q4: the
+attention `q/k/v/o_proj`, every Gated DeltaNet projection (`in_proj_qkv/z/a/b`,
+`out_proj`), the shared expert's `gate/up/down_proj` (in the trunk and in the
+draft head) and `lm_head`; `--q8-embed` does the same for `embed_tokens`. The
+routed experts stay Q4. Both record themselves in `lily.quantization` (the
+`q8_dense` / `q8_embed` flags and the extended `q8_suffixes`), which the
+loader follows; without them the output is byte-identical to before.
+
 `--mtp-only` adds the multi-token-prediction draft head (the `mtp.*` tensors:
 one attention+MoE block plus its input projections and output mixer) to an
 existing conversion as extra `mtp-*.safetensors` shards, merging them into the
@@ -170,12 +178,15 @@ def layer_index(name: str) -> int | None:
 Q4 = Quant(4, 64)
 Q8 = Quant(8, 64)
 
-_Q4_SUFFIXES = (
+# The dense projections: Q4 by default, Q8 under `--q8-dense` (with
+# `lm_head`). Kept apart from `_Q4_SUFFIXES` so the policy can move them
+# without touching the rules of the default.
+_DENSE_SUFFIXES = (
     r"\.self_attn\.(q|k|v|o)_proj\.weight$",
     r"\.linear_attn\.(in_proj_qkv|in_proj_z|in_proj_a|in_proj_b|out_proj)\.weight$",
     r"\.mlp\.shared_expert\.(gate|up|down)_proj\.weight$",
-    r"\.mlp\.experts\.down_proj$",
 )
+_Q4_SUFFIXES = (r"\.mlp\.experts\.down_proj$",)
 _Q8_SUFFIXES = (
     r"^mtp\.fc_(embedding|hidden)\.weight$",
     r"\.mlp\.gate\.weight$",
@@ -202,7 +213,46 @@ _PLE_CONSTS = (
 _NGRAM_SHARD = re.compile(r"\.ple\.ple_embedding\.ngram_embedding\.shard_\d+\.weight$")
 
 
-def plan_tensor(t: SourceTensor, keep_layers: int, ngram: Quant, mtp: bool = True, vision: bool = True) -> Plan:
+EMBED_NAME = "model.language_model.embed_tokens.weight"
+LM_HEAD_NAME = "lm_head.weight"
+
+
+@dataclass(frozen=True)
+class Policy:
+    """The storage choices the command line can change. The default (both
+    off) is the policy every checkpoint before `--q8-dense` was written with."""
+
+    q8_dense: bool = False
+    q8_embed: bool = False
+
+    def q8_suffixes(self) -> list[str]:
+        """The 8-bit tensor patterns as recorded in `config.json`: the fixed
+        list, then the dense projections and `lm_head` under `q8_dense`, then
+        `embed_tokens` under `q8_embed`, so the default list is unchanged."""
+        out = list(_Q8_SUFFIXES)
+        if self.q8_dense:
+            out += [*_DENSE_SUFFIXES, "^" + re.escape(LM_HEAD_NAME) + "$"]
+        if self.q8_embed:
+            out.append("^" + re.escape(EMBED_NAME) + "$")
+        return out
+
+    def config_block(self) -> dict:
+        """The keys `lily.quantization` gains; empty for the default, which
+        keeps its `config.json` byte-identical to older conversions."""
+        return {
+            **({"q8_dense": True} if self.q8_dense else {}),
+            **({"q8_embed": True} if self.q8_embed else {}),
+        }
+
+
+def plan_tensor(
+    t: SourceTensor,
+    keep_layers: int,
+    ngram: Quant,
+    mtp: bool = True,
+    vision: bool = True,
+    policy: Policy = Policy(),
+) -> Plan:
     name = t.name
     if name.startswith(VISION_PREFIX):
         # The tower stays bf16, byte for byte (see the module docstring).
@@ -212,14 +262,19 @@ def plan_tensor(t: SourceTensor, keep_layers: int, ngram: Quant, mtp: bool = Tru
     li = layer_index(name)
     if li is not None and li >= keep_layers:
         return Plan("drop")
-    if name in ("model.language_model.embed_tokens.weight", "lm_head.weight"):
-        return Plan("quant", Q4)
+    if name == EMBED_NAME:
+        return Plan("quant", Q8 if policy.q8_embed else Q4)
+    if name == LM_HEAD_NAME:
+        return Plan("quant", Q8 if policy.q8_dense else Q4)
     if name.endswith(".mlp.experts.gate_up_proj"):
         return Plan("expert_gate_up", Q4)
     if _NGRAM_SHARD.search(name):
         return Plan("quant", ngram)
     if any(name.endswith(s) for s in _PLE_CONSTS):
         return Plan("ple_const")
+    for pattern in _DENSE_SUFFIXES:
+        if re.search(pattern, name):
+            return Plan("quant", Q8 if policy.q8_dense else Q4)
     for pattern in _Q4_SUFFIXES:
         if re.search(pattern, name):
             return Plan("quant", Q4)
@@ -241,7 +296,7 @@ def category(name: str) -> str:
         return "ngram"
     if ".mlp.experts." in name:
         return "experts"
-    if name in ("model.language_model.embed_tokens.weight", "lm_head.weight"):
+    if name in (EMBED_NAME, LM_HEAD_NAME):
         return "embed/lm_head"
     return "dense"
 
@@ -251,10 +306,17 @@ def gate_up_output_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
     return (e, two_i // 2, h)
 
 
-def estimate(tensors: list[SourceTensor], keep_layers: int, ngram: Quant, mtp: bool = True, vision: bool = True) -> Totals:
+def estimate(
+    tensors: list[SourceTensor],
+    keep_layers: int,
+    ngram: Quant,
+    mtp: bool = True,
+    vision: bool = True,
+    policy: Policy = Policy(),
+) -> Totals:
     totals = Totals()
     for t in tensors:
-        plan = plan_tensor(t, keep_layers, ngram, mtp, vision)
+        plan = plan_tensor(t, keep_layers, ngram, mtp, vision, policy)
         cat = category(t.name)
         if plan.kind in ("drop", "ple_const"):
             continue
@@ -505,6 +567,7 @@ def write_config(
     revision: str | None,
     mtp: bool,
     vision: list[SourceTensor] | None,
+    policy: Policy,
 ) -> None:
     """`vision` is the list of copied tower tensors, or None when the tower was dropped."""
     cfg = json.loads((src / "config.json").read_text())
@@ -521,7 +584,8 @@ def write_config(
         "quantization": {
             "default": {"bits": Q4.bits, "group_size": Q4.group_size, "mode": "affine"},
             "ngram_embedding": {"bits": ngram.bits, "group_size": ngram.group_size, "mode": "affine"},
-            "q8_suffixes": list(_Q8_SUFFIXES),
+            "q8_suffixes": policy.q8_suffixes(),
+            **policy.config_block(),
         },
         "ple": ple,
         "mtp": mtp_block(text) if mtp else None,
@@ -531,7 +595,8 @@ def write_config(
     # Not read by lily (it uses `lily.quantization`): the Hugging Face Hub only
     # unpacks u32 codes into a parameter count when it finds the MLX-style
     # top-level block, and otherwise reports ~30B for this 180B model. The
-    # few 8-bit tensors are counted as 4-bit, about 0.4% high.
+    # few 8-bit tensors are counted as 4-bit, about 0.4% high (more under
+    # `--q8-dense`, whose dense projections count at half their size).
     cfg["quantization"] = {"group_size": Q4.group_size, "bits": Q4.bits, "mode": "affine"}
     (dst / "config.json").write_text(json.dumps(cfg, indent=2))
 
@@ -566,6 +631,13 @@ def add_vision_to_config(src: Path, dst: Path, vision: list[SourceTensor]) -> No
     path.write_text(json.dumps(cfg, indent=2))
 
 
+def policy_of_conversion(dst: Path) -> Policy:
+    """The policy an existing conversion was written with, so an appended
+    part (`--mtp-only`) stores its projections the way the trunk does."""
+    q = json.loads((dst / "config.json").read_text())["lily"]["quantization"]
+    return Policy(q8_dense=bool(q.get("q8_dense")), q8_embed=bool(q.get("q8_embed")))
+
+
 def source_revision(src: Path) -> str | None:
     """The HF snapshot revision, if the download cache left a metadata file."""
     for meta in (src / ".cache" / "huggingface" / "download").glob("config.json.metadata"):
@@ -598,6 +670,7 @@ def convert(args: argparse.Namespace) -> None:
 
     mtp = not args.no_mtp
     vision = not args.no_vision
+    policy = Policy(q8_dense=args.q8_dense, q8_embed=args.q8_embed)
     append_only = args.mtp_only or args.vision_only
     if args.mtp_only and args.vision_only:
         raise SystemExit("--mtp-only and --vision-only are separate append runs; pass one at a time")
@@ -611,17 +684,24 @@ def convert(args: argparse.Namespace) -> None:
             raise SystemExit(f"{dst} is not a finished conversion (no index); run a full conversion first")
         if any(dst.glob(f"{stem}-*.safetensors")):
             raise SystemExit(f"{dst} already holds {stem} shards; refusing to overwrite")
+        # The draft head shares the trunk's policy (its block and the shared
+        # LM head must agree); the flags may restate it but not change it.
+        existing = policy_of_conversion(dst)
+        if (args.q8_dense and not existing.q8_dense) or (args.q8_embed and not existing.q8_embed):
+            raise SystemExit(f"{dst} was converted with {existing}; an appended part cannot change the policy")
+        policy = existing
         mtp = vision = True
     else:
         stem = "model"
-    totals = estimate(tensors, keep_layers, ngram, mtp, vision)
+    totals = estimate(tensors, keep_layers, ngram, mtp, vision, policy)
     if args.mtp_only:
         what = "the MTP draft head"
     elif args.vision_only:
         what = "the vision tower"
     else:
         dropped = (", no mtp" if not mtp else "") + (", no vision" if not vision else "")
-        what = f"{keep_layers} layers (ngram {ngram.bits}-bit g{ngram.group_size}{dropped})"
+        q8 = (", q8 dense" if policy.q8_dense else "") + (", q8 embed" if policy.q8_embed else "")
+        what = f"{keep_layers} layers (ngram {ngram.bits}-bit g{ngram.group_size}{q8}{dropped})"
     print_totals(f"planned output for {what}", totals)
     if args.dry_run:
         return
@@ -634,7 +714,7 @@ def convert(args: argparse.Namespace) -> None:
             if (src / name).exists():
                 shutil.copy2(src / name, dst / name)
 
-    planned = [(t, plan_tensor(t, keep_layers, ngram, mtp, vision)) for t in tensors]
+    planned = [(t, plan_tensor(t, keep_layers, ngram, mtp, vision, policy)) for t in tensors]
     planned = [(t, p) for t, p in planned if p.kind != "drop"]
     src_bytes = sum(t.nbytes for t, _ in planned)
     quant_positions = [i for i, (_, p) in enumerate(planned) if p.kind == "quant"]
@@ -690,7 +770,9 @@ def convert(args: argparse.Namespace) -> None:
         add_vision_to_config(src, dst, vision_tensors)
     else:
         ple = verify_ple_constants(text_cfg, ple_consts) if ple_consts else {}
-        write_config(src, dst, keep_layers, ngram, ple, source_revision(src), mtp, vision_tensors if vision else None)
+        write_config(
+            src, dst, keep_layers, ngram, ple, source_revision(src), mtp, vision_tensors if vision else None, policy
+        )
 
     elapsed = time.time() - started
     print(f"\nwrote {len(writer.files)} shards, {fmt_gb(writer.total_bytes)} in {elapsed:.0f}s to {dst}")
@@ -710,6 +792,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--mtp-only", action="store_true", help="append only the mtp.* draft head to an existing conversion in --dst")
     parser.add_argument("--no-vision", action="store_true", help="drop the model.visual.* vision tower (it is copied in bf16 by default)")
     parser.add_argument("--vision-only", action="store_true", help="append only the model.visual.* vision tower to an existing conversion in --dst")
+    parser.add_argument(
+        "--q8-dense",
+        action="store_true",
+        help="store attention q/k/v/o, the GDN projections, the shared expert and lm_head at Q8 group 64 (default Q4)",
+    )
+    parser.add_argument("--q8-embed", action="store_true", help="store embed_tokens at Q8 group 64 (default Q4)")
     parser.add_argument("--dry-run", action="store_true", help="only print the size plan")
     convert(parser.parse_args(argv))
 

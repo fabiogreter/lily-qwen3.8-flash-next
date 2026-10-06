@@ -97,6 +97,26 @@ fn the_top_level_quantization_block_is_ignored() {
 }
 
 #[test]
+fn a_config_without_the_q8_flags_keeps_the_q4_storage_policy() {
+    // Every checkpoint converted before `--q8-dense` existed.
+    let cfg = parse(&fixture()).expect("fixture parses");
+    assert_eq!(cfg.storage, StoragePolicy::Q4);
+}
+
+#[test]
+fn the_q8_flags_select_8_bit_dense_and_embedding_storage() {
+    let mut v = fixture();
+    v["lily"]["quantization"]["q8_dense"] = json!(true);
+    let cfg = parse(&v).expect("parses");
+    assert_eq!(cfg.storage, StoragePolicy { dense_bits: 8, embed_bits: 4 });
+    v["lily"]["quantization"]["q8_embed"] = json!(true);
+    let cfg = parse(&v).expect("parses");
+    assert_eq!(cfg.storage, StoragePolicy { dense_bits: 8, embed_bits: 8 });
+    // The default width of the rest (the experts) is unchanged.
+    assert_eq!((cfg.quantization.bits, cfg.quantization.group_size), (4, 64));
+}
+
+#[test]
 fn a_config_that_declares_and_drops_the_tower_is_rejected() {
     let mut v = fixture();
     v["lily"]["dropped"] = json!(["model.visual."]);

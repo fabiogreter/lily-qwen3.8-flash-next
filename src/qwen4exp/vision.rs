@@ -162,7 +162,7 @@ impl VisionTower {
             format!("{} carries no vision tower (no lily.vision block)", dir.display())
         })?;
         let ckpt = Checkpoint::open(dir)?;
-        let loader = Loader::new(ctx, ckpt, config.quantization, &[], |_| 4);
+        let loader = Loader::new(ctx, ckpt, config.quantization, &[], Box::new(|_| 4));
         let weights = vision_weights::load(&loader, &vision)?;
         Self::new(vision, weights)
     }

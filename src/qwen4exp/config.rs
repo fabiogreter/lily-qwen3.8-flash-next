@@ -239,6 +239,32 @@ struct QuantJson {
 struct QuantBlockJson {
     default: QuantJson,
     ngram_embedding: QuantJson,
+    /// The converter's `--q8-dense`: the dense projections and `lm_head`
+    /// are 8-bit. Absent in every checkpoint written without it.
+    #[serde(default)]
+    q8_dense: bool,
+    /// The converter's `--q8-embed`: `embed_tokens` is 8-bit.
+    #[serde(default)]
+    q8_embed: bool,
+}
+
+/// The storage widths a conversion may choose (`lily.quantization.q8_dense`
+/// and `q8_embed`); every other tensor's width is fixed by the format
+/// (`weights::expected_bits`). Both are 4 for a checkpoint that predates the
+/// choice, which then loads exactly as before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoragePolicy {
+    /// Attention `q/k/v/o_proj`, the GDN `in_proj_*` and `out_proj`, the
+    /// shared expert's `gate/up/down_proj` (trunk and draft head) and
+    /// `lm_head`.
+    pub dense_bits: usize,
+    /// `embed_tokens`.
+    pub embed_bits: usize,
+}
+
+impl StoragePolicy {
+    /// The policy of every checkpoint written before the choice existed.
+    pub const Q4: Self = Self { dense_bits: 4, embed_bits: 4 };
 }
 
 #[derive(Deserialize, Default)]
@@ -360,6 +386,9 @@ pub struct Qwen4ExpConfig {
     pub indexer: IndexerConfig,
     /// Default affine quantization of the linear projections.
     pub quantization: QuantizationConfig,
+    /// Which projections the conversion stored at 8 bits beyond the fixed
+    /// ones.
+    pub storage: StoragePolicy,
     /// The draft head, when the checkpoint includes it.
     pub mtp: Option<MtpConfig>,
     /// The vision tower, when the checkpoint includes it.
@@ -420,6 +449,11 @@ impl Qwen4ExpConfig {
             quantization.bits,
             quantization.group_size
         );
+        let width = |q8: bool| if q8 { 8 } else { 4 };
+        let storage = StoragePolicy {
+            dense_bits: width(q.q8_dense),
+            embed_bits: width(q.q8_embed),
+        };
 
         let ple = match t.ple_layer_ids.as_slice() {
             [] => None,
@@ -566,6 +600,7 @@ impl Qwen4ExpConfig {
                 compress_ratio: t.indexer_compress_ratio,
             },
             quantization,
+            storage,
             mtp,
             vision,
         };
