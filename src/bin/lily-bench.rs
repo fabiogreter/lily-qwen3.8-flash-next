@@ -68,9 +68,11 @@ struct Cli {
     /// (`LanguageModel::decode_rows`): this many sessions, each with its own
     /// prompt of `--prompt-len` tokens (the synthetic sequence at a different
     /// offset per row, or consecutive slices of `--prompt-text`), decode
-    /// `--decode-steps` steps together. With `--gpu-timing`, every step
-    /// reports where its wall time went. `--drafts` then only loads the draft
-    /// head, which the server's batched step catches up on every row.
+    /// `--decode-steps` steps together, each parked behind the one before
+    /// it as the server runs them (see `--no-park`). With `--gpu-timing`,
+    /// every step reports where its wall time went. `--drafts` then only
+    /// loads the draft head, which the server's batched step catches up on
+    /// every row.
     #[arg(long)]
     batch_rows: Option<usize>,
     /// With `--batch-rows`: wait for every batched step before committing

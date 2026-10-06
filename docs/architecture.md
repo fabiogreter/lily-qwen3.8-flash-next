@@ -1559,6 +1559,34 @@ request whose estimated session does not fit beside them. A row takes
 decode checkpoints between batched steps as the single-session loop takes
 them, and resumes from them work the same way.
 
+**Parking.** Consecutive batched steps over the same rows hide the host
+round trip the way the single-session loop does ("Hiding the host round
+trip"). The scheduler runs the rows in stretches, until a row finishes or
+a waiting job could be admitted, and within a stretch commits step k + 1
+right after step k, parked on the step sync before its first n-gram
+gather (`LanguageModel::park_rows`). Its token ids are step k's draws,
+read on the GPU from one of two draw buffers used in turn, and its
+positions and draw indices are known ahead; once step k's draws are read,
+the host stages the rows' n-gram inputs and releases it. The next step is
+not parked when the stretch ends after the current one (a job could be
+admitted, or the steps between two prefill chunks are spent), or when any
+row has a decode checkpoint due where the current step leaves it, would
+need its caches grown, or ends on the current draw (`max_tokens`, a client
+gone): checkpoints, cache growth, admission and answers all happen with
+nothing in flight, between stretches. A row that finishes on a draw while
+the next step is parked (a stop token, a stop string) lets it run: the
+parked step feeds the row's final token, as the single-session parked step
+does, its extra draw is dropped, and the other rows take theirs as an
+ordinary step. A parked step runs the same kernels in the same order as an
+unparked one and computes the same bits
+(`a_parked_batched_step_computes_what_an_unparked_one_does`). Before
+parking, `lily-bench --batch-rows N --gpu-timing` measured 15.3 to 16.8 ms
+of GPU time per step at two rows and 24.9 to 27.4 ms at four, plus 0.7 to
+1.1 ms of host time per step with the GPU idle (encoding 0.3 to 0.6 ms,
+staging 0.1 to 0.3, submission 0.13, wake-up 0.07, the loop between steps
+0.07); `--no-park` still runs that path. What parking leaves of it is not
+measured yet.
+
 **Numerics.** A row never depends on the rows beside it: the same session
 paired with different neighbours, in either position, draws bit-identical
 tokens and leaves bit-identical caches and state
@@ -1600,10 +1628,9 @@ parked next passes for every combination of accepted counts, and would put
 rows from two sessions on. At two to four clients the plain batch already
 matches what drafting adds to one, so it is left as a `TODO(batch)`.
 
-Not batched yet: parking for batched steps (each pays the host round trip,
-0.4 to 0.6 ms), the expert cache (small-machine mode serves one request at
-a time), and admission's host work (a synchronous spill, a disk restore,
-the tower) still stalls the running rows while it runs. The engine
+Not batched yet: the expert cache (small-machine mode serves one request
+at a time), and admission's host work (a synchronous spill, a disk
+restore, the tower) still stalls the running rows while it runs. The engine
 counters behind a request's `prefill_phases` and `ngram` are engine-wide,
 so with interleaving they include the other rows' steps; the `batch`
 object in its timings says when that happened.
