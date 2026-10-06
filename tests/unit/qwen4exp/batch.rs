@@ -13,13 +13,16 @@ use super::*;
 
 const GREEDY: SamplingParams = SamplingParams::greedy();
 
+/// The checkpoint with its draft head, which the batched step catches up on
+/// every row (`mtp_rows`), so the exact checks below cover the head's
+/// per-row bindings and caches too.
 fn load(ctx: &MetalContext) -> Option<Qwen4ExpModel> {
     let dir = std::env::var("LILY_MODEL_DIR_FLASH").ok()?;
     Some(
         <Qwen4ExpModel as LanguageModel>::load(
             ctx,
             Path::new(&dir),
-            &LoadOptions::default(),
+            &LoadOptions { mtp_drafts: MAX_DRAFTS, ..LoadOptions::default() },
         )
         .expect("load"),
     )
