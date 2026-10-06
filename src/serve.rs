@@ -750,8 +750,10 @@ impl<M: LanguageModel> Engine<M> {
     ) -> Result<Self> {
         let Shared { generator, shutdown, timings, queue: _ } = shared.clone();
         // `LILY_KERNEL_PROFILE=1`: per-kernel GPU times per pass, printed
-        // after every request (diagnostic; the profile transport serializes
-        // dispatches, so throughput under it is not comparable).
+        // after every answered request (diagnostic; the profile transport
+        // serializes dispatches, so throughput under it is not comparable;
+        // with batching, a request's print covers every pass since the
+        // previous print, other requests' included).
         let ctx = if std::env::var_os("LILY_KERNEL_PROFILE").is_some() {
             MetalContext::new_with_profile(true)?
         } else {

@@ -1107,9 +1107,9 @@ impl<M: LanguageModel> Engine<M> {
         let released =
             self.sessions.release(&self.ctx, session, &images, p.cache_key.as_deref());
 
-        // TODO(batch): the batch scheduler never printed the kernel profile
-        // (nor took the recorded passes); kept so here, fixed on its own.
-        if decoded.batch.is_none() && self.ctx.profiling() {
+        // Every pass recorded since the last answer: under batching, other
+        // requests' steps and prefills included.
+        if self.ctx.profiling() {
             print_kernel_profile(&crate::metal::profile::take());
         }
         let completion_tokens = decoded.tokens.len();
