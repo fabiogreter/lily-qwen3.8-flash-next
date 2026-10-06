@@ -30,27 +30,23 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, ensure};
-use serde_json::{Value, json};
+use serde_json::json;
 
 use super::api::{self, Kind, Prepared};
 use super::pin::InFlight;
+use super::request::{self, Closing, Facts, Outcome};
 use super::session::{
-    CachedImage, DecodeCheckpoints, Evictions, Session, boundary_position,
-    last_user_turn,
+    CachedImage, DecodeCheckpoints, Session, boundary_position, last_user_turn,
 };
 use super::stream::{Event, OutputParser, ParserConfig};
-use super::timings::{
-    BatchTimings, EvictionPhase, EvictionTimings, MemoryStats, NgramStats,
-    PrefillParts, PrefillPhases, Speculation, Timings, TimingsEntry,
-};
+use super::timings::{BatchTimings, Speculation, TimingsEntry};
 use super::{
-    Cmd, Collected, Engine, EngineQueue, Job, Sink, call_id, chunk, describe_reuse,
-    error_json, now, response_id, text_chunk, user_turn_opener,
+    Cmd, Collected, Engine, EngineQueue, Job, Sink, call_id, chunk, error_json, now,
+    response_id, text_chunk, user_turn_opener,
 };
 use crate::engine::{BatchRow, CountsSlot, DecodeStateApi, Draw, LanguageModel};
 use crate::generate::{DecodeCheckpointer, FinishReason, GenerateOptions, Generator};
 use crate::qwen4exp::{ImageEmbeds, VisionInput, positions_for_prompt};
-use crate::stats::{Counters, VmCounters};
 
 /// Batched decode steps of the running rows between two prefill chunks of a
 /// request being admitted. A chunk is a 1.6 to 1.8 s pass the rows cannot
@@ -293,31 +289,6 @@ impl Output {
             }
         }
     }
-}
-
-/// What the admission measured, for the timings and the log line.
-struct Facts {
-    n: usize,
-    reused: usize,
-    agreement: usize,
-    cut_back: Option<usize>,
-    forked: bool,
-    from_disk: Option<Duration>,
-    durable: Option<(usize, f64)>,
-    durable_secs: f64,
-    image_tokens: usize,
-    vision_secs: f64,
-    encoded_images: usize,
-    queued_secs: f64,
-    pinned: bool,
-    session_secs: f64,
-    checkpoint_secs: f64,
-    prefix_secs: f64,
-    acquire_evictions: Evictions,
-    counters_start: Counters,
-    counters_prefill: Counters,
-    vm_start: Option<VmCounters>,
-    vm_prefill: Option<VmCounters>,
 }
 
 /// One request in its decode phase.
@@ -978,58 +949,57 @@ impl<M: LanguageModel> Engine<M> {
             let created = now();
             let id = response_id(p.kind, created, &mut self.next_id);
             let by = if sink.cancelled() { "client" } else { "shutdown" };
-            let measured = Timings::measure(n, reused, prefix_secs, 0, 0.0, None)
-                .with_agreement(agreement, durable.map(|(b, _)| b))
-                .with_vision(image_tokens, vision_secs)
-                .with_pinned(pinned)
-                .with_batch(stats.timings())
-                .with_cancel(Some(by), Some(at))
-                .with_evictions(EvictionTimings {
-                    acquire: EvictionPhase::new(&acquired.evictions),
-                    release: EvictionPhase::new(&released),
-                })
-                .with_diagnostics(
-                    queued.as_secs_f64(),
-                    PrefillPhases::split(
-                        prefix_secs,
-                        if p.images.is_empty() { 0.0 } else { vision_secs },
-                        PrefillParts {
-                            session_secs,
-                            durable_secs,
-                            checkpoint_secs: 0.0,
-                            counters: counters_end.since(counters_start).prefill,
-                        },
-                    ),
-                    NgramStats {
-                        prefill: counters_end.since(counters_start).gather.into(),
-                        decode: counters_end.since(counters_end).gather.into(),
-                    },
-                    MemoryStats::from_samples(
-                        [vm_start, vm_end, vm_end],
-                        crate::stats::pressure_level(),
-                        crate::stats::task_memory(),
-                    ),
-                );
+            // The prefill ended at the stop: its samples are the stop's.
+            let facts = Facts {
+                n,
+                reused,
+                agreement,
+                cut_back: acquired.cut_back,
+                forked: acquired.forked,
+                from_disk: acquired.from_disk,
+                durable,
+                durable_secs,
+                images: p.images.len(),
+                images_decoded: p.images_decoded,
+                prepare_secs: p.prepare_secs,
+                image_tokens,
+                vision_secs,
+                encoded_images,
+                queued_secs: queued.as_secs_f64(),
+                pinned,
+                session_secs,
+                checkpoint_secs: 0.0,
+                prefix_secs,
+                acquire_evictions: acquired.evictions,
+                counters_start,
+                counters_prefill: counters_end,
+                vm_start,
+                vm_prefill: vm_end,
+            };
+            let measured = request::timings(
+                &facts,
+                &Outcome {
+                    cancelled_by: Some(by),
+                    cancelled_at: Some(at),
+                    batch: Some(&stats),
+                    ..Outcome::default()
+                },
+                &released,
+                counters_end,
+                vm_end,
+                crate::stats::pressure_level(),
+                crate::stats::task_memory(),
+            );
             eprintln!(
-                "{id}: {n} prompt tokens ({reused} cached{}{}), cancelled by the {by} at {at} after {} prefilled in {prefix_secs:.2}s, kept {at} tokens as a session, sessions={} ({:.1}/{:.1} GB){}{}",
-                describe_reuse(acquired.cut_back, acquired.forked),
-                acquired
-                    .from_disk
-                    .map(|d| format!(", from disk in {:.2}s", d.as_secs_f64()))
-                    .unwrap_or_default(),
-                at - reused,
-                self.sessions.len(),
-                self.sessions.used_bytes() as f64 / 1e9,
-                self.sessions.budget_bytes() as f64 / 1e9,
-                self.sessions
-                    .disk()
-                    .map(|d| format!(
-                        ", disk {} ({:.1} GB)",
-                        d.len(),
-                        d.used_bytes() as f64 / 1e9
-                    ))
-                    .unwrap_or_default(),
-                measured.log_details(),
+                "{}",
+                request::stopped_line(
+                    &id,
+                    &facts,
+                    by,
+                    at,
+                    &request::describe_store(&self.sessions),
+                    &measured.log_details()
+                )
             );
             self.timings.record(TimingsEntry {
                 id,
@@ -1139,6 +1109,9 @@ impl<M: LanguageModel> Engine<M> {
             image_tokens,
             vision_secs,
             encoded_images,
+            images: p.images.len(),
+            images_decoded: p.images_decoded,
+            prepare_secs: p.prepare_secs,
             queued_secs: queued.as_secs_f64(),
             pinned,
             session_secs,
@@ -1347,123 +1320,40 @@ impl<M: LanguageModel> Engine<M> {
         } else {
             None
         };
-        let speculation = (self.drafts > 0)
-            .then_some(Speculation { drafted: row.drafted, accepted: row.accepted });
-        let measured = Timings::measure(
-            n,
-            f.reused,
-            f.prefix_secs,
-            completion_tokens,
+        let outcome = Outcome {
+            generated: completion_tokens,
             decode_secs,
-            speculation,
-        )
-        .with_agreement(f.agreement, f.durable.map(|(b, _)| b))
-        .with_vision(f.image_tokens, f.vision_secs)
-        .with_decode_checkpoints(decode_checkpoints_taken, decode_checkpoint_secs)
-        .with_pinned(f.pinned)
-        .with_batch(row.stats.timings())
-        .with_cancel(cancelled_by, None)
-        .with_evictions(EvictionTimings {
-            acquire: EvictionPhase::new(&f.acquire_evictions),
-            release: EvictionPhase::new(&released),
-        })
-        .with_diagnostics(
-            f.queued_secs,
-            PrefillPhases::split(
-                f.prefix_secs,
-                if p.images.is_empty() { 0.0 } else { f.vision_secs },
-                PrefillParts {
-                    session_secs: f.session_secs,
-                    durable_secs: f.durable_secs,
-                    checkpoint_secs: f.checkpoint_secs,
-                    counters: f.counters_prefill.since(f.counters_start).prefill,
-                },
-            ),
-            NgramStats {
-                prefill: f.counters_prefill.since(f.counters_start).gather.into(),
-                decode: counters_end.since(f.counters_prefill).gather.into(),
-            },
-            MemoryStats::from_samples(
-                [f.vm_start, f.vm_prefill, vm_end],
-                crate::stats::pressure_level(),
-                crate::stats::task_memory(),
-            ),
+            speculation: (self.drafts > 0).then_some(Speculation {
+                drafted: row.drafted,
+                accepted: row.accepted,
+            }),
+            decode_checkpoints: decode_checkpoints_taken,
+            decode_checkpoint_secs,
+            cancelled_by,
+            cancelled_at: None,
+            batch: Some(&row.stats),
+        };
+        let measured = request::timings(
+            f,
+            &outcome,
+            &released,
+            counters_end,
+            vm_end,
+            crate::stats::pressure_level(),
+            crate::stats::task_memory(),
         );
         let id = row.out.id.clone();
         let created = row.out.created;
         eprintln!(
-            "{}: {} prompt tokens ({} cached{}{}{}{}){}, {} generated, prefix {:.2}s, decode {:.2}s ({:.1} tok/s){}, finish={finish_reason}{}{}, sessions={} ({:.1}/{:.1} GB){}{}",
-            id,
-            n,
-            f.reused,
-            describe_reuse(f.cut_back, f.forked),
-            f.from_disk
-                .map(|d| format!(", from disk in {:.2}s", d.as_secs_f64()))
-                .unwrap_or_default(),
-            if f.agreement > f.reused {
-                format!(", agreement {}", f.agreement)
-            } else {
-                String::new()
-            },
-            f.durable
-                .map(|(b, secs)| format!(", durable prefix {b} written in {secs:.2}s"))
-                .unwrap_or_default(),
-            if p.images.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    ", images {} ({} tokens{}{}, prepared in {:.3}s), tower {:.2}s",
-                    p.images.len(),
-                    f.image_tokens,
-                    if f.encoded_images < p.images.len() {
-                        format!(", {} encoded", f.encoded_images)
-                    } else {
-                        String::new()
-                    },
-                    if p.images_decoded < p.images.len() {
-                        format!(", {} decoded", p.images_decoded)
-                    } else {
-                        String::new()
-                    },
-                    p.prepare_secs,
-                    f.vision_secs,
-                )
-            },
-            completion_tokens,
-            f.prefix_secs,
-            decode_secs,
-            completion_tokens as f64 / decode_secs.max(1e-9),
-            format_args!(
-                "{}{}",
-                if row.drafted > 0 {
-                    format!(", drafts {}/{} accepted", row.accepted, row.drafted)
-                } else {
-                    String::new()
-                },
-                if decode_checkpoints_taken > 0 {
-                    format!(
-                        ", {decode_checkpoints_taken} decode checkpoints in {decode_checkpoint_secs:.2}s"
-                    )
-                } else {
-                    String::new()
-                }
-            ),
-            cancelled_by
-                .map(|by| format!(" (cancelled by the {by} during the decode)"))
-                .unwrap_or_default(),
-            row.stats.describe(completion_tokens),
-            self.sessions.len(),
-            self.sessions.used_bytes() as f64 / 1e9,
-            self.sessions.budget_bytes() as f64 / 1e9,
-            self.sessions
-                .disk()
-                .map(|d| format!(
-                    ", disk {} ({:.1} GB)",
-                    d.len(),
-                    d.used_bytes() as f64 / 1e9
-                ))
-                .unwrap_or_default(),
-            measured.log_details(),
+            "{}",
+            request::answer_line(
+                &id,
+                f,
+                &outcome,
+                finish_reason,
+                &request::describe_store(&self.sessions),
+                &measured.log_details()
+            )
         );
         self.timings.record(TimingsEntry {
             id: id.clone(),
@@ -1489,79 +1379,25 @@ impl<M: LanguageModel> Engine<M> {
             f.reused,
             completion_tokens,
             (p.kind == Kind::Chat).then(|| row.parser.reasoning_tokens()),
-            (row.drafted > 0).then_some(Speculation {
-                drafted: row.drafted,
-                accepted: row.accepted,
-            }),
+            outcome.speculation.filter(|s| s.drafted > 0),
         );
-        let timings_json = serde_json::to_value(measured)?;
+        let closing = Closing {
+            kind: p.kind,
+            id: &id,
+            created,
+            model: M::MODEL_ID,
+            finish_reason,
+            usage,
+            timings: serde_json::to_value(measured)?,
+        };
         if p.stream {
-            let mut last = if p.kind == Kind::Chat {
-                chunk(&id, created, M::MODEL_ID, json!({}), Some(finish_reason))
-            } else {
-                text_chunk(&id, created, M::MODEL_ID, "", Some(finish_reason))
-            };
-            if p.include_usage {
-                sink.sse(&last);
-                last = json!({
-                    "id": id,
-                    "object": if p.kind == Kind::Chat { "chat.completion.chunk" } else { "text_completion" },
-                    "created": created,
-                    "model": M::MODEL_ID,
-                    "choices": [],
-                    "usage": usage,
-                });
+            for event in request::stream_end(closing, p.include_usage) {
+                sink.sse(&event);
             }
-            last["timings"] = timings_json;
-            sink.sse(&last);
             sink.send(b"data: [DONE]\n\n".to_vec());
         } else {
-            let collected = std::mem::take(&mut row.out.collected);
-            let body = if p.kind == Kind::Chat {
-                let mut message =
-                    json!({"role": "assistant", "content": collected.content});
-                if !collected.reasoning.is_empty() {
-                    message["reasoning_content"] = Value::String(collected.reasoning);
-                }
-                if !collected.tool_calls.is_empty() {
-                    if collected.content.is_empty() {
-                        message["content"] = Value::Null;
-                    }
-                    message["tool_calls"] = Value::Array(
-                        collected
-                            .tool_calls
-                            .iter()
-                            .enumerate()
-                            .map(|(i, call)| {
-                                json!({
-                                    "id": call_id(&id, i),
-                                    "type": "function",
-                                    "function": {"name": call.name, "arguments": call.arguments},
-                                })
-                            })
-                            .collect(),
-                    );
-                }
-                json!({
-                    "id": id,
-                    "object": "chat.completion",
-                    "created": created,
-                    "model": M::MODEL_ID,
-                    "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
-                    "usage": usage,
-                    "timings": timings_json,
-                })
-            } else {
-                json!({
-                    "id": id,
-                    "object": "text_completion",
-                    "created": created,
-                    "model": M::MODEL_ID,
-                    "choices": [{"index": 0, "text": collected.content, "finish_reason": finish_reason, "logprobs": null}],
-                    "usage": usage,
-                    "timings": timings_json,
-                })
-            };
+            let body =
+                request::response_body(closing, std::mem::take(&mut row.out.collected));
             sink.start(200, "application/json");
             sink.send(serde_json::to_vec(&body)?);
         }

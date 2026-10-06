@@ -30,6 +30,7 @@ pub mod data_uri;
 pub mod disk;
 pub mod http;
 pub mod pin;
+pub mod request;
 pub mod session;
 pub mod stream;
 pub mod timings;
@@ -65,12 +66,10 @@ use crate::qwen4exp::{
     ImageEmbeds, NgramStorage, Qwen4ExpModel, VisionInput, positions_for_prompt,
 };
 use api::{Defaults, ImagePolicy, Kind, Prepared};
+use request::{Closing, Facts, Outcome};
 use session::{CachedImage, SessionStore, boundary_position, last_user_turn};
 use stream::{Event, OutputParser, ParserConfig};
-use timings::{
-    EvictionPhase, EvictionTimings, MemoryStats, NgramStats, PrefillParts,
-    PrefillPhases, Speculation, Timings, TimingsEntry, TimingsLog,
-};
+use timings::{Speculation, TimingsEntry, TimingsLog};
 use tools::ParsedToolCall;
 
 /// Largest request body. Agent clients resend every image of the history
@@ -1418,57 +1417,57 @@ impl<M: LanguageModel> Engine<M> {
             let created = now();
             let id = response_id(p.kind, created, next_id);
             let by = if sink.cancelled() { "client" } else { "shutdown" };
-            let measured = Timings::measure(n, reused, prefix_secs, 0, 0.0, None)
-                .with_agreement(agreement, durable.map(|(b, _)| b))
-                .with_vision(image_tokens, vision_secs)
-                .with_pinned(pinned)
-                .with_cancel(Some(by), Some(at))
-                .with_evictions(EvictionTimings {
-                    acquire: EvictionPhase::new(&acquired.evictions),
-                    release: EvictionPhase::new(&released),
-                })
-                .with_diagnostics(
-                    queued.as_secs_f64(),
-                    PrefillPhases::split(
-                        prefix_secs,
-                        if p.images.is_empty() { 0.0 } else { vision_secs },
-                        PrefillParts {
-                            session_secs,
-                            durable_secs,
-                            checkpoint_secs: 0.0,
-                            counters: counters_end.since(counters_start).prefill,
-                        },
-                    ),
-                    NgramStats {
-                        prefill: counters_end.since(counters_start).gather.into(),
-                        decode: counters_end.since(counters_end).gather.into(),
-                    },
-                    MemoryStats::from_samples(
-                        [vm_start, vm_end, vm_end],
-                        crate::stats::pressure_level(),
-                        crate::stats::task_memory(),
-                    ),
-                );
+            // The prefill ended at the stop: its samples are the stop's.
+            let facts = Facts {
+                n,
+                reused,
+                agreement,
+                cut_back: acquired.cut_back,
+                forked: acquired.forked,
+                from_disk: acquired.from_disk,
+                durable,
+                durable_secs,
+                images: p.images.len(),
+                images_decoded: p.images_decoded,
+                prepare_secs: p.prepare_secs,
+                image_tokens,
+                vision_secs,
+                encoded_images,
+                queued_secs: queued.as_secs_f64(),
+                pinned,
+                session_secs,
+                checkpoint_secs: 0.0,
+                prefix_secs,
+                acquire_evictions: acquired.evictions,
+                counters_start,
+                counters_prefill: counters_end,
+                vm_start,
+                vm_prefill: vm_end,
+            };
+            let measured = request::timings(
+                &facts,
+                &Outcome {
+                    cancelled_by: Some(by),
+                    cancelled_at: Some(at),
+                    ..Outcome::default()
+                },
+                &released,
+                counters_end,
+                vm_end,
+                crate::stats::pressure_level(),
+                crate::stats::task_memory(),
+            );
+            let store = request::describe_store(sessions);
             eprintln!(
-                "{id}: {n} prompt tokens ({reused} cached{}{}), cancelled by the {by} at {at} after {} prefilled in {prefix_secs:.2}s, kept {at} tokens as a session, sessions={} ({:.1}/{:.1} GB){}{}",
-                describe_reuse(acquired.cut_back, acquired.forked),
-                acquired
-                    .from_disk
-                    .map(|d| format!(", from disk in {:.2}s", d.as_secs_f64()))
-                    .unwrap_or_default(),
-                at - reused,
-                sessions.len(),
-                sessions.used_bytes() as f64 / 1e9,
-                sessions.budget_bytes() as f64 / 1e9,
-                sessions
-                    .disk()
-                    .map(|d| format!(
-                        ", disk {} ({:.1} GB)",
-                        d.len(),
-                        d.used_bytes() as f64 / 1e9
-                    ))
-                    .unwrap_or_default(),
-                measured.log_details(),
+                "{}",
+                request::stopped_line(
+                    &id,
+                    &facts,
+                    by,
+                    at,
+                    &store,
+                    &measured.log_details()
+                )
             );
             timings.record(TimingsEntry {
                 id,
@@ -1692,122 +1691,65 @@ impl<M: LanguageModel> Engine<M> {
         } else {
             None
         };
-        let measured = Timings::measure(
+        let facts = Facts {
             n,
             reused,
+            agreement,
+            cut_back: acquired.cut_back,
+            forked: acquired.forked,
+            from_disk: acquired.from_disk,
+            durable,
+            durable_secs,
+            images: p.images.len(),
+            images_decoded: p.images_decoded,
+            prepare_secs: p.prepare_secs,
+            image_tokens,
+            vision_secs,
+            encoded_images,
+            queued_secs: queued.as_secs_f64(),
+            pinned,
+            session_secs,
+            checkpoint_secs,
             prefix_secs,
-            completion_tokens,
+            acquire_evictions: acquired.evictions,
+            counters_start,
+            counters_prefill,
+            vm_start,
+            vm_prefill,
+        };
+        let outcome = Outcome {
+            generated: completion_tokens,
             decode_secs,
-            (*drafts > 0).then_some(Speculation {
+            speculation: (*drafts > 0).then_some(Speculation {
                 drafted: generation.drafted,
                 accepted: generation.accepted,
             }),
-        )
-        .with_agreement(agreement, durable.map(|(b, _)| b))
-        .with_vision(image_tokens, vision_secs)
-        .with_decode_checkpoints(decode_checkpoints_taken, decode_checkpoint_secs)
-        .with_pinned(pinned)
-        .with_cancel(cancelled_by, None)
-        .with_evictions(EvictionTimings {
-            acquire: EvictionPhase::new(&acquired.evictions),
-            release: EvictionPhase::new(&released),
-        })
-        .with_diagnostics(
-            queued.as_secs_f64(),
-            PrefillPhases::split(
-                prefix_secs,
-                if p.images.is_empty() { 0.0 } else { vision_secs },
-                PrefillParts {
-                    session_secs,
-                    durable_secs,
-                    checkpoint_secs,
-                    counters: counters_prefill.since(counters_start).prefill,
-                },
-            ),
-            NgramStats {
-                prefill: counters_prefill.since(counters_start).gather.into(),
-                decode: counters_end.since(counters_prefill).gather.into(),
-            },
-            MemoryStats::from_samples(
-                [vm_start, vm_prefill, vm_end],
-                crate::stats::pressure_level(),
-                crate::stats::task_memory(),
-            ),
+            decode_checkpoints: decode_checkpoints_taken,
+            decode_checkpoint_secs,
+            cancelled_by,
+            cancelled_at: None,
+            batch: None,
+        };
+        let measured = request::timings(
+            &facts,
+            &outcome,
+            &released,
+            counters_end,
+            vm_end,
+            crate::stats::pressure_level(),
+            crate::stats::task_memory(),
         );
+        let store = request::describe_store(sessions);
         eprintln!(
-            "{}: {} prompt tokens ({} cached{}{}{}{}){}, {} generated, prefix {:.2}s, decode {:.2}s ({:.1} tok/s){}, finish={finish_reason}{}, sessions={} ({:.1}/{:.1} GB){}{}",
-            id,
-            n,
-            reused,
-            describe_reuse(acquired.cut_back, acquired.forked),
-            acquired
-                .from_disk
-                .map(|d| format!(", from disk in {:.2}s", d.as_secs_f64()))
-                .unwrap_or_default(),
-            if agreement > reused {
-                format!(", agreement {agreement}")
-            } else {
-                String::new()
-            },
-            durable
-                .map(|(b, secs)| format!(", durable prefix {b} written in {secs:.2}s"))
-                .unwrap_or_default(),
-            if p.images.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    ", images {} ({image_tokens} tokens{}{}, prepared in {:.3}s), tower {vision_secs:.2}s",
-                    p.images.len(),
-                    if encoded_images < p.images.len() {
-                        format!(", {encoded_images} encoded")
-                    } else {
-                        String::new()
-                    },
-                    if p.images_decoded < p.images.len() {
-                        format!(", {} decoded", p.images_decoded)
-                    } else {
-                        String::new()
-                    },
-                    p.prepare_secs
-                )
-            },
-            completion_tokens,
-            prefix_secs,
-            decode_secs,
-            completion_tokens as f64 / decode_secs.max(1e-9),
-            format_args!(
-                "{}{}",
-                if generation.drafted > 0 {
-                    format!(
-                        ", drafts {}/{} accepted",
-                        generation.accepted, generation.drafted
-                    )
-                } else {
-                    String::new()
-                },
-                if decode_checkpoints_taken > 0 {
-                    format!(
-                        ", {decode_checkpoints_taken} decode checkpoints in {decode_checkpoint_secs:.2}s"
-                    )
-                } else {
-                    String::new()
-                }
-            ),
-            cancelled_by
-                .map(|by| format!(" (cancelled by the {by} during the decode)"))
-                .unwrap_or_default(),
-            sessions.len(),
-            sessions.used_bytes() as f64 / 1e9,
-            sessions.budget_bytes() as f64 / 1e9,
-            sessions
-                .disk()
-                .map(|d| format!(
-                    ", disk {} ({:.1} GB)",
-                    d.len(),
-                    d.used_bytes() as f64 / 1e9
-                ))
-                .unwrap_or_default(),
-            measured.log_details(),
+            "{}",
+            request::answer_line(
+                &id,
+                &facts,
+                &outcome,
+                finish_reason,
+                &store,
+                &measured.log_details()
+            )
         );
         timings.record(TimingsEntry {
             id: id.clone(),
@@ -1835,83 +1777,24 @@ impl<M: LanguageModel> Engine<M> {
             reused,
             completion_tokens,
             (p.kind == Kind::Chat).then(|| parser.reasoning_tokens()),
-            (generation.drafted > 0).then_some(Speculation {
-                drafted: generation.drafted,
-                accepted: generation.accepted,
-            }),
+            outcome.speculation.filter(|s| s.drafted > 0),
         );
-        let timings_json = serde_json::to_value(measured)?;
+        let closing = Closing {
+            kind: p.kind,
+            id: &id,
+            created,
+            model: M::MODEL_ID,
+            finish_reason,
+            usage,
+            timings: serde_json::to_value(measured)?,
+        };
         if p.stream {
-            // `timings` rides the last chunk the stream already sends: the
-            // usage chunk when the client asked for one, the finish chunk
-            // otherwise. No client ever sees a chunk shape it did not
-            // already get, and the extension costs nothing to those that
-            // ignore it.
-            let mut last = if p.kind == Kind::Chat {
-                chunk(&id, created, M::MODEL_ID, json!({}), Some(finish_reason))
-            } else {
-                text_chunk(&id, created, M::MODEL_ID, "", Some(finish_reason))
-            };
-            if p.include_usage {
-                sink.sse(&last);
-                last = json!({
-                    "id": id,
-                    "object": if p.kind == Kind::Chat { "chat.completion.chunk" } else { "text_completion" },
-                    "created": created,
-                    "model": M::MODEL_ID,
-                    "choices": [],
-                    "usage": usage,
-                });
+            for event in request::stream_end(closing, p.include_usage) {
+                sink.sse(&event);
             }
-            last["timings"] = timings_json;
-            sink.sse(&last);
             sink.send(b"data: [DONE]\n\n".to_vec());
         } else {
-            let body = if p.kind == Kind::Chat {
-                let mut message =
-                    json!({"role": "assistant", "content": collected.content});
-                if !collected.reasoning.is_empty() {
-                    message["reasoning_content"] = Value::String(collected.reasoning);
-                }
-                if !collected.tool_calls.is_empty() {
-                    if collected.content.is_empty() {
-                        message["content"] = Value::Null;
-                    }
-                    message["tool_calls"] = Value::Array(
-                        collected
-                            .tool_calls
-                            .iter()
-                            .enumerate()
-                            .map(|(i, call)| {
-                                json!({
-                                    "id": call_id(&id, i),
-                                    "type": "function",
-                                    "function": {"name": call.name, "arguments": call.arguments},
-                                })
-                            })
-                            .collect(),
-                    );
-                }
-                json!({
-                    "id": id,
-                    "object": "chat.completion",
-                    "created": created,
-                    "model": M::MODEL_ID,
-                    "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
-                    "usage": usage,
-                    "timings": timings_json,
-                })
-            } else {
-                json!({
-                    "id": id,
-                    "object": "text_completion",
-                    "created": created,
-                    "model": M::MODEL_ID,
-                    "choices": [{"index": 0, "text": collected.content, "finish_reason": finish_reason, "logprobs": null}],
-                    "usage": usage,
-                    "timings": timings_json,
-                })
-            };
+            let body = request::response_body(closing, collected);
             sink.start(200, "application/json");
             sink.send(serde_json::to_vec(&body)?);
         }
