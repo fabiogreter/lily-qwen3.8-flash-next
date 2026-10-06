@@ -574,19 +574,20 @@ impl<M: LanguageModel> Engine<M> {
         let growth = job.prepared.max_tokens.min(ADMIT_GROWTH_TOKENS);
         let tokens = (job.prepared.prompt.len() + growth).min(self.max_seq);
         let estimate = self.model.session_bytes(tokens, 1).unwrap_or(0) as usize;
-        let in_flight = rows.iter().map(|r| r.req.session.bytes()).sum();
         admits(
             rows.len(),
             self.max_batch,
-            in_flight,
+            Self::in_flight(rows),
             estimate,
             self.sessions.budget_bytes(),
         )
     }
 
-    /// Bytes of the sessions in `rows`, which the store counts as in flight.
+    /// Bytes the requests in `rows` hold checked out, which the store
+    /// counts as in flight: their sessions and the decode checkpoints they
+    /// took so far ([`Admitted::bytes`]).
     fn in_flight(rows: &[Row<'_, M>]) -> usize {
-        rows.iter().map(|r| r.req.session.bytes()).sum()
+        rows.iter().map(|r| r.req.bytes()).sum()
     }
 
     /// Runs the one row in the single-session loop until it finishes or, with

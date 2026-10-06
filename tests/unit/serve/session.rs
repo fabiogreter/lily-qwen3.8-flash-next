@@ -346,6 +346,9 @@ mod store {
     struct Snap {
         pos: usize,
         recurrent: u64,
+        /// What it reports as its GPU bytes: 0 from the state and the disk
+        /// (the store's budget tests count the per-token caches only).
+        size: usize,
     }
 
     fn snap_bytes(pos: usize, recurrent: u64) -> Vec<u8> {
@@ -359,7 +362,7 @@ mod store {
             self.pos
         }
         fn bytes(&self) -> usize {
-            0
+            self.size
         }
         fn layout(&self) -> Result<Vec<Segment>> {
             Ok(vec![Segment::Bytes(snap_bytes(self.pos, self.recurrent))])
@@ -397,7 +400,7 @@ mod store {
             self.capacity * BYTES_PER_TOKEN
         }
         fn snapshot(&self, _: &MetalContext) -> Result<Snap> {
-            Ok(Snap { pos: self.data.len(), recurrent: self.recurrent })
+            Ok(Snap { pos: self.data.len(), recurrent: self.recurrent, size: 0 })
         }
         fn restore(&mut self, _: &MetalContext, snapshot: &Snap) -> Result<()> {
             self.data.truncate(snapshot.pos);
@@ -474,6 +477,7 @@ mod store {
             Ok(Snap {
                 pos: u64::from_le_bytes(b[..8].try_into()?) as usize,
                 recurrent: u64::from_le_bytes(b[8..].try_into()?),
+                size: 0,
             })
         }
         fn new_state(&self, _: &MetalContext, capacity: usize) -> Result<State> {
@@ -976,6 +980,28 @@ mod store {
             let mut off = DecodeCheckpoints::<State>::new(interval, max, 0);
             assert!(!off.due(1_000_000));
         }
+    }
+
+    /// A running request's decode checkpoints report the bytes of the
+    /// snapshots they hold, which the batch scheduler adds to the request's
+    /// session for admission and the store's in-flight bytes (they join the
+    /// session only at the answer): none at first, every held one, and
+    /// only the survivors once thinning dropped every other one. No GPU:
+    /// the snapshots are put in place as `take` would leave them.
+    #[test]
+    fn decode_checkpoints_count_the_bytes_of_the_snapshots_they_hold() {
+        let snap = |pos, size| Snap { pos, recurrent: 0, size };
+        let mut c = DecodeCheckpoints::<State>::new(100, 4, 9);
+        assert_eq!(c.bytes(), 0, "nothing taken yet");
+        c.snapshots.extend([snap(109, 7), snap(209, 11), snap(309, 13), snap(409, 17)]);
+        assert_eq!(c.bytes(), 7 + 11 + 13 + 17);
+        // A fifth due with four held: every other one goes (the oldest
+        // first), which moves the next one out past 509.
+        assert!(!c.due(509));
+        assert_eq!(c.positions(), [209, 409]);
+        assert_eq!(c.bytes(), 11 + 17);
+        let held: usize = c.into_snapshots().iter().map(SnapshotApi::bytes).sum();
+        assert_eq!(held, 11 + 17, "what the session gets at the answer");
     }
 
     /// [`serve`] for a request that also generates: after the prefill's

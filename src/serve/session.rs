@@ -392,6 +392,13 @@ impl<S: DecodeStateApi> DecodeCheckpoints<S> {
         self.secs
     }
 
+    /// GPU bytes of the snapshots held: they join the session (and
+    /// [`Session::bytes`]) only when the request is answered, so whoever
+    /// counts a running request's memory adds them.
+    pub fn bytes(&self) -> usize {
+        self.snapshots.iter().map(SnapshotApi::bytes).sum()
+    }
+
     /// The snapshots held, for [`Session::add_decode_checkpoints`].
     pub fn into_snapshots(self) -> Vec<S::Snapshot> {
         self.snapshots

@@ -1569,8 +1569,10 @@ cache pointers need no new kernel. The draft head is caught up on every
 row in every step, so a row that is alone again speculates with complete
 head caches: measured acceptance after a batched stretch 0.63 to 0.66,
 against 0.63 without one. Sessions in flight count against the cache
-budget (`SessionStore::set_in_flight_bytes`), and admission holds back a
-request whose estimated session does not fit beside them. A row takes
+budget (`SessionStore::set_in_flight_bytes`), each with the decode
+checkpoints its request took so far (113 MB apiece on the full model; they
+join the session only at the answer), and admission holds back a request
+whose estimated session does not fit beside them. A row takes
 decode checkpoints between batched steps as the single-session loop takes
 them, and resumes from them work the same way.
 

@@ -932,6 +932,17 @@ pub(super) struct Admitted<'g, M: LanguageModel> {
     pub(super) out: Output,
 }
 
+impl<M: LanguageModel> Admitted<'_, M> {
+    /// GPU bytes the request holds checked out: its session and the decode
+    /// checkpoints it took so far, which join the session only at the
+    /// answer. One checkpoint is a whole recurrent snapshot (about 113 MB
+    /// with the full model), so a long-running row undercounted by them can
+    /// let admission and the store overcommit by hundreds of MB.
+    pub(super) fn bytes(&self) -> usize {
+        self.session.bytes() + self.decode_checkpoints.bytes()
+    }
+}
+
 /// How an admitted request was decoded, for [`Engine::answer`].
 pub(super) struct Decoded<'a> {
     /// Every token drawn; the state holds all but the last, or all of them
