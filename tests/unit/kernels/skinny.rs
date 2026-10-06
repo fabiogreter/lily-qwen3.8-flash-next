@@ -72,6 +72,54 @@ fn gemm_skinny_q4_nt_reg(
     )
 }
 
+/// Test-only dispatch of the register-A Q4 kernels as shipped before the
+/// explicit-order rewrite (`tests/metal/skinny_test.metal`): two weight rows
+/// per simdgroup, two simdgroups per threadgroup.
+fn gemm_skinny_q4_nt_previous(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    a: &Tensor,
+    w: &QuantWeights,
+    c: &Tensor,
+) -> Result<()> {
+    const BF16: [&str; REG_MAX_M] = [
+        "gemm_skinny_q4_bf16_reg_m1_previous",
+        "gemm_skinny_q4_bf16_reg_m2_previous",
+        "gemm_skinny_q4_bf16_reg_m3_previous",
+        "gemm_skinny_q4_bf16_reg_m4_previous",
+        "gemm_skinny_q4_bf16_reg_m5_previous",
+        "gemm_skinny_q4_bf16_reg_m6_previous",
+        "gemm_skinny_q4_bf16_reg_m7_previous",
+        "gemm_skinny_q4_bf16_reg_m8_previous",
+    ];
+    const F32: [&str; REG_MAX_M] = [
+        "gemm_skinny_q4_f32_reg_m1_previous",
+        "gemm_skinny_q4_f32_reg_m2_previous",
+        "gemm_skinny_q4_f32_reg_m3_previous",
+        "gemm_skinny_q4_f32_reg_m4_previous",
+        "gemm_skinny_q4_f32_reg_m5_previous",
+        "gemm_skinny_q4_f32_reg_m6_previous",
+        "gemm_skinny_q4_f32_reg_m7_previous",
+        "gemm_skinny_q4_f32_reg_m8_previous",
+    ];
+    let (m, k, n) = validate_q4(a, w, c)?;
+    ensure!(m <= REG_MAX_M, "register-A kernels cover m <= 8 (m = {m})");
+    let names = if c.dtype() == DType::F32 { &F32 } else { &BF16 };
+    let pipeline = ctx.pipeline(names[m - 1], TEST_SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            w.codes.binding(),
+            w.scales.binding(),
+            w.biases.binding(),
+            a.binding(),
+            c.binding(),
+        ],
+        &[&u32_bytes(k), &u32_bytes(n), &u32_bytes(w.group_size)],
+        Grid::Threadgroups { groups: (n.div_ceil(4), 1, 1), threadgroup: (64, 1, 1) },
+    )
+}
+
 use half::bf16;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -573,6 +621,108 @@ fn gemm_skinny_fused_stack_matches_per_slice_bits() {
                     slice,
                     &format!("{name} split segment {si} at m={m}"),
                 );
+            }
+        }
+    }
+}
+
+/// Hashed Q4 weights for the bit-identity sweeps: every code pattern, scales
+/// from 2^-9 to 2^3 and biases of both signs, cheap enough for the LM head.
+fn bits_quant(ctx: &MetalContext, n: usize, k: usize, salt: u32) -> QuantWeights {
+    let words = k / 8;
+    let groups = k / GROUP_SIZE;
+    let hash = |i: usize, s: u32| -> u32 {
+        let h = (i as u32 ^ s.wrapping_mul(0x85EB_CA6B)).wrapping_mul(0x9E37_79B9);
+        h ^ (h >> 15)
+    };
+    let codes: Vec<u32> = (0..n * words)
+        .map(|i| hash(i, salt).wrapping_mul(2_654_435_761).rotate_left(11))
+        .collect();
+    let value = |i: usize, s: u32, sign: bool| -> f32 {
+        let h = hash(i, s);
+        let mant = 1.0 + (h & 0xFF) as f32 / 256.0;
+        let exp = ((h >> 8) % 13) as i32 - 9;
+        let v = mant * 2f32.powi(exp);
+        if sign && h & (1 << 20) != 0 { -v } else { v }
+    };
+    let scales: Vec<f32> =
+        (0..n * groups).map(|i| value(i, salt ^ 0x51, false)).collect();
+    let biases: Vec<f32> =
+        (0..n * groups).map(|i| value(i, salt ^ 0xB1, true)).collect();
+    quant_tensors(ctx, codes, &scales, &biases, n, k, GROUP_SIZE)
+}
+
+/// Activations for the bit-identity sweeps; `wide` spreads the exponents
+/// over 2^-24..2^24 so a changed summation order would round differently.
+fn bits_activations(rng: &mut StdRng, len: usize, wide: bool) -> Vec<f32> {
+    (0..len)
+        .map(|_| {
+            let v = rng.gen_range(-1.0f32..1.0);
+            if wide { v * 2f32.powi(rng.gen_range(-24i32..24)) } else { v }
+        })
+        .collect()
+}
+
+/// The register-A Q4 kernels compute bit for bit what they computed before
+/// the explicit-order rewrite (`*_previous`, main 0446016), for every m they
+/// serve, both output types, the model's projection shapes (the GDN input
+/// stack, the attention qkv-and-gate stack, the output projections, the LM
+/// head with f32 logits), row counts that leave a partial row group, K values
+/// whose last pass splits or does not, and an activation pointer that is not
+/// 16-byte aligned.
+#[test]
+fn gemm_skinny_q4_reg_matches_previous_bits() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(97);
+    // (K, N, output types)
+    let both = [DType::BF16, DType::F32];
+    let shapes: [(usize, usize, &[DType]); 12] = [
+        (2560, 16480, &[DType::BF16]),
+        (2560, 13312, &[DType::BF16]),
+        (6144, 2560, &[DType::BF16]),
+        (2560, 248320, &[DType::F32]),
+        (2560, 1029, &both),
+        (6144, 37, &both),
+        (64, 5, &both),
+        (320, 43, &both),
+        (640, 29, &both),
+        (1088, 21, &both),
+        (3072, 13, &both),
+        (5120, 3, &both),
+    ];
+    for (si, &(k, n, dtypes)) in shapes.iter().enumerate() {
+        let w = bits_quant(&ctx, n, k, si as u32 + 1);
+        for m in 1..=REG_MAX_M {
+            for (case, wide, unaligned) in [
+                ("plain", false, false),
+                ("wide", true, false),
+                ("unaligned", true, true),
+            ] {
+                // The large shapes run the plain and wide cases only.
+                if unaligned && n > 4096 {
+                    continue;
+                }
+                let a = bits_activations(&mut rng, m * k, wide);
+                let pad = if unaligned { 2 } else { 0 };
+                let mut padded = vec![0.0f32; pad];
+                padded.extend_from_slice(&a);
+                let backing = Tensor::from_f32_as_bf16(&ctx, &padded, &[m * k + pad])
+                    .expect("backing");
+                let ta = backing.view(pad, &[m, k]).expect("a view");
+                for &dt in dtypes {
+                    let got = Tensor::zeros(&ctx, &[m, n], dt).expect("c");
+                    let want = Tensor::zeros(&ctx, &[m, n], dt).expect("c");
+                    let pass = ctx.begin().expect("pass");
+                    gemm_skinny_q4_nt(&ctx, &pass, &ta, &w, &got).expect("shipped");
+                    gemm_skinny_q4_nt_previous(&ctx, &pass, &ta, &w, &want)
+                        .expect("previous");
+                    pass.commit_wait().expect("commit");
+                    assert_bits_eq(
+                        &got.to_f32().expect("read"),
+                        &want.to_f32().expect("read"),
+                        &format!("K={k} N={n} m={m} {case} {dt:?}"),
+                    );
+                }
             }
         }
     }
