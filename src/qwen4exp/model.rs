@@ -635,16 +635,29 @@ fn attn_prefix_regions(
     Ok(())
 }
 
-fn clone_tensor(ctx: &MetalContext, t: &Tensor) -> Result<Tensor> {
-    let out = Tensor::zeros(ctx, t.shape(), t.dtype())?;
-    ctx.blit_copy(&[BlitCopy {
-        src: t,
-        src_offset: 0,
-        dst: &out,
-        dst_offset: 0,
-        len: t.byte_len(),
-    }])?;
-    Ok(out)
+/// Copies of `sources`, in order, made in one GPU pass and one wait. A
+/// recurrent snapshot copies 74 tensors with the full model: a pass and a
+/// wait per tensor took 17 ms in all, one pass for all of them takes 7.3 ms,
+/// most of which is `Tensor::zeros`' allocation and first touch (about
+/// 5 ms).
+fn clone_tensors(ctx: &MetalContext, sources: &[&Tensor]) -> Result<Vec<Tensor>> {
+    let copies = sources
+        .iter()
+        .map(|t| Tensor::zeros(ctx, t.shape(), t.dtype()))
+        .collect::<Result<Vec<_>>>()?;
+    let blits: Vec<BlitCopy<'_>> = sources
+        .iter()
+        .zip(&copies)
+        .map(|(src, dst)| BlitCopy {
+            src,
+            src_offset: 0,
+            dst,
+            dst_offset: 0,
+            len: src.byte_len(),
+        })
+        .collect();
+    ctx.blit_copy(&blits)?;
+    Ok(copies)
 }
 
 /// Copies the first `rows` rows of every `[heads, cap, d]` head block from
@@ -3890,23 +3903,25 @@ impl DecodeStateApi for DecodeState {
         // roll back, and the position counts them.
         ensure!(self.spec.is_none(), "snapshot while a speculative step is pending");
         let slot = self.conv_slot;
-        let mut gdn = Vec::new();
+        let mut sources = Vec::new();
         for lstate in &self.layers {
             if let LayerState::Gdn { state, conv_windows } = lstate {
-                gdn.push((
-                    clone_tensor(ctx, state)?,
-                    clone_tensor(ctx, &conv_windows[slot])?,
-                ));
+                sources.push(state);
+                sources.push(&conv_windows[slot]);
             }
         }
-        let ple = match &self.ple {
-            Some(p) => Some((p.hist, clone_tensor(ctx, &p.conv_windows[slot])?)),
-            None => None,
-        };
-        let mtp_hidden = match &self.mtp {
-            Some(m) => Some(clone_tensor(ctx, &m.hidden)?),
-            None => None,
-        };
+        sources.extend(self.ple.as_ref().map(|p| &p.conv_windows[slot]));
+        sources.extend(self.mtp.as_ref().map(|m| &m.hidden));
+        let mut copies = clone_tensors(ctx, &sources)?.into_iter();
+        let mut next = || copies.next().expect("one copy per source");
+        let mut gdn = Vec::new();
+        for lstate in &self.layers {
+            if matches!(lstate, LayerState::Gdn { .. }) {
+                gdn.push((next(), next()));
+            }
+        }
+        let ple = self.ple.as_ref().map(|p| (p.hist, next()));
+        let mtp_hidden = self.mtp.as_ref().map(|_| next());
         Ok(Snapshot { pos: self.pos, gdn, ple, mtp_hidden })
     }
 
