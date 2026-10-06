@@ -181,6 +181,93 @@ fn persisted_session_continues_like_the_original() -> Result<()> {
     Ok(())
 }
 
+/// A checkpoint hit inside a disk entry that spans several capacity steps,
+/// restored into a state built for the prompt that hit it (as
+/// `acquire_from_disk` builds it, smaller than the entry's): the caches read
+/// back are the entry's own first tokens, byte for byte, every attention
+/// layer and the draft head's, and the generation from there is the one
+/// from a state forked in memory at the same checkpoint. The block-key skip
+/// was once sized by the restoring state's capacity, which read every region
+/// after the first layer's block keys from the wrong offset.
+#[test]
+#[ignore = "requires LILY_MODEL_DIR_FLASH"]
+fn a_checkpoint_inside_an_entry_longer_than_the_restoring_state_restores_exactly()
+-> Result<()> {
+    let dir = model_dir()?;
+    let ctx = MetalContext::new()?;
+    let model = <Qwen4ExpModel as LanguageModel>::load(
+        &ctx,
+        Path::new(&dir),
+        &LoadOptions { mtp_drafts: 2, ..LoadOptions::default() },
+    )?;
+    let mut generator = Generator::from_model_dir(Path::new(&dir))?;
+    generator.add_stop_tokens(&model.eos_token_ids());
+    let step = model.new_state(&ctx, 8)?.capacity();
+    // Three steps and a bit of varied text, then the question.
+    let filler = generator.tokenizer().encode(
+        "The river bends twice before the mill, and the miller counts the sacks \
+         by lamplight while the wheel turns slowly in the dark water. ",
+    )?;
+    let total = 3 * step + 1234;
+    let entry: Vec<u32> = filler.iter().copied().cycle().take(total).collect();
+    let at = 5000;
+    let question = prompt(&generator)?;
+
+    // The entry: fed in two parts with the checkpoint between them, written
+    // at its live end as the disk tier writes an evicted session.
+    let mut scratch = model.new_scratch_with_capacity(&ctx, total + 64)?;
+    let mut original = model.new_state(&ctx, total)?;
+    model.prefill(&ctx, &mut original, &mut scratch, &entry[..at], None)?;
+    let checkpoint = original.snapshot(&ctx)?;
+    model.prefill(&ctx, &mut original, &mut scratch, &entry[at..], None)?;
+    assert_eq!(original.pos(), total);
+    let mut entry_bytes = Vec::new();
+    original.write_prefix(total, &mut entry_bytes)?;
+    let mut expected = Vec::new();
+    original.write_prefix(at, &mut expected)?;
+
+    // The restore, into a state sized for the checkpoint.
+    let mut restored = model.new_state(&ctx, at)?;
+    assert!(
+        restored.capacity() < original.capacity(),
+        "the restoring state must be smaller than the entry's"
+    );
+    let mut cursor = Cursor::new(&entry_bytes);
+    restored.read_prefix(&ctx, total, at, &mut cursor)?;
+    assert_eq!(cursor.position() as usize, entry_bytes.len(), "the whole layout read");
+    restored.restore(&ctx, &checkpoint)?;
+    let mut actual = Vec::new();
+    restored.write_prefix(at, &mut actual)?;
+    assert!(actual == expected, "the restored caches differ from the entry's");
+
+    // The same checkpoint forked in memory decodes the same tokens.
+    let mut forked = model.new_state(&ctx, at)?;
+    forked.copy_prefix_from(&ctx, &original, at)?;
+    forked.restore(&ctx, &checkpoint)?;
+    let greedy = SamplingParams::greedy();
+    let options = GenerateOptions {
+        max_tokens: 16,
+        sampling: &greedy,
+        stop_tokens: &[],
+        drafts: 2,
+    };
+    let mut decode = |state: &mut _| {
+        generator.generate(
+            &ctx,
+            &model,
+            state,
+            &mut scratch,
+            &question,
+            &options,
+            &mut |_| Ok(true),
+        )
+    };
+    let from_disk = decode(&mut restored)?;
+    let from_memory = decode(&mut forked)?;
+    assert_eq!(from_disk.tokens, from_memory.tokens);
+    Ok(())
+}
+
 /// Plain decoding (no drafts) keeps one step parked on the GPU while the
 /// current one runs, and the caches must still be able to grow when the
 /// prompt plus the output crosses a capacity step. A prompt ending a few

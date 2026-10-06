@@ -518,13 +518,90 @@ fn recurrent_layout<'t>(
     out
 }
 
+/// Rows of an attention layer's block-key store for `capacity` tokens: one
+/// per complete indexer block, at least one. Capacities are multiples of the
+/// ratio (the config admits only 4), so this also covers the partial block a
+/// prefix of up to `capacity` tokens starts ([`attn_prefix_plan`] checks).
+fn block_key_rows(capacity: usize, ratio: usize) -> usize {
+    (capacity / ratio).max(1)
+}
+
+/// Which of an attention layer's caches a [`PrefixRegion`] lies in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttnStore {
+    K,
+    V,
+    IdxKeys,
+    BlkKeys,
+}
+
+/// One region of an attention layer's persisted cache prefix: `rows` rows
+/// of `store` from row `first` (K and V are `[heads, capacity, d]`, so head
+/// `h` starts at row `h * capacity`), followed in the layout by `skip` rows
+/// of the same width that a reader of a shorter prefix passes over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PrefixRegion {
+    store: AttnStore,
+    first: usize,
+    rows: usize,
+    skip: usize,
+}
+
+/// The regions of a `tokens`-token prefix of one attention layer, in the
+/// fixed persistence order: K per head, V per head, indexer keys, block keys
+/// of the blocks those tokens start. `written` is how many tokens the
+/// persisted layout was produced for (`>= tokens`; writers pass `tokens` and
+/// skip nothing); `heads`, `capacity` and `block_rows` describe the state on
+/// this side of the layout.
+///
+/// Every length that describes the layout (rows and skips) depends on
+/// `tokens`, `written` and `ratio` alone; the state's geometry only places
+/// the rows within its own buffers, and a prefix it cannot hold is an error
+/// rather than a shorter read. A restore builds its state for the prompt,
+/// not for the disk entry, so it can hold far fewer block-key rows than the
+/// writer did: sizing the skip by them once read a checkpoint inside a
+/// 32K-token entry into an 8K state with every later region at the wrong
+/// offset, silently.
+fn attn_prefix_plan(
+    heads: usize,
+    capacity: usize,
+    block_rows: usize,
+    ratio: usize,
+    tokens: usize,
+    written: usize,
+) -> Result<Vec<PrefixRegion>> {
+    ensure!(tokens <= written, "prefix of {tokens} tokens from a layout of {written}");
+    ensure!(tokens <= capacity, "prefix of {tokens} exceeds capacity {capacity}");
+    let (blocks, written_blocks) = (tokens.div_ceil(ratio), written.div_ceil(ratio));
+    ensure!(
+        blocks <= block_rows,
+        "prefix of {tokens} tokens needs {blocks} block keys, the state holds {block_rows}"
+    );
+    let per_token = |store, first| PrefixRegion {
+        store,
+        first,
+        rows: tokens,
+        skip: written - tokens,
+    };
+    let mut out = Vec::with_capacity(2 * heads + 2);
+    for store in [AttnStore::K, AttnStore::V] {
+        out.extend((0..heads).map(|h| per_token(store, h * capacity)));
+    }
+    out.push(per_token(AttnStore::IdxKeys, 0));
+    out.push(PrefixRegion {
+        store: AttnStore::BlkKeys,
+        first: 0,
+        rows: blocks,
+        skip: written_blocks - blocks,
+    });
+    Ok(out)
+}
+
 /// Visits an attention layer's cache regions holding the first `tokens`
-/// entries, in the fixed persistence order: K per head, V per head, indexer
-/// keys, block keys of the blocks those tokens start. `written` is how many
-/// tokens the persisted layout was produced for (`>= tokens`); `f` gets each
-/// region's view of `tokens` rows and the bytes the layout holds after them
-/// for that region, so a reader of a shorter prefix can skip them. Writers
-/// pass `written == tokens` and get zero.
+/// entries ([`attn_prefix_plan`] has the order and what `written` means):
+/// `f` gets each region's view of its rows and the bytes the layout holds
+/// after them for that region, so a reader of a shorter prefix can skip
+/// them. Writers pass `written == tokens` and get zero.
 fn attn_prefix_regions(
     lstate: &LayerState,
     tokens: usize,
@@ -535,23 +612,27 @@ fn attn_prefix_regions(
     let LayerState::Attn { k_cache, v_cache, idx_keys, blk_keys } = lstate else {
         return Ok(());
     };
-    ensure!(tokens <= written, "prefix of {tokens} tokens from a layout of {written}");
-    for cache in [k_cache, v_cache] {
-        let (heads, cap, d) = (cache.shape()[0], cache.shape()[1], cache.shape()[2]);
-        ensure!(tokens <= cap, "prefix of {tokens} exceeds capacity {cap}");
-        let tail = (written - tokens) * d * cache.dtype().size();
-        for h in 0..heads {
-            f(&cache.view(h * cap * d, &[tokens, d])?, tail)?;
-        }
+    let (heads, capacity) = (k_cache.shape()[0], k_cache.shape()[1]);
+    ensure!(
+        v_cache.shape() == k_cache.shape() && idx_keys.shape()[0] == capacity,
+        "attention caches of mismatched capacity"
+    );
+    let plan =
+        attn_prefix_plan(heads, capacity, blk_keys.shape()[0], ratio, tokens, written)?;
+    for region in plan {
+        let store = match region.store {
+            AttnStore::K => k_cache,
+            AttnStore::V => v_cache,
+            AttnStore::IdxKeys => idx_keys,
+            AttnStore::BlkKeys => blk_keys,
+        };
+        let width = store.shape()[store.shape().len() - 1];
+        f(
+            &store.view(region.first * width, &[region.rows, width])?,
+            region.skip * width * store.dtype().size(),
+        )?;
     }
-    let row = INDEXER_D * idx_keys.dtype().size();
-    f(&idx_keys.view(0, &[tokens, INDEXER_D])?, (written - tokens) * row)?;
-    let blocks = tokens.div_ceil(ratio).min(blk_keys.shape()[0]);
-    let written_blocks = written.div_ceil(ratio).min(blk_keys.shape()[0]);
-    f(
-        &blk_keys.view(0, &[blocks, INDEXER_D])?,
-        (written_blocks - blocks) * INDEXER_D * blk_keys.dtype().size(),
-    )
+    Ok(())
 }
 
 fn clone_tensor(ctx: &MetalContext, t: &Tensor) -> Result<Tensor> {
@@ -596,14 +677,24 @@ fn head_block_copies<'t>(
     Ok(())
 }
 
-/// Copies the first `rows` rows of a `[cap, d]` store.
+/// Copies the first `rows` rows of a `[cap, d]` store (both bf16, possibly
+/// different capacities). Rows either side lacks are an error, as in
+/// [`head_block_copies`], not a shorter copy: a prefix cut short here would
+/// leave the destination's tail rows stale without a word.
 fn row_copy<'t>(
     src: &'t Tensor,
     dst: &'t Tensor,
     rows: usize,
     out: &mut Vec<BlitCopy<'t>>,
 ) -> Result<()> {
-    let rows = rows.min(src.shape()[0]).min(dst.shape()[0]);
+    ensure!(
+        rows <= src.shape()[0]
+            && rows <= dst.shape()[0]
+            && dst.shape()[1] == src.shape()[1],
+        "row copy of {rows} rows between stores of {} and {}",
+        src.shape()[0],
+        dst.shape()[0]
+    );
     let row_bytes = src.shape()[1] * src.dtype().size();
     out.push(BlitCopy {
         src,
@@ -653,7 +744,7 @@ impl DecodeState {
             idx_keys: Tensor::zeros(ctx, &[capacity, INDEXER_D], DType::BF16)?,
             blk_keys: Tensor::zeros(
                 ctx,
-                &[(capacity / ratio).max(1), INDEXER_D],
+                &[block_key_rows(capacity, ratio), INDEXER_D],
                 DType::BF16,
             )?,
         })
@@ -666,7 +757,7 @@ impl DecodeState {
             self.layers.iter().filter(|l| matches!(l, LayerState::Attn { .. })).count()
                 + usize::from(self.mtp.is_some());
         let per_token = 2 * self.kv_heads * self.head_dim * 2 + INDEXER_D * 2;
-        let blocks = (capacity / self.ratio).max(1) * INDEXER_D * 2;
+        let blocks = block_key_rows(capacity, self.ratio) * INDEXER_D * 2;
         attn_layers * (capacity * per_token + blocks)
     }
 
@@ -3559,7 +3650,7 @@ pub(crate) fn session_bytes(
     // `DecodeState::cache_bytes`: every attention layer, the draft head's too.
     let attn_layers = count(LayerType::FullAttention) + usize::from(mtp);
     let per_token = 2 * cfg.num_key_value_heads * cfg.head_dim * 2 + INDEXER_D * 2;
-    let blocks = (capacity / cfg.indexer.compress_ratio).max(1) * INDEXER_D * 2;
+    let blocks = block_key_rows(capacity, cfg.indexer.compress_ratio) * INDEXER_D * 2;
     let caches = attn_layers * (capacity * per_token + blocks);
     // `Qwen4ExpModel::new_state`: per GDN layer the state and two conv
     // windows (a snapshot keeps one), the PLE's two windows (one), the draft
@@ -3804,7 +3895,10 @@ impl DecodeStateApi for DecodeState {
     /// tokens. Each region's rows past `tokens` are skipped, not stopped at:
     /// the regions follow one another, so stopping early would read the next
     /// head's rows as this one's (a checkpoint hit inside a longer disk entry
-    /// once did exactly that).
+    /// once did exactly that). The layout must end exactly where the last
+    /// region's skip does: a reader whose idea of the layout's lengths is off
+    /// reads every region after the first wrong one from the wrong offset,
+    /// and the bytes left over (or missing) are the only trace of it.
     fn read_prefix(
         &mut self,
         ctx: &MetalContext,
@@ -3835,6 +3929,11 @@ impl DecodeStateApi for DecodeState {
         for lstate in self.layers.iter().chain(self.mtp.as_ref().map(|m| &m.layer)) {
             attn_prefix_regions(lstate, tokens, written, self.ratio, &mut source)?;
         }
+        let past_end = std::io::Read::bytes(&mut *r).next().transpose()?;
+        ensure!(
+            past_end.is_none(),
+            "prefix layout for {written} tokens holds bytes past its end"
+        );
         Ok(())
     }
 }
@@ -4312,3 +4411,7 @@ mod qsa_route_tests;
 #[cfg(test)]
 #[path = "../../tests/unit/qwen4exp/prefill.rs"]
 mod prefill_tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/qwen4exp/prefix.rs"]
+mod prefix_tests;
