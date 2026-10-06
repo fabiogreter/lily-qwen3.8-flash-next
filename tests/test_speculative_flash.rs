@@ -16,7 +16,7 @@ use lily::kernels::sample::SamplingParams;
 use lily::metal::MetalContext;
 use lily::qwen4exp::Qwen4ExpModel;
 use lily::thinking::{
-    ThinkingControl, ThinkingSettings, ThinkingTexts, ThinkingTokens,
+    Action, ThinkingControl, ThinkingSettings, ThinkingTexts, ThinkingTokens,
 };
 
 fn model_dir() -> Result<String> {
@@ -474,6 +474,164 @@ fn controlled_run(
     Ok((g.tokens, state, g.finish))
 }
 
+/// The logits after feeding `tokens` into a fresh state as one prompt.
+fn prefill_logits(
+    ctx: &MetalContext,
+    model: &Qwen4ExpModel,
+    tokens: &[u32],
+) -> Result<Vec<f32>> {
+    use lily::engine::ScratchApi;
+    let capacity = tokens.len() + 16;
+    let mut state = model.new_state(ctx, capacity)?;
+    let mut scratch = model.new_scratch_with_capacity(ctx, capacity)?;
+    let greedy = SamplingParams::greedy();
+    scratch.begin_request();
+    model.prefill(
+        ctx,
+        &mut state,
+        &mut scratch,
+        tokens,
+        Some(lily::engine::Draw { params: &greedy, step: 0 }),
+    )?;
+    scratch.logits().to_f32()
+}
+
+/// The best id and its margin over the runner-up.
+fn top2(logits: &[f32]) -> (usize, f32) {
+    let mut best = (0usize, f32::NEG_INFINITY);
+    let mut second = f32::NEG_INFINITY;
+    for (i, &l) in logits.iter().enumerate() {
+        if l > best.1 {
+            second = best.1;
+            best = (i, l);
+        } else if l > second {
+            second = l;
+        }
+    }
+    (best.0, best.1 - second)
+}
+
+fn max_gap(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+}
+
+/// Teacher-forced comparison of two states that should hold the same
+/// tokens: `feed` goes into both, one token at a time (a one-row prefill
+/// with a draw each), and the worst logit gap of every step is returned.
+fn forced_gaps(
+    ctx: &MetalContext,
+    model: &Qwen4ExpModel,
+    a: &mut lily::qwen4exp::DecodeState,
+    b: &mut lily::qwen4exp::DecodeState,
+    feed: &[u32],
+) -> Result<Vec<f32>> {
+    use lily::engine::ScratchApi;
+    let capacity = a.pos().max(b.pos()) + feed.len() + 16;
+    let mut scratch = model.new_scratch_with_capacity(ctx, capacity)?;
+    let greedy = SamplingParams::greedy();
+    let mut gaps = Vec::with_capacity(feed.len());
+    for &t in feed {
+        let mut logits = Vec::new();
+        for s in [&mut *a, &mut *b] {
+            scratch.begin_request();
+            model.prefill(
+                ctx,
+                s,
+                &mut scratch,
+                &[t],
+                Some(lily::engine::Draw { params: &greedy, step: 0 }),
+            )?;
+            logits.push(scratch.logits().to_f32()?);
+        }
+        gaps.push(max_gap(&logits[0], &logits[1]));
+    }
+    Ok(gaps)
+}
+
+/// A fresh state that was fed `tokens` as one prompt.
+fn prefilled(
+    ctx: &MetalContext,
+    model: &Qwen4ExpModel,
+    tokens: &[u32],
+) -> Result<lily::qwen4exp::DecodeState> {
+    let mut state = model.new_state(ctx, tokens.len() + 64)?;
+    let mut scratch = model.new_scratch_with_capacity(ctx, tokens.len() + 64)?;
+    model.prefill(ctx, &mut state, &mut scratch, tokens, None)?;
+    Ok(state)
+}
+
+/// Where two token lists first differ, and the prefill reference's top-2
+/// margin there (the common prefix fed as one prompt).
+fn first_divergence(
+    ctx: &MetalContext,
+    model: &Qwen4ExpModel,
+    prompt: &[u32],
+    a: &[u32],
+    b: &[u32],
+) -> Result<Option<(usize, f32)>> {
+    let Some(d) = a.iter().zip(b).position(|(x, y)| x != y) else {
+        return Ok(None);
+    };
+    let prefix: Vec<u32> = prompt.iter().chain(&a[..d]).copied().collect();
+    let (_, margin) = top2(&prefill_logits(ctx, model, &prefix)?);
+    Ok(Some((d, margin)))
+}
+
+/// Replays a fresh control over an emitted stream and checks that every
+/// insertion in it is exactly what the control asks for at that token:
+/// `</think>\n\n` right before a `<tool_call>` it closes the block for, the
+/// close or nudge sequence right after the token it acts on (cut short only
+/// at the end of the stream). Returns the replayed control, to compare its
+/// counters with the run's.
+fn replay(
+    generator: &Generator,
+    tokens: &Arc<ThinkingTokens>,
+    settings: ThinkingSettings,
+    stream: &[u32],
+) -> Result<ThinkingControl> {
+    let t = generator.tokenizer();
+    let mut close_tag = vec![tokens.think_end];
+    close_tag.extend(t.encode("\n\n")?);
+    let mut control = ThinkingControl::new(tokens.clone(), settings, true);
+    let text = |id: u32| t.decode(&[id], false);
+    let mut i = 0;
+    while i < stream.len() {
+        let rest = &stream[i..];
+        if control.is_open()
+            && rest.starts_with(&close_tag)
+            && rest.get(close_tag.len()) == Some(&tokens.tool_call)
+        {
+            let action = control.decide(tokens.tool_call, &text(tokens.tool_call)?);
+            anyhow::ensure!(
+                action == Action::Before(close_tag.clone()),
+                "at {i}: a close before a tool call the control does not ask for ({action:?})"
+            );
+            i += close_tag.len() + 1;
+            continue;
+        }
+        match control.decide(rest[0], &text(rest[0])?) {
+            Action::Keep => i += 1,
+            Action::After(group) => {
+                let inserted = &rest[1..];
+                let n = group.len().min(inserted.len());
+                anyhow::ensure!(
+                    inserted[..n] == group[..n],
+                    "at {i}: inserted {:?}, the control asks for {group:?}",
+                    &inserted[..n]
+                );
+                i += 1 + n;
+            }
+            Action::Before(group) => {
+                anyhow::bail!(
+                    "at {i}: the control asks for {group:?} before {}",
+                    rest[0]
+                )
+            }
+        }
+    }
+    Ok(control)
+}
+
 fn load_with_head(ctx: &MetalContext) -> Result<(Qwen4ExpModel, Generator)> {
     let dir = model_dir()?;
     let model = <Qwen4ExpModel as LanguageModel>::load(
@@ -544,31 +702,76 @@ fn idle_thinking_controls_change_no_token() -> Result<()> {
     Ok(())
 }
 
-/// A budget closes the block: `</think>` is in the stream right after the
-/// transition text, and the state the generation leaves is the state a
-/// prefill of the same tokens makes: the next draw and the continuation
-/// agree, draft head included.
+/// Text fed teacher-forced into two states that should hold the same
+/// tokens, after the generation's own last token.
+const FORCED_FEED: &str = " The answer is blue, because the sky scatters short waves.";
+
+/// How far the state a generation leaves is from a prefill of the stream it
+/// emitted (the prompt and every token but the last): the worst logit gap
+/// over [`FORCED_FEED`] fed teacher-forced into both.
+fn gap_to_own_stream(
+    ctx: &MetalContext,
+    model: &Qwen4ExpModel,
+    generator: &Generator,
+    prompt: &[u32],
+    generated: &[u32],
+    state: &mut lily::qwen4exp::DecodeState,
+) -> Result<f32> {
+    let all: Vec<u32> =
+        prompt.iter().chain(&generated[..generated.len() - 1]).copied().collect();
+    let mut reference = prefilled(ctx, model, &all)?;
+    assert_eq!(state.pos(), reference.pos(), "the state holds all but the last");
+    let mut feed = vec![*generated.last().expect("generated")];
+    feed.extend(generator.tokenizer().encode(FORCED_FEED)?);
+    let gaps = forced_gaps(ctx, model, state, &mut reference, &feed)?;
+    Ok(gaps.into_iter().fold(0.0, f32::max))
+}
+
+/// The tolerance for a run with controls: what the same loop shows
+/// without them, the kernels' own non-invariance between decode steps,
+/// verify passes and prefill chunks (doubled, with a floor for a baseline
+/// that happens to come out tiny). A state fed the wrong tokens, or the
+/// right ones in the wrong order, is off by whole logits.
+fn tolerance(baseline: f32) -> f32 {
+    (2.0 * baseline).max(0.1)
+}
+
+/// A budget closes the block, and the state the generation leaves holds
+/// exactly the stream it emitted. What is guaranteed, and asserted: the
+/// inserted close is the control's own sequence at the token it acted on
+/// (replayed), the state's position is the stream's, and teacher-forced
+/// the state gives the logits a prefill of that stream gives, within what
+/// the same loop shows without any control. Free-running greedy
+/// continuations of the two are not compared: lily's kernels are not
+/// row-count invariant (decode steps, verify passes and prefill chunks
+/// round differently, a few 1e-2 in the logits), and the 4-layer model's
+/// near-random tokens have top-2 margins that small.
 #[test]
 #[ignore = "requires LILY_MODEL_DIR_FLASH"]
 fn a_forced_close_leaves_the_state_a_prefill_of_the_same_tokens_makes() -> Result<()> {
     let ctx = MetalContext::new()?;
     let (model, generator) = load_with_head(&ctx)?;
     let tokens = thinking_tokens(&generator)?;
-    let think_end = tokens.think_end;
     let prompt = thinking_prompt(&generator)?;
     let n = prompt.len();
+    // Grace 0: the close comes right at the budget (outside a fence).
+    let settings =
+        ThinkingSettings { budget: Some(8), grace: 0, ..ThinkingSettings::default() };
     for drafts in [0usize, 2] {
-        // Grace 0: the close comes right at the budget, wherever that is.
-        let control = RefCell::new(ThinkingControl::new(
-            tokens.clone(),
-            ThinkingSettings {
-                budget: Some(8),
-                grace: 0,
-                ..ThinkingSettings::default()
-            },
-            true,
-        ));
-        let (generated, mut state, finish) = controlled_run(
+        let (base, mut base_state, _) =
+            controlled_run(&ctx, &model, &generator, &prompt, drafts, 48, None, 0)?;
+        let baseline = gap_to_own_stream(
+            &ctx,
+            &model,
+            &generator,
+            &prompt,
+            &base,
+            &mut base_state,
+        )?;
+
+        let control =
+            RefCell::new(ThinkingControl::new(tokens.clone(), settings, true));
+        let (generated, mut state, _) = controlled_run(
             &ctx,
             &model,
             &generator,
@@ -580,97 +783,43 @@ fn a_forced_close_leaves_the_state_a_prefill_of_the_same_tokens_makes() -> Resul
         )?;
         let closed = control.borrow().closed().context("the budget did not close")?;
         assert_eq!(closed.thinking_tokens, 8);
+        let replayed = replay(&generator, &tokens, settings, &generated)?;
+        assert_eq!(replayed.closed(), Some(closed), "drafts={drafts}: replayed close");
         let at = generated
             .iter()
-            .position(|&t| t == think_end)
+            .position(|&t| t == tokens.think_end)
             .context("no </think> in the stream")?;
-        assert!(at > 8, "the transition text comes first");
-        let text = generator.decode_text(&generated[..at + 1])?;
-        assert!(text.contains("time to act"), "drafts={drafts}: {text:?}");
-        if finish != FinishReason::Length {
-            eprintln!(
-                "drafts={drafts}: ended by {finish:?}; the continuation check is skipped"
-            );
-            continue;
-        }
+        assert!(at > 8, "the preface comes first");
+        assert_eq!(state.pos(), n + generated.len() - 1, "drafts={drafts}: position");
 
-        // The reference: the prompt and every generated token but the last
-        // fed as one prompt.
-        let all: Vec<u32> =
-            prompt.iter().chain(&generated[..generated.len() - 1]).copied().collect();
-        let capacity = all.len() + 64;
-        let mut reference = model.new_state(&ctx, capacity)?;
-        let mut scratch = model.new_scratch_with_capacity(&ctx, capacity)?;
-        model.prefill(&ctx, &mut reference, &mut scratch, &all, None)?;
-        assert_eq!(state.pos(), reference.pos(), "drafts={drafts}: positions");
-        assert_eq!(state.pos(), n + generated.len() - 1);
-
-        // The same next token fed into both: the same logits' argmax, and
-        // the same continuation.
-        let greedy = SamplingParams::greedy();
-        let last = *generated.last().expect("generated");
-        let options = GenerateOptions {
-            max_tokens: 16,
-            sampling: &greedy,
-            stop_tokens: &[],
-            drafts,
-            thinking: None,
-        };
-        let mut logits = Vec::new();
-        let mut continuations = Vec::new();
-        for s in [&mut state, &mut reference] {
-            use lily::engine::ScratchApi;
-            scratch.begin_request();
-            model.prefill(
-                &ctx,
-                s,
-                &mut scratch,
-                &[last],
-                Some(lily::engine::Draw { params: &greedy, step: 0 }),
-            )?;
-            logits.push(scratch.logits().to_f32()?);
-            let first = scratch.next_token().view(0, &[1])?.to_u32()?[0];
-            // On from that draw, both states the same way (the draft head
-            // proposes from what the prefill left it).
-            let mut tokens = vec![first];
-            generator.resume(
-                &ctx,
-                &model,
-                s,
-                &mut scratch,
-                &mut tokens,
-                &options,
-                None,
-                &mut |_| Ok(true),
-            )?;
-            continuations.push(tokens);
-        }
-        let worst = logits[0]
-            .iter()
-            .zip(&logits[1])
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        let argmax = |l: &[f32]| {
-            l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i)
-        };
-        eprintln!("drafts={drafts}: worst logit gap {worst}");
-        assert_eq!(
-            argmax(&logits[0]),
-            argmax(&logits[1]),
-            "drafts={drafts}: next draw"
+        let gap = gap_to_own_stream(
+            &ctx, &model, &generator, &prompt, &generated, &mut state,
+        )?;
+        eprintln!(
+            "drafts={drafts}: state vs prefill of its stream, worst forced gap {gap:.4} (controls off: {baseline:.4})"
         );
-        assert_eq!(continuations[0], continuations[1], "drafts={drafts}: continuation");
+        assert!(
+            gap <= tolerance(baseline),
+            "drafts={drafts}: the state is {gap} off a prefill of its own stream (controls off: {baseline})"
+        );
     }
     Ok(())
 }
 
-/// The speculative loop (resting, feeding the inserted tokens, proposing
-/// afresh) and the plain loop (unpipelined around an insertion) emit the
-/// same tokens under a budget with nudges, with and without decode
-/// checkpoints.
+/// Every loop applies the controls to its own draws alike, and feeds what
+/// it inserts in order: the speculative loop (ending the step at the row,
+/// feeding the insertion, proposing afresh), the plain loop (unpipelined
+/// around an insertion), with and without decode checkpoints. Asserted for
+/// each: every insertion in its stream is exactly what the control asks for
+/// at that token (replayed, with the same nudge and close counts), the
+/// block was closed, and the state matches a prefill of the stream within
+/// what the same loop shows without controls. The loops' streams are not
+/// compared token for token: speculative and plain decoding part on
+/// near-ties without any control too (printed, with the margin there).
 #[test]
 #[ignore = "requires LILY_MODEL_DIR_FLASH"]
-fn speculative_and_plain_decoding_agree_under_a_budget() -> Result<()> {
+fn every_loop_applies_the_controls_to_its_own_draws_and_feeds_them_in_order()
+-> Result<()> {
     let ctx = MetalContext::new()?;
     let (model, generator) = load_with_head(&ctx)?;
     let tokens = thinking_tokens(&generator)?;
@@ -682,10 +831,23 @@ fn speculative_and_plain_decoding_agree_under_a_budget() -> Result<()> {
         tool_call_ends_thinking: true,
         seed: 3,
     };
-    let run = |drafts: usize, every: usize| -> Result<(Vec<u32>, usize)> {
+    let mut plain = None;
+    for (drafts, every) in [(0usize, 0usize), (2, 0), (1, 0), (2, 8), (0, 8)] {
+        let label = format!("drafts={drafts} checkpoints every {every}");
+        let (base, mut base_state, _) =
+            controlled_run(&ctx, &model, &generator, &prompt, drafts, 72, None, every)?;
+        let baseline = gap_to_own_stream(
+            &ctx,
+            &model,
+            &generator,
+            &prompt,
+            &base,
+            &mut base_state,
+        )?;
+
         let control =
             RefCell::new(ThinkingControl::new(tokens.clone(), settings, true));
-        let (generated, _, _) = controlled_run(
+        let (generated, mut state, _) = controlled_run(
             &ctx,
             &model,
             &generator,
@@ -695,20 +857,116 @@ fn speculative_and_plain_decoding_agree_under_a_budget() -> Result<()> {
             Some(&control),
             every,
         )?;
-        let nudged = control.borrow().nudged();
-        Ok((generated, nudged))
+        let replayed = replay(&generator, &tokens, settings, &generated)?;
+        let run = control.borrow();
+        assert!(run.closed().is_some(), "{label}: the budget did not close");
+        assert_eq!(replayed.closed(), run.closed(), "{label}: replayed close");
+        assert_eq!(replayed.nudged(), run.nudged(), "{label}: replayed nudges");
+
+        let gap = gap_to_own_stream(
+            &ctx, &model, &generator, &prompt, &generated, &mut state,
+        )?;
+        eprintln!(
+            "{label}: {} nudges, worst forced gap {gap:.4} (controls off: {baseline:.4})",
+            run.nudged()
+        );
+        assert!(
+            gap <= tolerance(baseline),
+            "{label}: the state is {gap} off a prefill of its own stream (controls off: {baseline})"
+        );
+
+        // For the record: where the loops part, with and without controls.
+        match &plain {
+            None => plain = Some((base, generated)),
+            Some((plain_base, plain_generated)) => {
+                for (what, a, b) in
+                    [("off", plain_base, &base), ("on", plain_generated, &generated)]
+                {
+                    match first_divergence(&ctx, &model, &prompt, a, b)? {
+                        None => eprintln!("{label} ({what}): the plain loop's tokens"),
+                        Some((d, margin)) => eprintln!(
+                            "{label} ({what}): parts from the plain loop at {d}, top-2 margin there {margin:.4}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires LILY_MODEL_DIR_FLASH; a report, asserts nothing beyond the replay"]
+fn thinking_controls_divergence_report() -> Result<()> {
+    let ctx = MetalContext::new()?;
+    let (model, generator) = load_with_head(&ctx)?;
+    let tokens = thinking_tokens(&generator)?;
+    let prompt = thinking_prompt(&generator)?;
+    let feed = generator
+        .tokenizer()
+        .encode(" The answer is blue because the sky scatters light.")?;
+    let settings_b = ThinkingSettings {
+        budget: Some(24),
+        grace: 2,
+        nudges: true,
+        tool_call_ends_thinking: true,
+        seed: 3,
     };
-    let (plain, nudged) = run(0, 0)?;
-    assert!(
-        plain.contains(&tokens.think_end),
-        "the budget closed the block: {:?}",
-        generator.decode_text(&plain)?
-    );
-    eprintln!("nudges: {nudged}; {:?}", generator.decode_text(&plain)?);
-    for (drafts, every) in [(2usize, 0usize), (1, 0), (2, 8), (0, 8)] {
-        let (got, got_nudged) = run(drafts, every)?;
-        assert_eq!(got, plain, "drafts={drafts} checkpoints every {every}");
-        assert_eq!(got_nudged, nudged);
+    let settings_a =
+        ThinkingSettings { budget: Some(8), grace: 0, ..ThinkingSettings::default() };
+    for (label, settings) in
+        [("off", None), ("budget24", Some(settings_b)), ("budget8", Some(settings_a))]
+    {
+        let mut runs = Vec::new();
+        for (drafts, every) in [(0usize, 0usize), (2, 0), (1, 0), (2, 8), (0, 8)] {
+            let control = settings
+                .map(|s| RefCell::new(ThinkingControl::new(tokens.clone(), s, true)));
+            let (g, mut state, _) = controlled_run(
+                &ctx,
+                &model,
+                &generator,
+                &prompt,
+                drafts,
+                72,
+                control.as_ref(),
+                every,
+            )?;
+            if let (Some(s), Some(c)) = (settings, &control) {
+                let replayed = replay(&generator, &tokens, s, &g)?;
+                let c = c.borrow();
+                eprintln!(
+                    "{label} drafts={drafts} every={every}: replay ok, nudged {} closed {:?} (run: {} {:?})",
+                    replayed.nudged(),
+                    replayed.closed(),
+                    c.nudged(),
+                    c.closed()
+                );
+            }
+            // The state against a prefill of its own stream, teacher-forced.
+            let all: Vec<u32> =
+                prompt.iter().chain(&g[..g.len() - 1]).copied().collect();
+            let mut reference = prefilled(&ctx, &model, &all)?;
+            let mut fed = vec![*g.last().unwrap()];
+            fed.extend(&feed);
+            let gaps = forced_gaps(&ctx, &model, &mut state, &mut reference, &fed)?;
+            let worst = gaps.iter().copied().fold(0.0f32, f32::max);
+            eprintln!(
+                "{label} drafts={drafts} every={every}: state vs prefill worst forced gap {worst:.4} {gaps:.3?}"
+            );
+            runs.push(((drafts, every), g));
+        }
+        let base = &runs[0].1;
+        for ((drafts, every), g) in &runs[1..] {
+            match first_divergence(&ctx, &model, &prompt, base, g)? {
+                None => eprintln!(
+                    "{label} drafts={drafts} every={every}: identical to plain"
+                ),
+                Some((d, m)) => eprintln!(
+                    "{label} drafts={drafts} every={every}: diverges from plain at {d} ({} vs {}), reference top-2 margin {m:.4}",
+                    base[d], g[d]
+                ),
+            }
+        }
     }
     Ok(())
 }
