@@ -933,6 +933,11 @@ fn bench_batched<M: LanguageModel>(
             "gpu_gap_ms": gpu_gap_ms,
             // `began` to `ended`; parked steps overlap the step before.
             "step_wall_ms": median(timings.iter().map(|t| t.wall_ms()).collect()),
+            // One step's end to the next one's: the cadence the rows see,
+            // comparable parked and unparked.
+            "step_cadence_ms": median(
+                timings.windows(2).map(|w| (w[1].ended - w[0].ended) * 1e3).collect()
+            ),
         })
     });
     let digests: Vec<String> =

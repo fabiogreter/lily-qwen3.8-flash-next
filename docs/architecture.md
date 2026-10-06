@@ -1584,8 +1584,14 @@ parking, `lily-bench --batch-rows N --gpu-timing` measured 15.3 to 16.8 ms
 of GPU time per step at two rows and 24.9 to 27.4 ms at four, plus 0.7 to
 1.1 ms of host time per step with the GPU idle (encoding 0.3 to 0.6 ms,
 staging 0.1 to 0.3, submission 0.13, wake-up 0.07, the loop between steps
-0.07); `--no-park` still runs that path. What parking leaves of it is not
-measured yet.
+0.07); `--no-park` still runs that path. Parked, the GPU's gap between
+steps measured 0 ms and the GPU time per step did not grow (15.6 against
+15.7 ms at two rows, 25.0 against 25.0 at four): the release arrives
+before the pass reaches its wait. Aggregate decode, medians of three
+alternating runs on one binary (2026-10-06, 1 024-token prompts, the
+draft head loaded, token digests identical parked and unparked): 122.0
+to 128.3 tok/s at two rows (+5.1 %), 153.8 to 159.5 at four (+3.7 %),
+and 115.6 to 119.0 at two rows over 8 192-token prompts.
 
 **Numerics.** A row never depends on the rows beside it: the same session
 paired with different neighbours, in either position, draws bit-identical
