@@ -589,9 +589,9 @@ impl ThinkingFields {
 }
 
 /// The server's thinking budget per template reasoning effort
-/// (`--thinking-budget`): `low=4000,medium=8000,xhigh=16000` (`high` is
-/// `xhigh`, as in requests), or one number for every level. A level left
-/// out has no budget.
+/// (`--thinking-budget`): `low=8000,medium=8000,xhigh=16000` (`high` is
+/// `xhigh`, as in requests), one number for every level, or `off` for none.
+/// A level left out has no budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ThinkingBudgets {
     pub low: Option<usize>,
@@ -602,6 +602,9 @@ pub struct ThinkingBudgets {
 impl ThinkingBudgets {
     pub fn parse(text: &str) -> Result<Self> {
         let text = text.trim();
+        if text == "off" {
+            return Ok(Self::default());
+        }
         if let Ok(all) = text.parse::<usize>() {
             ensure!(all > 0, "a thinking budget must be a positive token count");
             return Ok(Self { low: Some(all), medium: Some(all), xhigh: Some(all) });

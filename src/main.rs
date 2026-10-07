@@ -9,6 +9,12 @@ use lily::qwen4exp::NgramStorage;
 use lily::serve::api::{ThinkingBudgets, ThinkingDefaults};
 use lily::serve::{SamplingOverrides, ServeOptions, parse_duration_secs};
 
+/// The thinking budget by reasoning effort unless `--thinking-budget` says
+/// otherwise: on the 2026-10-07 agent replay (a 56K-token opencode turn at
+/// `low`), 8000 tokens with nudges ended every runaway block; xhigh gets
+/// twice that, unmeasured.
+const DEFAULT_THINKING_BUDGET: &str = "low=8000,medium=8000,xhigh=16000";
+
 #[derive(Parser)]
 #[command(
     name = "lily",
@@ -171,15 +177,14 @@ struct Cli {
     #[arg(long)]
     reasoning_effort: Option<String>,
 
-    /// Default thinking budget of chat requests, by the template's reasoning
-    /// effort: `low=4000,medium=8000,xhigh=16000` (`high` is `xhigh`), or
-    /// one number for all (positive counts). Once the reasoning block holds
-    /// that many tokens it is closed at the next line end, with a short
-    /// transition text, and an end of turn drawn inside the block is
-    /// replaced by the close. Unset: no budget. A request's
-    /// `thinking_budget` overrides it.
-    #[arg(long)]
-    thinking_budget: Option<String>,
+    /// Thinking budget of chat requests, by the template's reasoning
+    /// effort: `low=8000,medium=8000,xhigh=16000` (`high` is `xhigh`), one
+    /// number for all (positive counts), or `off`. Once the reasoning block
+    /// holds that many tokens it is closed at the next line end, with a
+    /// short transition text, and an end of turn drawn inside the block is
+    /// replaced by the close. A request's `thinking_budget` overrides it.
+    #[arg(long, default_value = DEFAULT_THINKING_BUDGET)]
+    thinking_budget: String,
 
     /// Scales the default budget of a turn whose last message is a tool
     /// result.
@@ -193,13 +198,13 @@ struct Cli {
 
     /// Insert graded nudges into the reasoning at 50, 75 and 90 % of the
     /// budget by default (request field `thinking_nudges`).
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     thinking_nudges: bool,
 
     /// A `<tool_call>` at a line start inside the reasoning block ends the
     /// block (`</think>` is inserted before it) by default, for chat
     /// requests with tools (request field `tool_call_ends_thinking`).
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     tool_call_ends_thinking: bool,
 
     /// JSON file replacing the texts the thinking controls insert:
@@ -296,12 +301,7 @@ fn run() -> Result<()> {
         thinking: cli.thinking,
         reasoning_effort: cli.reasoning_effort,
         thinking_controls: ThinkingDefaults {
-            budgets: cli
-                .thinking_budget
-                .as_deref()
-                .map(ThinkingBudgets::parse)
-                .transpose()?
-                .unwrap_or_default(),
+            budgets: ThinkingBudgets::parse(&cli.thinking_budget)?,
             tool_turn_factor: {
                 let f = cli.thinking_budget_tool_turn_factor;
                 anyhow::ensure!(

@@ -144,6 +144,7 @@ fn thinking_budgets_parse_per_effort_or_for_all() {
     assert_eq!(partial.at(Some("low")), None);
     assert_eq!(partial.at(None), Some(12000), "the template's default effort is xhigh");
     assert_eq!(map.at(Some("medium")), Some(8000));
+    assert_eq!(ThinkingBudgets::parse(" off ").unwrap(), ThinkingBudgets::default());
     assert!(ThinkingBudgets::parse("max=1").is_err());
     assert!(ThinkingBudgets::parse("low=many").is_err());
     assert!(ThinkingBudgets::parse("low").is_err());
