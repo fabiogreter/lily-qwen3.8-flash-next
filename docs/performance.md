@@ -995,6 +995,19 @@ the 4-layer Hugging Face comparison cannot see expert quantization error at
 scale. A perplexity or task run on the full model would have to come first,
 and the fork's goal is the model at this precision.
 
+**Finer mixed precision, not tried.** The 8-bit groups (`--q8`) move whole
+tensor kinds from 4 to 8 bits at group 64. oMLX's oQ4e conversion of the
+same model (`Jundot/Qwen3.8-Flash-Next-oQ4e-mtp`, its 0.7.0 benchmark
+checkpoint, read from its `config.json` on 2026-10-07) spends about the same
+bytes on the same kinds of tensors but spreads them finer: per-layer bit
+widths picked from calibrated sensitivity (attention at 4 to 8 bits by
+layer, the GDN projections at 5 to 6), group 128 for most of its 8- and
+5-bit tensors, the LM head and embedding at 8. Group 128 for the 8-bit
+groups is the cheap step (a few percent of their bytes, a quality check
+on the agent replay); 5- and 6-bit tensors need kernel formats lily does
+not have; per-layer choices need a sensitivity measurement on the full
+model.
+
 **Smaller machines.** A usage ranking that includes decode-time routing, a
 larger LRU region (30% measured 6.9% against 8.8% of decode lookups missing,
 at the price of prefill misses), and 8 192-token prefill chunks as the
