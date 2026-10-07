@@ -66,6 +66,10 @@ const TABLE: &[&str] = &[
     "<tool",
     "_call>",
     "```",
+    "````",
+    "~~~",
+    "Act now.",
+    " in",
 ];
 
 #[test]
@@ -352,11 +356,64 @@ fn a_tool_call_quoted_in_a_fence_or_nested_in_a_kept_call_stays_reasoning() {
     );
     assert_eq!(calls.len(), 1, "the call after the fence ends the block");
 
-    // A call kept mid-line, with a marker at a line start nested inside it.
-    // "Hello<tool_call>\n<tool_call>\n</tool_call>\n<tool_call>..."
-    let ids = [0, 5, 2, 5, 2, 6, 2, 5, 7, 10, 6];
+    // A mention mid-line opens no call: the call on the next line ends
+    // the block. "Hello<tool_call>\n<tool_call><function=f></function></tool_call>"
+    let ids = [0, 5, 2, 5, 7, 10, 6];
     let mut p = OutputParser::new(detok(TABLE), reasoning_with_tools(true));
     let (reasoning, _, calls) = text_of(&run(&mut p, &ids));
-    assert_eq!(reasoning, "Hello<tool_call>\n<tool_call>\n</tool_call>");
-    assert_eq!(calls.len(), 1, "only the call after the kept one closes");
+    assert_eq!(reasoning, "Hello<tool_call>");
+    assert_eq!(calls.len(), 1, "the call on its own line closes");
+}
+
+/// The fences of `fenced`, an unmatched `<tool_call>` line inside them,
+/// then `closing` and a real call: the decode-time control's own fence
+/// rules ([`crate::thinking::ReasoningScan`]).
+fn fenced_then_real(fenced: &[u32], closing: &[u32]) {
+    let ids: Vec<u32> = fenced
+        .iter()
+        .chain(&[5, 2])
+        .chain(closing)
+        .chain(&[5, 7, 10, 6])
+        .copied()
+        .collect();
+    let mut p = OutputParser::new(detok(TABLE), reasoning_with_tools(true));
+    let (reasoning, _, calls) = text_of(&run(&mut p, &ids));
+    assert_eq!(calls.len(), 1, "{fenced:?}: the call after the fence: {reasoning:?}");
+    assert!(!reasoning.contains("<function=f>"), "{fenced:?}: {reasoning:?}");
+}
+
+#[test]
+fn fences_follow_commonmark_for_the_tool_call_rule() {
+    // "```\n" ... "```\n"
+    fenced_then_real(&[19, 2], &[19, 2]);
+    // A four-backtick fence holding a three-backtick line: "````\n```\n"
+    // ... "````\n".
+    fenced_then_real(&[20, 2, 19, 2], &[20, 2]);
+    // Tildes, with backticks inside: "~~~\n```\n" ... "~~~\n".
+    fenced_then_real(&[21, 2, 19, 2], &[21, 2]);
+    // A three-backtick line does not close the four-backtick fence: the
+    // call after it is still quoted.
+    let ids = [20, 2, 19, 2, 5, 7, 10, 6];
+    let mut p = OutputParser::new(detok(TABLE), reasoning_with_tools(true));
+    let (reasoning, _, calls) = text_of(&run(&mut p, &ids));
+    assert_eq!(calls.len(), 0, "{reasoning:?}");
+}
+
+/// After a budget's close the content is parsed as usual: a stop string
+/// there ends it. "Hello\nAct now.\n</think>\n\nThe answer inSTOP world"
+#[test]
+fn a_stop_string_after_a_budget_close_ends_the_content() {
+    let config = ParserConfig {
+        thinking_open: true,
+        tools: None,
+        stop_strings: vec!["STOP".into()],
+        raw: false,
+        tool_call_ends_thinking: false,
+    };
+    let mut p = OutputParser::new(detok(TABLE), config);
+    let events = run(&mut p, &[0, 2, 22, 2, 3, 4, 16, 23, 14, 1]);
+    let (reasoning, content, _) = text_of(&events);
+    assert_eq!(reasoning, "Hello\nAct now.");
+    assert_eq!(content, "The answer in");
+    assert!(p.stopped);
 }

@@ -351,6 +351,12 @@ impl Tokenizer {
             .is_some_and(|t| t.special)
     }
 
+    /// Whether `id` is one of the vocabulary's added tokens, special or not
+    /// (`<|im_end|>`, `</think>`, `<tool_call>`, ...).
+    pub fn is_added(&self, id: u32) -> bool {
+        self.inner.get_added_vocabulary().get_added_tokens_decoder().contains_key(&id)
+    }
+
     fn load_template(dir: &Path, config: &serde_json::Value) -> Result<String> {
         let path = dir.join("chat_template.jinja");
         match std::fs::read_to_string(&path) {

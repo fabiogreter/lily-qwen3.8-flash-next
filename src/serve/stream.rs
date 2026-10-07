@@ -5,6 +5,7 @@
 use anyhow::Result;
 
 use super::tools::{ParsedToolCall, ToolSchema, parse_tool_call};
+use crate::thinking::ReasoningScan;
 
 const THINK_END: &str = "</think>";
 const TOOL_START: &str = "<tool_call>";
@@ -63,84 +64,10 @@ pub struct OutputParser<D: FnMut(&[u32]) -> Result<String>> {
     reasoning_tokens: usize,
     tool_call_ends_thinking: bool,
     /// Line, fence and tool-call state over the reasoning text released so
-    /// far, for the `<tool_call>` rule.
+    /// far, for the `<tool_call>` rule: the decode-time control's own scan
+    /// ([`ReasoningScan`]), so a `<tool_call>` quoted in a fence, written
+    /// mid-line or nested in a kept call is reasoning to both.
     reasoning_scan: ReasoningScan,
-}
-
-/// Where a reasoning text stands, character by character: at a line start,
-/// inside a code fence (a line whose first non-blank characters are three
-/// backticks opens or closes one), inside a `<tool_call>` the block kept.
-/// The same contexts the decode-time rule ([`crate::thinking`]) tracks: a
-/// `<tool_call>` quoted in a fence or nested in a kept call is reasoning.
-#[derive(Debug, Clone)]
-struct ReasoningScan {
-    line_start: bool,
-    lead_ticks: u8,
-    lead_done: bool,
-    in_fence: bool,
-    in_call: bool,
-    /// The last characters, to find the tags across released pieces.
-    tail: String,
-}
-
-impl Default for ReasoningScan {
-    fn default() -> Self {
-        // The prompt's `<think>\n`: the block starts at a line start.
-        Self {
-            line_start: true,
-            lead_ticks: 0,
-            lead_done: false,
-            in_fence: false,
-            in_call: false,
-            tail: String::new(),
-        }
-    }
-}
-
-impl ReasoningScan {
-    fn feed(&mut self, text: &str) {
-        for c in text.chars() {
-            self.tail.push(c);
-            if self.tail.len() > TOOL_END.len() {
-                let cut = self.tail.len() - TOOL_END.len();
-                let cut = (cut..self.tail.len())
-                    .find(|&i| self.tail.is_char_boundary(i))
-                    .unwrap_or(self.tail.len());
-                self.tail.drain(..cut);
-            }
-            if self.tail.ends_with(TOOL_END) {
-                self.in_call = false;
-            } else if self.tail.ends_with(TOOL_START) {
-                self.in_call = true;
-            }
-            if c == '\n' {
-                self.line_start = true;
-                self.lead_ticks = 0;
-                self.lead_done = false;
-                continue;
-            }
-            self.line_start = false;
-            if self.lead_done {
-                continue;
-            }
-            match c {
-                '`' => {
-                    self.lead_ticks += 1;
-                    if self.lead_ticks == 3 {
-                        self.in_fence = !self.in_fence;
-                        self.lead_done = true;
-                    }
-                }
-                ' ' | '\t' if self.lead_ticks == 0 => {}
-                _ => self.lead_done = true,
-            }
-        }
-    }
-
-    /// A `<tool_call>` arriving here ends the block.
-    fn closes_at_tool_call(&self) -> bool {
-        self.line_start && !self.in_fence && !self.in_call
-    }
 }
 
 impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
@@ -163,7 +90,7 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
             tool_calls_emitted: 0,
             reasoning_tokens: 0,
             tool_call_ends_thinking: config.tool_call_ends_thinking,
-            reasoning_scan: ReasoningScan::default(),
+            reasoning_scan: ReasoningScan::new(),
         }
     }
 
@@ -178,7 +105,7 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
         let mut scanned = 0;
         for (i, _) in self.buf.match_indices(TOOL_START) {
             scan.feed(&self.buf[scanned..i]);
-            if scan.closes_at_tool_call() {
+            if scan.call_may_start() {
                 return Some(i);
             }
             scanned = i;

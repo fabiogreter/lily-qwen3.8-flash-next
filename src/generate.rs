@@ -92,11 +92,15 @@ pub struct ThinkingHook<'a> {
 }
 
 impl ThinkingHook<'_> {
-    /// [`ThinkingControl::decide`] on `token` as it is about to be emitted.
-    pub fn decide(&self, token: u32) -> Result<Action> {
+    /// [`ThinkingControl::decide`] on `token` as it is about to be emitted,
+    /// or [`ThinkingControl::decide_stop`] when it is a stop token (`stop`).
+    pub fn decide(&self, token: u32, stop: bool) -> Result<Action> {
         // Once the block is closed nothing acts: no decode per token.
         if !self.control.borrow().is_open() {
             return Ok(Action::Keep);
+        }
+        if stop {
+            return Ok(self.control.borrow_mut().decide_stop());
         }
         let text = self.tokenizer.decode(&[token], false)?;
         Ok(self.control.borrow_mut().decide(token, &text))
@@ -139,8 +143,9 @@ pub fn push_group(
 
 /// Emits `drawn`, a draw the thinking control acted on (`action` is not
 /// [`Action::Keep`]), with what the control inserts: the close and then the
-/// draw ([`Action::Before`]), or the draw and then the close
-/// ([`Action::After`]). Returns why the generation ends, if it does.
+/// draw ([`Action::Before`]), the draw and then the close
+/// ([`Action::After`]), or the close alone, the draw (a stop token) dropped
+/// ([`Action::Replace`]). Returns why the generation ends, if it does.
 pub fn emit_acted(
     action: Action,
     drawn: u32,
@@ -154,6 +159,7 @@ pub fn emit_acted(
             group.push(drawn);
             push_group(tokens, &group, max_tokens, on_token)
         }
+        Action::Replace(group) => push_group(tokens, &group, max_tokens, on_token),
         Action::After(group) => {
             tokens.push(drawn);
             let stop = !on_token(drawn)?;
@@ -273,13 +279,15 @@ pub fn speculate<M: LanguageModel>(
 /// realises, not their distribution.
 ///
 /// With a thinking control, every confirmed row's token is put to it before
-/// it is emitted. Where the control acts at row `j`, the step ends there as
-/// a generation would (the state keeps the rows before `j`, and row `j`'s
-/// token stays the unfed last one when the insertion follows it), the
-/// inserted tokens are emitted and fed ([`feed_inserted`]), and the head
-/// proposes afresh from the last of them, as after a checkpoint. A sampled
-/// `<tool_call>` the control closes thinking in front of is thus fed after
-/// the close, never before it.
+/// it is emitted, a stop token too. Where the control acts at row `j`, the
+/// step ends there as a generation would (the state keeps the rows before
+/// `j`, and row `j`'s token stays the unfed last one when the insertion
+/// follows it), the inserted tokens are emitted and fed ([`feed_inserted`]),
+/// and the head proposes afresh from the last of them, as after a
+/// checkpoint. A sampled `<tool_call>` the control closes thinking in front
+/// of is thus fed after the close, never before it, and a stop token it
+/// replaces (even one inside the accepted run) is never fed: the run ends
+/// at its row.
 #[allow(clippy::too_many_arguments)]
 fn speculate_checkpointed<M: LanguageModel>(
     ctx: &MetalContext,
@@ -340,13 +348,18 @@ fn speculate_checkpointed<M: LanguageModel>(
         let callbacks_began = std::time::Instant::now();
         for (j, &token) in sampled.iter().enumerate() {
             let action = match thinking {
-                Some(hook) if !is_stop(token) => hook.decide(token)?,
-                _ => Action::Keep,
+                Some(hook) => hook.decide(token, is_stop(token))?,
+                None => Action::Keep,
             };
-            if let Action::Before(mut close) = action {
+            let instead = match &action {
                 // The state keeps the rows before this one; the token is
                 // emitted, and fed, after the close.
-                close.push(token);
+                Action::Before(close) => Some([close.as_slice(), &[token]].concat()),
+                // The stop token is dropped: neither emitted nor fed.
+                Action::Replace(close) => Some(close.clone()),
+                Action::Keep | Action::After(_) => None,
+            };
+            if let Some(close) = instead {
                 group = Some(close);
                 kept = j;
                 break;
@@ -580,8 +593,8 @@ impl Generator {
         let mut tokens = Vec::with_capacity(options.max_tokens.min(4096));
         let (mut drafted, mut accepted) = (0usize, 0usize);
         let action = match self.thinking_hook(options) {
-            Some(hook) if !self.is_stop(first, options) => hook.decide(first)?,
-            _ => Action::Keep,
+            Some(hook) => hook.decide(first, self.is_stop(first, options))?,
+            None => Action::Keep,
         };
         let end = if action == Action::Keep {
             tokens.push(first);
@@ -596,7 +609,8 @@ impl Generator {
             }
         } else {
             // Thinking ends at the prefill's draw (a tool call right after
-            // the generation prompt's `<think>\n`, or a budget of 1).
+            // the generation prompt's `<think>\n`, a budget of 1, or a stop
+            // token replaced).
             let end =
                 emit_acted(action, first, &mut tokens, options.max_tokens, on_token)?;
             feed_inserted(
@@ -760,10 +774,13 @@ impl Generator {
     ///
     /// Likewise when the thinking control may act on the current step's
     /// draw ([`ThinkingHook::may_act_next`]): a step committed behind it
-    /// would feed the draw before anything the control inserts. When the
-    /// control acts, the loop emits the draw and the inserted tokens and
-    /// returns [`LoopExit::Inserted`] with nothing in flight, for the caller
-    /// to feed them and come back.
+    /// would feed the draw before anything the control inserts, or feed a
+    /// stop token the control replaces. That is every step inside the
+    /// reasoning block with a budget, and every line start there with only
+    /// tool calls ending thinking. When the control acts, the loop emits
+    /// the draw and the inserted tokens (the inserted tokens alone in place
+    /// of a stop token) and returns [`LoopExit::Inserted`] with nothing in
+    /// flight, for the caller to feed them and come back.
     #[allow(clippy::too_many_arguments)]
     fn decode_loop<M: LanguageModel>(
         &self,
@@ -902,10 +919,8 @@ impl Generator {
             }
             slot_in = 1 - slot_in;
             let drawn = read_slot(slot_in)?;
-            if let Some(hook) = thinking
-                && !is_stop(drawn)
-            {
-                let action = hook.decide(drawn)?;
+            if let Some(hook) = thinking {
+                let action = hook.decide(drawn, is_stop(drawn))?;
                 if action != Action::Keep {
                     ensure!(
                         parked.is_none() && ahead.is_none(),

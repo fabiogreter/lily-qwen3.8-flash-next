@@ -423,6 +423,7 @@ fn thinking_tokens(generator: &Generator) -> Result<Arc<ThinkingTokens>> {
         id("</tool_call>")?,
         &ThinkingTexts::default(),
         |s| t.encode(s),
+        |id| t.is_added(id),
     )?))
 }
 
@@ -440,6 +441,32 @@ fn controlled_run(
     thinking: Option<&RefCell<ThinkingControl>>,
     every: usize,
 ) -> Result<(Vec<u32>, lily::qwen4exp::DecodeState, FinishReason)> {
+    controlled_run_stopping(
+        ctx,
+        model,
+        generator,
+        prompt,
+        drafts,
+        max_tokens,
+        thinking,
+        every,
+        &[],
+    )
+}
+
+/// [`controlled_run`] with `stops` as the request's own stop tokens.
+#[allow(clippy::too_many_arguments)]
+fn controlled_run_stopping(
+    ctx: &MetalContext,
+    model: &Qwen4ExpModel,
+    generator: &Generator,
+    prompt: &[u32],
+    drafts: usize,
+    max_tokens: usize,
+    thinking: Option<&RefCell<ThinkingControl>>,
+    every: usize,
+    stops: &[u32],
+) -> Result<(Vec<u32>, lily::qwen4exp::DecodeState, FinishReason)> {
     use lily::generate::DecodeCheckpointer;
     use lily::qwen4exp::DecodeState;
     use lily::serve::session::DecodeCheckpoints;
@@ -455,7 +482,7 @@ fn controlled_run(
     let options = GenerateOptions {
         max_tokens,
         sampling: &greedy,
-        stop_tokens: &[],
+        stop_tokens: stops,
         drafts,
         thinking,
     };
@@ -664,6 +691,21 @@ fn replay(
     settings: ThinkingSettings,
     stream: &[u32],
 ) -> Result<(ThinkingControl, Vec<std::ops::Range<usize>>)> {
+    replay_with(generator, tokens, settings, stream, None)
+}
+
+/// [`replay`] of a run whose control replaced a stop token after
+/// `ended_turn` thinking tokens (a dropped stop token leaves no trace in
+/// the stream to find it by): there the replayed control is given a stop
+/// token too, and its close must follow; the span is the close but its
+/// last token.
+fn replay_with(
+    generator: &Generator,
+    tokens: &Arc<ThinkingTokens>,
+    settings: ThinkingSettings,
+    stream: &[u32],
+    ended_turn: Option<usize>,
+) -> Result<(ThinkingControl, Vec<std::ops::Range<usize>>)> {
     let mut spans = Vec::new();
     let t = generator.tokenizer();
     let mut close_tag = vec![tokens.think_end];
@@ -673,6 +715,20 @@ fn replay(
     let mut i = 0;
     while i < stream.len() {
         let rest = &stream[i..];
+        if control.is_open() && ended_turn == Some(control.thinking_tokens()) {
+            let Action::Replace(group) = control.decide_stop() else {
+                anyhow::bail!("at {i}: the control does not replace a stop token");
+            };
+            let n = group.len().min(rest.len());
+            anyhow::ensure!(
+                rest[..n] == group[..n],
+                "at {i}: {:?} in place of the stop token, the control asks for {group:?}",
+                &rest[..n]
+            );
+            spans.push(i..i + n.min(group.len() - 1));
+            i += n;
+            continue;
+        }
         if control.is_open()
             && rest.starts_with(&close_tag)
             && rest.get(close_tag.len()) == Some(&tokens.tool_call)
@@ -699,9 +755,9 @@ fn replay(
                 spans.push(i..i + n);
                 i += 1 + n;
             }
-            Action::Before(group) => {
+            Action::Before(group) | Action::Replace(group) => {
                 anyhow::bail!(
-                    "at {i}: the control asks for {group:?} before {}",
+                    "at {i}: the control asks for {group:?} around {}",
                     rest[0]
                 )
             }
@@ -1086,6 +1142,115 @@ fn thinking_controls_divergence_report() -> Result<()> {
                     base[d], g[d]
                 ),
             }
+        }
+    }
+    Ok(())
+}
+
+/// A stop token drawn inside the block with a budget is replaced, in every
+/// loop: not emitted, not fed, the close alone in its place, and the
+/// generation goes on. Forced by making a token the model draws early in
+/// its reasoning one of the request's stop tokens. The plain loop's state
+/// is bit for bit the replica's (the close fed as a prefill where the loop
+/// rests for it, the stop token never); the speculative loop, one draft or
+/// two, with checkpoints or without, gives one stream and one state.
+#[test]
+#[ignore = "requires LILY_MODEL_DIR_FLASH"]
+fn an_end_of_turn_inside_the_block_is_replaced_by_the_close_in_every_loop() -> Result<()>
+{
+    use lily::thinking::{Closed, ClosedBy};
+    let ctx = MetalContext::new()?;
+    let (model, generator) = load_with_head(&ctx)?;
+    let tokens = thinking_tokens(&generator)?;
+    let prompt = thinking_prompt(&generator)?;
+    let n = prompt.len();
+    // The first token from the fifth on that the free run draws for the
+    // first time there: the forced end of turn.
+    let (free, _, _) =
+        controlled_run(&ctx, &model, &generator, &prompt, 0, 40, None, 0)?;
+    let k = (4..free.len())
+        .find(|&k| !free[..k].contains(&free[k]) && free[k] != tokens.think_end)
+        .context("no fresh token in the free run")?;
+    let stop = free[k];
+    let settings = ThinkingSettings {
+        budget: Some(10_000),
+        grace: 2,
+        ..ThinkingSettings::default()
+    };
+    let run = |drafts: usize, every: usize| {
+        let control =
+            RefCell::new(ThinkingControl::new(tokens.clone(), settings, true));
+        let (g, state, finish) = controlled_run_stopping(
+            &ctx,
+            &model,
+            &generator,
+            &prompt,
+            drafts,
+            72,
+            Some(&control),
+            every,
+            &[stop],
+        )?;
+        let closed = control.borrow().closed();
+        anyhow::Ok((g, state, finish, closed))
+    };
+
+    let (plain, mut state, finish, closed) = run(0, 0)?;
+    assert_eq!(
+        closed,
+        Some(Closed { by: ClosedBy::EndOfTurn, thinking_tokens: k }),
+        "the stop token at {k} was not replaced"
+    );
+    assert_eq!(plain[..k], free[..k], "the same draws up to the stop token");
+    let (_, spans) = replay_with(&generator, &tokens, settings, &plain, Some(k))?;
+    assert_eq!(spans.first().map(|s| s.start), Some(k), "the close at the stop token");
+    assert!(plain.len() > k + spans[0].len() + 1, "the generation went on");
+    eprintln!(
+        "stop token {stop} at {k}: {:?} then {:?}, finish {finish:?}",
+        generator.tokenizer().decode(&plain[k..k + spans[0].len() + 1], false)?,
+        generator.tokenizer().decode(&plain[k + spans[0].len() + 1..], false)?,
+    );
+    let mut copy = replica(&ctx, &model, &prompt, &plain, &spans)?;
+    if state.pos() == copy.pos() + 1 {
+        // A parked step fed the final stop token (after the block closed).
+        decode_fed(&ctx, &model, &mut copy, &plain[plain.len() - 1..])?;
+    }
+    assert_eq!(copy.pos(), state.pos());
+    assert!(state.pos() == n + plain.len() - 1 || state.pos() == n + plain.len());
+    let gaps = gaps_against(&ctx, &model, &generator, &plain, &mut state, &mut copy)?;
+    assert!(gaps.iter().all(|&g| g == 0.0), "plain vs the replica: {gaps:?}");
+
+    for group in [&[(0usize, 8usize)][..], &[(2, 0), (1, 0), (2, 8)][..]] {
+        let (first, mut first_state, _, first_closed) = run(group[0].0, group[0].1)?;
+        // Speculation may part from plain decoding on a near-tie before the
+        // stop token (see the test above): then it need not draw it.
+        match first_closed {
+            Some(c) => assert_eq!(c.by, ClosedBy::EndOfTurn),
+            None => eprintln!(
+                "drafts={}: the stop token was not drawn inside the block",
+                group[0].0
+            ),
+        }
+        let ended = first_closed.map(|c| c.thinking_tokens);
+        replay_with(&generator, &tokens, settings, &first, ended)?;
+        if group[0].0 == 0 {
+            assert_eq!(first, plain, "checkpoints change no token");
+        }
+        for &(drafts, every) in &group[1..] {
+            let what = format!("drafts={drafts} checkpoints every {every}");
+            let (other, mut other_state, _, other_closed) = run(drafts, every)?;
+            assert_eq!(other, first, "{what}: the stream");
+            assert_eq!(other_closed, first_closed, "{what}: the control");
+            let gaps = gaps_against(
+                &ctx,
+                &model,
+                &generator,
+                &first,
+                &mut first_state,
+                &mut other_state,
+            )?;
+            assert!(gaps.iter().all(|&g| g == 0.0), "{what}: the state: {gaps:?}");
+            first_state = run(group[0].0, group[0].1)?.1;
         }
     }
     Ok(())

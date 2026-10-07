@@ -1914,9 +1914,14 @@ fn thinking_tokens(
     ) else {
         return Ok(None);
     };
-    ThinkingTokens::new(think_end, tool_call, tool_call_end, texts, |text| {
-        tokenizer.encode(text)
-    })
+    ThinkingTokens::new(
+        think_end,
+        tool_call,
+        tool_call_end,
+        texts,
+        |text| tokenizer.encode(text),
+        |id| tokenizer.is_added(id),
+    )
     .map(Some)
     .context("the thinking controls' texts")
 }

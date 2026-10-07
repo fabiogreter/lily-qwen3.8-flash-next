@@ -3,7 +3,7 @@
 //! The model sometimes reasons for many thousands of tokens without closing
 //! its `<think>` block, and sometimes writes a tool call inside the block
 //! and ends the turn there, so the client receives nothing but reasoning.
-//! Three controls, all off unless a request (or the server's defaults) asks
+//! Four controls, all off unless a request (or the server's defaults) asks
 //! for them, act on the token stream while it is drawn:
 //!
 //! - **A tool call ends thinking** (`tool_call_ends_thinking`): a
@@ -25,34 +25,79 @@
 //!   and lets the model answer from what it has.
 //! - **Nudges** (`thinking_nudges`, with a budget): at fractions of the
 //!   budget (by default 50 %, 75 % and 90 %), a sentence of increasingly
-//!   firm wording is inserted into the reasoning on a paragraph of its own,
-//!   and the model goes on thinking. Each level has a few variants, picked
-//!   by the request's seed, so an agent's history does not repeat one phrase
+//!   firm wording is inserted into the reasoning on a line of its own, and
+//!   the model goes on thinking. Each level has a few variants, picked by
+//!   the request's seed, so an agent's history does not repeat one phrase
 //!   turn after turn; a template that keeps old reasoning
 //!   (`preserve_thinking`) keeps these texts in the history.
+//! - **An end of turn inside the block is replaced** (with a budget): a stop
+//!   token (`<|im_end|>`, EOS) drawn while the block is open would end the
+//!   turn with nothing but reasoning, which an agent sees as a stalled turn.
+//!   It is not emitted or fed; `\n</think>\n\n` alone is inserted instead
+//!   (no preface: the model has decided it is done thinking) and the decode
+//!   goes on, so the model writes its tool call or answer. Once per request:
+//!   the block is closed then, and a stop token after it ends the turn as
+//!   usual. A client's stop *string* is the output parser's business and is
+//!   left alone.
 //!
 //! Insertions never land inside a code fence or a tool call. A nudge lands
 //! only at a line end, within the grace window after its threshold; a level
 //! that finds none is dropped. The budget's close waits for a line end in
 //! the grace window, also takes a sentence end in a second window, and lands
-//! anywhere after both, but still not inside a fence or a tool call: it
-//! waits for those to end, bounded only by `max_tokens` (a fence the model
-//! never closes means no close). A `<tool_call>` inside a fence (an example
-//! the reasoning quotes) or inside a tool call the block kept does not end
-//! the block either. Every inserted text is untested as a prompt: the
-//! wording is configurable (`--thinking-texts`).
+//! anywhere after both (but not right after a space or tab mid-line, see
+//! below), still not inside a fence or a tool call: it waits for those to
+//! end, bounded only by `max_tokens` (a fence the model never closes means
+//! no close). A `<tool_call>` inside a fence (an example the reasoning
+//! quotes), or anywhere but at the start of a line, is reasoning text: it
+//! neither ends the block nor counts as a tool call the block kept. Every
+//! inserted text is untested as a prompt: the wording is configurable
+//! (`--thinking-texts`).
+//!
+//! Fences follow CommonMark ([`ReasoningScan`]): a line of at least three
+//! backticks or tildes, indented by at most three spaces, opens one (a
+//! backtick fence's info string has no backtick), and only a line of the
+//! same character, at least as long, with nothing after it but whitespace,
+//! closes it. A block indented by four spaces is code to CommonMark too,
+//! but not to these rules: an insertion or a `<tool_call>` line there is
+//! taken as reasoning outside a fence. The control and the output parser
+//! read the reasoning with the same [`ReasoningScan`], so they agree on
+//! every `<tool_call>`.
+//!
+//! **Seams.** An agent's next turn re-renders the reasoning as text, and
+//! the session cache reuses the state only as far as that re-encoding
+//! matches the tokens the state was fed. So every insertion is made of the
+//! ids the whole text encodes to, given the model's token in front of it:
+//! at a line start the text follows directly (no blank line: a second `\n`
+//! after the model's `\n` would encode as one `\n\n` token); mid-line after
+//! a letter, mark or digit it follows a paragraph break; mid-line after
+//! anything else (punctuation, a symbol) a space comes before the break,
+//! since the tokenizer's pre-split takes a punctuation run together with
+//! the line ends after it, while a space starts a piece of its own after
+//! any character. Mid-line right after a space or tab no seam is clean
+//! (whitespace and the line ends after it are one piece): the budget's close
+//! waits one more token there; a replaced end of turn cannot wait and takes
+//! the break. Each text ends in a line end (a nudge in `\n\n`, the close in
+//! `\n</think>\n\n`), which the model's next token, starting with anything
+//! but another line end, does not merge with. The pieces are encoded once
+//! per server; the tokenizer test checks the seams against the whole-text
+//! encoding.
 //!
 //! [`ThinkingControl`] is the state machine: it sees every token the
-//! generation emits, in order, with its text, and answers with an
-//! [`Action`]. It is pure host logic; the decode loops (`generate.rs`, the
-//! batch scheduler) feed the tokens it asks for into the state exactly like
-//! drawn ones, so the state, the session's token list and the client all
-//! see one sequence. A loop that pipelines its steps cannot insert a token
-//! in front of or right after one an already committed step feeds, so it
-//! asks [`ThinkingControl::may_act_next`] before it commits a step ahead and
-//! decodes unpipelined while that says yes (a line start with tool calls
-//! ending thinking, the windows around a nudge or the budget): rare steps,
-//! so the pipelining is kept nearly everywhere.
+//! generation emits, in order, with its text, and every stop token drawn,
+//! and answers with an [`Action`]. It is pure host logic; the decode loops
+//! (`generate.rs`, the batch scheduler) feed the tokens it asks for into
+//! the state exactly like drawn ones, so the state, the session's token
+//! list and the client all see one sequence. A loop that pipelines its
+//! steps cannot insert a token in front of or right after one an already
+//! committed step feeds, nor take back a stop token it fed, so it asks
+//! [`ThinkingControl::may_act_next`] before it commits a step ahead and
+//! decodes unpipelined while that says yes. That is not rare: with a budget
+//! it says yes at every token inside the block (a stop token can come at
+//! any of them), and with only `tool_call_ends_thinking` at every line
+//! start inside the block. The plain loop then decodes unpipelined there,
+//! and the batch scheduler parks no step while such a row is in its block;
+//! the speculative loop, which rests between verify passes anyway, is not
+//! affected. Outside the block, and without the controls, nothing changes.
 
 use std::sync::Arc;
 
@@ -134,22 +179,41 @@ impl ThinkingTexts {
     }
 }
 
-/// An inserted text encoded for the three places it can land: after a
-/// token whose text ends a paragraph (`\n\n`), a line (`\n`), or in the
-/// middle of a line. Each puts the text on a paragraph of its own.
+/// Tokens the controls insert at one place, with their text (which the
+/// control reads back like the model's: the output parser reads it too).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Insert {
+    ids: Vec<u32>,
+    text: String,
+}
+
+/// What the emitted text ends with where an insertion lands, which decides
+/// how the inserted text starts (see the module docs, "Seams").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seam {
+    /// A line end (one or more).
+    LineStart,
+    /// Mid-line after a letter, mark or digit.
+    Word,
+    /// Mid-line after any other character but whitespace.
+    Symbol,
+}
+
+/// An inserted text encoded for each [`Seam`]; each puts the text on a line
+/// of its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Placed {
-    after_paragraph: Vec<u32>,
-    after_line: Vec<u32>,
-    mid_line: Vec<u32>,
+    line_start: Insert,
+    word: Insert,
+    symbol: Insert,
 }
 
 impl Placed {
-    fn at(&self, trailing_newlines: usize) -> Vec<u32> {
-        match trailing_newlines {
-            0 => self.mid_line.clone(),
-            1 => self.after_line.clone(),
-            _ => self.after_paragraph.clone(),
+    fn at(&self, seam: Seam) -> &Insert {
+        match seam {
+            Seam::LineStart => &self.line_start,
+            Seam::Word => &self.word,
+            Seam::Symbol => &self.symbol,
         }
     }
 }
@@ -165,62 +229,68 @@ pub struct ThinkingTokens {
     close_tag: Vec<u32>,
     /// The budget's close variants: preface, line end, `</think>\n\n`.
     closes: Vec<Placed>,
+    /// The close without a preface, in place of an end of turn.
+    bare_close: Placed,
     /// The nudge levels (fraction of the budget, variants), ascending.
     nudges: Vec<(f64, Vec<Placed>)>,
 }
 
 impl ThinkingTokens {
     /// The sequences for `texts`, with `encode` the tokenizer's plain
-    /// encoding (it matches `</think>` as its token). The pieces are encoded
-    /// separately from the text before them, so the ids at the seam can
-    /// differ from what encoding the whole text would give (a later turn
-    /// that re-renders the reasoning may then fork the session cache a few
-    /// tokens early); the state is fed exactly these ids either way.
+    /// encoding (it matches `</think>` as its token) and `is_added` whether
+    /// an id is one of the vocabulary's added tokens (special or not). Each
+    /// piece is encoded on its own, and the pieces start and end where the
+    /// whole text's encoding has a boundary too (see the module docs,
+    /// "Seams"). A text whose encoding holds an added token (`</think>`, a
+    /// tool call tag, `<|im_end|>`, ...) is refused: inserted, it would
+    /// close the block, open a call or end the turn behind the loops' back.
     pub fn new(
         think_end: u32,
         tool_call: u32,
         tool_call_end: u32,
         texts: &ThinkingTexts,
         encode: impl Fn(&str) -> Result<Vec<u32>>,
+        is_added: impl Fn(u32) -> bool,
     ) -> Result<Self> {
         let paragraph = encode("\n\n")?;
         ensure!(!paragraph.is_empty(), "\"\\n\\n\" encodes to nothing");
         let mut close_tag = vec![think_end];
         close_tag.extend_from_slice(&paragraph);
+        let close_text = "</think>\n\n";
         let markers = [think_end, tool_call, tool_call_end];
-        // `text` on a paragraph of its own after each kind of place, then
-        // `tail`; an empty text is just a line end before the tail.
-        let place = |text: &str, end: &str, tail: &[u32]| -> Result<Placed> {
+        // `text` on a line of its own after each kind of seam, then `end`
+        // and `tail` (ids and text); an empty text is just a line end where
+        // one is needed.
+        let place = |text: &str, end: &str, tail: (&[u32], &str)| -> Result<Placed> {
             let text = text.trim();
-            let with = |sep: &str| -> Result<Vec<u32>> {
+            let with = |lead: &str, empty: &str| -> Result<Insert> {
                 let s = if text.is_empty() {
-                    if sep.is_empty() { String::new() } else { "\n".to_owned() }
+                    empty.to_owned()
                 } else {
-                    format!("{sep}{text}{end}")
+                    format!("{lead}{text}{end}")
                 };
                 let mut ids = if s.is_empty() { Vec::new() } else { encode(&s)? };
                 ensure!(
-                    !ids.iter().any(|id| markers.contains(id)),
-                    "the thinking text {text:?} spells </think> or a tool call tag"
+                    !ids.iter().any(|&id| is_added(id) || markers.contains(&id)),
+                    "the thinking text {text:?} encodes a special or added token \
+                     (such as </think>, a tool call tag or <|im_end|>)"
                 );
-                ids.extend_from_slice(tail);
+                ids.extend_from_slice(tail.0);
                 ensure!(!ids.is_empty(), "an inserted text encodes to nothing");
-                Ok(ids)
+                Ok(Insert { ids, text: s + tail.1 })
             };
             Ok(Placed {
-                after_paragraph: with("")?,
-                after_line: with("\n")?,
-                mid_line: with("\n\n")?,
+                line_start: with("", "")?,
+                word: with("\n\n", "\n")?,
+                symbol: with(" \n\n", " \n")?,
             })
         };
-        let mut closes = texts
+        let closes = texts
             .close
             .iter()
-            .map(|t| place(t, "\n", &close_tag))
+            .map(|t| place(t, "\n", (&close_tag, close_text)))
             .collect::<Result<Vec<_>>>()?;
-        if closes.is_empty() {
-            closes.push(place("", "\n", &close_tag)?);
-        }
+        let bare_close = place("", "\n", (&close_tag, close_text))?;
         let mut nudges = Vec::with_capacity(texts.nudges.len());
         let mut previous = 0.0;
         for level in &texts.nudges {
@@ -234,7 +304,7 @@ impl ThinkingTokens {
                 .texts
                 .iter()
                 .filter(|t| !t.trim().is_empty())
-                .map(|t| place(t, "\n\n", &[]))
+                .map(|t| place(t, "\n\n", (&[], "")))
                 .collect::<Result<Vec<_>>>()?;
             ensure!(
                 !variants.is_empty(),
@@ -243,19 +313,28 @@ impl ThinkingTokens {
             );
             nudges.push((level.at, variants));
         }
-        Ok(Self { think_end, tool_call, tool_call_end, close_tag, closes, nudges })
+        Ok(Self {
+            think_end,
+            tool_call,
+            tool_call_end,
+            close_tag,
+            closes,
+            bare_close,
+            nudges,
+        })
     }
 }
 
 /// What a request asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ThinkingSettings {
-    /// The model's tokens in the block before it is closed.
+    /// The model's tokens in the block before it is closed. Also turns on
+    /// the replacement of an end of turn inside the block.
     pub budget: Option<usize>,
     /// The waiting windows' length (see the module docs): a nudge's one
     /// window, the close's two. 0 closes right at the budget (outside a
-    /// fence or a tool call) and lets a nudge land only on the threshold's
-    /// own token.
+    /// fence or a tool call, and not right after a space mid-line) and lets
+    /// a nudge land only on the threshold's own token.
     pub grace: usize,
     /// Nudges before the budget (only with a budget).
     pub nudges: bool,
@@ -275,12 +354,16 @@ impl ThinkingSettings {
 /// What to do with a token the generation is about to emit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// Emit it as drawn.
+    /// Emit it as drawn (a stop token: end the generation as usual).
     Keep,
     /// Emit these tokens first, then it (a tool call that ends thinking).
     Before(Vec<u32>),
     /// Emit it, then these tokens (a nudge, or the budget's close).
     After(Vec<u32>),
+    /// Drop it (a stop token, never emitted or fed) and emit these tokens
+    /// instead (the close in place of an end of turn); the generation goes
+    /// on.
+    Replace(Vec<u32>),
 }
 
 /// Which control closed the block.
@@ -288,10 +371,13 @@ pub enum Action {
 pub enum ClosedBy {
     ToolCall,
     Budget,
+    /// A stop token drawn inside the block, replaced by the close.
+    EndOfTurn,
 }
 
-/// A close the control inserted: by what, after how many of the model's
-/// thinking tokens.
+/// A close the control asked for: by what, after how many of the model's
+/// thinking tokens. The loops may still cut it short at `max_tokens`
+/// ([`ThinkingControl::close_emitted`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Closed {
     pub by: ClosedBy,
@@ -322,18 +408,9 @@ pub struct ThinkingControl {
     /// The next nudge level to insert.
     level: usize,
     nudged: usize,
-    /// `\n` characters the emitted text ends with (the prompt's `<think>\n`
-    /// counts: the first token starts a line).
-    trailing_newlines: usize,
-    /// The last character that is not whitespace ends a sentence.
-    sentence_end: bool,
-    /// Backticks at the start of the current line (indentation skipped),
-    /// until something else arrives there.
-    lead_ticks: u8,
-    lead_done: bool,
-    in_fence: bool,
-    /// Between a `<tool_call>` the block kept and its `</tool_call>`.
-    in_tool_call: bool,
+    /// Lines, fences and tool calls of the block's text so far, inserted
+    /// nudges included.
+    scan: ReasoningScan,
     closed: Option<Closed>,
 }
 
@@ -353,12 +430,7 @@ impl ThinkingControl {
             counted: 0,
             level: 0,
             nudged: 0,
-            trailing_newlines: 1,
-            sentence_end: false,
-            lead_ticks: 0,
-            lead_done: false,
-            in_fence: false,
-            in_tool_call: false,
+            scan: ReasoningScan::new(),
             closed: None,
         }
     }
@@ -368,9 +440,19 @@ impl ThinkingControl {
         self.open
     }
 
-    /// The close this control inserted, if any.
+    /// The close this control asked for, if any.
     pub fn closed(&self) -> Option<Closed> {
         self.closed
+    }
+
+    /// Whether the close this control asked for made it into `generated`
+    /// (the generation's emitted tokens): `max_tokens` can cut an inserted
+    /// group short, or leave no room for it at all. False without a close.
+    pub fn close_emitted(&self, generated: &[u32]) -> bool {
+        // The block was open until the close, so the model drew no
+        // `</think>` before it; a generation cut short ends inside the
+        // group, so none after it either.
+        self.closed.is_some() && generated.contains(&self.tokens.think_end)
     }
 
     /// Nudges inserted so far.
@@ -393,35 +475,44 @@ impl ThinkingControl {
         Some(((at * budget as f64).ceil() as usize).max(1))
     }
 
-    /// Whether [`Self::decide`] may answer anything but [`Action::Keep`] for
-    /// the next token: a step that draws it must not have a following step
-    /// committed behind it, since that step would feed the token before
-    /// anything inserted in front of or after it. True at a line start
-    /// inside the block when tool calls end thinking, and from the token
-    /// that reaches a nudge's or the budget's threshold until it landed.
+    /// Whether [`Self::decide`] or [`Self::decide_stop`] may answer
+    /// anything but [`Action::Keep`] for the next draw: a step that draws
+    /// it must not have a following step committed behind it, since that
+    /// step would feed the draw before anything inserted in front of or
+    /// after it, or feed a stop token that is to be replaced. With a budget
+    /// that is every draw inside the block (a stop token can come at any);
+    /// with only tool calls ending thinking, every line start inside it.
     pub fn may_act_next(&self) -> bool {
-        let next = self.counted + 1;
-        self.open
-            && (self.tool_call_would_close()
-                || self.settings.budget.is_some_and(|b| next >= b)
-                || self.nudge_at(self.level).is_some_and(|at| next >= at))
+        self.open && (self.settings.budget.is_some() || self.tool_call_would_close())
     }
 
     /// Whether a `<tool_call>` emitted next would end the block: the rule
-    /// is on, it starts a line, and it is neither inside a code fence (an
-    /// example the reasoning quotes) nor inside a tool call the block kept
-    /// (a nested marker).
+    /// is on and a call may start here ([`ReasoningScan::call_may_start`]).
     fn tool_call_would_close(&self) -> bool {
-        self.settings.tool_call_ends_thinking
-            && self.trailing_newlines > 0
-            && !self.in_fence
-            && !self.in_tool_call
+        self.settings.tool_call_ends_thinking && self.scan.call_may_start()
     }
 
-    /// Takes the next token the generation emits (never a stop token) and
-    /// its text (the token decoded alone, special tokens spelled out), and
-    /// says what to do. Tokens it asks to insert are emitted without being
-    /// passed back through here.
+    /// Where an insertion lands if it lands now, or `None` mid-line right
+    /// after whitespace, where no seam is clean (see the module docs).
+    fn seam(&self) -> Option<Seam> {
+        if self.scan.trailing_newlines() > 0 {
+            return Some(Seam::LineStart);
+        }
+        match self.scan.last_char() {
+            None => Some(Seam::LineStart),
+            Some(c) if c.is_whitespace() => None,
+            // `is_alphanumeric` is within the letters, marks and digits the
+            // pre-split keeps apart from line ends; anything it misses
+            // takes the space, which is clean after any character.
+            Some(c) if c.is_alphanumeric() => Some(Seam::Word),
+            Some(_) => Some(Seam::Symbol),
+        }
+    }
+
+    /// Takes the next token the generation emits (never a stop token: see
+    /// [`Self::decide_stop`]) and its text (the token decoded alone, special
+    /// tokens spelled out), and says what to do. Tokens it asks to insert
+    /// are emitted without being passed back through here.
     pub fn decide(&mut self, token: u32, text: &str) -> Action {
         if !self.open {
             return Action::Keep;
@@ -439,12 +530,7 @@ impl ThinkingControl {
             return Action::Before(tokens.close_tag.clone());
         }
         self.counted += 1;
-        if token == tokens.tool_call {
-            self.in_tool_call = true;
-        } else if token == tokens.tool_call_end {
-            self.in_tool_call = false;
-        }
-        self.observe_text(text);
+        self.scan.feed(text);
         let Some(budget) = self.settings.budget else {
             return Action::Keep;
         };
@@ -456,14 +542,20 @@ impl ThinkingControl {
             // A close is never dropped, and never lands inside a code fence
             // or a tool call: it waits for them to end, bounded only by
             // `max_tokens` (a fence the model never closes gets no close).
-            if self.close_place(self.counted - budget) {
+            if let Some(seam) = self.close_seam(self.counted - budget) {
                 self.open = false;
                 self.closed = Some(Closed {
                     by: ClosedBy::Budget,
                     thinking_tokens: self.counted,
                 });
-                let variant = &tokens.closes[pick(0, tokens.closes.len())];
-                return Action::After(variant.at(self.trailing_newlines));
+                let ids = match tokens.closes.len() {
+                    0 => &tokens.bare_close,
+                    n => &tokens.closes[pick(0, n)],
+                }
+                .at(seam)
+                .ids
+                .clone();
+                return Action::After(ids);
             }
             return Action::Keep;
         }
@@ -479,33 +571,58 @@ impl ThinkingControl {
             }
             Place::Here => {
                 let (_, variants) = &tokens.nudges[self.level];
-                let variant = &variants[pick(self.level, variants.len())];
-                let ids = variant.at(self.trailing_newlines);
+                let insert =
+                    variants[pick(self.level, variants.len())].at(Seam::LineStart);
                 self.level += 1;
                 self.nudged += 1;
-                // The text ends a paragraph: the model goes on at a line
-                // start, outside any fence (a nudge never lands in one).
-                self.trailing_newlines = 2;
-                self.sentence_end = false;
-                self.lead_ticks = 0;
-                self.lead_done = false;
-                Action::After(ids)
+                // The text is read like the model's: it ends a paragraph,
+                // and the model goes on at a line start.
+                self.scan.feed(&insert.text);
+                Action::After(insert.ids.clone())
             }
         }
     }
 
-    /// Whether the budget's close, `over` tokens past the budget, lands
-    /// after the token just observed: at a line end in the first grace
-    /// window, also at a sentence end in the second, anywhere after both;
-    /// never inside a tool call or a code fence, however long.
-    fn close_place(&self, over: usize) -> bool {
-        let grace = self.settings.grace;
-        if self.in_tool_call || self.in_fence {
-            return false;
+    /// Takes a stop token the generation drew, before it ends the
+    /// generation: with a budget, inside the block, [`Action::Replace`]
+    /// with the close (`\n</think>\n\n` placed by the seam rules, no
+    /// preface), and the block is closed; otherwise [`Action::Keep`]. So it
+    /// replaces at most one per generation.
+    // TODO(thinking): the replaced draw stays in the sampler's penalty
+    // counts (with penalties on), which makes a later end of turn slightly
+    // less likely. Undoing it needs an engine call that reaches the row's
+    // counts slot (engine scratch or batch slot) in all three loops; left
+    // until it can be tested on the GPU.
+    pub fn decide_stop(&mut self) -> Action {
+        if !self.open || self.settings.budget.is_none() {
+            return Action::Keep;
         }
-        over >= 2 * grace
-            || self.trailing_newlines > 0
-            || (over >= grace && self.sentence_end)
+        self.open = false;
+        self.closed =
+            Some(Closed { by: ClosedBy::EndOfTurn, thinking_tokens: self.counted });
+        // The model is done thinking: the close comes now, inside a fence
+        // or a tool call too, and right after whitespace with the break
+        // (no clean seam there).
+        let seam = self.seam().unwrap_or(Seam::Word);
+        Action::Replace(self.tokens.bare_close.at(seam).ids.clone())
+    }
+
+    /// Where the budget's close, `over` tokens past the budget, lands after
+    /// the token just observed: at a line end in the first grace window,
+    /// also at a sentence end in the second, anywhere after both; never
+    /// inside a tool call or a code fence, however long, nor mid-line right
+    /// after whitespace.
+    fn close_seam(&self, over: usize) -> Option<Seam> {
+        if self.scan.in_call() || self.scan.in_fence() {
+            return None;
+        }
+        let seam = self.seam()?;
+        let grace = self.settings.grace;
+        let sentence_end = matches!(self.scan.last_char(), Some('.' | '!' | '?'));
+        (over >= 2 * grace
+            || seam == Seam::LineStart
+            || (over >= grace && sentence_end))
+            .then_some(seam)
     }
 
     /// Where a nudge `over` tokens past its threshold goes: only at a line
@@ -515,9 +632,9 @@ impl ThinkingControl {
     fn nudge_place(&self, over: usize) -> Place {
         let grace = self.settings.grace;
         if over <= grace
-            && self.trailing_newlines > 0
-            && !self.in_fence
-            && !self.in_tool_call
+            && self.scan.trailing_newlines() > 0
+            && !self.scan.in_fence()
+            && !self.scan.in_call()
         {
             Place::Here
         } else if over >= self.settings.grace {
@@ -526,36 +643,197 @@ impl ThinkingControl {
             Place::Wait
         }
     }
+}
 
-    /// Line ends, sentence ends and code fences: a line whose first
-    /// non-blank characters are three backticks opens or closes a fence.
-    fn observe_text(&mut self, text: &str) {
-        for c in text.chars() {
-            if c == '\n' {
-                self.trailing_newlines += 1;
-                self.lead_ticks = 0;
-                self.lead_done = false;
-                continue;
+const TOOL_START: &str = "<tool_call>";
+const TOOL_END: &str = "</tool_call>";
+
+/// An open code fence, or a line's run that may be one: its character and
+/// length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Fence {
+    ch: char,
+    len: usize,
+}
+
+/// What the current line starts with, for the fence rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lead {
+    /// Spaces only so far (at most three).
+    Indent(u8),
+    /// A run of backticks or tildes, nothing after it yet.
+    Run(Fence),
+    /// Something after a run of three or more: only whitespace so far
+    /// (`blank`), a backtick among it (`tick`).
+    After { run: Fence, blank: bool, tick: bool },
+    /// Not a fence line.
+    Text,
+}
+
+impl Lead {
+    fn next(self, c: char) -> Self {
+        match self {
+            Lead::Indent(n) => match c {
+                ' ' if n < 3 => Lead::Indent(n + 1),
+                '`' | '~' => Lead::Run(Fence { ch: c, len: 1 }),
+                // A fourth space or a tab: an indented code line to
+                // CommonMark, not a fence (and not tracked as code here).
+                _ => Lead::Text,
+            },
+            Lead::Run(run) if c == run.ch => {
+                Lead::Run(Fence { len: run.len + 1, ..run })
             }
-            self.trailing_newlines = 0;
-            if !c.is_whitespace() {
-                self.sentence_end = matches!(c, '.' | '!' | '?');
+            Lead::Run(run) if run.len >= 3 => {
+                Lead::After { run, blank: c.is_whitespace(), tick: c == '`' }
             }
-            if self.lead_done {
-                continue;
-            }
-            match c {
-                '`' => {
-                    self.lead_ticks += 1;
-                    if self.lead_ticks == 3 {
-                        self.in_fence = !self.in_fence;
-                        self.lead_done = true;
-                    }
-                }
-                ' ' | '\t' if self.lead_ticks == 0 => {}
-                _ => self.lead_done = true,
-            }
+            Lead::Run(_) | Lead::Text => Lead::Text,
+            Lead::After { run, blank, tick } => Lead::After {
+                run,
+                blank: blank && c.is_whitespace(),
+                tick: tick || c == '`',
+            },
         }
+    }
+
+    /// The fence this line opens, if it ends here.
+    fn opens(self) -> Option<Fence> {
+        match self {
+            Lead::Run(run) if run.len >= 3 => Some(run),
+            Lead::After { run, tick, .. } if !(run.ch == '`' && tick) => Some(run),
+            _ => None,
+        }
+    }
+
+    /// Whether this line closes `open`, if it ends here.
+    fn closes(self, open: Fence) -> bool {
+        match self {
+            Lead::Run(run) | Lead::After { run, blank: true, .. } => {
+                run.ch == open.ch && run.len >= open.len
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Where a reasoning text stands, character by character: line ends, the
+/// last character, CommonMark code fences (see the module docs), and the
+/// tool calls the block kept. A `<tool_call>` that starts a line outside a
+/// fence opens a call (until `</tool_call>`, inside which fences are not
+/// tracked: an argument may hold any text); one anywhere else is text. The
+/// thinking control and the output parser's `<tool_call>` rule
+/// (`serve::stream`) both read the reasoning with it, so they agree.
+#[derive(Debug, Clone)]
+pub struct ReasoningScan {
+    /// `\n` characters the text ends with.
+    trailing_newlines: usize,
+    last: Option<char>,
+    /// Characters of the current line so far.
+    line_len: usize,
+    lead: Lead,
+    fence: Option<Fence>,
+    in_call: bool,
+    /// The last characters, to find the tags across pieces.
+    tail: String,
+}
+
+impl Default for ReasoningScan {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReasoningScan {
+    /// At the start of a block: the prompt's `<think>\n` ended a line.
+    pub fn new() -> Self {
+        Self {
+            trailing_newlines: 1,
+            last: None,
+            line_len: 0,
+            lead: Lead::Indent(0),
+            fence: None,
+            in_call: false,
+            tail: String::new(),
+        }
+    }
+
+    pub fn feed(&mut self, text: &str) {
+        for c in text.chars() {
+            self.push(c);
+        }
+    }
+
+    fn push(&mut self, c: char) {
+        self.last = Some(c);
+        self.tail.push(c);
+        if self.tail.len() > TOOL_END.len() {
+            let cut = self.tail.len() - TOOL_END.len();
+            let cut = (cut..self.tail.len())
+                .find(|&i| self.tail.is_char_boundary(i))
+                .unwrap_or(self.tail.len());
+            self.tail.drain(..cut);
+        }
+        if c == '\n' {
+            self.trailing_newlines += 1;
+            if !self.in_call {
+                match self.fence {
+                    Some(open) if self.lead.closes(open) => self.fence = None,
+                    Some(_) => {}
+                    None => self.fence = self.lead.opens(),
+                }
+            }
+            self.lead = Lead::Indent(0);
+            self.line_len = 0;
+            return;
+        }
+        self.trailing_newlines = 0;
+        self.line_len += 1;
+        if self.in_call {
+            if self.tail.ends_with(TOOL_END) {
+                self.in_call = false;
+            }
+            return;
+        }
+        if self.fence.is_none()
+            && self.line_len == TOOL_START.len()
+            && self.tail.ends_with(TOOL_START)
+        {
+            self.in_call = true;
+            self.lead = Lead::Text;
+            return;
+        }
+        self.lead = self.lead.next(c);
+    }
+
+    /// `\n` characters the text ends with.
+    pub fn trailing_newlines(&self) -> usize {
+        self.trailing_newlines
+    }
+
+    /// The last character, if any.
+    pub fn last_char(&self) -> Option<char> {
+        self.last
+    }
+
+    /// Inside a tool call the block kept.
+    pub fn in_call(&self) -> bool {
+        self.in_call
+    }
+
+    /// Whether text inserted here, starting with a line end, would be
+    /// inside a code fence: an open fence unless the current line so far
+    /// would close it, or no fence but the current line so far would open
+    /// one.
+    pub fn in_fence(&self) -> bool {
+        match self.fence {
+            Some(open) => !self.lead.closes(open),
+            None => !self.in_call && self.lead.opens().is_some(),
+        }
+    }
+
+    /// Whether a `<tool_call>` arriving here is a call: at the start of a
+    /// line, outside a code fence and outside a call the block kept.
+    pub fn call_may_start(&self) -> bool {
+        self.trailing_newlines > 0 && self.fence.is_none() && !self.in_call
     }
 }
 

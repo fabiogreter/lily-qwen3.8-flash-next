@@ -756,3 +756,33 @@ fn a_shutdown_ends_the_response_with_a_503_or_an_error_event() {
         ]
     );
 }
+
+/// The log group says how the block ended, and that a close `max_tokens`
+/// cut short did not close it.
+#[test]
+fn the_thinking_group_is_truthful_about_the_close() {
+    let outcome = |closed_by, close_cut, nudges| ThinkingOutcome {
+        closed_by,
+        close_cut,
+        thinking_tokens: 120,
+        nudges,
+    };
+    assert_eq!(outcome(None, false, 0).describe(), "");
+    assert_eq!(outcome(None, false, 2).describe(), ", thinking 120 tokens, 2 nudges");
+    assert_eq!(
+        outcome(Some(ClosedBy::Budget), false, 1).describe(),
+        ", thinking closed by the budget after 120 tokens, 1 nudge"
+    );
+    assert_eq!(
+        outcome(Some(ClosedBy::ToolCall), false, 0).describe(),
+        ", thinking closed by a tool call after 120 tokens"
+    );
+    assert_eq!(
+        outcome(Some(ClosedBy::EndOfTurn), false, 0).describe(),
+        ", thinking closed by a replaced end of turn after 120 tokens"
+    );
+    assert_eq!(
+        outcome(Some(ClosedBy::Budget), true, 0).describe(),
+        ", thinking 120 tokens, its close by the budget cut short by max_tokens"
+    );
+}

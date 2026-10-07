@@ -302,16 +302,21 @@ pub(super) fn answer_line(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ThinkingOutcome {
     pub(super) closed_by: Option<ClosedBy>,
+    /// `max_tokens` cut the close short (or left no room for it): the
+    /// block was not closed after all.
+    pub(super) close_cut: bool,
     /// The model's tokens in the reasoning block (up to the close).
     pub(super) thinking_tokens: usize,
     pub(super) nudges: usize,
 }
 
 impl ThinkingOutcome {
-    pub(super) fn of(control: &ThinkingControl) -> Self {
+    /// What `control` did over `generated`, the request's emitted tokens.
+    pub(super) fn of(control: &ThinkingControl, generated: &[u32]) -> Self {
         let closed = control.closed();
         Self {
             closed_by: closed.map(|c| c.by),
+            close_cut: closed.is_some() && !control.close_emitted(generated),
             thinking_tokens: closed
                 .map_or(control.thinking_tokens(), |c| c.thinking_tokens),
             nudges: control.nudged(),
@@ -325,13 +330,19 @@ impl ThinkingOutcome {
             1 => ", 1 nudge".to_owned(),
             n => format!(", {n} nudges"),
         };
+        let by = match self.closed_by {
+            Some(ClosedBy::Budget) => "the budget",
+            Some(ClosedBy::ToolCall) => "a tool call",
+            Some(ClosedBy::EndOfTurn) => "a replaced end of turn",
+            None => "",
+        };
         match self.closed_by {
-            Some(ClosedBy::Budget) => format!(
-                ", thinking closed by the budget after {} tokens{nudges}",
+            Some(_) if self.close_cut => format!(
+                ", thinking {} tokens, its close by {by} cut short by max_tokens{nudges}",
                 self.thinking_tokens
             ),
-            Some(ClosedBy::ToolCall) => format!(
-                ", thinking closed by a tool call after {} tokens{nudges}",
+            Some(_) => format!(
+                ", thinking closed by {by} after {} tokens{nudges}",
                 self.thinking_tokens
             ),
             None if self.nudges > 0 => {
@@ -1259,7 +1270,8 @@ impl<M: LanguageModel> Engine<M> {
             cancelled_by,
             cancelled_at: None,
             batch: decoded.batch,
-            thinking: thinking.map(|t| ThinkingOutcome::of(&t.into_inner())),
+            thinking: thinking
+                .map(|t| ThinkingOutcome::of(&t.into_inner(), decoded.tokens)),
         };
         let measured = timings(
             &f,

@@ -153,8 +153,9 @@ pub(super) struct RowAhead {
     /// row's `max_tokens`-th, or the client has left.
     pub(super) ending: bool,
     /// The row's thinking control may act on the committed step's draw
-    /// (insert tokens in front of it or after it), which a parked step
-    /// feeding that draw would get ahead of.
+    /// (insert tokens in front of it or after it, or replace it if it is a
+    /// stop token), which a parked step feeding that draw would get ahead
+    /// of. With a budget that is every step of the row's reasoning block.
     pub(super) may_insert: bool,
 }
 
@@ -352,8 +353,9 @@ impl<M: LanguageModel> Row<'_, M> {
     /// `max_tokens` end it).
     ///
     /// When the row's thinking control acts on the draw, the tokens it
-    /// inserts are emitted with it, whole ([`push_group`]), and the state
-    /// is left behind them: the caller feeds them at rest
+    /// inserts are emitted with it, whole ([`push_group`]), or instead of it
+    /// for a stop token it replaces, and the state is left behind them: the
+    /// caller feeds them at rest
     /// ([`Admitted::feed_inserted`]). A stretch never has a step committed
     /// ahead of a draw the control may act on (see [`RowAhead::may_insert`]).
     fn take_draw(
@@ -364,11 +366,9 @@ impl<M: LanguageModel> Row<'_, M> {
     ) -> Result<()> {
         let stop = generator.stop_tokens().contains(&token);
         let action = match &self.req.thinking {
-            Some(control) if !stop => {
-                ThinkingHook { control, tokenizer: generator.tokenizer() }
-                    .decide(token)?
-            }
-            _ => Action::Keep,
+            Some(control) => ThinkingHook { control, tokenizer: generator.tokenizer() }
+                .decide(token, stop)?,
+            None => Action::Keep,
         };
         if action != Action::Keep {
             let Row { req: Admitted { parser, out, p, .. }, sink, generated, .. } =
