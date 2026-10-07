@@ -1553,19 +1553,30 @@ tokens are drawn: a tool call at a line start ends the block
 (`</think>\n\n` inserted in front of it, the shape the template writes
 for a reasoned call, as vLLM's Qwen3 reasoning parser reads it), a budget
 closes the block at the next line end with a short preface (llama.cpp's
-reasoning budget, Qwen's own Qwen3 recipe), and nudges insert firmer
-sentences at fractions of the budget. Nothing is inserted inside a code
-fence or a tool call the block kept, and a `<tool_call>` there (an
-example the reasoning quotes, a nested marker) does not end the block;
-the close waits for a fence to end however long it runs. The output
-parser treats a `<tool_call>` at a line start in the block (outside
-those) as its end too, as a safety net for text the decode-time rule did
-not see. None of it exists for a
-request that asks for nothing: no control is made, and the decode is the
-one without them.
+reasoning budget, Qwen's own Qwen3 recipe), nudges insert firmer
+sentences at fractions of the budget, and with a budget a stop token
+drawn inside the block (4 of 20 replayed agent turns ended that way,
+"...Let me write the code now." and then the end of turn) is replaced,
+once, by `\n</think>\n\n` alone so the model goes on to act. Nothing is
+inserted inside a code fence or a tool call the block kept, and a
+`<tool_call>` there (an example the reasoning quotes, a nested marker),
+or one mid-line, does not end the block; the close waits for a fence to
+end however long it runs. Fences follow CommonMark (the character, a run
+of three or more, up to three spaces of indentation, a closing line of
+the same character at least as long with nothing after it); a block
+indented by four spaces is not taken as code. A tool call the block kept
+starts only with a `<tool_call>` at a line start outside a fence, so a
+mention mid-line cannot latch the block into "inside a call" and switch
+the controls off for the rest of it. The output parser reads the
+reasoning with the control's own scanner (`ReasoningScan`) and treats a
+`<tool_call>` at a line start in the block (outside those) as its end
+too, as a safety net for text the decode-time rule did not see. None of
+it exists for a request that asks for nothing: no control is made, and
+the decode is the one without them.
 
 `ThinkingControl` is a host state machine that sees every emitted token
-with its text and answers keep, insert before, or insert after. Inserted
+with its text, and every stop token drawn, and answers keep, insert
+before, insert after, or (for a stop token) insert instead. Inserted
 tokens are not drawn, so they cannot ride a speculative step: where the
 control acts, the loop comes to rest as for a decode checkpoint. In the
 speculative loop the verify pass ends at the row in question (the state
@@ -1575,27 +1586,55 @@ generation), the inserted tokens are emitted and fed as a prefill without
 a draw (which also catches the draft head up), and the head proposes
 afresh from the last of them (`draft_initial`, as after the prefill). A
 sampled `<tool_call>` accepted inside the block is thus fed after the
-`</think>` inserted in front of it, never before. The plain loop and the
-batch scheduler pipeline their steps: a step committed behind the current
-one feeds the current draw before anything could be inserted next to it.
-So they ask the control before they commit ahead
-(`ThinkingControl::may_act_next`: a line start while tool calls end
-thinking, the windows around a nudge or the budget) and decode
-unpipelined there; when the control acts nothing is in flight, the
-inserted tokens are fed at rest (a batch stretch ends for that), and the
-row or loop continues. Rows that share a batched step keep decoding
+`</think>` inserted in front of it, never before, and a replaced stop
+token in an accepted run ends the run at its row, never fed. The plain
+loop and the batch scheduler pipeline their steps: a step committed
+behind the current one feeds the current draw before anything could be
+inserted next to it, and a recurrent state cannot take back a stop token
+it fed. So they ask the control before they commit ahead
+(`ThinkingControl::may_act_next`) and decode unpipelined while it says
+yes. That is not rare: with a budget it is every step inside the
+reasoning block (a stop token can be drawn at any), and with only
+`tool_call_ends_thinking` every line start there. So with a budget the
+plain loop decodes the whole block unpipelined, and the batch scheduler
+parks no step while any row is in its block; the speculative loop, which
+rests between verify passes, is unaffected, and outside the block nothing
+changes. (The throughput cost of that is still to be measured.) When the
+control acts nothing is in flight, the inserted tokens are fed at rest (a
+batch stretch ends for that), and the row or loop continues. Rows that share a batched step keep decoding
 plainly; the controls need no single-session fallback. Penalty counts
 cover draws only: inserted tokens are not counted, which a prefill
 without a draw leaves alone.
 
 The session's token list is what the state was fed, inserted tokens
 included, so the cache's bookkeeping and the next turn's prefix lookup
-see them like any generated text. Two costs remain: the inserted texts
-are encoded on their own, so a later turn that re-renders the reasoning
-can tokenize the seam differently and fork the cache a few tokens early,
-and a template that keeps old reasoning (`preserve_thinking`) keeps the
+see them like any generated text. That lookup reuses the state only as
+far as the next prompt's encoding of the text matches, and the recurrent
+state rewinds only to a decode checkpoint, so a seam that tokenizes
+differently cuts the cache back to the checkpoint before it (with
+checkpoints every 2048 tokens, often to the prompt's end). The first
+version encoded each text as `"\n" + text` after a line end, which the
+whole text encodes as one `\n\n` token: the next turn forked at the first
+nudge or close. Each text is now encoded per seam, so that, given the
+model's token in front of it, the inserted ids are the whole text's: at
+a line start directly (the text on the next line, no blank line),
+mid-line after a word after `\n\n`, after punctuation after ` \n\n` (the
+pre-split joins a punctuation run with the line ends after it; this
+vocabulary has no such merged token, but another may), and the budget's
+close waits one more token right after a space mid-line, where no seam
+is clean. Each ends in a line end the model's next token does not merge
+with. `every_insertion_matches_the_whole_texts_encoding`
+(`tests/test_tokenizer.rs`) checks every built-in text at every seam
+against the whole text's encoding, followed by what the model typically
+writes next. What remains: a replaced end of turn right after a space, a
+model token that itself ends in more line ends than the text needs, and
+a template that keeps old reasoning (`preserve_thinking`) keeps the
 nudges and prefaces in the history (their variants rotate with the
-request's seed so the same phrase is not repeated turn after turn).
+request's seed so the same phrase is not repeated turn after turn). A
+replaced stop token stays in the penalty counts (with penalties on): the
+draw was counted on the GPU and nothing uncounts it. The log line says
+when `max_tokens` cut a close short, so it never claims a close that did
+not happen.
 
 ### Continuous batching
 

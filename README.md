@@ -61,23 +61,32 @@ opencode. The differences:
 - **Thinking controls**, all off by default (experimental; the inserted
   texts are untested as prompts). Per request, at the top level or in
   `chat_template_kwargs` (which wins):
-  - `thinking_budget` (tokens; negative turns a server default off): once
-    the reasoning block holds that many of the model's tokens it is closed
-    at the next line end (after a grace window also a sentence end, after
-    a second one anywhere), never inside a code fence or a tool call (it
-    waits for them to end; a fence never closed means no close), with a
-    short preface and `</think>`.
+  - `thinking_budget` (a positive token count; negative turns a server
+    default off, 0 is refused): once the reasoning block holds that many of
+    the model's tokens it is closed at the next line end (after a grace
+    window also a sentence end, after a second one anywhere), never inside
+    a code fence or a tool call (it waits for them to end; a fence never
+    closed means no close), with a short preface and `</think>`. With a
+    budget, an end of turn the model draws inside the block (which would
+    leave the client only reasoning) is replaced, once, by `</think>` alone,
+    and the model goes on to its tool call or answer.
   - `thinking_nudges` (bool, with a budget): sentences of increasingly firm
     wording inserted into the reasoning at 50, 75 and 90 % of the budget,
     each only at a line end within the grace window (otherwise skipped).
   - `tool_call_ends_thinking` (bool, chat requests with tools): a
     `<tool_call>` at a line start inside the reasoning block, outside a
-    code fence and outside a tool call the block kept, ends it, with
-    `</think>` inserted in front of it.
+    code fence (CommonMark's rules) and outside a tool call the block kept,
+    ends it, with `</think>` inserted in front of it. One mid-line or in a
+    fence is reasoning text.
 
   Inserted tokens are fed to the model like generated ones, appear in the
   stream (the texts in `reasoning_content`) and count as completion
-  tokens. The server's defaults for chat: `--thinking-budget
+  tokens; they are the ids the whole text encodes to, so a next turn that
+  sends the text back reuses the cache through them. Inside the reasoning
+  block a budget makes a decode that would pipeline its steps rest at every
+  token (the plain loop, and batched steps, which park nothing while such
+  a row thinks); `tool_call_ends_thinking` alone does so at every line
+  start there. The server's defaults for chat: `--thinking-budget
   low=4000,medium=8000,xhigh=16000` (by the template's reasoning effort,
   `xhigh` when unset; or one number for all),
   `--thinking-budget-tool-turn-factor` (scales it after a tool result),
