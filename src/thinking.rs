@@ -656,6 +656,12 @@ struct Fence {
     len: usize,
 }
 
+/// The whitespace CommonMark allows after a closing fence (the `\r` of a
+/// `\r\n` line end included); a no-break space is not one.
+fn blank_char(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\r')
+}
+
 /// What the current line starts with, for the fence rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lead {
@@ -684,12 +690,12 @@ impl Lead {
                 Lead::Run(Fence { len: run.len + 1, ..run })
             }
             Lead::Run(run) if run.len >= 3 => {
-                Lead::After { run, blank: c.is_whitespace(), tick: c == '`' }
+                Lead::After { run, blank: blank_char(c), tick: c == '`' }
             }
             Lead::Run(_) | Lead::Text => Lead::Text,
             Lead::After { run, blank, tick } => Lead::After {
                 run,
-                blank: blank && c.is_whitespace(),
+                blank: blank && blank_char(c),
                 tick: tick || c == '`',
             },
         }

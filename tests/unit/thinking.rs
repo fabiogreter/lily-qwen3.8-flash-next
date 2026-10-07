@@ -395,8 +395,10 @@ fn fences_open_and_close_as_commonmark_has_them() {
     quoted_call_then_real_one(&["```\n"], "   `````  \n");
     // Tildes: backticks inside do not close them, nor fewer tildes.
     quoted_call_then_real_one(&["~~~ text\n", "```\n", "~~\n"], "~~~~\n");
-    // A run with an info string after it does not close.
+    // A run with an info string after it does not close, nor one with a
+    // no-break space after it (only spaces and tabs may follow a close).
     quoted_call_then_real_one(&["```\n", "```rust\n"], "```\n");
+    quoted_call_then_real_one(&["~~~\n", "~~~\u{a0}\n"], "~~~\t\r\n");
 
     let on = ThinkingSettings { tool_call_ends_thinking: true, ..Default::default() };
     // Not fences: four spaces of indentation, two backticks, a backtick
