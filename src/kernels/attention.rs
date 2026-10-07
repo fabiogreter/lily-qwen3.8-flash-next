@@ -67,10 +67,12 @@ pub const KV_Q8_GROUP: usize = 32;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum KvFormat {
     /// bf16 values, what the model computes.
-    #[default]
     Bf16,
     /// Signed bytes with one f16 scale per [`KV_Q8_GROUP`] values (q8_0):
-    /// 1.0625 bytes a value instead of 2.
+    /// 1.0625 bytes a value instead of 2. The default: the same speed, 40 %
+    /// less cache memory, a teacher-forced KL of 2e-3 to 4e-3 against bf16
+    /// (docs/architecture.md, "The 8-bit K/V cache").
+    #[default]
     Q8,
 }
 

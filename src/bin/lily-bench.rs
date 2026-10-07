@@ -43,7 +43,7 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     drafts: usize,
     /// Element format of the attention K/V caches (`bf16` or `q8`).
-    #[arg(long, default_value = "bf16")]
+    #[arg(long, default_value = "q8")]
     kv_cache: lily::kernels::attention::KvFormat,
     /// Per-kernel GPU profile: runs the transport in its profile mode (one
     /// command buffer per dispatch) and prints, per pass label, GPU ms per

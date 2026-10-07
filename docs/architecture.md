@@ -823,10 +823,12 @@ it, and parking the pass there would put the wait inside its GPU span.
 
 **Session cache budget.** By default it is the device's recommended working
 set minus what is already allocated minus the paged weights minus 8 GiB of
-headroom for other applications, floored at 8 GiB. On a 128 GB machine that
-is 115.4 - 73.0 - 32.0 - 8.6 GB, so the floor applies and the budget is
-8 GiB, which is two full 131 072-token contexts. The disk tier holds the
-rest. The server logs the derivation at load.
+headroom for other applications, floored at 5 GiB with q8 K/V caches (the
+default) and at 8 GiB with bf16. On a 128 GB machine that is 115.4 - 73.0 -
+32.0 - 8.6 GB, so the floor applies: 5 GiB of q8 caches, which hold about
+what 8 GiB of bf16 ones did (two full 131 072-token contexts). The disk tier
+holds the rest. The server logs the derivation at load. An explicit
+`--cache-bytes` below 8 GiB with `--kv-cache bf16` refuses to start.
 
 ### The 8-bit K/V cache
 
@@ -843,7 +845,8 @@ longer requests side by side (it holds a newcomer back while the sessions
 in flight plus the newcomer's estimate exceed the budget; the estimate is
 roughly `(prompt + 8 192) x bytes per token`, rounded to the capacity
 step, plus its recurrent state and checkpoints).
-bf16 is the default.
+q8 is the default; `--kv-cache bf16` keeps the model's own precision on a
+machine that holds the full model (the expert cache runs q8 only).
 
 The writers quantize the value the bf16 cache would hold (the bf16-rounded
 normed, roped K and the bf16 V), each simdgroup's 32 lanes one group. The

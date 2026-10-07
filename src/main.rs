@@ -46,21 +46,23 @@ struct Cli {
     /// e.g. `24G`. Default: what the device's recommended working set leaves
     /// after the weights, the paged n-gram table (32 GB of page cache with
     /// `--ngram-table paged`) and 8 GiB of headroom for other applications,
-    /// but at least 8 GiB; with the expert cache exactly one full session at
-    /// `--max-seq`, which its plan kept free. The log states the derivation.
+    /// but at least 5 GiB with q8 K/V caches (8 GiB with bf16); with the
+    /// expert cache exactly one full session at `--max-seq`, which its plan
+    /// kept free. The log states the derivation. With `--kv-cache bf16` a
+    /// value below 8 GiB refuses to start.
     #[arg(long)]
     cache_bytes: Option<String>,
 
-    /// Element format of the attention K/V caches: `bf16` (what the model
-    /// computes) or `q8` (int8 with one f16 scale per 32 values, llama.cpp's
-    /// q8_0): about 40 % less memory per token of context, so the session
-    /// cache holds more sessions and longer batched requests, at a small
-    /// loss of precision. Each format keeps its own disk tier directory,
+    /// Element format of the attention K/V caches: `q8` (the default: int8
+    /// with one f16 scale per 32 values, llama.cpp's q8_0, about 40 % less
+    /// memory per token of context than bf16 at the same speed and a small
+    /// loss of precision) or `bf16` (what the model computes; not with the
+    /// expert cache, which runs q8 only). Each format keeps its own disk tier directory,
     /// each with the full `--disk-cache-bytes`. The `LILY_KV_CACHE`
     /// environment variable (for tests and measurement) overrides this flag;
     /// the log's memory line states the format in effect.
-    #[arg(long, default_value = "bf16")]
-    kv_cache: lily::kernels::attention::KvFormat,
+    #[arg(long)]
+    kv_cache: Option<lily::kernels::attention::KvFormat>,
 
     /// Most sessions kept in the cache.
     #[arg(long, default_value_t = 16)]
@@ -230,9 +232,10 @@ struct Cli {
     /// Requests that decode together in one batched step when several
     /// arrive at once (continuous batching, up to 4). A request decoding
     /// alone keeps speculative decoding; requests sharing a step decode one
-    /// token each. 1 serves one request at a time.
-    #[arg(long, default_value_t = 4)]
-    max_batch: usize,
+    /// token each. 1 serves one request at a time. Default 4; the expert
+    /// cache serves one request at a time and refuses a value above 1.
+    #[arg(long)]
+    max_batch: Option<usize>,
 
     /// Default sampling overrides (the checkpoint's generation_config.json
     /// supplies the rest).

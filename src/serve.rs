@@ -56,7 +56,7 @@ use crate::engine::{
     VisionMode, VisionTower,
 };
 use crate::generate::{DecodeCheckpointer, GenerateOptions, Generator};
-use crate::kernels::attention::MAX_SEQ;
+use crate::kernels::attention::{KvFormat, MAX_SEQ};
 use crate::kernels::sample::SamplingParams;
 use crate::metal::MetalContext;
 use crate::qwen4exp::image::ImageLimits;
@@ -89,9 +89,59 @@ const TIMINGS_LOG_CAPACITY: usize = 32;
 /// and the applications that share the machine with the server (a browser,
 /// containers, an IDE), so a full cache does not push them into swap.
 const BUDGET_HEADROOM_BYTES: usize = 8 << 30;
-/// The derived budget never goes below this (two full 131k contexts of the
-/// Qwen3.8 caches), whatever the arithmetic says; `--cache-bytes` overrides.
-const BUDGET_FLOOR_BYTES: usize = 8 << 30;
+/// The derived budget never goes below this with bf16 K/V caches (two full
+/// 131k contexts of the Qwen3.8 caches), whatever the arithmetic says; an
+/// explicit `--cache-bytes` below it refuses to start with bf16.
+const BUDGET_FLOOR_BF16_BYTES: usize = 8 << 30;
+/// The same floor with q8 K/V caches: about the context the bf16 floor
+/// holds (q8 takes 18 304 bytes a token against 30 784), in 3 GiB less
+/// memory. `--cache-bytes` overrides it either way.
+const BUDGET_FLOOR_Q8_BYTES: usize = 5 << 30;
+/// Requests decoding together when `--max-batch` is not given (and the
+/// configuration batches at all).
+const DEFAULT_MAX_BATCH: usize = 4;
+
+/// The derived budget's floor for a K/V format.
+fn budget_floor(format: KvFormat) -> usize {
+    match format {
+        KvFormat::Bf16 => BUDGET_FLOOR_BF16_BYTES,
+        KvFormat::Q8 => BUDGET_FLOOR_Q8_BYTES,
+    }
+}
+
+/// What the memory options may not combine to, checked once the load has
+/// settled the K/V format and whether the expert cache engaged (the
+/// small-machine mode): an explicit value the configuration cannot honour
+/// fails the start instead of being replaced without a word.
+fn check_memory_options(
+    kv_format: KvFormat,
+    small_machine: bool,
+    cache_bytes: Option<usize>,
+    max_batch: Option<usize>,
+) -> Result<()> {
+    if small_machine {
+        ensure!(
+            kv_format == KvFormat::Q8,
+            "--kv-cache bf16: the expert cache (small-machine mode) runs q8 K/V caches only"
+        );
+        if let Some(n) = max_batch {
+            ensure!(
+                n <= 1,
+                "--max-batch {n}: the expert cache (small-machine mode) serves one request at a time"
+            );
+        }
+    }
+    if let (KvFormat::Bf16, Some(bytes)) = (kv_format, cache_bytes) {
+        ensure!(
+            bytes >= BUDGET_FLOOR_BF16_BYTES,
+            "--cache-bytes {:.1} GB with bf16 K/V caches: at least {:.1} GB (the bf16 default's floor); \
+             q8 caches (the default) take smaller budgets",
+            bytes as f64 / 1e9,
+            BUDGET_FLOOR_BF16_BYTES as f64 / 1e9
+        );
+    }
+    Ok(())
+}
 /// The write ahead keeps the evictions for a new session of at least this
 /// context free of writes (the size of the last few new sessions raises
 /// it): an agent client's new conversation or subagent starts from a
@@ -112,12 +162,13 @@ fn derive_cache_budget(
     working_set: usize,
     allocated: usize,
     paged: usize,
+    floor: usize,
 ) -> (usize, bool) {
     let derived = working_set
         .saturating_sub(allocated)
         .saturating_sub(paged)
         .saturating_sub(BUDGET_HEADROOM_BYTES);
-    (derived.max(BUDGET_FLOOR_BYTES), derived < BUDGET_FLOOR_BYTES)
+    (derived.max(floor), derived < floor)
 }
 /// How long a running request may keep going after a stop signal before it
 /// is cancelled at its next token or prefill chunk.
@@ -162,8 +213,8 @@ pub struct ServeOptions {
     pub bind: String,
     pub max_seq: usize,
     pub cache_bytes: Option<usize>,
-    /// The attention K/V caches' element format.
-    pub kv_format: crate::kernels::attention::KvFormat,
+    /// The attention K/V caches' element format (`None`: the default, q8).
+    pub kv_format: Option<KvFormat>,
     pub max_sessions: usize,
     pub ngram_storage: NgramStorage,
     pub ngram_preload: bool,
@@ -203,8 +254,9 @@ pub struct ServeOptions {
     pub queue: usize,
     /// Requests that decode together in one batched step (`--max-batch`);
     /// 1 serves one request at a time, exactly as before batching existed.
-    /// Capped by what the model supports.
-    pub max_batch: usize,
+    /// Capped by what the model supports. `None`: [`DEFAULT_MAX_BATCH`];
+    /// an explicit value above 1 refuses to start in small-machine mode.
+    pub max_batch: Option<usize>,
     pub sampling: SamplingOverrides,
     /// Seconds without a request after which the engine is unloaded (0: never).
     pub idle_unload_secs: u64,
@@ -792,25 +844,32 @@ impl<M: LanguageModel> Engine<M> {
                 session_context: Some(SessionContext {
                     max_seq: effective_max_seq(options.max_seq, 0),
                     checkpoints: CHECKPOINTS_PER_SESSION,
-                    kv_format: options.kv_format,
+                    kv_format: options.kv_format.unwrap_or_default(),
                 }),
-                kv_format: options.kv_format,
+                kv_format: options.kv_format.unwrap_or_default(),
             },
         )?;
+        check_memory_options(
+            model.kv_format(),
+            model.expert_cache_stats().is_some(),
+            options.cache_bytes,
+            options.max_batch,
+        )?;
         let drafts = options.mtp_drafts.min(model.max_drafts());
-        let max_batch = options.max_batch.clamp(1, model.max_batch_rows().max(1));
-        if options.max_batch > 1 && max_batch == 1 {
+        let requested_batch = options.max_batch.unwrap_or(DEFAULT_MAX_BATCH);
+        let max_batch = requested_batch.clamp(1, model.max_batch_rows().max(1));
+        if requested_batch > 1 && max_batch == 1 {
             eprintln!(
                 "batching: off, {} cannot batch decode steps in this configuration (the expert cache)",
                 M::MODEL_ID
             );
-        } else if options.max_batch > 1 {
+        } else if requested_batch > 1 {
             eprintln!(
                 "batching: up to {max_batch} requests decode together{}",
-                if max_batch < options.max_batch {
+                if max_batch < requested_batch {
                     format!(
                         " (--max-batch {} capped by what {} batches)",
-                        options.max_batch,
+                        requested_batch,
                         M::MODEL_ID
                     )
                 } else {
@@ -914,8 +973,9 @@ impl<M: LanguageModel> Engine<M> {
                 reserve as usize
             }
             (None, None) => {
+                let floor = budget_floor(model.kv_format());
                 let (budget, floored) =
-                    derive_cache_budget(working_set, allocated, paged);
+                    derive_cache_budget(working_set, allocated, paged, floor);
                 eprintln!(
                     "session cache budget: {:.1} GB = {:.1} GB recommended working set - {:.1} GB allocated \
                      (weights, scratch) - {:.1} GB paged weights in the page cache - {:.1} GB headroom for \
@@ -927,8 +987,9 @@ impl<M: LanguageModel> Engine<M> {
                     gb(BUDGET_HEADROOM_BYTES),
                     if floored {
                         format!(
-                            ", raised to the {:.1} GB floor",
-                            gb(BUDGET_FLOOR_BYTES)
+                            ", raised to the {:.1} GB floor of {} K/V caches",
+                            gb(floor),
+                            model.kv_format().name()
                         )
                     } else {
                         String::new()

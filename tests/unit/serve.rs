@@ -55,26 +55,59 @@ fn default_cache_budget_leaves_room_for_the_paged_table_and_other_apps() {
     const GB: usize = 1 << 30;
     // The 128 GB machine: 115.4 GB working set, 73.0 GB weights, 32.0 GB
     // paged table. The arithmetic gives 2.4 GB; the floor lifts it to 8 GiB.
+    let floor = BUDGET_FLOOR_BF16_BYTES;
     let (budget, floored) =
-        derive_cache_budget(115_400_000_000, 73_000_000_000, 32_000_000_000);
+        derive_cache_budget(115_400_000_000, 73_000_000_000, 32_000_000_000, floor);
     assert_eq!((budget, floored), (8 * GB, true));
+    // With q8 caches the floor holds about the same context in 5 GiB.
+    let (budget, floored) = derive_cache_budget(
+        115_400_000_000,
+        73_000_000_000,
+        32_000_000_000,
+        budget_floor(KvFormat::Q8),
+    );
+    assert_eq!((budget, floored), (5 * GB, true));
     // With the table resident on the GPU (`--ngram-table resident`) it is in
     // the allocated bytes instead and counts once.
-    let (budget, floored) = derive_cache_budget(115_400_000_000, 105_000_000_000, 0);
+    let (budget, floored) =
+        derive_cache_budget(115_400_000_000, 105_000_000_000, 0, floor);
     assert_eq!((budget, floored), (8 * GB, true));
     // A small model on the same machine: working set - allocated - table - headroom.
     let (budget, floored) =
-        derive_cache_budget(115_400_000_000, 8_200_000_000, 32_000_000_000);
+        derive_cache_budget(115_400_000_000, 8_200_000_000, 32_000_000_000, floor);
     assert_eq!(
         (budget, floored),
         (115_400_000_000 - 8_200_000_000 - 32_000_000_000 - 8 * GB, false)
     );
     // No paged weights at all (an in-GPU n-gram table, or none).
-    let (budget, floored) = derive_cache_budget(115_400_000_000, 20_000_000_000, 0);
+    let (budget, floored) =
+        derive_cache_budget(115_400_000_000, 20_000_000_000, 0, floor);
     assert_eq!((budget, floored), (115_400_000_000 - 20_000_000_000 - 8 * GB, false));
     // Nothing underflows when the weights alone exceed the working set.
-    assert_eq!(derive_cache_budget(10 * GB, 20 * GB, 0), (8 * GB, true));
-    assert_eq!((BUDGET_HEADROOM_BYTES, BUDGET_FLOOR_BYTES), (8 * GB, 8 * GB));
+    assert_eq!(derive_cache_budget(10 * GB, 20 * GB, 0, floor), (8 * GB, true));
+    assert_eq!((BUDGET_HEADROOM_BYTES, budget_floor(KvFormat::Bf16)), (8 * GB, 8 * GB));
+}
+
+/// An explicit option the configuration cannot honour fails the start:
+/// bf16 caches or more than one batched request under the expert cache
+/// (small-machine mode), a bf16 budget below its floor. Defaults and q8
+/// budgets of any size start.
+#[test]
+fn memory_options_the_configuration_cannot_honour_fail_the_start() {
+    const GB: usize = 1 << 30;
+    let check = check_memory_options;
+    use KvFormat::{Bf16, Q8};
+    // Small-machine mode.
+    assert!(check(Q8, true, None, None).is_ok());
+    assert!(check(Q8, true, Some(GB), Some(1)).is_ok());
+    assert!(check(Bf16, true, None, None).is_err());
+    assert!(check(Q8, true, None, Some(2)).is_err());
+    // The resident model.
+    assert!(check(Q8, false, Some(700 << 20), Some(4)).is_ok());
+    assert!(check(Bf16, false, None, Some(4)).is_ok());
+    assert!(check(Bf16, false, Some(8 * GB), None).is_ok());
+    assert!(check(Bf16, false, Some(8 * GB - 1), None).is_err());
+    assert!(check(Bf16, false, Some(2 * GB), None).is_err());
 }
 
 #[test]

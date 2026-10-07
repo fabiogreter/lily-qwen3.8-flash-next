@@ -67,7 +67,9 @@ plan keeps exactly one full session at `--max-seq` free before it sizes
 the slab, and the server's session budget is then exactly that session
 (`--cache-bytes` still overrides): its per-token caches, the recurrent
 state and three checkpoints of it, without the draft head, which the cache
-leaves unloaded. More sessions spill to the disk tier and come back from
+leaves unloaded. The K/V caches are always q8 here (`--kv-cache bf16`
+refuses to start), and requests are served one at a time (`--max-batch`
+above 1 refuses to start). More sessions spill to the disk tier and come back from
 it, synchronously: the full machine's write ahead of evictions is off here,
 since every new session evicts the one before it. Before, the budget was derived separately and fell to its 8 GiB floor
 on 64 GB, on top of the plan, which left the system about 5 GB of the 13
@@ -77,8 +79,8 @@ the plan keeps for it and for the page cache the experts stream through.
 
 | `--max-seq` | one session | slots it takes (of 16 441 at 64 GB) |
 |---:|---:|---:|
-| 131 072 (the default) | 4.2 GB | about 1 630 |
-| 262 144 | 7.9 GB | about 3 080 |
+| 131 072 (the default) | 2.7 GB (4.2 GB with bf16 caches) | about 1 050 |
+| 262 144 | 4.9 GB (7.9 GB with bf16 caches) | about 1 900 |
 
 On 64 GB, 131 072 is the sensible choice; 262 144 costs a fifth of the
 slots for a context most conversations never reach. The slot counts are

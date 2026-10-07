@@ -37,14 +37,21 @@ request at a time.
 
 ## Memory
 
-The session cache keeps recent conversations' state in GPU memory (by
-default what the working set leaves after the weights and 8 GiB of
-headroom, at least 8 GiB, `--cache-bytes`) and spills the rest to the disk
-tier (`--disk-cache-bytes`). `--kv-cache q8` stores the attention K/V caches
-in 8 bits (q8_0): 18 304 instead of 30 784 bytes per token of context, so
-the cache holds about 1.7 times as much, for a teacher-forced KL of about
-2e-3 to 4e-3 against bf16 and the same speed. bf16 is the default. See
+The session cache keeps recent conversations' state in GPU memory and
+spills the rest to the disk tier (`--disk-cache-bytes`). The attention K/V
+caches are 8-bit by default (`--kv-cache q8`, q8_0): 18 304 instead of
+30 784 bytes per token of context, for a teacher-forced KL of about 2e-3
+to 4e-3 against bf16 and the same speed. `--kv-cache bf16` keeps the
+model's precision. The budget (`--cache-bytes`) defaults to what the
+working set leaves after the weights and 8 GiB of headroom, at least 5 GiB
+with q8 and 8 GiB with bf16 (about the same context either way); with bf16
+an explicit budget below 8 GiB refuses to start. See
 [architecture.md](architecture.md), "The 8-bit K/V cache".
+
+On a machine that does not hold the model (the expert cache,
+[low-ram-experts.md](low-ram-experts.md)) the caches are q8 and requests
+are served one at a time: `--kv-cache bf16` or `--max-batch` above 1
+refuses to start there.
 
 ## Thinking
 

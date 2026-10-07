@@ -46,7 +46,7 @@ struct Cli {
     #[arg(long)]
     out: Option<PathBuf>,
     /// Element format of the attention K/V caches (`bf16` or `q8`).
-    #[arg(long, default_value = "bf16")]
+    #[arg(long, default_value = "q8")]
     kv_cache: lily::kernels::attention::KvFormat,
 }
 
