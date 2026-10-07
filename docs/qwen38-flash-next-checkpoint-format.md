@@ -86,15 +86,29 @@ The n-gram table rows are 160 wide, which is not a multiple of 64, hence
 group 32 there. Routers, gates and the small mixing projections stay at 8 bits
 because they steer the computation and cost almost nothing.
 
-Two converter flags move rows of the table to Q8 group 64 (experimental):
-`--q8-dense` the attention, GDN and shared-expert projections (in the trunk and
-in the draft head) together with `lm_head`, `--q8-embed` `embed_tokens`. The
-routed experts stay Q4 either way. On the full model `--q8-dense` adds 1.8 GB
-(107.3 GB with the draft head and the tower) and `--q8-embed` another 0.3 GB.
-A conversion records them in `lily.quantization` (below) and the loader
-expects exactly the widths recorded, so a checkpoint without the flags loads
-as before and an older binary refuses a Q8 one by name instead of misreading
-it.
+The converter's `--q8 GROUPS` (experimental) moves any subset of five groups
+of rows of the table to Q8 group 64; the routed experts stay Q4 whatever the
+choice. The size column is what the group adds to the full model (105.49 GB
+all-Q4 with the draft head and the tower), the read column what it adds to the
+weights one plain decode step reads (4.13 GB all-Q4, counting 10 of 512
+experts per layer and one embedding row):
+
+| group    | tensors                                                                 | size     | read per token |
+|----------|-------------------------------------------------------------------------|----------|----------------|
+| `attn`   | attention `q/k/v/o_proj`, trunk and draft head                          | +0.32 GB | +0.30 GB       |
+| `gdn`    | GDN `in_proj_qkv/z/a/b`, `out_proj`                                     | +1.04 GB | +1.04 GB       |
+| `shared` | shared expert `gate/up/down_proj`, trunk and draft head                 | +0.12 GB | +0.12 GB       |
+| `head`   | `lm_head` (shared by the draft head, so also +0.32 GB per draft step)   | +0.32 GB | +0.32 GB       |
+| `embed`  | `embed_tokens`                                                          | +0.32 GB | one row, ~0    |
+
+`--q8-dense` is `--q8 attn,gdn,shared,head` and `--q8-embed` is `--q8 embed`
+(both: 107.62 GB). A conversion records its groups in `lily.quantization`
+(below) and the loader expects exactly the widths recorded, so a checkpoint
+without them loads as before and an older binary refuses a Q8 one by name
+instead of misreading it. Every group is loaded tensor by tensor, so any
+subset runs on the existing kernels: each projection dispatches on its own
+width, and the fused stacks (q|k|v, the GDN `in_proj_*`, the shared gate|up)
+never span two groups.
 
 ### Expert split
 
@@ -154,12 +168,15 @@ a checkpoint outside that fails at load naming the field.
 
 `lily.quantization` carries `default` (4 / 64), `ngram_embedding` (4 / 32)
 and `q8_suffixes`, the regular expressions of the 8-bit tensors (documentation
-for other tools; lily does not evaluate them). A `--q8-dense` conversion adds
-`"q8_dense": true` and appends the dense patterns and `^lm_head\.weight$` to
-`q8_suffixes`; `--q8-embed` adds `"q8_embed": true` and
-`^model\.language_model\.embed_tokens\.weight$`. The two booleans are what the
-loader reads (`StoragePolicy`); without them a `config.json` is byte-identical
-to one written before they existed.
+for other tools; lily does not evaluate them). A `--q8` conversion appends
+each 8-bit group's patterns to `q8_suffixes` (in the order attn, gdn, shared,
+head, embed) and records the set: as `"q8_dense": true` when it holds all of
+attn, gdn, shared and head, plus `"q8_embed": true` when it holds embed,
+whenever those two flags spell the set exactly (so `--q8-dense` /
+`--q8-embed` conversions are byte-identical to the ones written before
+`--q8`); otherwise as `"q8_groups": ["attn", "head", "embed"]` (for example),
+never both. That is what the loader reads (`StoragePolicy`); without any of
+them a `config.json` is byte-identical to one written before they existed.
 
 `text_config.num_hidden_layers` and `text_config.layer_types` are rewritten to
 the kept layer count when the converter truncates (`--layers N`), so a

@@ -14,13 +14,16 @@ bit-identical to what lily's Q4/Q8 Metal kernels consume.
 `mlx` needs a Metal device even for CPU arrays, so a real conversion must run
 outside any GPU-less sandbox; `--dry-run` never imports it.
 
-`--q8-dense` stores the dense projections at Q8 group 64 instead of Q4: the
-attention `q/k/v/o_proj`, every Gated DeltaNet projection (`in_proj_qkv/z/a/b`,
-`out_proj`), the shared expert's `gate/up/down_proj` (in the trunk and in the
-draft head) and `lm_head`; `--q8-embed` does the same for `embed_tokens`. The
-routed experts stay Q4. Both record themselves in `lily.quantization` (the
-`q8_dense` / `q8_embed` flags and the extended `q8_suffixes`), which the
-loader follows; without them the output is byte-identical to before.
+`--q8 GROUPS` stores a comma-separated subset of five projection groups at Q8
+group 64 instead of Q4: `attn` (attention `q/k/v/o_proj`, trunk and draft
+head), `gdn` (every Gated DeltaNet projection, `in_proj_qkv/z/a/b` and
+`out_proj`), `shared` (the shared expert's `gate/up/down_proj`, trunk and draft
+head), `head` (`lm_head`) and `embed` (`embed_tokens`). `--q8-dense` is
+`--q8 attn,gdn,shared,head` and `--q8-embed` is `--q8 embed`; the flags
+combine. The routed experts stay Q4. The choice is recorded in
+`lily.quantization` (the `q8_dense` / `q8_embed` flags when they can spell it,
+otherwise `q8_groups`, plus the extended `q8_suffixes`), which the loader
+follows; without any of them the output is byte-identical to before.
 
 `--mtp-only` adds the multi-token-prediction draft head (the `mtp.*` tensors:
 one attention+MoE block plus its input projections and output mixer) to an
@@ -178,14 +181,6 @@ def layer_index(name: str) -> int | None:
 Q4 = Quant(4, 64)
 Q8 = Quant(8, 64)
 
-# The dense projections: Q4 by default, Q8 under `--q8-dense` (with
-# `lm_head`). Kept apart from `_Q4_SUFFIXES` so the policy can move them
-# without touching the rules of the default.
-_DENSE_SUFFIXES = (
-    r"\.self_attn\.(q|k|v|o)_proj\.weight$",
-    r"\.linear_attn\.(in_proj_qkv|in_proj_z|in_proj_a|in_proj_b|out_proj)\.weight$",
-    r"\.mlp\.shared_expert\.(gate|up|down)_proj\.weight$",
-)
 _Q4_SUFFIXES = (r"\.mlp\.experts\.down_proj$",)
 _Q8_SUFFIXES = (
     r"^mtp\.fc_(embedding|hidden)\.weight$",
@@ -217,32 +212,96 @@ EMBED_NAME = "model.language_model.embed_tokens.weight"
 LM_HEAD_NAME = "lm_head.weight"
 
 
+# The projection groups `--q8` can move from Q4 to Q8, in the order the
+# config records them, each with its tensor patterns. Kept apart from
+# `_Q4_SUFFIXES` so the policy can move them without touching the rules of
+# the default.
+Q8_GROUPS: dict[str, tuple[str, ...]] = {
+    "attn": (r"\.self_attn\.(q|k|v|o)_proj\.weight$",),
+    "gdn": (r"\.linear_attn\.(in_proj_qkv|in_proj_z|in_proj_a|in_proj_b|out_proj)\.weight$",),
+    "shared": (r"\.mlp\.shared_expert\.(gate|up|down)_proj\.weight$",),
+    "head": ("^" + re.escape(LM_HEAD_NAME) + "$",),
+    "embed": ("^" + re.escape(EMBED_NAME) + "$",),
+}
+# What the legacy flags stand for.
+DENSE_GROUPS = frozenset(("attn", "gdn", "shared", "head"))
+EMBED_GROUPS = frozenset(("embed",))
+
+
+def q8_group_of(name: str) -> str | None:
+    """The `Q8_GROUPS` group a source tensor belongs to, if any."""
+    for group, patterns in Q8_GROUPS.items():
+        if any(re.search(p, name) for p in patterns):
+            return group
+    return None
+
+
 @dataclass(frozen=True)
 class Policy:
-    """The storage choices the command line can change. The default (both
-    off) is the policy every checkpoint before `--q8-dense` was written with."""
+    """The storage choices the command line can change: which `Q8_GROUPS`
+    are 8-bit. The default (none) is the policy every checkpoint before
+    `--q8-dense` was written with."""
 
-    q8_dense: bool = False
-    q8_embed: bool = False
+    q8: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        unknown = sorted(set(self.q8) - set(Q8_GROUPS))
+        if unknown:
+            raise ValueError(f"unknown q8 group(s) {', '.join(unknown)}; known: {', '.join(Q8_GROUPS)}")
+        object.__setattr__(self, "q8", frozenset(self.q8))
+
+    @classmethod
+    def parse(cls, spec: str) -> "Policy":
+        """`attn,head,embed` (the `--q8` argument); repeats are an error."""
+        names = [n.strip() for n in spec.split(",") if n.strip()]
+        if not names:
+            raise ValueError("--q8 needs at least one group")
+        if len(set(names)) != len(names):
+            raise ValueError(f"--q8 {spec}: a group is listed twice")
+        return cls(frozenset(names))
+
+    @classmethod
+    def from_config(cls, q: dict) -> "Policy":
+        """The policy a `lily.quantization` block records (the inverse of
+        `config_block`)."""
+        if "q8_groups" in q:
+            if q.get("q8_dense") or q.get("q8_embed"):
+                raise ValueError("lily.quantization carries both q8_groups and q8_dense/q8_embed")
+            return cls(frozenset(q["q8_groups"]))
+        return cls((DENSE_GROUPS if q.get("q8_dense") else frozenset()) | (EMBED_GROUPS if q.get("q8_embed") else frozenset()))
+
+    def groups(self) -> list[str]:
+        """The 8-bit groups in `Q8_GROUPS` order."""
+        return [g for g in Q8_GROUPS if g in self.q8]
+
+    def quant_of(self, group: str) -> Quant:
+        return Q8 if group in self.q8 else Q4
 
     def q8_suffixes(self) -> list[str]:
         """The 8-bit tensor patterns as recorded in `config.json`: the fixed
-        list, then the dense projections and `lm_head` under `q8_dense`, then
-        `embed_tokens` under `q8_embed`, so the default list is unchanged."""
+        list, then each 8-bit group's patterns in `Q8_GROUPS` order, so the
+        default list is unchanged and the legacy flags' lists are what they
+        were."""
         out = list(_Q8_SUFFIXES)
-        if self.q8_dense:
-            out += [*_DENSE_SUFFIXES, "^" + re.escape(LM_HEAD_NAME) + "$"]
-        if self.q8_embed:
-            out.append("^" + re.escape(EMBED_NAME) + "$")
+        for g in self.groups():
+            out += Q8_GROUPS[g]
         return out
 
     def config_block(self) -> dict:
-        """The keys `lily.quantization` gains; empty for the default, which
-        keeps its `config.json` byte-identical to older conversions."""
-        return {
-            **({"q8_dense": True} if self.q8_dense else {}),
-            **({"q8_embed": True} if self.q8_embed else {}),
-        }
+        """The keys `lily.quantization` gains: the legacy `q8_dense` /
+        `q8_embed` flags when they spell the set exactly (so those configs are
+        byte-identical to the ones written before `--q8`), otherwise
+        `q8_groups`; empty for the default."""
+        dense, embed = self.q8 & DENSE_GROUPS, self.q8 & EMBED_GROUPS
+        if dense in (frozenset(), DENSE_GROUPS):
+            return {
+                **({"q8_dense": True} if dense else {}),
+                **({"q8_embed": True} if embed else {}),
+            }
+        return {"q8_groups": self.groups()}
+
+    def describe(self) -> str:
+        return ", q8 " + ",".join(self.groups()) if self.q8 else ""
 
 
 def plan_tensor(
@@ -262,19 +321,15 @@ def plan_tensor(
     li = layer_index(name)
     if li is not None and li >= keep_layers:
         return Plan("drop")
-    if name == EMBED_NAME:
-        return Plan("quant", Q8 if policy.q8_embed else Q4)
-    if name == LM_HEAD_NAME:
-        return Plan("quant", Q8 if policy.q8_dense else Q4)
+    group = q8_group_of(name)
+    if group is not None:
+        return Plan("quant", policy.quant_of(group))
     if name.endswith(".mlp.experts.gate_up_proj"):
         return Plan("expert_gate_up", Q4)
     if _NGRAM_SHARD.search(name):
         return Plan("quant", ngram)
     if any(name.endswith(s) for s in _PLE_CONSTS):
         return Plan("ple_const")
-    for pattern in _DENSE_SUFFIXES:
-        if re.search(pattern, name):
-            return Plan("quant", Q8 if policy.q8_dense else Q4)
     for pattern in _Q4_SUFFIXES:
         if re.search(pattern, name):
             return Plan("quant", Q4)
@@ -596,7 +651,7 @@ def write_config(
     # unpacks u32 codes into a parameter count when it finds the MLX-style
     # top-level block, and otherwise reports ~30B for this 180B model. The
     # few 8-bit tensors are counted as 4-bit, about 0.4% high (more under
-    # `--q8-dense`, whose dense projections count at half their size).
+    # `--q8`, whose 8-bit groups count at half their size).
     cfg["quantization"] = {"group_size": Q4.group_size, "bits": Q4.bits, "mode": "affine"}
     (dst / "config.json").write_text(json.dumps(cfg, indent=2))
 
@@ -635,7 +690,7 @@ def policy_of_conversion(dst: Path) -> Policy:
     """The policy an existing conversion was written with, so an appended
     part (`--mtp-only`) stores its projections the way the trunk does."""
     q = json.loads((dst / "config.json").read_text())["lily"]["quantization"]
-    return Policy(q8_dense=bool(q.get("q8_dense")), q8_embed=bool(q.get("q8_embed")))
+    return Policy.from_config(q)
 
 
 def source_revision(src: Path) -> str | None:
@@ -658,6 +713,16 @@ def print_totals(title: str, totals: Totals) -> None:
     print(f"  {'total':14s} {fmt_gb(totals.total())}   ({totals.tensors} output tensors)")
 
 
+def policy_of_args(args: argparse.Namespace) -> Policy:
+    """`--q8 GROUPS` together with its aliases `--q8-dense` and `--q8-embed`."""
+    groups: frozenset[str] = Policy.parse(args.q8).q8 if args.q8 else frozenset()
+    if args.q8_dense:
+        groups |= DENSE_GROUPS
+    if args.q8_embed:
+        groups |= EMBED_GROUPS
+    return Policy(groups)
+
+
 def convert(args: argparse.Namespace) -> None:
     src, dst = Path(args.src).expanduser(), Path(args.dst).expanduser()
     ngram = Quant(args.ngram_bits, args.ngram_group)
@@ -670,7 +735,10 @@ def convert(args: argparse.Namespace) -> None:
 
     mtp = not args.no_mtp
     vision = not args.no_vision
-    policy = Policy(q8_dense=args.q8_dense, q8_embed=args.q8_embed)
+    try:
+        policy = policy_of_args(args)
+    except ValueError as e:
+        raise SystemExit(str(e)) from e
     append_only = args.mtp_only or args.vision_only
     if args.mtp_only and args.vision_only:
         raise SystemExit("--mtp-only and --vision-only are separate append runs; pass one at a time")
@@ -687,8 +755,10 @@ def convert(args: argparse.Namespace) -> None:
         # The draft head shares the trunk's policy (its block and the shared
         # LM head must agree); the flags may restate it but not change it.
         existing = policy_of_conversion(dst)
-        if (args.q8_dense and not existing.q8_dense) or (args.q8_embed and not existing.q8_embed):
-            raise SystemExit(f"{dst} was converted with {existing}; an appended part cannot change the policy")
+        if not policy.q8 <= existing.q8:
+            raise SystemExit(
+                f"{dst} was converted with q8 groups {existing.groups() or 'none'}; an appended part cannot change the policy"
+            )
         policy = existing
         mtp = vision = True
     else:
@@ -700,8 +770,7 @@ def convert(args: argparse.Namespace) -> None:
         what = "the vision tower"
     else:
         dropped = (", no mtp" if not mtp else "") + (", no vision" if not vision else "")
-        q8 = (", q8 dense" if policy.q8_dense else "") + (", q8 embed" if policy.q8_embed else "")
-        what = f"{keep_layers} layers (ngram {ngram.bits}-bit g{ngram.group_size}{q8}{dropped})"
+        what = f"{keep_layers} layers (ngram {ngram.bits}-bit g{ngram.group_size}{policy.describe()}{dropped})"
     print_totals(f"planned output for {what}", totals)
     if args.dry_run:
         return
@@ -793,11 +862,14 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--no-vision", action="store_true", help="drop the model.visual.* vision tower (it is copied in bf16 by default)")
     parser.add_argument("--vision-only", action="store_true", help="append only the model.visual.* vision tower to an existing conversion in --dst")
     parser.add_argument(
-        "--q8-dense",
-        action="store_true",
-        help="store attention q/k/v/o, the GDN projections, the shared expert and lm_head at Q8 group 64 (default Q4)",
+        "--q8",
+        metavar="GROUPS",
+        default=None,
+        help="comma-separated groups to store at Q8 group 64 instead of Q4: "
+        "attn (attention q/k/v/o), gdn (GDN projections), shared (shared expert), head (lm_head), embed (embed_tokens)",
     )
-    parser.add_argument("--q8-embed", action="store_true", help="store embed_tokens at Q8 group 64 (default Q4)")
+    parser.add_argument("--q8-dense", action="store_true", help="alias of --q8 attn,gdn,shared,head")
+    parser.add_argument("--q8-embed", action="store_true", help="alias of --q8 embed")
     parser.add_argument("--dry-run", action="store_true", help="only print the size plan")
     convert(parser.parse_args(argv))
 

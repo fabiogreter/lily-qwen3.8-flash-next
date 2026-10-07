@@ -105,15 +105,57 @@ fn a_config_without_the_q8_flags_keeps_the_q4_storage_policy() {
 
 #[test]
 fn the_q8_flags_select_8_bit_dense_and_embedding_storage() {
+    use Q8Group::*;
     let mut v = fixture();
     v["lily"]["quantization"]["q8_dense"] = json!(true);
     let cfg = parse(&v).expect("parses");
-    assert_eq!(cfg.storage, StoragePolicy { dense_bits: 8, embed_bits: 4 });
+    assert_eq!(cfg.storage, StoragePolicy::q8(&[Attn, Gdn, Shared, Head]));
+    assert_eq!(cfg.storage.bits(Embed), 4);
     v["lily"]["quantization"]["q8_embed"] = json!(true);
     let cfg = parse(&v).expect("parses");
-    assert_eq!(cfg.storage, StoragePolicy { dense_bits: 8, embed_bits: 8 });
+    assert_eq!(cfg.storage, StoragePolicy::q8(&Q8Group::ALL));
     // The default width of the rest (the experts) is unchanged.
     assert_eq!((cfg.quantization.bits, cfg.quantization.group_size), (4, 64));
+
+    let mut v = fixture();
+    v["lily"]["quantization"]["q8_embed"] = json!(true);
+    assert_eq!(parse(&v).expect("parses").storage, StoragePolicy::q8(&[Embed]));
+}
+
+#[test]
+fn q8_groups_selects_any_subset() {
+    use Q8Group::*;
+    let mut v = fixture();
+    v["lily"]["quantization"]["q8_groups"] = json!(["attn", "head", "embed"]);
+    let s = parse(&v).expect("parses").storage;
+    assert_eq!(s, StoragePolicy::q8(&[Attn, Head, Embed]));
+    assert_eq!(s.q8_groups(), [Attn, Head, Embed]);
+    assert_eq!(
+        Q8Group::ALL.map(|g| s.bits(g)),
+        [8, 4, 4, 8, 8],
+        "attn gdn shared head embed"
+    );
+    // Order in the list does not matter; the set does.
+    v["lily"]["quantization"]["q8_groups"] = json!(["embed", "attn", "head"]);
+    assert_eq!(parse(&v).expect("parses").storage, s);
+    v["lily"]["quantization"]["q8_groups"] = json!(["gdn"]);
+    assert_eq!(parse(&v).expect("parses").storage, StoragePolicy::q8(&[Gdn]));
+}
+
+#[test]
+fn q8_groups_rejects_unknown_repeated_or_doubly_specified_groups() {
+    let mut v = fixture();
+    v["lily"]["quantization"]["q8_groups"] = json!(["attn", "experts"]);
+    assert!(error_of(&v).contains("unknown group \"experts\""), "{}", error_of(&v));
+    v["lily"]["quantization"]["q8_groups"] = json!(["head", "head"]);
+    assert!(error_of(&v).contains("twice"), "{}", error_of(&v));
+    v["lily"]["quantization"]["q8_groups"] = json!(["head"]);
+    v["lily"]["quantization"]["q8_embed"] = json!(true);
+    assert!(
+        error_of(&v).contains("both q8_groups and q8_dense/q8_embed"),
+        "{}",
+        error_of(&v)
+    );
 }
 
 #[test]

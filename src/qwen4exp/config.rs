@@ -239,32 +239,121 @@ struct QuantJson {
 struct QuantBlockJson {
     default: QuantJson,
     ngram_embedding: QuantJson,
-    /// The converter's `--q8-dense`: the dense projections and `lm_head`
-    /// are 8-bit. Absent in every checkpoint written without it.
+    /// The converter's `--q8-dense`: the `attn`, `gdn`, `shared` and `head`
+    /// groups are 8-bit. Absent in every checkpoint written without it.
     #[serde(default)]
     q8_dense: bool,
-    /// The converter's `--q8-embed`: `embed_tokens` is 8-bit.
+    /// The converter's `--q8-embed`: the `embed` group is 8-bit.
     #[serde(default)]
     q8_embed: bool,
+    /// The converter's `--q8 GROUPS` for a set the two flags above cannot
+    /// spell; a config carries either this list or the flags, never both.
+    #[serde(default)]
+    q8_groups: Option<Vec<String>>,
 }
 
-/// The storage widths a conversion may choose (`lily.quantization.q8_dense`
-/// and `q8_embed`); every other tensor's width is fixed by the format
-/// (`weights::expected_bits`). Both are 4 for a checkpoint that predates the
-/// choice, which then loads exactly as before.
+/// A set of projections a conversion may store at Q8 group 64 instead of
+/// Q4 (`lily.quantization`, the converter's `--q8`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Q8Group {
+    /// Attention `q/k/v/o_proj`, in the trunk and in the draft head.
+    Attn,
+    /// The Gated DeltaNet `in_proj_qkv/z/a/b` and `out_proj`.
+    Gdn,
+    /// The shared expert's `gate/up/down_proj`, trunk and draft head.
+    Shared,
+    /// `lm_head` (which the draft head shares).
+    Head,
+    /// `embed_tokens` (which the draft head shares).
+    Embed,
+}
+
+impl Q8Group {
+    /// Every group, in the order the converter records them.
+    pub const ALL: [Self; 5] =
+        [Self::Attn, Self::Gdn, Self::Shared, Self::Head, Self::Embed];
+    /// The groups `q8_dense` stands for.
+    pub const DENSE: [Self; 4] = [Self::Attn, Self::Gdn, Self::Shared, Self::Head];
+
+    /// The group's name in `config.json` and on the converter's command line.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Attn => "attn",
+            Self::Gdn => "gdn",
+            Self::Shared => "shared",
+            Self::Head => "head",
+            Self::Embed => "embed",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|g| g.name() == name)
+    }
+
+    const fn bit(self) -> u8 {
+        1 << self as u8
+    }
+}
+
+/// The storage widths a conversion may choose: which `Q8Group`s are 8-bit
+/// (`lily.quantization.q8_dense` / `q8_embed`, or `q8_groups`); every other
+/// tensor's width is fixed by the format (`weights::expected_bits`). Empty
+/// for a checkpoint that predates the choice, which then loads exactly as
+/// before.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StoragePolicy {
-    /// Attention `q/k/v/o_proj`, the GDN `in_proj_*` and `out_proj`, the
-    /// shared expert's `gate/up/down_proj` (trunk and draft head) and
-    /// `lm_head`.
-    pub dense_bits: usize,
-    /// `embed_tokens`.
-    pub embed_bits: usize,
+    q8: u8,
 }
 
 impl StoragePolicy {
     /// The policy of every checkpoint written before the choice existed.
-    pub const Q4: Self = Self { dense_bits: 4, embed_bits: 4 };
+    pub const Q4: Self = Self { q8: 0 };
+
+    /// The policy with exactly `groups` at 8 bits.
+    pub fn q8(groups: &[Q8Group]) -> Self {
+        Self { q8: groups.iter().fold(0, |m, g| m | g.bit()) }
+    }
+
+    /// The width `group` is stored at: 8 or 4.
+    pub fn bits(self, group: Q8Group) -> usize {
+        if self.q8 & group.bit() != 0 { 8 } else { 4 }
+    }
+
+    /// The 8-bit groups, in the converter's order.
+    pub fn q8_groups(self) -> Vec<Q8Group> {
+        Q8Group::ALL.into_iter().filter(|&g| self.bits(g) == 8).collect()
+    }
+
+    fn from_json(q: &QuantBlockJson) -> Result<Self> {
+        let Some(names) = &q.q8_groups else {
+            let mut groups = Vec::new();
+            if q.q8_dense {
+                groups.extend(Q8Group::DENSE);
+            }
+            if q.q8_embed {
+                groups.push(Q8Group::Embed);
+            }
+            return Ok(Self::q8(&groups));
+        };
+        ensure!(
+            !q.q8_dense && !q.q8_embed,
+            "lily.quantization carries both q8_groups and q8_dense/q8_embed"
+        );
+        let mut groups = Vec::with_capacity(names.len());
+        for name in names {
+            let Some(g) = Q8Group::from_name(name) else {
+                anyhow::bail!(
+                    "lily.quantization.q8_groups: unknown group {name:?} (known: attn, gdn, shared, head, embed)"
+                );
+            };
+            ensure!(
+                !groups.contains(&g),
+                "lily.quantization.q8_groups lists {name:?} twice"
+            );
+            groups.push(g);
+        }
+        Ok(Self::q8(&groups))
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -449,11 +538,7 @@ impl Qwen4ExpConfig {
             quantization.bits,
             quantization.group_size
         );
-        let width = |q8: bool| if q8 { 8 } else { 4 };
-        let storage = StoragePolicy {
-            dense_bits: width(q.q8_dense),
-            embed_bits: width(q.q8_embed),
-        };
+        let storage = StoragePolicy::from_json(q)?;
 
         let ple = match t.ple_layer_ids.as_slice() {
             [] => None,

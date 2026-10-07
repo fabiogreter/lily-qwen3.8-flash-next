@@ -21,7 +21,7 @@ use super::expert_cache::ExpertCache;
 use super::expert_store::{ExpertStore, LiveUsage, SlotPolicy, UsageRanking};
 use crate::weights::{LinearWeights, Loader, MlpWeights, MoeWeights, expect_shape};
 
-use super::config::{LayerType, Qwen4ExpConfig, StoragePolicy, VISION_PREFIX};
+use super::config::{LayerType, Q8Group, Qwen4ExpConfig, StoragePolicy, VISION_PREFIX};
 use super::ngram::{self, NgramStorage, NgramTable, PagedTable};
 use super::vision_weights::{self, VisionWeights};
 
@@ -168,13 +168,12 @@ pub struct SessionContext {
 }
 
 /// The converter's storage policy: routers, gates and the small mixing
-/// projections are always 8-bit; the dense projections (with `lm_head`) and
-/// `embed_tokens` are whatever the checkpoint's config records
-/// (`StoragePolicy`, 4-bit unless converted with `--q8-dense` /
-/// `--q8-embed`); the routed experts are 4-bit. A fused stack (q|k|v,
-/// the GDN `in_proj_*`, the shared gate|up) is one width: every base must be
-/// a dense projection, and the loader's row concatenation rejects slices of
-/// different packed widths anyway.
+/// projections are always 8-bit; the projections of each `Q8Group` are
+/// whatever the checkpoint's config records (`StoragePolicy`, 4-bit unless
+/// converted with `--q8`); the routed experts are 4-bit. A fused stack
+/// (q|k|v, the GDN `in_proj_*`, the shared gate|up) is one width: every base
+/// must be in the same group, and the loader's row concatenation rejects
+/// slices of different packed widths anyway.
 fn expected_bits(storage: StoragePolicy, bases: &[&str]) -> usize {
     let fixed_q8 = bases.len() == 1 && {
         let b = bases[0];
@@ -192,32 +191,36 @@ fn expected_bits(storage: StoragePolicy, bases: &[&str]) -> usize {
     if fixed_q8 {
         return 8;
     }
-    if bases == [format!("{PREFIX}embed_tokens").as_str()] {
-        return storage.embed_bits;
+    let first = bases.first().and_then(|b| q8_group(b));
+    match first {
+        Some(g) if bases.iter().all(|b| q8_group(b) == Some(g)) => storage.bits(g),
+        _ => 4,
     }
-    if bases.iter().all(|b| is_dense_projection(b)) {
-        return storage.dense_bits;
-    }
-    4
 }
 
-/// The projections `StoragePolicy::dense_bits` governs, by tensor base.
-fn is_dense_projection(base: &str) -> bool {
-    const SUFFIXES: &[&str] = &[
-        ".self_attn.q_proj",
-        ".self_attn.k_proj",
-        ".self_attn.v_proj",
-        ".self_attn.o_proj",
-        ".linear_attn.in_proj_qkv",
-        ".linear_attn.in_proj_z",
-        ".linear_attn.in_proj_a",
-        ".linear_attn.in_proj_b",
-        ".linear_attn.out_proj",
-        ".mlp.shared_expert.gate_proj",
-        ".mlp.shared_expert.up_proj",
-        ".mlp.shared_expert.down_proj",
+/// The `Q8Group` a tensor base belongs to, if any.
+fn q8_group(base: &str) -> Option<Q8Group> {
+    const SUFFIXES: &[(&str, Q8Group)] = &[
+        (".self_attn.q_proj", Q8Group::Attn),
+        (".self_attn.k_proj", Q8Group::Attn),
+        (".self_attn.v_proj", Q8Group::Attn),
+        (".self_attn.o_proj", Q8Group::Attn),
+        (".linear_attn.in_proj_qkv", Q8Group::Gdn),
+        (".linear_attn.in_proj_z", Q8Group::Gdn),
+        (".linear_attn.in_proj_a", Q8Group::Gdn),
+        (".linear_attn.in_proj_b", Q8Group::Gdn),
+        (".linear_attn.out_proj", Q8Group::Gdn),
+        (".mlp.shared_expert.gate_proj", Q8Group::Shared),
+        (".mlp.shared_expert.up_proj", Q8Group::Shared),
+        (".mlp.shared_expert.down_proj", Q8Group::Shared),
     ];
-    base == "lm_head" || SUFFIXES.iter().any(|s| base.ends_with(s))
+    if base == "lm_head" {
+        return Some(Q8Group::Head);
+    }
+    if base.strip_prefix(PREFIX) == Some("embed_tokens") {
+        return Some(Q8Group::Embed);
+    }
+    SUFFIXES.iter().find(|(s, _)| base.ends_with(s)).map(|&(_, g)| g)
 }
 
 fn load_mtp(loader: &Loader<'_>, config: &Qwen4ExpConfig) -> Result<MtpWeights> {

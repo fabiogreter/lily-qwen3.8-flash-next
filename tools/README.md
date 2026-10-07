@@ -16,13 +16,18 @@ Converts the raw Hugging Face BF16 checkpoint into lily's
     --src ~/models/Qwen3.8-Flash-Next \
     --dst ~/models/Qwen3.8-Flash-Next-lily-q4 \
     [--layers 4] [--dry-run] [--ngram-bits 4 --ngram-group 32] [--no-mtp] [--no-vision] \
-    [--q8-dense] [--q8-embed]
+    [--q8 attn,gdn,shared,head,embed] [--q8-dense] [--q8-embed]
 ```
 
-`--q8-dense` (experimental) stores the attention, GDN and shared-expert
-projections and `lm_head` at Q8 instead of Q4, `--q8-embed` `embed_tokens`
-(policy and sizes in `docs/qwen38-flash-next-checkpoint-format.md`). An
-appended `--mtp-only` run takes the policy the trunk was converted with.
+`--q8 GROUPS` (experimental) stores a comma-separated subset of the groups
+`attn` (attention q/k/v/o), `gdn` (GDN projections), `shared` (shared expert),
+`head` (`lm_head`) and `embed` (`embed_tokens`) at Q8 instead of Q4;
+`--q8-dense` is an alias of `attn,gdn,shared,head` and `--q8-embed` of `embed`
+(policy, sizes and per-token read cost in
+`docs/qwen38-flash-next-checkpoint-format.md`). An appended `--mtp-only` run
+takes the policy the trunk was converted with. The policy's unit tests run
+without mlx or a checkpoint:
+`.venv/bin/python tools/convert/test_convert_qwen38_flash_next.py`.
 
 `mlx` needs a Metal device even for CPU arrays, so a real conversion cannot run
 in a GPU-less sandbox; `--dry-run` never imports it. Measured on the M5 Max:

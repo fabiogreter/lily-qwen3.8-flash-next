@@ -14,55 +14,90 @@ fn plan(ram: u64, session: u64) -> Option<usize> {
 }
 
 #[test]
-fn the_storage_policy_moves_only_the_dense_projections_and_the_tables() {
+fn the_storage_policy_moves_each_group_and_nothing_else() {
+    use Q8Group::*;
     let l = "model.language_model.layers.3.";
-    let dense: Vec<String> = [
-        "self_attn.o_proj",
-        "linear_attn.in_proj_qkv",
-        "linear_attn.out_proj",
-        "mlp.shared_expert.down_proj",
-    ]
-    .iter()
-    .map(|s| format!("{l}{s}"))
-    .collect();
-    let qkv: Vec<String> = ["q_proj", "k_proj", "v_proj"]
-        .iter()
-        .map(|s| format!("{l}self_attn.{s}"))
-        .collect();
-    let qkv: Vec<&str> = qkv.iter().map(String::as_str).collect();
-    let mtp_gate_up = [
-        "mtp.layers.0.mlp.shared_expert.gate_proj",
-        "mtp.layers.0.mlp.shared_expert.up_proj",
+    let at = |s: &str| format!("{l}{s}");
+    // One base list per loader call, with the group it belongs to.
+    let calls: Vec<(Vec<String>, Q8Group)> = vec![
+        (
+            vec![
+                at("self_attn.q_proj"),
+                at("self_attn.k_proj"),
+                at("self_attn.v_proj"),
+            ],
+            Attn,
+        ),
+        (vec![at("self_attn.o_proj")], Attn),
+        (vec!["mtp.layers.0.self_attn.o_proj".into()], Attn),
+        (
+            ["in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b"]
+                .iter()
+                .map(|p| at(&format!("linear_attn.{p}")))
+                .collect(),
+            Gdn,
+        ),
+        (vec![at("linear_attn.out_proj")], Gdn),
+        (
+            vec![at("mlp.shared_expert.gate_proj"), at("mlp.shared_expert.up_proj")],
+            Shared,
+        ),
+        (vec![at("mlp.shared_expert.down_proj")], Shared),
+        (
+            vec![
+                "mtp.layers.0.mlp.shared_expert.gate_proj".into(),
+                "mtp.layers.0.mlp.shared_expert.up_proj".into(),
+            ],
+            Shared,
+        ),
+        (vec!["lm_head".into()], Head),
+        (vec!["model.language_model.embed_tokens".into()], Embed),
     ];
-    let embed = "model.language_model.embed_tokens";
     let fixed_q8 = [
-        format!("{l}mlp.gate"),
-        format!("{l}self_attn.indexer.index_qk_proj"),
+        at("mlp.gate"),
+        at("mlp.shared_expert_gate"),
+        at("self_attn.indexer.index_qk_proj"),
         "mtp.fc_hidden".to_string(),
     ];
-    let experts = format!("{l}mlp.experts.gate_proj");
-    let q8 = StoragePolicy { dense_bits: 8, embed_bits: 8 };
-    for (policy, dense_bits, embed_bits) in [
-        (StoragePolicy::Q4, 4, 4),
-        (StoragePolicy { dense_bits: 8, embed_bits: 4 }, 8, 4),
-        (q8, 8, 8),
-    ] {
-        for b in &dense {
-            assert_eq!(expected_bits(policy, &[b]), dense_bits, "{b}");
+    let experts = at("mlp.experts.gate_proj");
+    // Every subset of the five groups.
+    for mask in 0..32u32 {
+        let groups: Vec<Q8Group> = Q8Group::ALL
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| mask >> i & 1 == 1)
+            .map(|(_, g)| g)
+            .collect();
+        let policy = StoragePolicy::q8(&groups);
+        for (bases, group) in &calls {
+            let bases: Vec<&str> = bases.iter().map(String::as_str).collect();
+            let want = if groups.contains(group) { 8 } else { 4 };
+            assert_eq!(
+                expected_bits(policy, &bases),
+                want,
+                "{bases:?} under {groups:?}"
+            );
         }
-        assert_eq!(expected_bits(policy, &qkv), dense_bits, "fused qkv");
-        assert_eq!(
-            expected_bits(policy, &mtp_gate_up),
-            dense_bits,
-            "draft head gate|up"
-        );
-        assert_eq!(expected_bits(policy, &["lm_head"]), dense_bits, "lm_head");
-        assert_eq!(expected_bits(policy, &[embed]), embed_bits, "embed_tokens");
         for b in &fixed_q8 {
             assert_eq!(expected_bits(policy, &[b]), 8, "{b}");
         }
         assert_eq!(expected_bits(policy, &[&experts]), 4, "experts");
     }
+    // A stack that straddled two groups is no group's.
+    let mixed = [at("self_attn.o_proj"), at("linear_attn.out_proj")];
+    let mixed: Vec<&str> = mixed.iter().map(String::as_str).collect();
+    assert_eq!(expected_bits(StoragePolicy::q8(&Q8Group::ALL), &mixed), 4);
+}
+
+#[test]
+fn the_legacy_policies_are_the_group_sets_they_stand_for() {
+    use Q8Group::*;
+    assert_eq!(StoragePolicy::Q4, StoragePolicy::q8(&[]));
+    assert_eq!(StoragePolicy::Q4.q8_groups(), []);
+    assert_eq!(
+        StoragePolicy::q8(&Q8Group::DENSE).q8_groups(),
+        [Attn, Gdn, Shared, Head]
+    );
 }
 
 #[test]
