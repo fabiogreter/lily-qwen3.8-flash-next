@@ -145,9 +145,10 @@ then says what assumption it rests on.
 ## The numbers
 
 The README's table is the headline: fresh real prompts over HTTP at 4K to
-64K, last measured 2026-10-01 at commit `c096b75` (below, "The README
-series"): prefill 2 387 to 2 534 tok/s, decode 97 to 110 tok/s with two
-drafts and 77 to 85 without.
+64K, last measured 2026-10-07 for both checkpoints (below, "The README
+series, 2026-10-07"): prefill 2 158 to 2 373 tok/s, decode 94 to 103 tok/s
+with two drafts, 79 to 87 without on q4 and 68 to 73 on q4-xl. The
+2026-10-01 series that preceded it is kept below.
 
 The fixed `lily-bench` matrix that follows was measured 2026-09-18 at
 commit `38d2642` against the commit before that day's kernel work
@@ -250,6 +251,33 @@ bounds, and the 32K cells of the synthetic matrices were trajectory artifacts
 falling into a run of a repeated special token that the head predicts
 poorly). The kernels involved do not depend on position, and the 4-layer
 differential test of the speculative step at position 33 000 passes.
+
+### The README series, 2026-10-07 (q4 and q4-xl)
+
+Same method as the 2026-10-01 series below, `--max-seq 131072`, disk tier
+off, one server per checkpoint and draft count, run back to back in one
+afternoon rather than interleaved. Builds: q4 and q4-xl without drafts and
+q4 with drafts at `a4a23d7`; q4-xl with drafts at `6d45554` (the 4-bit draft
+path, the shipped q4-xl checkpoint); prefill rows from the 2-draft servers.
+Medians of three:
+
+| tok/s | 4K | 16K | 32K | 64K |
+|---|---:|---:|---:|---:|
+| prefill q4-xl | 2 219 | 2 370 | 2 373 | 2 180 |
+| prefill q4 | 2 158 | 2 208 | 2 240 | 2 205 |
+| decode q4-xl, 2 drafts | 100.8 | 100.6 | 93.9 | 94.1 |
+| decode q4, 2 drafts | 102.9 | 100.3 | 99.4 | 99.1 |
+| decode q4-xl, no drafts | 72.9 | 72.9 | 69.0 | 67.7 |
+| decode q4, no drafts | 86.9 | 81.8 | 84.5 | 79.0 |
+
+Acceptance 63 % (q4), 64 % (q4-xl). Two disturbances: a checkpoint
+conversion wrote to disk during the q4 run without drafts (one 32K prefill
+at 1 306 tok/s, the median moved little), and a CPU-bound build ran during
+the first repeats of the q4-xl run with drafts. The q4-xl rows without
+drafts were measured on the same trunk before the 4-bit draft path existed,
+which does not change a plain decode step. The same afternoon, back to back,
+the 4-bit draft path took q4-xl's 2-draft decode from 89.4 to 97.5 tok/s at
+4K and 91.1 to 95.6 at 32K.
 
 ### The README series, 2026-10-01 (`c096b75`)
 

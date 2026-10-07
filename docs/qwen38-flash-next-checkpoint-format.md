@@ -139,7 +139,7 @@ they follow the groups.
 
 The published q4-xl checkpoint (`Qwen3.8-Flash-Next-lily-q4-xl`, the
 converter's `--q4-xl`) is `--q8 attn,shared,head,embed --draft-q4`; the
-plain q4 checkpoint is the default policy. The README's "Two checkpoints"
+plain q4 checkpoint is the default policy. The README's "The model"
 says why both exist.
 
 ### Expert split

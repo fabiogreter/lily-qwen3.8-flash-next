@@ -24,7 +24,7 @@ does both. `status` shows launchd's state, the pid and last exit code, the
 process's memory and `/health`. Logs go to `~/Library/Logs/lily/server.log`.
 
 Environment for `install`: `LILY_MODEL` (checkpoint directory: the q4 or
-the q4-xl checkpoint, see the README's "Two checkpoints"), `LILY_BIN`,
+the q4-xl checkpoint, see the README's "The model"), `LILY_BIN`,
 `LILY_BIND`, `LILY_MAX_SEQ`, `LILY_IDLE_UNLOAD` (`0` keeps the model loaded),
 `LILY_EXTRA_ARGS` (e.g. `"--mtp-drafts 0 --reasoning-effort low"`),
 `LILY_LABEL`.

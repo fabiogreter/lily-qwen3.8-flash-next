@@ -19,7 +19,7 @@ Converts the raw Hugging Face BF16 checkpoint into lily's
     [--q4-xl] [--q8 attn,gdn,shared,head,embed] [--q8-dense] [--q8-embed] [--draft-q4]
 ```
 
-`--q4-xl` writes the q4-xl checkpoint (the README's "Two checkpoints"):
+`--q4-xl` writes the q4-xl checkpoint (the README's "The model"):
 it is `--q8 attn,shared,head,embed --draft-q4`. `--q8 GROUPS` stores a
 comma-separated subset of the groups
 `attn` (attention q/k/v/o), `gdn` (GDN projections), `shared` (shared expert),

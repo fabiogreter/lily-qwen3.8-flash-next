@@ -15,6 +15,12 @@ Against Unsloth's llama.cpp fork on the same machine and prompts, prefill is
 2.7 to 4.2 times faster and decode 2.1 to 3.6 times faster, more so at longer
 context.
 
+There are two checkpoints, both mostly 4-bit: **q4-xl**, recommended,
+keeps the dense tensors every token passes through at 8 bits and is
+noticeably more reliable on long agent turns; **q4** is faster, by a few
+percent for a request decoding alone and about 15 % for batched ones.
+[The model](#the-model) has the details.
+
 ## Running it
 
 You need an M5 or newer (Apple GPU family 10), macOS 26, the Rust toolchain
@@ -22,185 +28,64 @@ pinned by `rust-toolchain.toml`, and 128 GB of unified memory, or 64 GB with
 the expert cache (see [Smaller machines](#smaller-machines)).
 
 ```sh
+hf download fabiogreter/Qwen3.8-Flash-Next-lily-q4-xl \
+  --local-dir ~/models/Qwen3.8-Flash-Next-lily-q4-xl
+
 cargo build --release --locked
 
-./target/release/lily --model ~/models/Qwen3.8-Flash-Next-lily-q4 \
+./target/release/lily --model ~/models/Qwen3.8-Flash-Next-lily-q4-xl \
   --bind 127.0.0.1:8000 --max-seq 131072
 ```
 
-The checkpoints are on Hugging Face as
-[fabiogreter/Qwen3.8-Flash-Next-lily-q4](https://huggingface.co/fabiogreter/Qwen3.8-Flash-Next-lily-q4)
-and
-[fabiogreter/Qwen3.8-Flash-Next-lily-q4-xl](https://huggingface.co/fabiogreter/Qwen3.8-Flash-Next-lily-q4-xl);
-[Two checkpoints](#two-checkpoints) says which to take.
 The server answers `/health` with `503 loading` while the model loads and
 serves after about 25 seconds, while the n-gram table keeps loading in the
 background. `--help` lists every flag. The server can also be run as a
 launchd service, see here: [tools/service/README.md](tools/service/README.md).
 
-The API is OpenAI-compatible: `POST /v1/chat/completions` (streaming or
-not), `POST /v1/completions` and `GET /v1/models`, with tools,
-`reasoning_content` and `prompt_cache_key`. It is developed against
-opencode. The differences:
-
-- **Images** are base64 data URIs (PNG or JPEG, no count limit beyond the
-  context); the server never fetches URLs. A 1920 x 1080 screenshot costs
-  about 2 000 prompt tokens. No video.
-- **Message text is always text.** A special token spelled in a message, a
-  tool result or a tool definition (`<|im_end|>`, `<|image_pad|>`) is
-  tokenized as the characters it is, never as conversation structure or an
-  image placeholder; only the chat template's own markup is special.
-  `/v1/completions` takes its raw prompt as written, special tokens
-  included.
-- **Up to four requests decode together** (`--max-batch`, continuous
-  batching): a request that arrives while another decodes gets its prefill
-  between the other's steps instead of waiting for its answer, then the two
-  share each decode step. A request decoding alone keeps speculative
-  decoding. Prefills run one at a time; more requests queue, with 503 when
-  the queue is full. `--max-batch 1` serves one request at a time.
-- **Thinking is on by default.** `reasoning_effort` (`none`, `low`,
-  `medium`, `high`) sets it per request; `--thinking` and
-  `--reasoning-effort` set the server's default.
-- **Thinking controls**, on by default for chat requests: a thinking
-  budget of 8 000 tokens at `low` and `medium` effort and 16 000 at
-  `xhigh`, with nudges and a tool call ending thinking. On a captured
-  opencode turn where the model kept reasoning (56K tokens of context,
-  `low` effort, 30 samples each), they took the runaway reasoning blocks
-  from 16 of 30 to none and the turns that went on to a tool call from 9
-  to 18; the 16 000 at `xhigh` is not measured. Per request, at the top
-  level or in `chat_template_kwargs` (which wins):
-  - `thinking_budget` (a positive token count; negative turns a server
-    default off, 0 is refused): once the reasoning block holds that many of
-    the model's tokens it is closed at the next line end (after a grace
-    window also a sentence end, after a second one anywhere), never inside
-    a code fence or a tool call (it waits for them to end; a fence never
-    closed means no close), with a short preface and `</think>`. With a
-    budget, an end of turn the model draws inside the block (which would
-    leave the client only reasoning) is replaced, once, by `</think>` alone,
-    and the model goes on to its tool call or answer.
-  - `thinking_nudges` (bool, with a budget): sentences of increasingly firm
-    wording inserted into the reasoning at 50, 75 and 90 % of the budget,
-    each only at a line end within the grace window (otherwise skipped).
-  - `tool_call_ends_thinking` (bool, chat requests with tools): a
-    `<tool_call>` at a line start inside the reasoning block, outside a
-    code fence (CommonMark's rules) and outside a tool call the block kept,
-    ends it, with `</think>` inserted in front of it. One mid-line or in a
-    fence is reasoning text.
-
-  Inserted tokens are fed to the model like generated ones, appear in the
-  stream (the texts in `reasoning_content`) and count as completion
-  tokens; they are the ids the whole text encodes to, so a next turn that
-  sends the text back reuses the cache through them. Inside the reasoning
-  block a budget makes a decode that would pipeline its steps rest at every
-  token (the plain loop, and batched steps, which park nothing while such
-  a row thinks); `tool_call_ends_thinking` alone does so at every line
-  start there. The server's defaults for chat: `--thinking-budget
-  low=8000,medium=8000,xhigh=16000` (by the template's reasoning effort,
-  `xhigh` when unset; or one number for all, or `off`),
-  `--thinking-budget-tool-turn-factor` (scales it after a tool result),
-  `--thinking-nudges`, `--tool-call-ends-thinking`,
-  `--thinking-budget-grace` and `--thinking-texts` (a JSON file with the
-  texts). `/v1/completions` takes only the request fields, and only for a
-  prompt that ends with `<think>\n`. `--thinking-budget off`,
-  `--thinking-nudges false` and `--tool-call-ends-thinking false` turn the
-  defaults off; a request's `thinking_budget: -1` turns its budget off.
-- **Every response carries a `timings` object** with prefill and decode
-  rates, cached tokens and draft acceptance. `GET /v1/timings` keeps the
-  last 32; `tools/opencode-plugin-timings/` shows them in opencode.
-- `max_tokens` beyond the context is clamped, not refused.
+The API is OpenAI-compatible (`/v1/chat/completions`, `/v1/completions`,
+`/v1/models`, with tools and `reasoning_content`) and developed against
+opencode. Up to `--max-batch` requests (4 by default) decode together.
+Thinking is on by default, with thinking controls that keep the model from
+reasoning without end: a thinking budget (8 000 tokens at `low` and `medium`
+effort, 16 000 at `xhigh`) with nudges before it, and a tool call drawn
+inside the reasoning ends it. Every response carries a `timings` object with
+prefill and decode rates, cached tokens and draft acceptance;
+`tools/opencode-plugin-timings/` shows them in opencode. The API's details,
+batching and the thinking controls: [docs/server.md](docs/server.md).
 
 ## Performance
 
-M5 Max, 40-core GPU, 128 GB. Both engines over HTTP with the same real-text
-prompts, 256 greedy tokens, medians of three interleaved repeats. This fork
-at commit `c096b75` (2026-10-01); the llama.cpp rows are from 2026-09-17 and
-were not re-measured.
+M5 Max, 40-core GPU, 128 GB, over HTTP with real-text prompts (this
+repository's documentation and code), 256 greedy tokens of new text,
+medians of three repeats, 2026-10-07. oMLX's rows are its own published
+numbers for its oQ4e conversion on an M5 Max 128 GB, from the chart in the
+[0.7.0 release notes](https://github.com/jundot/omlx/releases/tag/v0.7.0),
+not measured by us; the chart does not state its sampling or whether its
+generation used MTP.
 
 | tokens per second | 4K context | 16K | 32K | 64K |
 |---|---:|---:|---:|---:|
-| **prefill** this fork | 2 387 | 2 534 | 2 495 | 2 335 |
-| prefill llama.cpp | 887 | 882 | 713 | 550 |
-| **decode** this fork, 2 drafts | 110 | 105 | 105 | 97 |
-| decode llama.cpp, MTP 2 drafts | 52 | 44 | 37 | 27 |
-| decode this fork, no drafts | 85 | 84 | 83 | 77 |
-| decode llama.cpp, no drafts | 39 | 31 | 25 | 17 |
+| **prefill** q4-xl | 2 219 | 2 370 | 2 373 | 2 180 |
+| prefill q4 | 2 158 | 2 208 | 2 240 | 2 205 |
+| prefill oMLX 0.7.0, published | 2 768 | 2 844 | | 2 366 |
+| **decode** q4-xl, 2 drafts | 101 | 101 | 94 | 94 |
+| decode q4, 2 drafts | 103 | 100 | 99 | 99 |
+| decode q4-xl, no drafts | 73 | 73 | 69 | 68 |
+| decode q4, no drafts | 87 | 82 | 85 | 79 |
+| generation oMLX 0.7.0, published | 93.0 | 87.1 | | 75.9 |
 
-Decode loses about a tenth from 4K to 64K, where llama.cpp loses half,
-because the sparse-attention kernels keep the cost of context to a small
-part of a step. Three drafts per step were slower than two on both
-engines. Under sustained load the GPU clock sags a few percent, which slows
-the speculative and prefill rows slightly.
+A request decoding alone uses two drafts per step from the model's own
+draft head; batched requests decode without drafts. Decode loses little from
+4K to 64K because the sparse-attention kernels keep the cost of context to a
+small part of a step.
 
-During actual use with opencode, prefill is often quite a bit slower, due to
-most turns being short, so that fixed per-request costs dominate.
-
-Decode in practice is typically faster, because the speculative decoding gets
-more hits than in the synthetic tests: usually still >100 tok/s at 220-230K
-context. One day of opencode sessions on a single project (339 requests,
-2026-09-30, server log) accepted 74 to 82% of the drafts at every context
-length, against 59 to 64% on the synthetic prompts:
-
-| context | requests | decode tok/s | drafts accepted | ms per step |
-|---|---:|---:|---:|---:|
-| 32-64K | 72 | 113 | 82% | 23.6 |
-| 64-128K | 148 | 101 | 74% | 24.8 |
-| 128-192K | 89 | 103 | 80% | 25.4 |
-| 192-270K | 29 | 106 | 80% | 24.7 |
-
-Acceptance does not grow with context; decode stays flat because a step is
-only about 5% slower at 250K than at 50K. Agent output (tool calls, paths,
-code repeated from the context) is easy for the draft head to predict. Other
-projects and tasks will accept more or fewer drafts.
-
-The quantizations for the tests differ slightly (affine 4-bit, group 64, against
-UD-IQ4_XS), and the llama.cpp MTP rows use a one-line fix the shipped build
-lacks. Method, noise and the full record: [docs/performance.md](docs/performance.md).
-
-### Smaller machines
-
-On smaller machines, lily automatically employs an expert cache that
-keeps only the most used experts in GPU memory and streams the rest from
-disk. Expert usage is tracked during runtime, so the cache adapts to your
-usage. The cached configuration then gets saved to disk and reused on the
-next run.
-
-Moving experts around between RAM and disk does of course cost time. On a
-simulated 64 GB machine, prefill was measured at about 930 tok/s, and decode
-at around 50-65 tok/s. Speculative decoding is off in this mode, as it requires
-additional expert reads and thus slows down the process. Note that in practice,
-performance may be worse, as there is additional RAM required to hold the session
-KV cache. If anyone wants to test with a real 64 GB machine, your feedback is welcome.
-Less than 64 GB is probably impractical.
-
-The cache sizes itself from physical memory; `--memory-gb 64` plans for
-64 GB instead, which is also how to try the mode on a bigger machine.
-Details: [docs/low-ram-experts.md](docs/low-ram-experts.md).
-
-### MLX engines
-
-At the time of testing, no released official mlx-lm ran this model. MLX-based
-engines with their own implementation publish M5 Max numbers:
-
-- [MTPLX](https://mtplx.com/benchmarks/) 79 tok/s at 9K and 61 at 109K with
-its speculative path (44 without)
-- [oMLX 0.7.0](https://github.com/jundot/omlx/releases/tag/v0.7.0) (released
-2026-09-30), Qwen3.8-Flash-Next oQ4e on an M5 Max 128 GB, from the chart in
-its release notes:
-
-| tokens per second | 4K context | 16K | 64K |
-|---|---:|---:|---:|
-| prefill oMLX 0.7.0, published | 2 768 | 2 844 | 2 366 |
-| prefill this fork | 2 387 | 2 534 | 2 335 |
-| generation oMLX 0.7.0, published | 93.0 | 87.1 | 75.9 |
-| decode this fork, 2 drafts | 110 | 105 | 97 |
-| decode this fork, no drafts | 85 | 84 | 77 |
-
-The oMLX rows are its own published numbers, not measured by us, with a
-different quantization (oQ4e) and sampling the chart does not state (the
-benchmarks in its pull requests used temperature 1.0; ours are greedy).
-This fork's rows are the table above, prefill with the draft head loaded as
-shipped; without it (`--mtp-drafts 0`) prefill measured 2 582 / 2 647 /
-2 448. We have not run MTPLX or oMLX ourselves.
+In actual use with opencode, prefill is often slower than this, because most
+turns are short and fixed per-request costs dominate. Decode is typically
+faster: agent output (tool calls, paths, code repeated from the context) is
+easy for the draft head to predict, so more drafts are accepted than on
+these prompts, and decode has stayed above 100 tok/s beyond 200K tokens
+of context, because a step grows only slowly with context.
+Method, noise and the full record: [docs/performance.md](docs/performance.md).
 
 ## The model
 
@@ -211,54 +96,28 @@ indexer that picks 512 blocks per query, a 512-expert MoE with 10 active, a
 four-stream gated residual, a 32 GB hashed n-gram embedding, a
 multi-token-prediction head and a vision tower.
 
-The server runs a 4-bit conversion of it (98 GiB), or the q4-xl conversion
-with its most sensitive dense tensors at 8 bits (99.6 GiB, see below), both
-made by `tools/convert/convert_qwen38_flash_next.py` from the BF16 weights,
-with the vision tower kept in bf16. The layout is documented in
+The server runs either of two conversions of it, made by
+`tools/convert/convert_qwen38_flash_next.py` from the BF16 weights with the
+vision tower kept in bf16. Both keep the routed experts and the n-gram
+tables, about 95 % of the bytes, at 4 bits:
+
+- **[q4-xl](https://huggingface.co/fabiogreter/Qwen3.8-Flash-Next-lily-q4-xl)**
+  (recommended, 106.9 GB) keeps attention, the shared expert, the LM head
+  and the embedding at 8 bits. On long agent turns the 4-bit model more
+  often announces its next step and ends the turn without making the tool
+  call; on a captured opencode turn, sampled 30 times each with the thinking
+  controls on, 23 of 30 samples went on to a tool call on q4-xl against 18
+  on q4. Of the 8-bit sets tried, the attention tensors carried the
+  difference. The draft head keeps a 4-bit path, so drafting costs what it
+  does on q4 while the trunk, which verifies every draft, decides the output.
+- **[q4](https://huggingface.co/fabiogreter/Qwen3.8-Flash-Next-lily-q4)**
+  (105.5 GB) is 4-bit apart from a small set of routing and mixing
+  tensors, and is faster when requests decode without drafts, for example
+  several at once (see [Performance](#performance)).
+
+This is one prompt, not a task-level evaluation. The layout and the 8-bit
+groups are documented in
 [docs/qwen38-flash-next-checkpoint-format.md](docs/qwen38-flash-next-checkpoint-format.md).
-
-## Two checkpoints
-
-Both checkpoints keep the routed experts and the n-gram tables, about 95 %
-of the bytes, at 4 bits; they differ in the dense tensors every token
-passes through:
-
-| | q4 | q4-xl |
-|---|---|---|
-| Hugging Face | [lily-q4](https://huggingface.co/fabiogreter/Qwen3.8-Flash-Next-lily-q4) | [lily-q4-xl](https://huggingface.co/fabiogreter/Qwen3.8-Flash-Next-lily-q4-xl) |
-| at 8 bits besides the small fixed set | nothing | attention, the shared expert, the LM head, the embedding |
-| size | 105.5 GB | 106.9 GB |
-| decode, 2 drafts, 4K / 16K / 32K / 64K | 103 / 100 / 99 / 99 tok/s | 101 / 101 / 94 / 94 tok/s |
-| decode, no drafts | 87 / 82 / 85 / 79 tok/s | 73 / 73 / 69 / 68 tok/s |
-
-**Why q4-xl exists.** On long agent turns the 4-bit model more often
-announces its next step and ends the turn without making the tool call. On
-the captured opencode turn above, with the thinking controls on, 18 of 30
-samples went on to a tool call on q4 and 23 of 30 on q4-xl, and 12 against
-7 announced and stopped; the thinking controls alone do not close that gap.
-Unsloth's llama.cpp quantization (UD-IQ4_XS) keeps the same kinds of tensors
-at 8 bits, and on that turn it, too, rarely stopped after announcing (1 of
-10 closed turns, without thinking controls). Of the variants tried, the
-attention tensors carried the difference: 8 bits on the shared expert, LM
-head and embedding alone did not help, and 8 bits on the GDN projections as
-well did not add to it. This is one prompt and 30 samples per checkpoint,
-not a task-level evaluation; quality was measured on the trunk alone, which
-the draft head's precision cannot change (below).
-
-**The speed caveat.** q4-xl reads about 18 % more weight bytes per token
-(attention in the 12 full-attention layers, the shared expert in all 48,
-the whole LM head every step).
-A request decoding alone keeps speculative decoding and loses 2 to 5 %:
-the draft head keeps its own 4-bit copy of the LM head and its block at 4
-bits (`--draft-q4`), so drafting costs what it costs on q4, and the trunk,
-which verifies every draft, keeps its 8-bit tensors, so the output is
-q4-xl's. Decoding without drafts, which batched requests do, loses about
-15 %. Prefill is unchanged. Take q4-xl for agent work and q4 when
-throughput matters more, for example with several concurrent requests.
-
-Same-day HTTP series (2026-10-07, commits `a4a23d7` and `6d45554`, method
-as under Performance, medians of three; the q4 rows without drafts were
-disturbed by a conversion writing to disk in one repeat).
 
 ## Exactness
 
@@ -331,6 +190,26 @@ recurrent-state work is specific to this architecture family. The detailed
 account is [docs/architecture.md](docs/architecture.md); what was tried,
 dropped and why is in [docs/performance.md](docs/performance.md).
 
+## Smaller machines
+
+On smaller machines, lily automatically employs an expert cache that
+keeps only the most used experts in GPU memory and streams the rest from
+disk. Expert usage is tracked during runtime, so the cache adapts to your
+usage. The cached configuration then gets saved to disk and reused on the
+next run.
+
+Moving experts around between RAM and disk does of course cost time. On a
+simulated 64 GB machine, prefill was measured at about 930 tok/s, and decode
+at around 50-65 tok/s. Speculative decoding is off in this mode, as it requires
+additional expert reads and thus slows down the process. Note that in practice,
+performance may be worse, as there is additional RAM required to hold the session
+KV cache. If anyone wants to test with a real 64 GB machine, your feedback is welcome.
+Less than 64 GB is probably impractical.
+
+The cache sizes itself from physical memory; `--memory-gb 64` plans for
+64 GB instead, which is also how to try the mode on a bigger machine.
+Details: [docs/low-ram-experts.md](docs/low-ram-experts.md).
+
 ## Converting a checkpoint
 
 The converter needs a Python environment with `mlx`, `safetensors`, `numpy`,
@@ -347,8 +226,7 @@ uv pip install --python .venv/bin/python mlx safetensors numpy torch torchvision
 
 Add `--q4-xl` for the q4-xl checkpoint (`--dst
 ~/models/Qwen3.8-Flash-Next-lily-q4-xl`). It takes about a minute on an M5
-Max. `--layers 4` writes the small
-checkpoint the tests use. [tools/README.md](tools/README.md) has the other
+Max. `--layers 4` writes the small checkpoint the tests use. [tools/README.md](tools/README.md) has the other
 flags and the reference harnesses.
 
 ## Tests
