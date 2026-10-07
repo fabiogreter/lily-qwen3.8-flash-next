@@ -13,7 +13,7 @@ memory it needs.
 
 Against Unsloth's llama.cpp fork on the same machine and prompts, prefill is
 2.7 to 4.2 times faster and decode 2.1 to 3.6 times faster, more so at longer
-context.
+context ([the comparison](docs/performance.md#against-llamacpp), 2026-09-17).
 
 There are two checkpoints, both mostly 4-bit: **q4-xl**, recommended,
 keeps the dense tensors every token passes through at 8 bits and is
