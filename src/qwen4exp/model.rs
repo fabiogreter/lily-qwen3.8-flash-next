@@ -1608,7 +1608,7 @@ impl Qwen4ExpModel {
             hasher,
             prefill_chunk,
             ngram_ahead: true,
-            kv_format: KvFormat::Bf16,
+            kv_format: kv_format_from_env()?.unwrap_or_default(),
         })
     }
 
@@ -3956,6 +3956,14 @@ pub(crate) fn session_bytes(
     Ok((live + checkpoints * snapshot) as u64)
 }
 
+/// `LILY_KV_CACHE` (`bf16` or `q8`), which overrides the K/V format of
+/// every load (`--kv-cache`, `LoadOptions::kv_format`, the inherent
+/// loaders' default): measurement and tests run either format through the
+/// same binaries.
+fn kv_format_from_env() -> Result<Option<KvFormat>> {
+    std::env::var("LILY_KV_CACHE").ok().map(|v| v.parse()).transpose()
+}
+
 /// Rounds a requested capacity up to the growth step, within the kernel limit.
 fn round_capacity(tokens: usize) -> Result<usize> {
     ensure!(tokens <= MAX_SEQ, "capacity {tokens} exceeds kernel limit {MAX_SEQ}");
@@ -4288,12 +4296,8 @@ impl LanguageModel for Qwen4ExpModel {
             .map(|gb| (gb * (1u64 << 30) as f64) as u64)
             .or(options.memory_budget);
         let expert_usage_out = options.expert_usage_out.clone();
-        // `LILY_KV_CACHE` overrides the option (the tests and probes that
-        // load with defaults, run under q8); the plan's session follows.
-        let kv_format = match std::env::var("LILY_KV_CACHE") {
-            Ok(v) => v.parse()?,
-            Err(_) => options.kv_format,
-        };
+        // The plan's session follows the format in effect.
+        let kv_format = kv_format_from_env()?.unwrap_or(options.kv_format);
         let session_context =
             options.session_context.map(|s| weights::SessionContext { kv_format, ..s });
         Qwen4ExpModel::load_with(

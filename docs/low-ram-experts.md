@@ -82,8 +82,8 @@ the plan keeps for it and for the page cache the experts stream through.
 | 131 072 (the default) | 2.7 GB (4.2 GB with bf16 caches) | about 1 050 |
 | 262 144 | 4.9 GB (7.9 GB with bf16 caches) | about 1 900 |
 
-On 64 GB, 131 072 is the sensible choice; 262 144 costs a fifth of the
-slots for a context most conversations never reach. The slot counts are
+On 64 GB, 131 072 is the sensible choice; 262 144 costs about an eighth of
+the slots for a context most conversations never reach. The slot counts are
 computed from the sizes, not measured; the load prints the real ones. The
 bench (`lily-bench`) reserves no session and plans as before, so its slot
 counts stay comparable with the measurements below.

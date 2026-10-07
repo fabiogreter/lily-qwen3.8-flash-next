@@ -37,8 +37,8 @@ struct Cli {
     /// Maximum prompt plus completion length per request. With the expert
     /// cache (a machine that cannot hold the checkpoint, or `--memory-gb`)
     /// it also sizes the session reserve the plan keeps free: one full
-    /// session, 4.2 GB at 131072 and 7.9 GB at 262144, taken from the expert
-    /// slots. 131072 is the sensible choice on 64 GB.
+    /// session with q8 K/V caches, 2.7 GB at 131072 and 4.9 GB at 262144,
+    /// taken from the expert slots. 131072 is the sensible choice on 64 GB.
     #[arg(long, default_value_t = 131072)]
     max_seq: usize,
 
@@ -347,4 +347,32 @@ fn run() -> Result<()> {
         inject_metal_fault: cli.debug_inject_metal_fault,
     };
     lily::serve::run(&cli.model, options)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lily::kernels::attention::KvFormat;
+
+    /// `--kv-cache` and `--max-batch` stay unset unless given, so the server
+    /// tells an explicit value (which may refuse to start) from the default.
+    #[test]
+    fn kv_cache_and_max_batch_are_unset_unless_given() {
+        let cli = Cli::try_parse_from(["lily", "--model", "m"]).expect("parse");
+        assert_eq!((cli.kv_cache, cli.max_batch), (None, None));
+        let cli = Cli::try_parse_from([
+            "lily",
+            "--model",
+            "m",
+            "--kv-cache",
+            "bf16",
+            "--max-batch",
+            "1",
+        ])
+        .expect("parse");
+        assert_eq!((cli.kv_cache, cli.max_batch), (Some(KvFormat::Bf16), Some(1)));
+        assert!(
+            Cli::try_parse_from(["lily", "--model", "m", "--kv-cache", "q4"]).is_err()
+        );
+    }
 }
