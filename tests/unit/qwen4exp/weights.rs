@@ -111,12 +111,16 @@ fn draft_q4_keeps_the_draft_path_4_bit_and_the_trunk_as_recorded() {
         "mtp.layers.0.mlp.shared_expert.up_proj",
     ];
     let embed = "model.language_model.embed_tokens";
-    // The q8mid set: every draft-path group 8-bit in the trunk.
-    let q8mid = StoragePolicy::q8(&[Attn, Shared, Head, Embed]);
-    let d4 = q8mid.with_draft_q4();
-    assert!(d4.draft_q4() && !q8mid.draft_q4());
-    assert_eq!(d4.q8_groups(), q8mid.q8_groups(), "the trunk's groups are unchanged");
-    for (policy, draft) in [(q8mid, 8), (d4, 4)] {
+    // The q4-xl set: every draft-path group 8-bit in the trunk.
+    let q4_xl_trunk = StoragePolicy::q8(&[Attn, Shared, Head, Embed]);
+    let d4 = q4_xl_trunk.with_draft_q4();
+    assert!(d4.draft_q4() && !q4_xl_trunk.draft_q4());
+    assert_eq!(
+        d4.q8_groups(),
+        q4_xl_trunk.q8_groups(),
+        "the trunk's groups are unchanged"
+    );
+    for (policy, draft) in [(q4_xl_trunk, 8), (d4, 4)] {
         assert_eq!(expected_bits(policy, &trunk_attn), 8);
         assert_eq!(expected_bits(policy, &[&trunk_shared]), 8);
         assert_eq!(expected_bits(policy, &["lm_head"]), 8);
@@ -134,7 +138,7 @@ fn draft_q4_keeps_the_draft_path_4_bit_and_the_trunk_as_recorded() {
     // The head's own LM head exists exactly when the trunk's is 8-bit.
     assert_eq!(expected_bits(d4, &["mtp.lm_head"]), 4);
     assert!(d4.draft_head_copy());
-    assert!(!q8mid.draft_head_copy());
+    assert!(!q4_xl_trunk.draft_head_copy());
     let attn_only = StoragePolicy::q8(&[Attn]).with_draft_q4();
     assert!(!attn_only.draft_head_copy(), "a 4-bit trunk head is already 4-bit");
     assert_eq!(expected_bits(attn_only, &[draft_o]), 4);
@@ -142,7 +146,7 @@ fn draft_q4_keeps_the_draft_path_4_bit_and_the_trunk_as_recorded() {
     for g in Q8Group::ALL {
         let want = if g == Embed { d4.bits(g) } else { 4 };
         assert_eq!(d4.draft_bits(g), want, "{g:?}");
-        assert_eq!(q8mid.draft_bits(g), q8mid.bits(g), "{g:?}");
+        assert_eq!(q4_xl_trunk.draft_bits(g), q4_xl_trunk.bits(g), "{g:?}");
     }
 }
 

@@ -68,6 +68,7 @@ def args(*argv: str):
     p.add_argument("--q8-dense", action="store_true")
     p.add_argument("--q8-embed", action="store_true")
     p.add_argument("--draft-q4", action="store_true")
+    p.add_argument("--q4-xl", action="store_true")
     return p.parse_args(list(argv))
 
 
@@ -99,6 +100,10 @@ class PolicyTest(unittest.TestCase):
         both = conv.policy_of_args(args("--q8-dense", "--q8-embed"))
         self.assertEqual(both, conv.policy_of_args(args("--q8", "embed,head,shared,gdn,attn")))
         self.assertEqual(conv.policy_of_args(args("--q8", "attn,head", "--q8-embed")).q8, {"attn", "head", "embed"})
+        self.assertEqual(
+            conv.policy_of_args(args("--q4-xl")),
+            conv.policy_of_args(args("--q8", "attn,shared,head,embed", "--draft-q4")),
+        )
 
     def test_parse_rejects_unknown_repeated_and_empty_lists(self):
         for spec in ("attn,experts", "head,head", ",", ""):
@@ -167,12 +172,12 @@ class DraftQ4Test(unittest.TestCase):
         )
 
     def test_the_config_gains_draft_q4_after_the_groups(self):
-        q8mid = conv.Policy.parse("attn,shared,head,embed")
-        d4 = conv.Policy(q8mid.q8, draft_q4=True)
+        q4_xl_trunk = conv.Policy.parse("attn,shared,head,embed")
+        d4 = conv.Policy(q4_xl_trunk.q8, draft_q4=True)
         self.assertEqual(d4.config_block(), {"q8_groups": ["attn", "shared", "head", "embed"], "draft_q4": True})
         self.assertEqual(list(d4.config_block()), ["q8_groups", "draft_q4"])
         # The trunk's patterns are what they were.
-        self.assertEqual(d4.q8_suffixes(), q8mid.q8_suffixes())
+        self.assertEqual(d4.q8_suffixes(), q4_xl_trunk.q8_suffixes())
         dense = conv.Policy(conv.DENSE_GROUPS, draft_q4=True)
         self.assertEqual(dense.config_block(), {"q8_dense": True, "draft_q4": True})
         # Without the flag, nothing changes (every policy is still draft_q4=False).
@@ -187,11 +192,11 @@ class DraftQ4Test(unittest.TestCase):
             source("mtp.layers.0.self_attn.q_proj.weight", "s2", 8192),
             source("model.visual.blocks.0.attn.qkv.weight", "s3", 0),
         ]
-        q8mid = conv.Policy.parse("attn,shared,head,embed")
-        self.assertIs(conv.with_draft_head_copy(tensors, q8mid), tensors)
+        q4_xl_trunk = conv.Policy.parse("attn,shared,head,embed")
+        self.assertIs(conv.with_draft_head_copy(tensors, q4_xl_trunk), tensors)
         # A Q4 trunk head is already what the draft head should read.
         self.assertIs(conv.with_draft_head_copy(tensors, conv.Policy(frozenset(("attn",)), True)), tensors)
-        out = conv.with_draft_head_copy(tensors, conv.Policy(q8mid.q8, True))
+        out = conv.with_draft_head_copy(tensors, conv.Policy(q4_xl_trunk.q8, True))
         self.assertEqual([t.name for t in out[:4]], [t.name for t in tensors[:4]])
         self.assertEqual(out[4].name, conv.MTP_LM_HEAD_NAME)
         self.assertEqual(out[5:], tensors[4:])
@@ -200,10 +205,10 @@ class DraftQ4Test(unittest.TestCase):
         self.assertEqual(conv.category(out[4].name), "mtp")
         # Without a draft head in the source there is nothing to copy for.
         no_mtp = [t for t in tensors if not t.name.startswith("mtp.")]
-        self.assertIs(conv.with_draft_head_copy(no_mtp, conv.Policy(q8mid.q8, True)), no_mtp)
+        self.assertIs(conv.with_draft_head_copy(no_mtp, conv.Policy(q4_xl_trunk.q8, True)), no_mtp)
         # `--no-mtp` drops the copy with the rest of the head.
         t = source(conv.MTP_LM_HEAD_NAME)
-        self.assertEqual(conv.plan_tensor(t, 48, conv.Quant(4, 32), mtp=False, policy=conv.Policy(q8mid.q8, True)).kind, "drop")
+        self.assertEqual(conv.plan_tensor(t, 48, conv.Quant(4, 32), mtp=False, policy=conv.Policy(q4_xl_trunk.q8, True)).kind, "drop")
 
 
 if __name__ == "__main__":

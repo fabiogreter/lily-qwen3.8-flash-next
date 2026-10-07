@@ -163,11 +163,11 @@ fn draft_q4_keeps_the_trunk_groups_and_marks_the_draft_path() {
     use Q8Group::*;
     let mut v = fixture();
     v["lily"]["quantization"]["q8_groups"] = json!(["attn", "shared", "head", "embed"]);
-    let q8mid = parse(&v).expect("parses").storage;
-    assert!(!q8mid.draft_q4());
+    let q4_xl_trunk = parse(&v).expect("parses").storage;
+    assert!(!q4_xl_trunk.draft_q4());
     v["lily"]["quantization"]["draft_q4"] = json!(true);
     let d4 = parse(&v).expect("parses").storage;
-    assert_eq!(d4, q8mid.with_draft_q4());
+    assert_eq!(d4, q4_xl_trunk.with_draft_q4());
     assert_eq!(d4.q8_groups(), [Attn, Shared, Head, Embed]);
     assert!(d4.draft_head_copy());
     // The legacy flags combine with it too.

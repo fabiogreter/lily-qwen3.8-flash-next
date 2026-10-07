@@ -25,6 +25,9 @@ combine. The routed experts stay Q4. The choice is recorded in
 otherwise `q8_groups`, plus the extended `q8_suffixes`), which the loader
 follows; without any of them the output is byte-identical to before.
 
+`--q4-xl` is `--q8 attn,shared,head,embed --draft-q4`, the recipe of the
+published `Qwen3.8-Flash-Next-lily-q4-xl` checkpoint.
+
 `--draft-q4` keeps the draft head's path 4-bit under such a policy: the
 head's own attention and shared expert stay Q4 whatever `attn` and `shared`
 say, and an 8-bit `lm_head` gets a Q4 g64 copy, `mtp.lm_head`, that only the
@@ -771,9 +774,17 @@ def print_totals(title: str, totals: Totals) -> None:
     print(f"  {'total':14s} {fmt_gb(totals.total())}   ({totals.tensors} output tensors)")
 
 
+# `--q4-xl`: the published 4-bit checkpoint with its most sensitive dense
+# tensors at 8 bits (Qwen3.8-Flash-Next-lily-q4-xl).
+Q4_XL_GROUPS = frozenset({"attn", "shared", "head", "embed"})
+
+
 def q8_groups_of_args(args: argparse.Namespace) -> frozenset[str]:
-    """`--q8 GROUPS` together with its aliases `--q8-dense` and `--q8-embed`."""
+    """`--q8 GROUPS` together with its aliases `--q8-dense`, `--q8-embed` and
+    `--q4-xl`."""
     groups: frozenset[str] = Policy.parse(args.q8).q8 if args.q8 else frozenset()
+    if args.q4_xl:
+        groups |= Q4_XL_GROUPS
     if args.q8_dense:
         groups |= DENSE_GROUPS
     if args.q8_embed:
@@ -782,8 +793,8 @@ def q8_groups_of_args(args: argparse.Namespace) -> frozenset[str]:
 
 
 def policy_of_args(args: argparse.Namespace) -> Policy:
-    """The q8 groups plus `--draft-q4`."""
-    return Policy(q8_groups_of_args(args), args.draft_q4)
+    """The q8 groups plus `--draft-q4` (which `--q4-xl` implies)."""
+    return Policy(q8_groups_of_args(args), args.draft_q4 or args.q4_xl)
 
 
 def convert(args: argparse.Namespace) -> None:
@@ -814,7 +825,7 @@ def convert(args: argparse.Namespace) -> None:
         # The draft head shares the trunk's policy (its block and the shared
         # LM head must agree); the flags may restate it but not change it.
         existing = policy_of_conversion(dst)
-        if not groups <= existing.q8 or (args.draft_q4 and not existing.draft_q4):
+        if not groups <= existing.q8 or ((args.draft_q4 or args.q4_xl) and not existing.draft_q4):
             raise SystemExit(
                 f"{dst} was converted with q8 groups {existing.groups() or 'none'}"
                 f"{' and --draft-q4' if existing.draft_q4 else ''}; an appended part cannot change the policy"
@@ -946,6 +957,11 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="keep the draft head's path Q4 under an 8-bit attn, shared or head group: its own attention and "
         "shared expert stay Q4, and an 8-bit lm_head gets a Q4 copy (mtp.lm_head) for the head's logits",
+    )
+    parser.add_argument(
+        "--q4-xl",
+        action="store_true",
+        help="the q4-xl checkpoint: alias of --q8 attn,shared,head,embed --draft-q4",
     )
     parser.add_argument("--dry-run", action="store_true", help="only print the size plan")
     convert(parser.parse_args(argv))
