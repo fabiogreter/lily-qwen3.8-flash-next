@@ -159,6 +159,54 @@ fn q8_groups_rejects_unknown_repeated_or_doubly_specified_groups() {
 }
 
 #[test]
+fn draft_q4_keeps_the_trunk_groups_and_marks_the_draft_path() {
+    use Q8Group::*;
+    let mut v = fixture();
+    v["lily"]["quantization"]["q8_groups"] = json!(["attn", "shared", "head", "embed"]);
+    let q8mid = parse(&v).expect("parses").storage;
+    assert!(!q8mid.draft_q4());
+    v["lily"]["quantization"]["draft_q4"] = json!(true);
+    let d4 = parse(&v).expect("parses").storage;
+    assert_eq!(d4, q8mid.with_draft_q4());
+    assert_eq!(d4.q8_groups(), [Attn, Shared, Head, Embed]);
+    assert!(d4.draft_head_copy());
+    // The legacy flags combine with it too.
+    let mut v = fixture();
+    v["lily"]["quantization"]["q8_dense"] = json!(true);
+    v["lily"]["quantization"]["draft_q4"] = json!(true);
+    let s = parse(&v).expect("parses").storage;
+    assert_eq!(s, StoragePolicy::q8(&Q8Group::DENSE).with_draft_q4());
+    // `false` is the absent key.
+    let mut v = fixture();
+    v["lily"]["quantization"]["draft_q4"] = json!(false);
+    assert_eq!(parse(&v).expect("parses").storage, StoragePolicy::Q4);
+}
+
+#[test]
+fn draft_q4_needs_an_8_bit_group_on_the_draft_path() {
+    for groups in
+        [json!(null), json!(["gdn"]), json!(["embed"]), json!(["gdn", "embed"])]
+    {
+        let mut v = fixture();
+        if !groups.is_null() {
+            v["lily"]["quantization"]["q8_groups"] = groups.clone();
+        }
+        v["lily"]["quantization"]["draft_q4"] = json!(true);
+        assert!(
+            error_of(&v).contains("none of attn, shared or head is 8-bit"),
+            "{groups}: {}",
+            error_of(&v)
+        );
+    }
+    for group in ["attn", "shared", "head"] {
+        let mut v = fixture();
+        v["lily"]["quantization"]["q8_groups"] = json!([group]);
+        v["lily"]["quantization"]["draft_q4"] = json!(true);
+        assert!(parse(&v).expect(group).storage.draft_q4(), "{group}");
+    }
+}
+
+#[test]
 fn a_config_that_declares_and_drops_the_tower_is_rejected() {
     let mut v = fixture();
     v["lily"]["dropped"] = json!(["model.visual."]);

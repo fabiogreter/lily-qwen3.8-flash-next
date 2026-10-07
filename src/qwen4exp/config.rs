@@ -250,19 +250,28 @@ struct QuantBlockJson {
     /// spell; a config carries either this list or the flags, never both.
     #[serde(default)]
     q8_groups: Option<Vec<String>>,
+    /// The converter's `--draft-q4`: the draft head's own projections stay
+    /// 4-bit whatever the trunk's groups, and an 8-bit `lm_head` gets a 4-bit
+    /// copy for the head's logits (`mtp.lm_head`). Absent in every
+    /// checkpoint written without it.
+    #[serde(default)]
+    draft_q4: bool,
 }
 
 /// A set of projections a conversion may store at Q8 group 64 instead of
 /// Q4 (`lily.quantization`, the converter's `--q8`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Q8Group {
-    /// Attention `q/k/v/o_proj`, in the trunk and in the draft head.
+    /// Attention `q/k/v/o_proj`, in the trunk and in the draft head
+    /// (unless `draft_q4` keeps the head's 4-bit).
     Attn,
     /// The Gated DeltaNet `in_proj_qkv/z/a/b` and `out_proj`.
     Gdn,
-    /// The shared expert's `gate/up/down_proj`, trunk and draft head.
+    /// The shared expert's `gate/up/down_proj`, trunk and draft head
+    /// (unless `draft_q4` keeps the head's 4-bit).
     Shared,
-    /// `lm_head` (which the draft head shares).
+    /// `lm_head` (which the draft head shares, unless `draft_q4` gives it a
+    /// 4-bit copy).
     Head,
     /// `embed_tokens` (which the draft head shares).
     Embed,
@@ -296,27 +305,60 @@ impl Q8Group {
 }
 
 /// The storage widths a conversion may choose: which `Q8Group`s are 8-bit
-/// (`lily.quantization.q8_dense` / `q8_embed`, or `q8_groups`); every other
+/// (`lily.quantization.q8_dense` / `q8_embed`, or `q8_groups`), and whether
+/// the draft head's path stays 4-bit regardless (`draft_q4`); every other
 /// tensor's width is fixed by the format (`weights::expected_bits`). Empty
 /// for a checkpoint that predates the choice, which then loads exactly as
 /// before.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StoragePolicy {
     q8: u8,
+    draft_q4: bool,
 }
 
 impl StoragePolicy {
     /// The policy of every checkpoint written before the choice existed.
-    pub const Q4: Self = Self { q8: 0 };
+    pub const Q4: Self = Self { q8: 0, draft_q4: false };
+
+    /// The groups whose 8-bit width the draft head would read: its own
+    /// attention and shared expert, and the LM head it shares with the
+    /// trunk. `draft_q4` needs one of them.
+    pub const DRAFT_PATH: [Q8Group; 3] =
+        [Q8Group::Attn, Q8Group::Shared, Q8Group::Head];
 
     /// The policy with exactly `groups` at 8 bits.
     pub fn q8(groups: &[Q8Group]) -> Self {
-        Self { q8: groups.iter().fold(0, |m, g| m | g.bit()) }
+        Self { q8: groups.iter().fold(0, |m, g| m | g.bit()), draft_q4: false }
     }
 
-    /// The width `group` is stored at: 8 or 4.
+    /// The same trunk widths with the draft head's path kept 4-bit.
+    pub fn with_draft_q4(self) -> Self {
+        Self { draft_q4: true, ..self }
+    }
+
+    /// The width `group` is stored at in the trunk: 8 or 4.
     pub fn bits(self, group: Q8Group) -> usize {
         if self.q8 & group.bit() != 0 { 8 } else { 4 }
+    }
+
+    /// Whether the draft head's path stays 4-bit (`--draft-q4`).
+    pub fn draft_q4(self) -> bool {
+        self.draft_q4
+    }
+
+    /// The width the draft head reads `group` at: its own projections
+    /// (`Attn`, `Shared`) and its logits (`Head`) are 4-bit under
+    /// `draft_q4`; the embedding is the trunk's table either way (one row
+    /// per token, nothing to save).
+    pub fn draft_bits(self, group: Q8Group) -> usize {
+        if self.draft_q4 && group != Q8Group::Embed { 4 } else { self.bits(group) }
+    }
+
+    /// Whether the draft head has its own 4-bit LM head (`mtp.lm_head`):
+    /// under `draft_q4` with an 8-bit trunk head. A 4-bit trunk head is
+    /// already what the head would read.
+    pub fn draft_head_copy(self) -> bool {
+        self.draft_q4 && self.bits(Q8Group::Head) == 8
     }
 
     /// The 8-bit groups, in the converter's order.
@@ -325,6 +367,18 @@ impl StoragePolicy {
     }
 
     fn from_json(q: &QuantBlockJson) -> Result<Self> {
+        let policy = Self::q8_from_json(q)?;
+        if !q.draft_q4 {
+            return Ok(policy);
+        }
+        ensure!(
+            Self::DRAFT_PATH.iter().any(|&g| policy.bits(g) == 8),
+            "lily.quantization.draft_q4 is set but none of attn, shared or head is 8-bit"
+        );
+        Ok(policy.with_draft_q4())
+    }
+
+    fn q8_from_json(q: &QuantBlockJson) -> Result<Self> {
         let Some(names) = &q.q8_groups else {
             let mut groups = Vec::new();
             if q.q8_dense {

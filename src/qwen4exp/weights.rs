@@ -31,6 +31,8 @@ const PREFIX: &str = "model.language_model.";
 const SKIP_PREFIXES_TEXT_ONLY: &[&str] = &[VISION_PREFIX, "mtp."];
 const SKIP_PREFIXES_WITH_VISION: &[&str] = &["mtp."];
 const MTP_PREFIX: &str = "mtp.";
+/// The draft head's own 4-bit copy of `lm_head` (`--draft-q4`).
+const MTP_LM_HEAD: &str = "mtp.lm_head";
 
 /// One hyper-connection (gated residual) block: a grouped norm over the
 /// `hc_count` streams, the low-rank read gate, and the per-stream write gate
@@ -126,6 +128,18 @@ pub struct MtpWeights {
     pub layer: LayerWeights,
     /// The head-level read that collapses the streams before the LM head.
     pub mixer: HcWeights,
+    /// The head's own 4-bit LM head (`mtp.lm_head`), when the conversion
+    /// stored the trunk's at 8 bits with `--draft-q4`
+    /// (`StoragePolicy::draft_head_copy`); `None`: the head reads the trunk's.
+    pub lm_head: Option<LinearWeights>,
+}
+
+impl MtpWeights {
+    /// The LM head the draft head's logits use: its own copy, else the
+    /// trunk's `lm_head`.
+    pub fn head<'a>(&'a self, trunk: &'a LinearWeights) -> &'a LinearWeights {
+        self.lm_head.as_ref().unwrap_or(trunk)
+    }
 }
 
 pub struct ModelWeights {
@@ -170,10 +184,11 @@ pub struct SessionContext {
 /// The converter's storage policy: routers, gates and the small mixing
 /// projections are always 8-bit; the projections of each `Q8Group` are
 /// whatever the checkpoint's config records (`StoragePolicy`, 4-bit unless
-/// converted with `--q8`); the routed experts are 4-bit. A fused stack
-/// (q|k|v, the GDN `in_proj_*`, the shared gate|up) is one width: every base
-/// must be in the same group, and the loader's row concatenation rejects
-/// slices of different packed widths anyway.
+/// converted with `--q8`), in the draft head (`mtp.*`, its LM head copy
+/// included) at `StoragePolicy::draft_bits`; the routed experts are 4-bit. A
+/// fused stack (q|k|v, the GDN `in_proj_*`, the shared gate|up) is one width:
+/// every base must be in the same group, and the loader's row concatenation
+/// rejects slices of different packed widths anyway.
 fn expected_bits(storage: StoragePolicy, bases: &[&str]) -> usize {
     let fixed_q8 = bases.len() == 1 && {
         let b = bases[0];
@@ -193,7 +208,13 @@ fn expected_bits(storage: StoragePolicy, bases: &[&str]) -> usize {
     }
     let first = bases.first().and_then(|b| q8_group(b));
     match first {
-        Some(g) if bases.iter().all(|b| q8_group(b) == Some(g)) => storage.bits(g),
+        Some(g) if bases.iter().all(|b| q8_group(b) == Some(g)) => {
+            if bases.iter().all(|b| b.starts_with(MTP_PREFIX)) {
+                storage.draft_bits(g)
+            } else {
+                storage.bits(g)
+            }
+        }
         _ => 4,
     }
 }
@@ -214,7 +235,7 @@ fn q8_group(base: &str) -> Option<Q8Group> {
         (".mlp.shared_expert.up_proj", Q8Group::Shared),
         (".mlp.shared_expert.down_proj", Q8Group::Shared),
     ];
-    if base == "lm_head" {
+    if base == "lm_head" || base == MTP_LM_HEAD {
         return Some(Q8Group::Head);
     }
     if base.strip_prefix(PREFIX) == Some("embed_tokens") {
@@ -247,6 +268,15 @@ fn load_mtp(loader: &Loader<'_>, config: &Qwen4ExpConfig) -> Result<MtpWeights> 
         config,
         false,
     )?;
+    // Without the copy a stray `mtp.lm_head` stays unconsumed and fails the
+    // load, so the config and the files agree in both directions.
+    let lm_head = if config.storage.draft_head_copy() {
+        let w = loader.linear(&[MTP_LM_HEAD], h)?;
+        w.expect_features(config.vocab_size, h, "mtp lm_head")?;
+        Some(w)
+    } else {
+        None
+    };
     Ok(MtpWeights {
         norm_embedding,
         norm_hidden,
@@ -254,6 +284,7 @@ fn load_mtp(loader: &Loader<'_>, config: &Qwen4ExpConfig) -> Result<MtpWeights> 
         fc_hidden,
         layer: LayerWeights { ple: None, attn_hc, mixer: mixer_w, mlp_hc, ffn },
         mixer,
+        lm_head,
     })
 }
 

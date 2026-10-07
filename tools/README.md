@@ -16,7 +16,7 @@ Converts the raw Hugging Face BF16 checkpoint into lily's
     --src ~/models/Qwen3.8-Flash-Next \
     --dst ~/models/Qwen3.8-Flash-Next-lily-q4 \
     [--layers 4] [--dry-run] [--ngram-bits 4 --ngram-group 32] [--no-mtp] [--no-vision] \
-    [--q8 attn,gdn,shared,head,embed] [--q8-dense] [--q8-embed]
+    [--q8 attn,gdn,shared,head,embed] [--q8-dense] [--q8-embed] [--draft-q4]
 ```
 
 `--q8 GROUPS` (experimental) stores a comma-separated subset of the groups
@@ -24,8 +24,13 @@ Converts the raw Hugging Face BF16 checkpoint into lily's
 `head` (`lm_head`) and `embed` (`embed_tokens`) at Q8 instead of Q4;
 `--q8-dense` is an alias of `attn,gdn,shared,head` and `--q8-embed` of `embed`
 (policy, sizes and per-token read cost in
-`docs/qwen38-flash-next-checkpoint-format.md`). An appended `--mtp-only` run
-takes the policy the trunk was converted with. The policy's unit tests run
+`docs/qwen38-flash-next-checkpoint-format.md`). `--draft-q4` keeps the draft
+head's path Q4 under an 8-bit `attn`, `shared` or `head`: its own attention
+and shared expert stay Q4, and an 8-bit `lm_head` gets a Q4 copy,
+`mtp.lm_head`, for the head's logits (+0.36 GB; the trunk keeps its 8-bit
+head), so speculative decoding's draft steps read what they read on the
+all-Q4 checkpoint. An appended `--mtp-only` run takes the policy the trunk
+was converted with, `--draft-q4` included. The policy's unit tests run
 without mlx or a checkpoint:
 `.venv/bin/python tools/convert/test_convert_qwen38_flash_next.py`.
 

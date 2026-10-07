@@ -660,14 +660,15 @@ impl Qwen4ExpModel {
             let head_params = draft_params(params);
             let mut last = sp.chain_in.view(0, &[1, wide])?;
             for (i, (pos, block, count)) in chain_words.iter().enumerate() {
-                // Head: mixer over the last residual row, shared LM head, argmax.
+                // Head: mixer over the last residual row, the head's LM head
+                // (the trunk's, or its 4-bit copy), argmax.
                 self.hc_read_batched(ctx, &pass, &mtp.mixer, &last, s, &ps1)?;
                 let logits = sp.logits.view(0, &[1, cfg.vocab_size])?;
                 project_mat(
                     ctx,
                     &pass,
                     &ps1.hc.mixed,
-                    &self.weights.lm_head,
+                    mtp.head(&self.weights.lm_head),
                     &logits,
                     &s.dequant,
                 )?;
@@ -837,14 +838,15 @@ impl Qwen4ExpModel {
                 let ps1 = capacity.rows(1)?;
                 let mut last = hyper.view(chain_row * wide, &[1, wide])?;
                 for i in 0..drafts {
-                    // Head: mixer over the last residual row, shared LM head, argmax.
+                    // Head: mixer over the last residual row, the head's LM
+                    // head (the trunk's, or its 4-bit copy), argmax.
                     self.hc_read_batched(ctx, &pass, &mtp.mixer, &last, s, &ps1)?;
                     let logits = sp.logits.view(0, &[1, cfg.vocab_size])?;
                     project_mat(
                         ctx,
                         &pass,
                         &ps1.hc.mixed,
-                        &self.weights.lm_head,
+                        mtp.head(&self.weights.lm_head),
                         &logits,
                         &s.dequant,
                     )?;

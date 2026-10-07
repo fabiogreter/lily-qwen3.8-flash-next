@@ -86,7 +86,9 @@ hidden state. Its input is built per hyper-connection stream:
 `fc_hidden(norm(stream))` for each of the four streams, plus
 `fc_embedding(norm(embed(next token)))` broadcast to all of them. The block
 then runs like a trunk attention layer, with its own KV and indexer caches at
-trunk positions, and its mixer feeds the shared LM head. During prefill the
+trunk positions, and its mixer feeds the shared LM head (or, in a
+`--draft-q4` conversion with an 8-bit trunk head, its own 4-bit copy
+`mtp.lm_head`; `docs/qwen38-flash-next-checkpoint-format.md`). During prefill the
 head runs over the chunk paired with the next token so its caches keep up
 with the trunk, and the batched decode step does the same per row. That
 catch-up stops once the head's caches are written: its residual is never

@@ -24,7 +24,8 @@ its own `hyper_connection_mixer`) is converted with the same rules as the trunk
 (`fc_embedding`/`fc_hidden` at 8 bits, the two `pre_fc_norm_*` weights
 verbatim) and written to `mtp-*` shards: by default in the same run, or later
 with `--mtp-only` into an existing conversion, which merges the index and adds
-a `lily.mtp` block to `config.json`. `--no-mtp` drops it.
+a `lily.mtp` block to `config.json`. `--no-mtp` drops it. Under `--draft-q4`
+(below) the head also carries `mtp.lm_head`, its own Q4 copy of `lm_head`.
 
 The vision tower (`model.visual.*`: 333 bf16 tensors, 0.90 GB; 27 blocks of
 hidden size 1152, the patch embedding, the 2304-row position table and the
@@ -50,7 +51,9 @@ tensors without the block (or the reverse).
 
 Names are the Hugging Face names verbatim (`model.language_model.layers.N.*`,
 `model.language_model.embed_tokens`, `model.language_model.hyper_connection_mixer.*`,
-`lm_head`). A quantized linear or embedding `foo.weight` becomes three tensors:
+`lm_head`), plus one name of lily's own, `mtp.lm_head` (the draft head's Q4
+copy of `lm_head` under `--draft-q4`, derived from the same source tensor). A
+quantized linear or embedding `foo.weight` becomes three tensors:
 
 | suffix    | dtype | shape                              |
 |-----------|-------|------------------------------------|
@@ -109,6 +112,30 @@ instead of misreading it. Every group is loaded tensor by tensor, so any
 subset runs on the existing kernels: each projection dispatches on its own
 width, and the fused stacks (q|k|v, the GDN `in_proj_*`, the shared gate|up)
 never span two groups.
+
+`--draft-q4` (experimental) keeps the draft head's path 4-bit under such a
+policy. The trunk verifies every proposal, so the head only has to be roughly
+right, and speculative sampling stays exact whatever the head reads; yet each
+draft step reads the head's block and an LM head, so an 8-bit `head` alone
+costs every draft step +0.32 GB. With the flag:
+
+- the head's own `mtp.layers.0.self_attn.q/k/v/o_proj` and
+  `mtp.layers.0.mlp.shared_expert.gate/up/down_proj` stay Q4 g64 whatever
+  `attn` and `shared` say (the trunk's follow the groups as before);
+- an 8-bit `head` gets a second, Q4 g64, copy for the head's logits,
+  `mtp.lm_head.{weight,scales,biases}` (`[248320, 320]` U32 codes,
+  0.36 GB), written with the other `mtp.*` tensors; the trunk keeps its
+  8-bit `lm_head`. With a 4-bit `head` there is no copy: the trunk's head
+  is already Q4;
+- the embedding stays shared: the head gathers one row of the trunk's table
+  per draft, which costs nothing worth a copy.
+
+On `--q8 attn,shared,head,embed` the draft head grows from 1.51 to 1.84 GB
+(the copy, less 0.03 GB on its block) and a draft step reads what it reads
+on the all-Q4 checkpoint. The flag needs one of `attn`, `shared` or `head` in
+the policy (otherwise the head is Q4 already) and is recorded as
+`lily.quantization.draft_q4` (below); `--mtp-only` appends follow it like
+they follow the groups.
 
 ### Expert split
 
@@ -175,8 +202,15 @@ attn, gdn, shared and head, plus `"q8_embed": true` when it holds embed,
 whenever those two flags spell the set exactly (so `--q8-dense` /
 `--q8-embed` conversions are byte-identical to the ones written before
 `--q8`); otherwise as `"q8_groups": ["attn", "head", "embed"]` (for example),
-never both. That is what the loader reads (`StoragePolicy`); without any of
-them a `config.json` is byte-identical to one written before they existed.
+never both. A `--draft-q4` conversion adds `"draft_q4": true` after them;
+the `q8_suffixes` stay the trunk's and do not apply to `mtp.*` tensors then.
+That is what the loader reads (`StoragePolicy`): it expects the head's
+projections at 4 bits and loads `mtp.lm_head` for the head's logits exactly
+when `draft_q4` is set and `head` is 8-bit, and refuses a `draft_q4` without
+an 8-bit `attn`, `shared` or `head`. An older binary ignores the key and then
+refuses the checkpoint at load (the head's projections are not the width it
+expects), rather than misreading it. Without any of them a `config.json` is
+byte-identical to one written before they existed.
 
 `text_config.num_hidden_layers` and `text_config.layer_types` are rewritten to
 the kept layer count when the converter truncates (`--layers N`), so a

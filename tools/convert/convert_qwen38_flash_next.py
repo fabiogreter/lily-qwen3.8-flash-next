@@ -25,6 +25,15 @@ combine. The routed experts stay Q4. The choice is recorded in
 otherwise `q8_groups`, plus the extended `q8_suffixes`), which the loader
 follows; without any of them the output is byte-identical to before.
 
+`--draft-q4` keeps the draft head's path 4-bit under such a policy: the
+head's own attention and shared expert stay Q4 whatever `attn` and `shared`
+say, and an 8-bit `lm_head` gets a Q4 g64 copy, `mtp.lm_head`, that only the
+head's logits read (the trunk keeps its 8-bit head; the embedding stays
+shared). The trunk verifies every draft, so the head only has to be roughly
+right, and each draft step reads about 0.34 GB less on `--q8
+attn,shared,head`. It needs one of `attn`, `shared` or `head` in the policy
+and is recorded as `lily.quantization.draft_q4`.
+
 `--mtp-only` adds the multi-token-prediction draft head (the `mtp.*` tensors:
 one attention+MoE block plus its input projections and output mixer) to an
 existing conversion as extra `mtp-*.safetensors` shards, merging them into the
@@ -210,6 +219,9 @@ _NGRAM_SHARD = re.compile(r"\.ple\.ple_embedding\.ngram_embedding\.shard_\d+\.we
 
 EMBED_NAME = "model.language_model.embed_tokens.weight"
 LM_HEAD_NAME = "lm_head.weight"
+# The draft head's own Q4 copy of the LM head under `--draft-q4` (not in the
+# source: `with_draft_head_copy` derives it from `lm_head.weight`).
+MTP_LM_HEAD_NAME = "mtp.lm_head.weight"
 
 
 # The projection groups `--q8` can move from Q4 to Q8, in the order the
@@ -226,10 +238,15 @@ Q8_GROUPS: dict[str, tuple[str, ...]] = {
 # What the legacy flags stand for.
 DENSE_GROUPS = frozenset(("attn", "gdn", "shared", "head"))
 EMBED_GROUPS = frozenset(("embed",))
+# The groups whose 8-bit width the draft head would read (its own block's
+# attention and shared expert, the LM head it shares); `--draft-q4` needs one.
+DRAFT_PATH_GROUPS = frozenset(("attn", "shared", "head"))
 
 
 def q8_group_of(name: str) -> str | None:
     """The `Q8_GROUPS` group a source tensor belongs to, if any."""
+    if name == MTP_LM_HEAD_NAME:
+        return "head"
     for group, patterns in Q8_GROUPS.items():
         if any(re.search(p, name) for p in patterns):
             return group
@@ -239,16 +256,20 @@ def q8_group_of(name: str) -> str | None:
 @dataclass(frozen=True)
 class Policy:
     """The storage choices the command line can change: which `Q8_GROUPS`
-    are 8-bit. The default (none) is the policy every checkpoint before
+    are 8-bit, and whether the draft head's path stays 4-bit regardless
+    (`draft_q4`). The default (none) is the policy every checkpoint before
     `--q8-dense` was written with."""
 
     q8: frozenset[str] = frozenset()
+    draft_q4: bool = False
 
     def __post_init__(self) -> None:
         unknown = sorted(set(self.q8) - set(Q8_GROUPS))
         if unknown:
             raise ValueError(f"unknown q8 group(s) {', '.join(unknown)}; known: {', '.join(Q8_GROUPS)}")
         object.__setattr__(self, "q8", frozenset(self.q8))
+        if self.draft_q4 and not self.q8 & DRAFT_PATH_GROUPS:
+            raise ValueError("--draft-q4 needs an 8-bit group on the draft path: attn, shared or head")
 
     @classmethod
     def parse(cls, spec: str) -> "Policy":
@@ -264,18 +285,30 @@ class Policy:
     def from_config(cls, q: dict) -> "Policy":
         """The policy a `lily.quantization` block records (the inverse of
         `config_block`)."""
+        draft_q4 = bool(q.get("draft_q4"))
         if "q8_groups" in q:
             if q.get("q8_dense") or q.get("q8_embed"):
                 raise ValueError("lily.quantization carries both q8_groups and q8_dense/q8_embed")
-            return cls(frozenset(q["q8_groups"]))
-        return cls((DENSE_GROUPS if q.get("q8_dense") else frozenset()) | (EMBED_GROUPS if q.get("q8_embed") else frozenset()))
+            return cls(frozenset(q["q8_groups"]), draft_q4)
+        groups = (DENSE_GROUPS if q.get("q8_dense") else frozenset()) | (EMBED_GROUPS if q.get("q8_embed") else frozenset())
+        return cls(groups, draft_q4)
 
     def groups(self) -> list[str]:
         """The 8-bit groups in `Q8_GROUPS` order."""
         return [g for g in Q8_GROUPS if g in self.q8]
 
-    def quant_of(self, group: str) -> Quant:
+    def quant_of(self, group: str, draft: bool = False) -> Quant:
+        """The width of `group`'s tensors, in the draft head (`mtp.*`) when
+        `draft`: Q4 there under `draft_q4` (the embedding is never a draft
+        tensor; the head reads the trunk's table)."""
+        if draft and self.draft_q4:
+            return Q4
         return Q8 if group in self.q8 else Q4
+
+    def draft_head_copy(self) -> bool:
+        """Whether the draft head gets its own Q4 `mtp.lm_head`: under
+        `draft_q4` with an 8-bit trunk head."""
+        return self.draft_q4 and "head" in self.q8
 
     def q8_suffixes(self) -> list[str]:
         """The 8-bit tensor patterns as recorded in `config.json`: the fixed
@@ -291,17 +324,42 @@ class Policy:
         """The keys `lily.quantization` gains: the legacy `q8_dense` /
         `q8_embed` flags when they spell the set exactly (so those configs are
         byte-identical to the ones written before `--q8`), otherwise
-        `q8_groups`; empty for the default."""
+        `q8_groups`; empty for the default. `draft_q4` follows them when
+        set. The `q8_suffixes` stay the trunk's: under `draft_q4` they do not
+        apply to `mtp.*` tensors."""
         dense, embed = self.q8 & DENSE_GROUPS, self.q8 & EMBED_GROUPS
+        draft = {"draft_q4": True} if self.draft_q4 else {}
         if dense in (frozenset(), DENSE_GROUPS):
             return {
                 **({"q8_dense": True} if dense else {}),
                 **({"q8_embed": True} if embed else {}),
+                **draft,
             }
-        return {"q8_groups": self.groups()}
+        return {"q8_groups": self.groups(), **draft}
 
     def describe(self) -> str:
-        return ", q8 " + ",".join(self.groups()) if self.q8 else ""
+        return (", q8 " + ",".join(self.groups()) if self.q8 else "") + (", draft q4" if self.draft_q4 else "")
+
+
+def with_draft_head_copy(tensors: list[SourceTensor], policy: Policy) -> list[SourceTensor]:
+    """The source list plus, when the policy gives the draft head its own LM
+    head, `mtp.lm_head.weight`: a second view of `lm_head.weight`'s bytes,
+    placed after the last `mtp.*` tensor so it lands with the head (in the
+    `mtp-*` shards of an `--mtp-only` run). Unchanged otherwise, and when the
+    source has no draft head."""
+    if not policy.draft_head_copy():
+        return tensors
+    mtp_at = [i for i, t in enumerate(tensors) if t.name.startswith(MTP_PREFIX)]
+    if not mtp_at:
+        return tensors
+    if any(t.name == MTP_LM_HEAD_NAME for t in tensors):
+        raise SystemExit(f"source already has {MTP_LM_HEAD_NAME}; refusing to derive the draft head's copy")
+    head = next((t for t in tensors if t.name == LM_HEAD_NAME), None)
+    if head is None:
+        raise SystemExit(f"source has no {LM_HEAD_NAME} to copy for the draft head")
+    copy = SourceTensor(MTP_LM_HEAD_NAME, head.dtype, head.shape, head.shard, head.start, head.end)
+    at = mtp_at[-1] + 1
+    return tensors[:at] + [copy] + tensors[at:]
 
 
 def plan_tensor(
@@ -323,7 +381,7 @@ def plan_tensor(
         return Plan("drop")
     group = q8_group_of(name)
     if group is not None:
-        return Plan("quant", policy.quant_of(group))
+        return Plan("quant", policy.quant_of(group, draft=name.startswith(MTP_PREFIX)))
     if name.endswith(".mlp.experts.gate_up_proj"):
         return Plan("expert_gate_up", Q4)
     if _NGRAM_SHARD.search(name):
@@ -713,14 +771,19 @@ def print_totals(title: str, totals: Totals) -> None:
     print(f"  {'total':14s} {fmt_gb(totals.total())}   ({totals.tensors} output tensors)")
 
 
-def policy_of_args(args: argparse.Namespace) -> Policy:
+def q8_groups_of_args(args: argparse.Namespace) -> frozenset[str]:
     """`--q8 GROUPS` together with its aliases `--q8-dense` and `--q8-embed`."""
     groups: frozenset[str] = Policy.parse(args.q8).q8 if args.q8 else frozenset()
     if args.q8_dense:
         groups |= DENSE_GROUPS
     if args.q8_embed:
         groups |= EMBED_GROUPS
-    return Policy(groups)
+    return groups
+
+
+def policy_of_args(args: argparse.Namespace) -> Policy:
+    """The q8 groups plus `--draft-q4`."""
+    return Policy(q8_groups_of_args(args), args.draft_q4)
 
 
 def convert(args: argparse.Namespace) -> None:
@@ -735,31 +798,39 @@ def convert(args: argparse.Namespace) -> None:
 
     mtp = not args.no_mtp
     vision = not args.no_vision
-    try:
-        policy = policy_of_args(args)
-    except ValueError as e:
-        raise SystemExit(str(e)) from e
     append_only = args.mtp_only or args.vision_only
     if args.mtp_only and args.vision_only:
         raise SystemExit("--mtp-only and --vision-only are separate append runs; pass one at a time")
+    try:
+        groups = q8_groups_of_args(args)
+        # An appended part takes the conversion's policy (below), so only a
+        # full run's flags must form a valid policy on their own.
+        policy = Policy(groups) if append_only else policy_of_args(args)
+    except ValueError as e:
+        raise SystemExit(str(e)) from e
+    if append_only:
+        if not (dst / "model.safetensors.index.json").exists():
+            raise SystemExit(f"{dst} is not a finished conversion (no index); run a full conversion first")
+        # The draft head shares the trunk's policy (its block and the shared
+        # LM head must agree); the flags may restate it but not change it.
+        existing = policy_of_conversion(dst)
+        if not groups <= existing.q8 or (args.draft_q4 and not existing.draft_q4):
+            raise SystemExit(
+                f"{dst} was converted with q8 groups {existing.groups() or 'none'}"
+                f"{' and --draft-q4' if existing.draft_q4 else ''}; an appended part cannot change the policy"
+            )
+        policy = existing
+    # Before the append filter: the draft head's LM head copy is an `mtp.*`
+    # tensor made from the trunk's `lm_head.weight`.
+    tensors = with_draft_head_copy(tensors, policy)
     if append_only:
         # One optional part, appended to a finished conversion.
         prefix, stem = (MTP_PREFIX, "mtp") if args.mtp_only else (VISION_PREFIX, "vision")
         tensors = [t for t in tensors if t.name.startswith(prefix)]
         if not tensors:
             raise SystemExit(f"source has no {prefix}* tensors")
-        if not (dst / "model.safetensors.index.json").exists():
-            raise SystemExit(f"{dst} is not a finished conversion (no index); run a full conversion first")
         if any(dst.glob(f"{stem}-*.safetensors")):
             raise SystemExit(f"{dst} already holds {stem} shards; refusing to overwrite")
-        # The draft head shares the trunk's policy (its block and the shared
-        # LM head must agree); the flags may restate it but not change it.
-        existing = policy_of_conversion(dst)
-        if not policy.q8 <= existing.q8:
-            raise SystemExit(
-                f"{dst} was converted with q8 groups {existing.groups() or 'none'}; an appended part cannot change the policy"
-            )
-        policy = existing
         mtp = vision = True
     else:
         stem = "model"
@@ -870,6 +941,12 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--q8-dense", action="store_true", help="alias of --q8 attn,gdn,shared,head")
     parser.add_argument("--q8-embed", action="store_true", help="alias of --q8 embed")
+    parser.add_argument(
+        "--draft-q4",
+        action="store_true",
+        help="keep the draft head's path Q4 under an 8-bit attn, shared or head group: its own attention and "
+        "shared expert stay Q4, and an 8-bit lm_head gets a Q4 copy (mtp.lm_head) for the head's logits",
+    )
     parser.add_argument("--dry-run", action="store_true", help="only print the size plan")
     convert(parser.parse_args(argv))
 

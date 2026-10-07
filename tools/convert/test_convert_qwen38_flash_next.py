@@ -1,5 +1,5 @@
 """Unit tests for the converter's storage policy (`--q8`, `--q8-dense`,
-`--q8-embed`); no checkpoint and no mlx needed.
+`--q8-embed`, `--draft-q4`); no checkpoint and no mlx needed.
 
     .venv/bin/python tools/convert/test_convert_qwen38_flash_next.py
 """
@@ -67,7 +67,19 @@ def args(*argv: str):
     p.add_argument("--q8", default=None)
     p.add_argument("--q8-dense", action="store_true")
     p.add_argument("--q8-embed", action="store_true")
+    p.add_argument("--draft-q4", action="store_true")
     return p.parse_args(list(argv))
+
+
+def subsets():
+    """Every subset of the q8 groups."""
+    names = list(conv.Q8_GROUPS)
+    for mask in range(1 << len(names)):
+        yield frozenset(g for i, g in enumerate(names) if mask >> i & 1)
+
+
+def source(name: str, shard: str = "a", start: int = 0) -> conv.SourceTensor:
+    return conv.SourceTensor(name, "BF16", (64, 64), Path(shard), start, start + 8192)
 
 
 class PolicyTest(unittest.TestCase):
@@ -112,12 +124,86 @@ class PolicyTest(unittest.TestCase):
         )
 
     def test_from_config_inverts_config_block(self):
-        names = list(conv.Q8_GROUPS)
-        for mask in range(1 << len(names)):
-            p = conv.Policy(frozenset(g for i, g in enumerate(names) if mask >> i & 1))
-            self.assertEqual(conv.Policy.from_config(p.config_block()), p)
+        for groups in subsets():
+            for draft_q4 in (False, True):
+                if draft_q4 and not groups & conv.DRAFT_PATH_GROUPS:
+                    continue
+                p = conv.Policy(groups, draft_q4)
+                self.assertEqual(conv.Policy.from_config(p.config_block()), p)
         with self.assertRaises(ValueError):
             conv.Policy.from_config({"q8_groups": ["head"], "q8_dense": True})
+
+
+class DraftQ4Test(unittest.TestCase):
+    def test_the_draft_head_stays_q4_and_the_trunk_follows_the_groups(self):
+        for groups in subsets():
+            if not groups & conv.DRAFT_PATH_GROUPS:
+                continue
+            policy = conv.Policy(groups, draft_q4=True)
+            for name, group in TENSORS.items():
+                if group is None:
+                    want = FIXED_BITS[name]
+                elif name.startswith("mtp."):
+                    want = 4
+                else:
+                    want = 8 if group in groups else 4
+                self.assertEqual(bits(name, policy), want, f"{name} under {sorted(groups)} + draft_q4")
+            self.assertEqual(bits(conv.MTP_LM_HEAD_NAME, policy), 4)
+            # The head's fixed 8-bit inputs are not part of the choice.
+            self.assertEqual(bits("mtp.fc_embedding.weight", policy), 8)
+            self.assertEqual(bits("mtp.layers.0.self_attn.indexer.index_qk_proj.weight", policy), 8)
+
+    def test_it_needs_a_q8_group_on_the_draft_path(self):
+        for groups in ((), ("gdn",), ("embed",), ("gdn", "embed")):
+            with self.assertRaises(ValueError, msg=str(groups)):
+                conv.Policy(frozenset(groups), draft_q4=True)
+        for group in sorted(conv.DRAFT_PATH_GROUPS):
+            self.assertTrue(conv.Policy(frozenset((group,)), draft_q4=True).draft_q4)
+        with self.assertRaises(ValueError):
+            conv.policy_of_args(args("--q8", "gdn,embed", "--draft-q4"))
+        self.assertEqual(
+            conv.policy_of_args(args("--q8", "attn,shared,head,embed", "--draft-q4")),
+            conv.Policy(frozenset(("attn", "shared", "head", "embed")), True),
+        )
+
+    def test_the_config_gains_draft_q4_after_the_groups(self):
+        q8mid = conv.Policy.parse("attn,shared,head,embed")
+        d4 = conv.Policy(q8mid.q8, draft_q4=True)
+        self.assertEqual(d4.config_block(), {"q8_groups": ["attn", "shared", "head", "embed"], "draft_q4": True})
+        self.assertEqual(list(d4.config_block()), ["q8_groups", "draft_q4"])
+        # The trunk's patterns are what they were.
+        self.assertEqual(d4.q8_suffixes(), q8mid.q8_suffixes())
+        dense = conv.Policy(conv.DENSE_GROUPS, draft_q4=True)
+        self.assertEqual(dense.config_block(), {"q8_dense": True, "draft_q4": True})
+        # Without the flag, nothing changes (every policy is still draft_q4=False).
+        for groups in subsets():
+            self.assertNotIn("draft_q4", conv.Policy(groups).config_block())
+
+    def test_the_head_copy_follows_the_last_mtp_tensor_and_reads_lm_head(self):
+        tensors = [
+            source("model.language_model.embed_tokens.weight", "s1", 0),
+            source("lm_head.weight", "s1", 8192),
+            source("mtp.fc_hidden.weight", "s2", 0),
+            source("mtp.layers.0.self_attn.q_proj.weight", "s2", 8192),
+            source("model.visual.blocks.0.attn.qkv.weight", "s3", 0),
+        ]
+        q8mid = conv.Policy.parse("attn,shared,head,embed")
+        self.assertIs(conv.with_draft_head_copy(tensors, q8mid), tensors)
+        # A Q4 trunk head is already what the draft head should read.
+        self.assertIs(conv.with_draft_head_copy(tensors, conv.Policy(frozenset(("attn",)), True)), tensors)
+        out = conv.with_draft_head_copy(tensors, conv.Policy(q8mid.q8, True))
+        self.assertEqual([t.name for t in out[:4]], [t.name for t in tensors[:4]])
+        self.assertEqual(out[4].name, conv.MTP_LM_HEAD_NAME)
+        self.assertEqual(out[5:], tensors[4:])
+        head = tensors[1]
+        self.assertEqual((out[4].shard, out[4].start, out[4].end, out[4].shape), (head.shard, head.start, head.end, head.shape))
+        self.assertEqual(conv.category(out[4].name), "mtp")
+        # Without a draft head in the source there is nothing to copy for.
+        no_mtp = [t for t in tensors if not t.name.startswith("mtp.")]
+        self.assertIs(conv.with_draft_head_copy(no_mtp, conv.Policy(q8mid.q8, True)), no_mtp)
+        # `--no-mtp` drops the copy with the rest of the head.
+        t = source(conv.MTP_LM_HEAD_NAME)
+        self.assertEqual(conv.plan_tensor(t, 48, conv.Quant(4, 32), mtp=False, policy=conv.Policy(q8mid.q8, True)).kind, "drop")
 
 
 if __name__ == "__main__":
