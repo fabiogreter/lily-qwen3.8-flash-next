@@ -727,3 +727,271 @@ fn real_images_get_exactly_their_placeholders() -> Result<()> {
     }
     Ok(())
 }
+
+// --- thinking controls -------------------------------------------------------
+
+use lily::thinking::{
+    Action, NudgeLevel, ThinkingControl, ThinkingSettings, ThinkingTexts,
+    ThinkingTokens,
+};
+
+fn thinking_tokens(
+    tok: &Tokenizer,
+    texts: &ThinkingTexts,
+) -> Result<Arc<ThinkingTokens>> {
+    let id = |s: &str| tok.token_id(s).with_context(|| format!("no {s}"));
+    Ok(Arc::new(ThinkingTokens::new(
+        id("</think>")?,
+        id("<tool_call>")?,
+        id("</tool_call>")?,
+        texts,
+        |s| tok.encode(s),
+        |id| tok.is_added(id),
+    )?))
+}
+
+/// Reasoning that ends at each seam (a paragraph, a line, mid-line after a
+/// word, a digit, punctuation, a backtick), after the generation prompt's
+/// `<think>\n`.
+const SEAM_PREFIXES: &[&str] = &[
+    "The bug is in the parser.\n\n",
+    "The bug is in the parser.\n",
+    "The bug is in the parser",
+    "Let me check step 2",
+    "The bug is in the parser.",
+    "Let me check `main.rs`",
+    "Then:\n- read the file;",
+];
+
+/// What the model may write after a close (the tool call, an answer) and
+/// after a nudge (more reasoning).
+const AFTER_CLOSE: &[&str] = &[
+    "<tool_call>\n<function=read>\n<parameter=path>\nsrc/main.rs\n</parameter>\n</function>\n</tool_call>",
+    "The fix is to check the length first.",
+    "**Answer:** 42.",
+];
+const AFTER_NUDGE: &[&str] =
+    &["Let me look at the tests first.", "So the parser is wrong.", "1. Read it."];
+
+/// Given the model's tokens before the last one and the last one, the ids
+/// a control inserts there, if any.
+type Act<'a> = dyn FnMut(&[u32], u32) -> Option<Vec<u32>> + 'a;
+
+/// Feeds `prefix`'s own encoding (the model's tokens) to `act` token by
+/// token, from after the `<think>\n` it starts with, and checks that the
+/// ids `act` inserts on the last one, then the continuation's own ids, are
+/// the encoding of the whole text: what the next turn's prompt holds, so
+/// the session cache reuses the state through the insertion. Returns the
+/// inserted text.
+fn check_seam(
+    tok: &Tokenizer,
+    prefix: &str,
+    continuation: &str,
+    act: &mut Act<'_>,
+) -> Result<String> {
+    let head = tok.encode("<think>\n")?;
+    let before = tok.encode(&format!("<think>\n{prefix}"))?;
+    ensure!(before.starts_with(&head), "{prefix:?}: the prompt's tail re-encodes");
+    let model = &before[head.len()..];
+    let (&last, earlier) = model.split_last().context("an empty prefix")?;
+    let inserted = act(earlier, last)
+        .with_context(|| format!("{prefix:?}: nothing inserted at the last token"))?;
+    let inserted_text = tok.decode(&inserted, false)?;
+    let mut fed = before.clone();
+    fed.extend(&inserted);
+    fed.extend(tok.encode(continuation)?);
+    let whole =
+        tok.encode(&format!("<think>\n{prefix}{inserted_text}{continuation}"))?;
+    ensure!(
+        fed == whole,
+        "{prefix:?} + {inserted_text:?} + {continuation:?}: the fed ids part from the \
+         whole text's at {}:\n  fed   {:?}\n  whole {:?}",
+        fed.iter()
+            .zip(&whole)
+            .position(|(a, b)| a != b)
+            .unwrap_or(fed.len().min(whole.len())),
+        &fed[before.len().saturating_sub(3)..],
+        &whole[before.len().saturating_sub(3).min(whole.len())..],
+    );
+    Ok(inserted_text)
+}
+
+/// Every insertion, at every seam, with every built-in text, is fed as the
+/// ids the whole text encodes to (see `src/thinking.rs`, "Seams"): the
+/// budget's close variants, the nudges, the close in place of an end of
+/// turn and the close in front of a tool call, each followed by what the
+/// model typically writes next.
+#[test]
+#[ignore = "requires LILY_MODEL_DIR_FLASH"]
+fn every_insertion_matches_the_whole_texts_encoding() -> Result<()> {
+    let tok = tokenizer()?;
+    let builtin = ThinkingTexts::default();
+    let decide = |c: &mut ThinkingControl, id: u32| -> Result<Action> {
+        Ok(c.decide(id, &tok.decode(&[id], false)?))
+    };
+    let mut checked = 0;
+
+    // The budget's close: each variant on its own, at the last token
+    // (grace 0, the budget reached there).
+    for close in &builtin.close {
+        let tokens = thinking_tokens(
+            &tok,
+            &ThinkingTexts { close: vec![close.clone()], nudges: vec![] },
+        )?;
+        for prefix in SEAM_PREFIXES {
+            for after in AFTER_CLOSE {
+                let mut act = |earlier: &[u32], last: u32| {
+                    let settings = ThinkingSettings {
+                        budget: Some(earlier.len() + 1),
+                        ..ThinkingSettings::default()
+                    };
+                    let mut c = ThinkingControl::new(tokens.clone(), settings, true);
+                    for &id in earlier {
+                        assert_eq!(decide(&mut c, id).ok()?, Action::Keep);
+                    }
+                    match decide(&mut c, last).ok()? {
+                        Action::After(ids) => Some(ids),
+                        _ => None,
+                    }
+                };
+                let text = check_seam(&tok, prefix, after, &mut act)?;
+                ensure!(
+                    text.contains(close.as_str()) && text.ends_with("\n</think>\n\n")
+                );
+                checked += 1;
+            }
+        }
+    }
+
+    // The nudges, each text of each level: only at line ends.
+    for level in &builtin.nudges {
+        for nudge in &level.texts {
+            let texts = ThinkingTexts {
+                close: vec![],
+                nudges: vec![NudgeLevel { at: 0.5, texts: vec![nudge.clone()] }],
+            };
+            let tokens = thinking_tokens(&tok, &texts)?;
+            for prefix in SEAM_PREFIXES.iter().filter(|p| p.ends_with('\n')) {
+                for after in AFTER_NUDGE {
+                    let mut act = |earlier: &[u32], last: u32| {
+                        let settings = ThinkingSettings {
+                            budget: Some(2 * (earlier.len() + 1)),
+                            nudges: true,
+                            ..ThinkingSettings::default()
+                        };
+                        let mut c =
+                            ThinkingControl::new(tokens.clone(), settings, true);
+                        for &id in earlier {
+                            assert_eq!(decide(&mut c, id).ok()?, Action::Keep);
+                        }
+                        match decide(&mut c, last).ok()? {
+                            Action::After(ids) => Some(ids),
+                            _ => None,
+                        }
+                    };
+                    let text = check_seam(&tok, prefix, after, &mut act)?;
+                    ensure!(text == format!("{nudge}\n\n"), "{text:?}");
+                    checked += 1;
+                }
+            }
+        }
+    }
+
+    // The close in place of an end of turn (no preface), at every seam but
+    // right after a space (where none is clean; see the module docs).
+    let tokens = thinking_tokens(&tok, &builtin)?;
+    for prefix in SEAM_PREFIXES {
+        for after in AFTER_CLOSE {
+            let mut act = |earlier: &[u32], last: u32| {
+                let settings = ThinkingSettings {
+                    budget: Some(100_000),
+                    ..ThinkingSettings::default()
+                };
+                let mut c = ThinkingControl::new(tokens.clone(), settings, true);
+                for &id in earlier.iter().chain([&last]) {
+                    assert_eq!(decide(&mut c, id).ok()?, Action::Keep);
+                }
+                match c.decide_stop() {
+                    Action::Replace(ids) => Some(ids),
+                    _ => None,
+                }
+            };
+            let text = check_seam(&tok, prefix, after, &mut act)?;
+            ensure!(
+                text.ends_with("\n</think>\n\n") || text == "</think>\n\n",
+                "{text:?}"
+            );
+            checked += 1;
+        }
+    }
+
+    // The close in front of a tool call at a line start: `</think>\n\n`,
+    // then the call (the draw) and its body.
+    for prefix in SEAM_PREFIXES.iter().filter(|p| p.ends_with('\n')) {
+        let on =
+            ThinkingSettings { tool_call_ends_thinking: true, ..Default::default() };
+        let mut act = |earlier: &[u32], last: u32| {
+            let mut c = ThinkingControl::new(tokens.clone(), on, true);
+            for &id in earlier.iter().chain([&last]) {
+                assert_eq!(decide(&mut c, id).ok()?, Action::Keep);
+            }
+            match decide(&mut c, tokens.tool_call).ok()? {
+                Action::Before(mut ids) => {
+                    ids.push(tokens.tool_call);
+                    Some(ids)
+                }
+                _ => None,
+            }
+        };
+        let after = AFTER_CLOSE[0].strip_prefix("<tool_call>").expect("a call");
+        check_seam(&tok, prefix, after, &mut act)?;
+        checked += 1;
+    }
+    eprintln!("{checked} insertions match the whole text's encoding");
+    Ok(())
+}
+
+/// The tool call rule needs tools: a chat request without them (or with
+/// `tool_choice: none`) does not get it, even when it asks; a budget of 0
+/// is a 400.
+#[test]
+#[ignore = "requires LILY_MODEL_DIR_FLASH"]
+fn the_tool_call_rule_needs_tools_and_a_zero_budget_is_refused() -> Result<()> {
+    let tok = tokenizer()?;
+    let prepare = |extra: Value| -> Result<api::Prepared> {
+        let mut body = json!({
+            "messages": [{"role": "user", "content": "Read src/main.rs."}],
+            "tool_call_ends_thinking": true,
+        });
+        for (k, v) in extra.as_object().context("an object")? {
+            body[k] = v.clone();
+        }
+        let request: ChatRequest = serde_json::from_value(body)?;
+        api::prepare_chat(request, &tok, &defaults(), 1 << 20, &images())
+    };
+    let with_tools = prepare(json!({"tools": agent_tools()}))?;
+    ensure!(with_tools.thinking.tool_call_ends_thinking, "asked for, with tools");
+    let without = prepare(json!({}))?;
+    ensure!(!without.thinking.tool_call_ends_thinking, "no tools: no rule");
+    ensure!(!without.thinking.any(), "and no control at all");
+    let none = prepare(json!({"tools": agent_tools(), "tool_choice": "none"}))?;
+    ensure!(!none.thinking.tool_call_ends_thinking, "tool_choice none: no rule");
+    // The server's default is gated the same way.
+    let mut d = defaults();
+    d.thinking_controls.tool_call_ends_thinking = true;
+    let request: ChatRequest = serde_json::from_value(json!({
+        "messages": [{"role": "user", "content": "hi"}],
+    }))?;
+    let p = api::prepare_chat(request, &tok, &d, 1 << 20, &images())?;
+    ensure!(!p.thinking.tool_call_ends_thinking, "the default without tools");
+
+    for extra in [
+        json!({"thinking_budget": 0}),
+        json!({"chat_template_kwargs": {"thinking_budget": 0}}),
+    ] {
+        let err = prepare(extra.clone()).err().with_context(|| format!("{extra}"))?;
+        ensure!(err.to_string().contains("positive"), "{err}");
+    }
+    ensure!(prepare(json!({"thinking_budget": 1}))?.thinking.budget == Some(1));
+    Ok(())
+}
