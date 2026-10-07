@@ -839,8 +839,10 @@ then costs 18 304 bytes instead of 30 784 with the draft head (13 attention
 layers x (2 caches x 2 heads x (256 + 16) bytes + 256 + 64)), 40 % less, so
 the same session-cache budget holds about 1.7 times the context: more
 sessions stay in memory instead of on the disk tier, and the batch admits
-longer requests side by side (it holds a newcomer back while
-`in flight + (prompt + 8 192) x bytes per token` exceeds the budget).
+longer requests side by side (it holds a newcomer back while the sessions
+in flight plus the newcomer's estimate exceed the budget; the estimate is
+roughly `(prompt + 8 192) x bytes per token`, rounded to the capacity
+step, plus its recurrent state and checkpoints).
 bf16 is the default.
 
 The writers quantize the value the bf16 cache would hold (the bf16-rounded

@@ -56,7 +56,9 @@ struct Cli {
     /// q8_0): about 40 % less memory per token of context, so the session
     /// cache holds more sessions and longer batched requests, at a small
     /// loss of precision. Each format keeps its own disk tier directory,
-    /// each with the full `--disk-cache-bytes`.
+    /// each with the full `--disk-cache-bytes`. The `LILY_KV_CACHE`
+    /// environment variable (for tests and measurement) overrides this flag;
+    /// the log's memory line states the format in effect.
     #[arg(long, default_value = "bf16")]
     kv_cache: lily::kernels::attention::KvFormat,
 

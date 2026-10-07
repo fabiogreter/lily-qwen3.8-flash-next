@@ -222,14 +222,18 @@ kernel void k_norm_rope_scatter_decode_bf16(
 // rint(x / scale) clamped to +-127, zero for an all-zero group. The writers
 // quantize the bf16-rounded value the bf16 cache would have held, so both
 // caches start from the same numbers. A simdgroup's 32 lanes hold one group.
+// The scale is capped at half's largest finite value: a group past
+// 127 x 65504 (about 8.3e6) saturates at +-127 x 65504 instead of storing an
+// infinite scale, whose zeros would dequantize to NaN.
 #define KV_Q8_GROUP 32
+#define KV_Q8_SCALE_MAX 65504.0f
 
 static inline void kv_q8_store(float x,
                                device char* value,
                                device half* scale,
                                uint lane) {
     const float amax = simd_max(abs(x));
-    const half d = half(amax / 127.0f);
+    const half d = half(min(amax / 127.0f, KV_Q8_SCALE_MAX));
     const float id = float(d) != 0.0f ? 1.0f / float(d) : 0.0f;
     *value = char(clamp(rint(x * id), -127.0f, 127.0f));
     if (lane == 0) {
@@ -237,8 +241,11 @@ static inline void kv_q8_store(float x,
     }
 }
 
-// scatter_kv_bf16 into a q8 cache; D must be a multiple of 32, and the
-// threadgroup a multiple of 32, so that each simdgroup covers one group.
+// scatter_kv_bf16 into a q8 cache. Each simdgroup must cover exactly one
+// group: lane == gid % 32 holds because D is a multiple of 32 (a q8 cache's
+// shape check) and so is the threadgroup (256), which makes the grid a
+// multiple of 32 and leaves even the last, partial threadgroup whole
+// simdgroups.
 kernel void scatter_kv_q8(device char*         cache  [[buffer(0)]],
                           device half*         scales [[buffer(1)]],
                           device const bfloat* rows   [[buffer(2)]],

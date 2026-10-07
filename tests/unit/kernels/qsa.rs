@@ -1232,7 +1232,9 @@ fn q8_sparse_attention_matches_bf16_over_the_dequantized_cache() {
     use crate::kernels::attention::tests::{kv_like_rows, q8_cache_of};
     let ctx = MetalContext::new().expect("metal context");
     let mut rng = StdRng::seed_from_u64(84);
-    let (kvh, group, d, ratio) = (2usize, 8usize, 256usize, 4usize);
+    // The model's GQA group of 12: the tensor-op tile's second row
+    // fragment and the split kernel's third head group both hold heads.
+    let (kvh, group, d, ratio) = (2usize, 12usize, 256usize, 4usize);
     let nq = kvh * group;
     let scale = 1.0 / (d as f32).sqrt();
     for (qb, base_pos, k_max) in

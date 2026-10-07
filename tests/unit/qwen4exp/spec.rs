@@ -137,7 +137,15 @@ fn head_cache_diff(g: &DecodeState, b: &DecodeState, pos: usize) -> Vec<String> 
     else {
         panic!("head is not attention")
     };
-    for (name, x, y) in [("k", &gk.values, &bk.values), ("v", &gv.values, &bv.values)] {
+    let mut stores = vec![("k", &gk.values, &bk.values), ("v", &gv.values, &bv.values)];
+    // A q8 cache's scales are rows of their own ([KVH, cap, D / 32]).
+    if let (Some(gs), Some(bs)) = (&gk.scales, &bk.scales) {
+        stores.push(("k scales", gs, bs));
+    }
+    if let (Some(gs), Some(bs)) = (&gv.scales, &bv.scales) {
+        stores.push(("v scales", gs, bs));
+    }
+    for (name, x, y) in stores {
         let (kvh, max_seq, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
         let (xb, yb) = (x.raw_bytes(), y.raw_bytes());
         let es = x.dtype().size();
@@ -190,7 +198,8 @@ fn gpu_selected_drafts_equal_host_driven_drafts() {
     let greedy = SamplingParams::greedy();
     let chain = 2usize;
     let pattern = [0usize, 0, 1, 0, 2, 1, 1, 0, 2, 0, 1, 2];
-    for prompt_len in [300usize, 33000] {
+    // 2040: the steps cross the indexer's dense limit (2 051).
+    for prompt_len in [300usize, 2040, 33000] {
         let prompt: Vec<u32> =
             (0..prompt_len).map(|i| 1000 + (i * 37 % 5000) as u32).collect();
         let capacity = prompt_len + 128;

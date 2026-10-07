@@ -569,14 +569,17 @@ fn assert_q8_row(values: &[i8], scales: &[half::f16], x: &[f32], at: &str) {
             "{at}: value {i}: {g} vs {w}"
         );
     }
-    // Every value within half a step of the input (plus the one-step slack).
+    // Every value within half a step of the input (plus the one-step slack),
+    // except in a saturated group (scale at half's maximum).
     for (i, ((&q, &v), s)) in values
         .iter()
         .zip(x)
         .zip(scales.iter().flat_map(|s| std::iter::repeat_n(s.to_f32(), KV_Q8_GROUP)))
         .enumerate()
     {
-        assert!((f32::from(q) * s - v).abs() <= 1.5 * s + 1e-6, "{at}: value {i}");
+        if s < 65504.0 {
+            assert!((f32::from(q) * s - v).abs() <= 1.5 * s + 1e-6, "{at}: value {i}");
+        }
     }
 }
 
@@ -596,9 +599,20 @@ fn q8_scatter_matches_the_cpu_quantizer_and_dequantizes() {
     let mut rng = StdRng::seed_from_u64(81);
     let (kvh, max_seq, d, m, base) = (2usize, 16usize, 256usize, 5usize, 3usize);
     let rows = kv_like_rows(&mut rng, m * kvh, d);
-    // A zero group: scale 0, values 0.
+    // A zero group: scale 0, values 0. A group of tiny values: a subnormal
+    // half scale. A group past 127 x 65504: the scale saturates at half's
+    // maximum instead of overflowing to infinity (whose zeros would
+    // dequantize to NaN).
     let mut rows = rows;
     rows[..KV_Q8_GROUP].fill(0.0);
+    let g = KV_Q8_GROUP;
+    for (i, v) in rows[g..2 * g].iter_mut().enumerate() {
+        *v = (i as f32 - 15.5) * 1e-6;
+    }
+    for (i, v) in rows[2 * g..3 * g].iter_mut().enumerate() {
+        *v = if i % 2 == 0 { 1.6e7 } else { -3.0 };
+    }
+    let rows = cpu_ref::round_bf16(&rows);
     let cache = KvCache::zeros(&ctx, KvFormat::Q8, kvh, max_seq, d).expect("cache");
     let t_rows = Tensor::from_f32_as_bf16(&ctx, &rows, &[m, kvh, d]).expect("rows");
     let staged = Tensor::zeros(&ctx, &[kvh, max_seq, d], DType::BF16).expect("staged");
@@ -634,6 +648,11 @@ fn q8_scatter_matches_the_cpu_quantizer_and_dequantizes() {
     }
     let (v0, s0) = (&values[base * d..base * d + KV_Q8_GROUP], scales[base * g]);
     assert!(v0.iter().all(|&b| b == 0) && s0.to_f32() == 0.0, "the zero group");
+    let tiny = scales[base * g + 1];
+    assert!(!tiny.is_normal() && tiny.to_f32() > 0.0, "subnormal scale {tiny}");
+    let big = scales[base * g + 2];
+    assert_eq!(big.to_f32(), 65504.0, "saturated scale");
+    assert!(staged.iter().all(|x| x.is_finite()), "a dequantized value is not finite");
 }
 
 /// The fused decode K prep into a q8 cache stores the q8_0 of exactly the
@@ -676,7 +695,8 @@ fn q8_decode_k_prep_quantizes_the_bf16_kernels_row() {
 fn q8_sdpa_decode_matches_bf16_over_the_dequantized_cache() {
     let ctx = MetalContext::new().expect("metal context");
     let mut rng = StdRng::seed_from_u64(83);
-    let (nq, kvh, d, max_seq) = (16usize, 2usize, 256usize, 2056usize);
+    // The model's GQA shape: 24 query heads over 2 KV heads.
+    let (nq, kvh, d, max_seq) = (24usize, 2usize, 256usize, 2056usize);
     let scale = 1.0 / (d as f32).sqrt();
     let k = kv_like_rows(&mut rng, kvh * max_seq, d);
     let v = kv_like_rows(&mut rng, kvh * max_seq, d);
