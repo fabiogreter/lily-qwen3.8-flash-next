@@ -89,7 +89,7 @@ The n-gram table rows are 160 wide, which is not a multiple of 64, hence
 group 32 there. Routers, gates and the small mixing projections stay at 8 bits
 because they steer the computation and cost almost nothing.
 
-The converter's `--q8 GROUPS` (experimental) moves any subset of five groups
+The converter's `--q8 GROUPS` moves any subset of five groups
 of rows of the table to Q8 group 64; the routed experts stay Q4 whatever the
 choice. The size column is what the group adds to the full model (105.49 GB
 all-Q4 with the draft head and the tower), the read column what it adds to the
@@ -113,7 +113,7 @@ subset runs on the existing kernels: each projection dispatches on its own
 width, and the fused stacks (q|k|v, the GDN `in_proj_*`, the shared gate|up)
 never span two groups.
 
-`--draft-q4` (experimental) keeps the draft head's path 4-bit under such a
+`--draft-q4` keeps the draft head's path 4-bit under such a
 policy. The trunk verifies every proposal, so the head only has to be roughly
 right, and speculative sampling stays exact whatever the head reads; yet each
 draft step reads the head's block and an LM head, so an 8-bit `head` alone
@@ -136,6 +136,11 @@ on the all-Q4 checkpoint. The flag needs one of `attn`, `shared` or `head` in
 the policy (otherwise the head is Q4 already) and is recorded as
 `lily.quantization.draft_q4` (below); `--mtp-only` appends follow it like
 they follow the groups.
+
+The published q4-xl checkpoint (`Qwen3.8-Flash-Next-lily-q4-xl`, the
+converter's `--q4-xl`) is `--q8 attn,shared,head,embed --draft-q4`; the
+plain q4 checkpoint is the default policy. The README's "Two checkpoints"
+says why both exist.
 
 ### Expert split
 

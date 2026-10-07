@@ -16,10 +16,12 @@ Converts the raw Hugging Face BF16 checkpoint into lily's
     --src ~/models/Qwen3.8-Flash-Next \
     --dst ~/models/Qwen3.8-Flash-Next-lily-q4 \
     [--layers 4] [--dry-run] [--ngram-bits 4 --ngram-group 32] [--no-mtp] [--no-vision] \
-    [--q8 attn,gdn,shared,head,embed] [--q8-dense] [--q8-embed] [--draft-q4]
+    [--q4-xl] [--q8 attn,gdn,shared,head,embed] [--q8-dense] [--q8-embed] [--draft-q4]
 ```
 
-`--q8 GROUPS` (experimental) stores a comma-separated subset of the groups
+`--q4-xl` writes the q4-xl checkpoint (the README's "Two checkpoints"):
+it is `--q8 attn,shared,head,embed --draft-q4`. `--q8 GROUPS` stores a
+comma-separated subset of the groups
 `attn` (attention q/k/v/o), `gdn` (GDN projections), `shared` (shared expert),
 `head` (`lm_head`) and `embed` (`embed_tokens`) at Q8 instead of Q4;
 `--q8-dense` is an alias of `attn,gdn,shared,head` and `--q8-embed` of `embed`

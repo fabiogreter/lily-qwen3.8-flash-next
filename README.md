@@ -28,8 +28,11 @@ cargo build --release --locked
   --bind 127.0.0.1:8000 --max-seq 131072
 ```
 
-The checkpoint is on Hugging Face as
-[fabiogreter/Qwen3.8-Flash-Next-lily-q4](https://huggingface.co/fabiogreter/Qwen3.8-Flash-Next-lily-q4).
+The checkpoints are on Hugging Face as
+[fabiogreter/Qwen3.8-Flash-Next-lily-q4](https://huggingface.co/fabiogreter/Qwen3.8-Flash-Next-lily-q4)
+and
+[fabiogreter/Qwen3.8-Flash-Next-lily-q4-xl](https://huggingface.co/fabiogreter/Qwen3.8-Flash-Next-lily-q4-xl);
+[Two checkpoints](#two-checkpoints) says which to take.
 The server answers `/health` with `503 loading` while the model loads and
 serves after about 25 seconds, while the n-gram table keeps loading in the
 background. `--help` lists every flag. The server can also be run as a
@@ -58,9 +61,14 @@ opencode. The differences:
 - **Thinking is on by default.** `reasoning_effort` (`none`, `low`,
   `medium`, `high`) sets it per request; `--thinking` and
   `--reasoning-effort` set the server's default.
-- **Thinking controls**, all off by default (experimental; the inserted
-  texts are untested as prompts). Per request, at the top level or in
-  `chat_template_kwargs` (which wins):
+- **Thinking controls**, on by default for chat requests: a thinking
+  budget of 8 000 tokens at `low` and `medium` effort and 16 000 at
+  `xhigh`, with nudges and a tool call ending thinking. On a captured
+  opencode turn where the model kept reasoning (56K tokens of context,
+  `low` effort, 30 samples each), they took the runaway reasoning blocks
+  from 16 of 30 to none and the turns that went on to a tool call from 9
+  to 18; the 16 000 at `xhigh` is not measured. Per request, at the top
+  level or in `chat_template_kwargs` (which wins):
   - `thinking_budget` (a positive token count; negative turns a server
     default off, 0 is refused): once the reasoning block holds that many of
     the model's tokens it is closed at the next line end (after a grace
@@ -87,13 +95,15 @@ opencode. The differences:
   token (the plain loop, and batched steps, which park nothing while such
   a row thinks); `tool_call_ends_thinking` alone does so at every line
   start there. The server's defaults for chat: `--thinking-budget
-  low=4000,medium=8000,xhigh=16000` (by the template's reasoning effort,
-  `xhigh` when unset; or one number for all),
+  low=8000,medium=8000,xhigh=16000` (by the template's reasoning effort,
+  `xhigh` when unset; or one number for all, or `off`),
   `--thinking-budget-tool-turn-factor` (scales it after a tool result),
   `--thinking-nudges`, `--tool-call-ends-thinking`,
   `--thinking-budget-grace` and `--thinking-texts` (a JSON file with the
   texts). `/v1/completions` takes only the request fields, and only for a
-  prompt that ends with `<think>\n`.
+  prompt that ends with `<think>\n`. `--thinking-budget off`,
+  `--thinking-nudges false` and `--tool-call-ends-thinking false` turn the
+  defaults off; a request's `thinking_budget: -1` turns its budget off.
 - **Every response carries a `timings` object** with prefill and decode
   rates, cached tokens and draft acceptance. `GET /v1/timings` keeps the
   last 32; `tools/opencode-plugin-timings/` shows them in opencode.
@@ -201,10 +211,54 @@ indexer that picks 512 blocks per query, a 512-expert MoE with 10 active, a
 four-stream gated residual, a 32 GB hashed n-gram embedding, a
 multi-token-prediction head and a vision tower.
 
-The server runs a 4-bit conversion of it (98 GiB), made by
-`tools/convert/convert_qwen38_flash_next.py` from the BF16 weights, with the
-vision tower kept in bf16. The layout is documented in
+The server runs a 4-bit conversion of it (98 GiB), or the q4-xl conversion
+with its most sensitive dense tensors at 8 bits (99.6 GiB, see below), both
+made by `tools/convert/convert_qwen38_flash_next.py` from the BF16 weights,
+with the vision tower kept in bf16. The layout is documented in
 [docs/qwen38-flash-next-checkpoint-format.md](docs/qwen38-flash-next-checkpoint-format.md).
+
+## Two checkpoints
+
+Both checkpoints keep the routed experts and the n-gram tables, about 95 %
+of the bytes, at 4 bits; they differ in the dense tensors every token
+passes through:
+
+| | q4 | q4-xl |
+|---|---|---|
+| Hugging Face | [lily-q4](https://huggingface.co/fabiogreter/Qwen3.8-Flash-Next-lily-q4) | [lily-q4-xl](https://huggingface.co/fabiogreter/Qwen3.8-Flash-Next-lily-q4-xl) |
+| at 8 bits besides the small fixed set | nothing | attention, the shared expert, the LM head, the embedding |
+| size | 105.5 GB | 106.9 GB |
+| decode, 2 drafts, 4K / 16K / 32K / 64K | 103 / 100 / 99 / 99 tok/s | 101 / 101 / 94 / 94 tok/s |
+| decode, no drafts | 87 / 82 / 85 / 79 tok/s | 73 / 73 / 69 / 68 tok/s |
+
+**Why q4-xl exists.** On long agent turns the 4-bit model more often
+announces its next step and ends the turn without making the tool call. On
+the captured opencode turn above, with the thinking controls on, 18 of 30
+samples went on to a tool call on q4 and 23 of 30 on q4-xl, and 12 against
+7 announced and stopped; the thinking controls alone do not close that gap.
+Unsloth's llama.cpp quantization (UD-IQ4_XS) keeps the same kinds of tensors
+at 8 bits, and on that turn it, too, rarely stopped after announcing (1 of
+10 closed turns, without thinking controls). Of the variants tried, the
+attention tensors carried the difference: 8 bits on the shared expert, LM
+head and embedding alone did not help, and 8 bits on the GDN projections as
+well did not add to it. This is one prompt and 30 samples per checkpoint,
+not a task-level evaluation; quality was measured on the trunk alone, which
+the draft head's precision cannot change (below).
+
+**The speed caveat.** q4-xl reads about 18 % more weight bytes per token
+(attention in the 12 full-attention layers, the shared expert in all 48,
+the whole LM head every step).
+A request decoding alone keeps speculative decoding and loses 2 to 5 %:
+the draft head keeps its own 4-bit copy of the LM head and its block at 4
+bits (`--draft-q4`), so drafting costs what it costs on q4, and the trunk,
+which verifies every draft, keeps its 8-bit tensors, so the output is
+q4-xl's. Decoding without drafts, which batched requests do, loses about
+15 %. Prefill is unchanged. Take q4-xl for agent work and q4 when
+throughput matters more, for example with several concurrent requests.
+
+Same-day HTTP series (2026-10-07, commits `a4a23d7` and `6d45554`, method
+as under Performance, medians of three; the q4 rows without drafts were
+disturbed by a conversion writing to disk in one repeat).
 
 ## Exactness
 
@@ -291,7 +345,9 @@ uv pip install --python .venv/bin/python mlx safetensors numpy torch torchvision
     --src ~/models/Qwen3.8-Flash-Next --dst ~/models/Qwen3.8-Flash-Next-lily-q4
 ```
 
-It takes about a minute on an M5 Max. `--layers 4` writes the small
+Add `--q4-xl` for the q4-xl checkpoint (`--dst
+~/models/Qwen3.8-Flash-Next-lily-q4-xl`). It takes about a minute on an M5
+Max. `--layers 4` writes the small
 checkpoint the tests use. [tools/README.md](tools/README.md) has the other
 flags and the reference harnesses.
 
