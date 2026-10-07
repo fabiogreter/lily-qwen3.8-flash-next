@@ -28,3 +28,6 @@ docs/performance-timeline.md
 docs/phase2-server-design.md
 docs/optimization-potential.md
 docs/continuous-batching-draft.md
+
+# Claude Code agent worktrees.
+/.claude/worktrees/
