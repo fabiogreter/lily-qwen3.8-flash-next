@@ -137,13 +137,14 @@ fn head_cache_diff(g: &DecodeState, b: &DecodeState, pos: usize) -> Vec<String> 
     else {
         panic!("head is not attention")
     };
-    for (name, x, y) in [("k", gk, bk), ("v", gv, bv)] {
+    for (name, x, y) in [("k", &gk.values, &bk.values), ("v", &gv.values, &bv.values)] {
         let (kvh, max_seq, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
         let (xb, yb) = (x.raw_bytes(), y.raw_bytes());
+        let es = x.dtype().size();
         for h in 0..kvh {
             for p in 0..pos {
-                let o = ((h * max_seq + p) * d) * 2;
-                if xb[o..o + d * 2] != yb[o..o + d * 2] {
+                let o = ((h * max_seq + p) * d) * es;
+                if xb[o..o + d * es] != yb[o..o + d * es] {
                     out.push(format!("{name}[head {h}, pos {p}]"));
                 }
             }

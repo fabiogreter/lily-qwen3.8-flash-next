@@ -1219,3 +1219,100 @@ fn scores_on_both_routes_match_cpu() {
         }
     }
 }
+
+// --- the q8 K/V cache -----------------------------------------------------------
+
+/// Both sparse kernels over a q8 cache against their bf16 twins over the
+/// same cache dequantized (`kv_dequant_q8`, the values rounded to bf16):
+/// the per-query tensor-op kernel rounds its dequantized operands to bf16
+/// exactly as the staging does, so it must match bit for bit; the split
+/// kernel dots the unrounded products, so it matches within that rounding.
+#[test]
+fn q8_sparse_attention_matches_bf16_over_the_dequantized_cache() {
+    use crate::kernels::attention::tests::{kv_like_rows, q8_cache_of};
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(84);
+    let (kvh, group, d, ratio) = (2usize, 8usize, 256usize, 4usize);
+    let nq = kvh * group;
+    let scale = 1.0 / (d as f32).sqrt();
+    for (qb, base_pos, k_max) in [(37usize, 61usize, 6usize), (20, 4093, 512), (1, 5000, 512)] {
+        let max_seq = base_pos + qb + 3;
+        let q = cpu_ref::round_bf16(&random(&mut rng, qb * nq * d, -1.0, 1.0));
+        let k = kv_like_rows(&mut rng, kvh * max_seq, d);
+        let v = kv_like_rows(&mut rng, kvh * max_seq, d);
+        let (kq, ks) = q8_cache_of(&ctx, &k, (kvh, max_seq, d), max_seq);
+        let (vq, vs) = q8_cache_of(&ctx, &v, (kvh, max_seq, d), max_seq);
+        let hot: Vec<u32> = vec![2, 5, 11];
+        let (sel, n_sel) = random_selections(&mut rng, qb, k_max, base_pos, ratio, &hot);
+        let t_q = Tensor::from_f32_as_bf16(&ctx, &q, &[qb, nq, d]).expect("q");
+        let t_sel =
+            Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[qb, k_max], DType::U32)
+                .expect("sel");
+        let t_n = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&n_sel), &[qb], DType::U32)
+            .expect("n");
+        let out = |_: ()| Tensor::zeros(&ctx, &[qb, nq, d], DType::BF16).expect("out");
+        let (query_q8, query_bf, split_q8, split_bf) = (out(()), out(()), out(()), out(()));
+        let slots = split_scratch_slots(qb, k_max, ratio);
+        let partials = Tensor::zeros(&ctx, &[slots * nq, d], DType::F32).expect("partials");
+        let stats = Tensor::zeros(&ctx, &[slots * nq, 2], DType::F32).expect("stats");
+        let scratch = SparseSplitScratch { partials: &partials, stats: &stats };
+        let pass = ctx.begin().expect("pass");
+        qsa_attention_query(
+            &ctx, &pass, &t_q, &kq, &vq, &t_sel, &t_n, &query_q8, qb, k_max, ratio, base_pos,
+            scale,
+        )
+        .expect("q8 query attention");
+        qsa_attention_query(
+            &ctx, &pass, &t_q, &ks, &vs, &t_sel, &t_n, &query_bf, qb, k_max, ratio, base_pos,
+            scale,
+        )
+        .expect("bf16 query attention");
+        qsa_attention(
+            &ctx, &pass, &t_q, &kq, &vq, &t_sel, &t_n, &split_q8, &scratch, qb, k_max, ratio,
+            base_pos, scale,
+        )
+        .expect("q8 split attention");
+        pass.level_barrier(&[]).expect("barrier");
+        qsa_attention(
+            &ctx, &pass, &t_q, &ks, &vs, &t_sel, &t_n, &split_bf, &scratch, qb, k_max, ratio,
+            base_pos, scale,
+        )
+        .expect("bf16 split attention");
+        pass.commit_wait().expect("commit");
+        let at = format!("{qb} queries at {base_pos}, {k_max} blocks");
+        let query_q8 = query_q8.to_f32().expect("q8");
+        assert!(query_q8.iter().all(|x| x.is_finite()), "{at}: non-finite output");
+        assert_eq!(query_q8, query_bf.to_f32().expect("bf16"), "{at}: query route");
+        cpu_ref::assert_close(
+            &split_q8.to_f32().expect("q8"),
+            &split_bf.to_f32().expect("bf16"),
+            2e-2,
+            2e-2,
+        );
+        // And the q8 output is close to the unquantized attention overall
+        // (relative RMS error): per element the outlier channels (x24) are
+        // off by more than a step, since their group's coarse K steps also
+        // move the softmax weights their large values are averaged with.
+        // The data is harsh on purpose: 7 of a row's 8 groups hold an
+        // outlier, so their step is 24 times coarser (about 2 % here); the
+        // model's own error is measured on its activations, not here.
+        let expected = cpu_sparse_attention(
+            &q,
+            &k,
+            &v,
+            &sel,
+            &n_sel,
+            (qb, nq, kvh, d),
+            (max_seq, k_max, ratio, base_pos),
+            scale,
+        );
+        let rms = |x: &mut dyn Iterator<Item = f32>| {
+            let (sum, n) = x.fold((0.0f64, 0usize), |(s, n), v| (s + f64::from(v * v), n + 1));
+            (sum / n as f64).sqrt()
+        };
+        let err = rms(&mut query_q8.iter().zip(&expected).map(|(a, b)| a - b));
+        let rel = err / rms(&mut expected.iter().copied());
+        println!("{at}: q8 vs unquantized relative RMS error {rel:.4}");
+        assert!(rel < 0.04, "{at}: relative RMS error {rel}");
+    }
+}

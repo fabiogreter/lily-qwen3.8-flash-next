@@ -1,4 +1,5 @@
 use super::*;
+use crate::kernels::attention::KvFormat;
 
 const GB: u64 = 1 << 30;
 /// The checkpoint's shape as `docs/low-ram-experts.md` measures it: 24 576
@@ -204,13 +205,20 @@ fn the_slab_never_drops_below_two_layers() {
 fn a_session_costs_its_tokens_plus_the_recurrent_state() {
     let Ok(dir) = std::env::var("LILY_MODEL_DIR_FLASH") else { return };
     let cfg = Qwen4ExpConfig::from_model_dir(&dir).expect("config");
-    let at = |mtp, tokens, checkpoints| {
-        super::super::model::session_bytes(&cfg, mtp, tokens, checkpoints).unwrap()
+    let at_format = |format, mtp, tokens, checkpoints| {
+        super::super::model::session_bytes(&cfg, mtp, format, tokens, checkpoints)
+            .unwrap()
     };
+    let at =
+        |mtp, tokens, checkpoints| at_format(KvFormat::Bf16, mtp, tokens, checkpoints);
     // Whole capacity steps, so the rounding does not blur the difference.
     let (short, long) = (65_536usize, 131_072usize);
     let per_token = (at(true, long, 0) - at(true, short, 0)) / (long - short) as u64;
     assert_eq!(per_token, 30_784, "the server's B/token of context");
+    // q8 K/V: 13 attention layers x (2 caches x 2 heads x (256 B + 8 scales
+    // x 2 B) + 256 B of indexer keys + 64 B of block keys).
+    let q8 = |tokens| at_format(KvFormat::Q8, true, tokens, 0);
+    assert_eq!((q8(long) - q8(short)) / (long - short) as u64, 18_304, "q8 B/token");
     // Without the draft head, one attention layer fewer.
     assert!(at(false, long, 0) < at(true, long, 0));
     // Checkpoints add a snapshot each.

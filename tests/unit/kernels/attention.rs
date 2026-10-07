@@ -514,3 +514,212 @@ fn sdpa_small_m_timing() {
         }
     }
 }
+
+// --- the q8 K/V cache -----------------------------------------------------------
+
+/// Random K/V-like rows: uniform values with a few outlier channels (as
+/// RoPE'd keys have), rounded to bf16, the values the writers receive.
+pub(crate) fn kv_like_rows(rng: &mut StdRng, rows: usize, d: usize) -> Vec<f32> {
+    let x: Vec<f32> = (0..rows * d)
+        .map(|i| {
+            let v = rng.gen_range(-1.0f32..1.0);
+            if i % d % 37 == 5 { v * 24.0 } else { v }
+        })
+        .collect();
+    cpu_ref::round_bf16(&x)
+}
+
+/// A q8 cache `[kvh, max_seq, d]` whose first `len` positions hold `x`'s
+/// rows (`[kvh, max_seq, d]` f32, bf16-rounded) quantized by the GPU writer,
+/// and its bf16 dequantization (the staging kernel, every position).
+pub(crate) fn q8_cache_of(
+    ctx: &MetalContext,
+    x: &[f32],
+    (kvh, max_seq, d): (usize, usize, usize),
+    len: usize,
+) -> (KvCache, Tensor) {
+    let cache = KvCache::zeros(ctx, KvFormat::Q8, kvh, max_seq, d).expect("q8 cache");
+    // scatter_kv takes [M, KVH, D] rows.
+    let mut rows = vec![0.0f32; len * kvh * d];
+    for h in 0..kvh {
+        for t in 0..len {
+            rows[(t * kvh + h) * d..(t * kvh + h + 1) * d]
+                .copy_from_slice(&x[(h * max_seq + t) * d..(h * max_seq + t + 1) * d]);
+        }
+    }
+    let rows = Tensor::from_f32_as_bf16(ctx, &rows, &[len, kvh, d]).expect("rows");
+    let staged = Tensor::zeros(ctx, &[kvh, max_seq, d], DType::BF16).expect("staged");
+    let pass = ctx.begin().expect("pass");
+    scatter_kv(ctx, &pass, &cache, &rows, 0).expect("scatter");
+    pass.level_barrier(&[&cache.values]).expect("barrier");
+    kv_dequant_q8(ctx, &pass, &cache, &staged, max_seq).expect("dequant");
+    pass.commit_wait().expect("commit");
+    (cache, staged)
+}
+
+/// Asserts a GPU-written q8 row equals the CPU q8_0 of `x`: the scales
+/// exactly, the values within one step (a quotient that lands on .5 may
+/// round either way under fast math).
+fn assert_q8_row(values: &[i8], scales: &[half::f16], x: &[f32], at: &str) {
+    let (want_v, want_s) = cpu_ref::quantize_q8(x, KV_Q8_GROUP);
+    assert_eq!(scales, &want_s[..], "{at}: scales");
+    for (i, (g, w)) in values.iter().zip(&want_v).enumerate() {
+        assert!((i16::from(*g) - i16::from(*w)).abs() <= 1, "{at}: value {i}: {g} vs {w}");
+    }
+    // Every value within half a step of the input (plus the one-step slack).
+    for (i, ((&q, &v), s)) in values
+        .iter()
+        .zip(x)
+        .zip(scales.iter().flat_map(|s| std::iter::repeat_n(s.to_f32(), KV_Q8_GROUP)))
+        .enumerate()
+    {
+        assert!((f32::from(q) * s - v).abs() <= 1.5 * s + 1e-6, "{at}: value {i}");
+    }
+}
+
+fn q8_parts(cache: &KvCache) -> (Vec<i8>, Vec<half::f16>) {
+    let values = cache.values.raw_bytes().iter().map(|&b| b as i8).collect();
+    let scales = bytemuck::cast_slice(cache.scales.as_ref().expect("scales").raw_bytes())
+        .to_vec();
+    (values, scales)
+}
+
+/// The scatter writer quantizes each row as q8_0 does, at the right slots,
+/// leaving the others zero; the staging kernel reads back value x scale.
+#[test]
+fn q8_scatter_matches_the_cpu_quantizer_and_dequantizes() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(81);
+    let (kvh, max_seq, d, m, base) = (2usize, 16usize, 256usize, 5usize, 3usize);
+    let rows = kv_like_rows(&mut rng, m * kvh, d);
+    // A zero group: scale 0, values 0.
+    let mut rows = rows;
+    rows[..KV_Q8_GROUP].fill(0.0);
+    let cache = KvCache::zeros(&ctx, KvFormat::Q8, kvh, max_seq, d).expect("cache");
+    let t_rows = Tensor::from_f32_as_bf16(&ctx, &rows, &[m, kvh, d]).expect("rows");
+    let staged = Tensor::zeros(&ctx, &[kvh, max_seq, d], DType::BF16).expect("staged");
+    let pass = ctx.begin().expect("pass");
+    scatter_kv(&ctx, &pass, &cache, &t_rows, base).expect("scatter");
+    pass.level_barrier(&[]).expect("barrier");
+    kv_dequant_q8(&ctx, &pass, &cache, &staged, max_seq).expect("dequant");
+    pass.commit_wait().expect("commit");
+
+    let (values, scales) = q8_parts(&cache);
+    let staged = staged.to_f32().expect("staged");
+    let g = d / KV_Q8_GROUP;
+    for h in 0..kvh {
+        for t in 0..max_seq {
+            let slot = h * max_seq + t;
+            let (v, s) = (&values[slot * d..(slot + 1) * d], &scales[slot * g..(slot + 1) * g]);
+            if (base..base + m).contains(&t) {
+                let x = &rows[((t - base) * kvh + h) * d..((t - base) * kvh + h + 1) * d];
+                assert_q8_row(v, s, x, &format!("head {h} slot {t}"));
+            } else {
+                assert!(v.iter().all(|&b| b == 0) && s.iter().all(|s| s.to_f32() == 0.0));
+            }
+            for i in 0..d {
+                let want = half::bf16::from_f32(f32::from(v[i]) * s[i / KV_Q8_GROUP].to_f32());
+                assert_eq!(staged[slot * d + i], want.to_f32(), "dequant {h} {t} {i}");
+            }
+        }
+    }
+    let (v0, s0) = (&values[base * d..base * d + KV_Q8_GROUP], scales[base * g]);
+    assert!(v0.iter().all(|&b| b == 0) && s0.to_f32() == 0.0, "the zero group");
+}
+
+/// The fused decode K prep into a q8 cache stores the q8_0 of exactly the
+/// row the bf16 kernel stores.
+#[test]
+fn q8_decode_k_prep_quantizes_the_bf16_kernels_row() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(82);
+    let (kvh, max_seq, d, rot, pos) = (2usize, 64usize, 256usize, 64usize, 41usize);
+    let k = kv_like_rows(&mut rng, kvh, d);
+    let w: Vec<f32> = (0..d).map(|_| rng.gen_range(-0.5f32..0.5)).collect();
+    let t_k = Tensor::from_f32_as_bf16(&ctx, &k, &[kvh, d]).expect("k");
+    let t_w = Tensor::from_f32_as_bf16(&ctx, &w, &[d]).expect("w");
+    let bf = Tensor::zeros(&ctx, &[kvh, max_seq, d], DType::BF16).expect("bf16 cache");
+    let q8 = KvCache::zeros(&ctx, KvFormat::Q8, kvh, max_seq, d).expect("q8 cache");
+    let pass = ctx.begin().expect("pass");
+    k_norm_rope_scatter_decode(&ctx, &pass, &t_k, &t_w, &bf, rot, pos, 1e7, 1e-6, 3)
+        .expect("bf16 prep");
+    k_norm_rope_scatter_decode(&ctx, &pass, &t_k, &t_w, &q8, rot, pos, 1e7, 1e-6, 3)
+        .expect("q8 prep");
+    pass.commit_wait().expect("commit");
+    let bf = bf.to_f32().expect("bf16");
+    let (values, scales) = q8_parts(&q8);
+    let g = d / KV_Q8_GROUP;
+    for h in 0..kvh {
+        let slot = h * max_seq + pos;
+        assert_q8_row(
+            &values[slot * d..(slot + 1) * d],
+            &scales[slot * g..(slot + 1) * g],
+            &bf[slot * d..(slot + 1) * d],
+            &format!("head {h}"),
+        );
+    }
+}
+
+/// Dense decode over a q8 cache against the bf16 kernel over the same cache
+/// dequantized: one split, a full one, ragged tails, up to the dense limit.
+/// Only the bf16 rounding of the dequantized operands differs.
+#[test]
+fn q8_sdpa_decode_matches_bf16_over_the_dequantized_cache() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(83);
+    let (nq, kvh, d, max_seq) = (16usize, 2usize, 256usize, 2056usize);
+    let scale = 1.0 / (d as f32).sqrt();
+    let k = kv_like_rows(&mut rng, kvh * max_seq, d);
+    let v = kv_like_rows(&mut rng, kvh * max_seq, d);
+    let (kq, ks) = q8_cache_of(&ctx, &k, (kvh, max_seq, d), max_seq);
+    let (vq, vs) = q8_cache_of(&ctx, &v, (kvh, max_seq, d), max_seq);
+    let splits = max_seq.div_ceil(SDPA_SPLIT);
+    let partials = Tensor::zeros(&ctx, &[nq, splits, d], DType::F32).expect("partials");
+    let stats = Tensor::zeros(&ctx, &[nq, splits, 2], DType::F32).expect("stats");
+    for len in [1usize, 33, 256, 257, 700, 2051] {
+        let q = cpu_ref::round_bf16(
+            &(0..nq * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect::<Vec<_>>(),
+        );
+        let t_q = Tensor::from_f32_as_bf16(&ctx, &q, &[nq, d]).expect("q");
+        let out_q8 = Tensor::zeros(&ctx, &[nq, d], DType::BF16).expect("out");
+        let out_bf = Tensor::zeros(&ctx, &[nq, d], DType::BF16).expect("out");
+        let pass = ctx.begin().expect("pass");
+        sdpa_decode(&ctx, &pass, &t_q, &kq, &vq, &out_q8, len, scale, Some((&partials, &stats)))
+            .expect("q8 decode");
+        pass.level_barrier(&[]).expect("barrier");
+        sdpa_decode(&ctx, &pass, &t_q, &ks, &vs, &out_bf, len, scale, Some((&partials, &stats)))
+            .expect("bf16 decode");
+        pass.commit_wait().expect("commit");
+        cpu_ref::assert_close(
+            &out_q8.to_f32().expect("q8"),
+            &out_bf.to_f32().expect("bf16"),
+            2e-2,
+            2e-2,
+        );
+    }
+}
+
+/// A q8 cache is never read as bf16 (or the other way round): the dense
+/// prefill kernel, a decode without its split scratch, mismatched K and V
+/// formats, and a split route past the dense lengths all refuse.
+#[test]
+fn q8_caches_are_refused_where_no_q8_kernel_reads_them() {
+    let ctx = MetalContext::new().expect("metal context");
+    let (nq, kvh, d, max_seq) = (16usize, 2usize, 256usize, 9000usize);
+    let q8 = KvCache::zeros(&ctx, KvFormat::Q8, kvh, max_seq, d).expect("q8");
+    let bf = KvCache::zeros(&ctx, KvFormat::Bf16, kvh, max_seq, d).expect("bf16");
+    let q = Tensor::zeros(&ctx, &[1, nq, d], DType::BF16).expect("q");
+    let out = Tensor::zeros(&ctx, &[1, nq, d], DType::BF16).expect("out");
+    let partials = Tensor::zeros(&ctx, &[nq, 64, d], DType::F32).expect("partials");
+    let stats = Tensor::zeros(&ctx, &[nq, 64, 2], DType::F32).expect("stats");
+    let scratch = Some((&partials, &stats));
+    let pass = ctx.begin().expect("pass");
+    assert!(sdpa_prefill(&ctx, &pass, &q, &q8.values, &q8.values, &out, 0, 1.0).is_err());
+    assert!(sdpa_decode(&ctx, &pass, &q, &q8, &q8, &out, 10, 1.0, None).is_err());
+    assert!(sdpa_decode(&ctx, &pass, &q, &q8, &bf, &out, 10, 1.0, scratch).is_err());
+    assert!(sdpa_decode(&ctx, &pass, &q, &q8, &q8, &out, 8192, 1.0, scratch).is_err());
+    // Values without their scales are not a cache.
+    let bare = Kv { values: &q8.values, scales: None };
+    assert!(sdpa_decode(&ctx, &pass, &q, bare, bare, &out, 10, 1.0, scratch).is_err());
+    pass.commit_wait().expect("commit");
+}

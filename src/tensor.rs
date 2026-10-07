@@ -12,12 +12,17 @@ pub enum DType {
     BF16,
     F32,
     U32,
+    /// IEEE half: the q8 KV cache's group scales.
+    F16,
+    /// Signed bytes: the q8 KV cache's values.
+    I8,
 }
 
 impl DType {
     pub fn size(self) -> usize {
         match self {
-            DType::BF16 => 2,
+            DType::I8 => 1,
+            DType::BF16 | DType::F16 => 2,
             DType::F32 | DType::U32 => 4,
         }
     }
@@ -241,6 +246,13 @@ impl Tensor {
             DType::BF16 => {
                 let vals: &[bf16] = bytemuck::cast_slice(self.contents());
                 Ok(vals.iter().map(|v| v.to_f32()).collect())
+            }
+            DType::F16 => {
+                let vals: &[half::f16] = bytemuck::cast_slice(self.contents());
+                Ok(vals.iter().map(|v| v.to_f32()).collect())
+            }
+            DType::I8 => {
+                Ok(self.contents().iter().map(|&b| f32::from(b as i8)).collect())
             }
             DType::U32 => Err(anyhow!("to_f32 on U32 tensor")),
         }

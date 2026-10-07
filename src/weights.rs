@@ -200,7 +200,7 @@ impl Loader<'_> {
         match t.dtype() {
             DType::F32 => Ok(t),
             DType::BF16 => Tensor::from_f32(self.ctx, &t.to_f32()?, t.shape()),
-            DType::U32 => anyhow::bail!("{name} is U32, expected float"),
+            other => anyhow::bail!("{name} is {other:?}, expected float"),
         }
     }
 

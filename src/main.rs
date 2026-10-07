@@ -51,6 +51,15 @@ struct Cli {
     #[arg(long)]
     cache_bytes: Option<String>,
 
+    /// Element format of the attention K/V caches: `bf16` (what the model
+    /// computes) or `q8` (int8 with one f16 scale per 32 values, llama.cpp's
+    /// q8_0): about 40 % less memory per token of context, so the session
+    /// cache holds more sessions and longer batched requests, at a small
+    /// loss of precision. Each format keeps its own disk tier directory,
+    /// each with the full `--disk-cache-bytes`.
+    #[arg(long, default_value = "bf16")]
+    kv_cache: lily::kernels::attention::KvFormat,
+
     /// Most sessions kept in the cache.
     #[arg(long, default_value_t = 16)]
     max_sessions: usize,
@@ -317,6 +326,7 @@ fn run() -> Result<()> {
         thinking_texts: cli.thinking_texts,
         queue: cli.queue,
         max_batch: cli.max_batch,
+        kv_format: cli.kv_cache,
         sampling: SamplingOverrides {
             temperature: cli.temperature,
             top_k: cli.top_k,

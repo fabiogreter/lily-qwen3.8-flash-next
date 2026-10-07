@@ -403,6 +403,7 @@ fn warm_up_on_load_and_reload() {
         memory_budget: None,
         expert_usage_out: None,
         session_context: None,
+        kv_format: Default::default(),
     };
     for round in ["load", "reload"] {
         let ctx = MetalContext::new().expect("metal");

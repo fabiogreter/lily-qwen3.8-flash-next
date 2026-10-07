@@ -78,8 +78,8 @@ struct RowScratch {
 /// One row's attention bindings: the caches of one session's layer (trunk
 /// or draft head), the sequence index the row writes and the rope delta.
 struct AttnRow<'t> {
-    k_cache: &'t Tensor,
-    v_cache: &'t Tensor,
+    k_cache: &'t KvCache,
+    v_cache: &'t KvCache,
     idx_keys: &'t Tensor,
     blk_keys: &'t Tensor,
     pos: usize,

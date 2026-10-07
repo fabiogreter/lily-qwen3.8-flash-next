@@ -162,6 +162,8 @@ pub struct ServeOptions {
     pub bind: String,
     pub max_seq: usize,
     pub cache_bytes: Option<usize>,
+    /// The attention K/V caches' element format.
+    pub kv_format: crate::kernels::attention::KvFormat,
     pub max_sessions: usize,
     pub ngram_storage: NgramStorage,
     pub ngram_preload: bool,
@@ -790,7 +792,9 @@ impl<M: LanguageModel> Engine<M> {
                 session_context: Some(SessionContext {
                     max_seq: effective_max_seq(options.max_seq, 0),
                     checkpoints: CHECKPOINTS_PER_SESSION,
+                    kv_format: options.kv_format,
                 }),
+                kv_format: options.kv_format,
             },
         )?;
         let drafts = options.mtp_drafts.min(model.max_drafts());

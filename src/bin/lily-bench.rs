@@ -42,6 +42,9 @@ struct Cli {
     /// checkpoint's draft head instead of the pipelined one-token loop.
     #[arg(long, default_value_t = 0)]
     drafts: usize,
+    /// Element format of the attention K/V caches (`bf16` or `q8`).
+    #[arg(long, default_value = "bf16")]
+    kv_cache: lily::kernels::attention::KvFormat,
     /// Per-kernel GPU profile: runs the transport in its profile mode (one
     /// command buffer per dispatch) and prints, per pass label, GPU ms per
     /// pass by kernel. Wall-clock results under this flag are not comparable
@@ -371,6 +374,7 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
             mtp_drafts: cli.drafts,
             memory_budget: cli.memory_gb.map(|gb| (gb * (1u64 << 30) as f64) as u64),
             expert_usage_out: cli.expert_usage_out.clone(),
+            kv_format: cli.kv_cache,
             ..LoadOptions::default()
         },
     )?;

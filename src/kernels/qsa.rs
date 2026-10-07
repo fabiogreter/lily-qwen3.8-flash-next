@@ -4,7 +4,7 @@
 
 use anyhow::{Result, ensure};
 
-use crate::kernels::attention;
+use crate::kernels::attention::{self, Kv, KvFormat};
 use crate::kernels::{MROPE_SECTION, Pos, Rope, u32_bytes};
 use crate::metal::{ComputePass, Grid, MetalContext, MslVersion, Param};
 use crate::tensor::{DType, Tensor};
@@ -446,12 +446,12 @@ pub struct SparseSplitScratch<'a> {
 /// position `base_pos + qi`) over their selected blocks plus tail, writing
 /// `out` (`[QB, NQ, D]`), under the split plan for `qb` rows.
 #[allow(clippy::too_many_arguments)]
-pub fn qsa_attention<'t>(
+pub fn qsa_attention<'t, 'c>(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
     q: &Tensor,
-    k_cache: &Tensor,
-    v_cache: &Tensor,
+    k_cache: impl Into<Kv<'c>>,
+    v_cache: impl Into<Kv<'c>>,
     sel: &Tensor,
     n_sel: &Tensor,
     out: &Tensor,
@@ -462,7 +462,8 @@ pub fn qsa_attention<'t>(
     base_pos: impl Into<Pos<'t>>,
     scale: f32,
 ) -> Result<()> {
-    let kvh = k_cache.shape()[0];
+    let (k_cache, v_cache) = (k_cache.into(), v_cache.into());
+    let kvh = k_cache.shape().0;
     ensure!(
         qb > 0 && q.numel().is_multiple_of(qb * ATTN_D),
         "q must be BF16 [QB, NQ, D]"
@@ -478,12 +479,12 @@ pub fn qsa_attention<'t>(
 
 /// [`qsa_attention`] under an explicit split plan.
 #[allow(clippy::too_many_arguments)]
-pub fn qsa_attention_with<'t>(
+pub fn qsa_attention_with<'t, 'c>(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
     q: &Tensor,
-    k_cache: &Tensor,
-    v_cache: &Tensor,
+    k_cache: impl Into<Kv<'c>>,
+    v_cache: impl Into<Kv<'c>>,
     sel: &Tensor,
     n_sel: &Tensor,
     out: &Tensor,
@@ -505,12 +506,12 @@ pub fn qsa_attention_with<'t>(
 /// (timing variants share the shipped kernels' bindings and grids); `None`
 /// takes the shipped ones.
 #[allow(clippy::too_many_arguments)]
-pub fn qsa_attention_named<'t>(
+pub fn qsa_attention_named<'t, 'c>(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
     q: &Tensor,
-    k_cache: &Tensor,
-    v_cache: &Tensor,
+    k_cache: impl Into<Kv<'c>>,
+    v_cache: impl Into<Kv<'c>>,
     sel: &Tensor,
     n_sel: &Tensor,
     out: &Tensor,
@@ -524,10 +525,15 @@ pub fn qsa_attention_named<'t>(
     names: Option<(&'static str, &'static str)>,
 ) -> Result<()> {
     let base_pos = base_pos.into();
-    let (kvh, max_seq, d) =
-        (k_cache.shape()[0], k_cache.shape()[1], k_cache.shape()[2]);
+    let (k_cache, v_cache) = (k_cache.into(), v_cache.into());
+    let format = Kv::pair_format(&k_cache, &v_cache)?;
+    // The timing variants read bf16 caches.
+    ensure!(
+        names.is_none() || format == KvFormat::Bf16,
+        "named split kernels take bf16 caches"
+    );
+    let (kvh, max_seq, d) = k_cache.shape();
     ensure!(d == ATTN_D, "sparse attention is compiled for head dim {ATTN_D}, got {d}");
-    ensure!(v_cache.shape() == k_cache.shape(), "k/v cache shape mismatch");
     ensure!(
         q.dtype() == DType::BF16 && q.numel().is_multiple_of(qb * d),
         "q must be BF16 [QB, NQ, D]"
@@ -570,20 +576,27 @@ pub fn qsa_attention_named<'t>(
             && scratch.stats.dtype() == DType::F32,
         "sparse stats scratch too small"
     );
-    let (split_name, combine_name) =
-        names.unwrap_or(("qsa_attn_split_bf16", "sdpa_decode_combine"));
+    let (split_name, combine_name) = names.unwrap_or(match format {
+        KvFormat::Bf16 => ("qsa_attn_split_bf16", "sdpa_decode_combine"),
+        KvFormat::Q8 => ("qsa_attn_split_q8", "sdpa_decode_combine"),
+    });
     let stage1 = ctx.pipeline(split_name, SOURCE, MslVersion::V3_1)?;
+    let scales;
+    let mut buffers =
+        vec![q.binding(), k_cache.values.binding(), v_cache.values.binding()];
+    if format == KvFormat::Q8 {
+        scales = [k_cache.scales()?, v_cache.scales()?];
+        buffers.extend(scales.iter().map(|t| t.binding()));
+    }
+    buffers.extend([
+        sel.binding(),
+        n_sel.binding(),
+        scratch.partials.binding(),
+        scratch.stats.binding(),
+    ]);
     pass.dispatch_with(
         &stage1,
-        &[
-            q.binding(),
-            k_cache.binding(),
-            v_cache.binding(),
-            sel.binding(),
-            n_sel.binding(),
-            scratch.partials.binding(),
-            scratch.stats.binding(),
-        ],
+        &buffers,
         &[
             Param::U32(d as u32),
             Param::U32(max_seq as u32),
@@ -665,12 +678,12 @@ const QSA_GQA_ROWS: usize = 16;
 /// threadgroup per (query, KV head) with the group's query heads as the rows
 /// of one tensor-op tile, K and V read from the cache into the operands.
 #[allow(clippy::too_many_arguments)]
-pub fn qsa_attention_query<'t>(
+pub fn qsa_attention_query<'t, 'c>(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
     q: &Tensor,
-    k_cache: &Tensor,
-    v_cache: &Tensor,
+    k_cache: impl Into<Kv<'c>>,
+    v_cache: impl Into<Kv<'c>>,
     sel: &Tensor,
     n_sel: &Tensor,
     out: &Tensor,
@@ -681,10 +694,10 @@ pub fn qsa_attention_query<'t>(
     scale: f32,
 ) -> Result<()> {
     let base_pos = base_pos.into();
-    let (kvh, max_seq, d) =
-        (k_cache.shape()[0], k_cache.shape()[1], k_cache.shape()[2]);
+    let (k_cache, v_cache) = (k_cache.into(), v_cache.into());
+    let format = Kv::pair_format(&k_cache, &v_cache)?;
+    let (kvh, max_seq, d) = k_cache.shape();
     ensure!(d == ATTN_D, "sparse attention is compiled for head dim {ATTN_D}, got {d}");
-    ensure!(v_cache.shape() == k_cache.shape(), "k/v cache shape mismatch");
     ensure!(
         qb > 0 && q.dtype() == DType::BF16 && q.numel().is_multiple_of(qb * d),
         "q must be BF16 [QB, NQ, D]"
@@ -704,17 +717,22 @@ pub fn qsa_attention_query<'t>(
         "n_sel must be U32 [QB]"
     );
     ensure!(base_pos.max + qb <= max_seq, "queries exceed the cache");
-    let pipeline = ctx.pipeline("qsa_attn_gqa_nax", SOURCE, MslVersion::V4_0)?;
+    let name = match format {
+        KvFormat::Bf16 => "qsa_attn_gqa_nax",
+        KvFormat::Q8 => "qsa_attn_gqa_nax_q8",
+    };
+    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V4_0)?;
+    let scales;
+    let mut buffers =
+        vec![q.binding(), k_cache.values.binding(), v_cache.values.binding()];
+    if format == KvFormat::Q8 {
+        scales = [k_cache.scales()?, v_cache.scales()?];
+        buffers.extend(scales.iter().map(|t| t.binding()));
+    }
+    buffers.extend([sel.binding(), n_sel.binding(), out.binding()]);
     pass.dispatch_with(
         &pipeline,
-        &[
-            q.binding(),
-            k_cache.binding(),
-            v_cache.binding(),
-            sel.binding(),
-            n_sel.binding(),
-            out.binding(),
-        ],
+        &buffers,
         &[
             Param::U32(max_seq as u32),
             Param::U32((nq / kvh) as u32),

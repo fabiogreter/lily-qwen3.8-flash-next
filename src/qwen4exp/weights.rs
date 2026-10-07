@@ -179,6 +179,8 @@ pub struct ModelWeights {
 pub struct SessionContext {
     pub max_seq: usize,
     pub checkpoints: usize,
+    /// The format of the session's K/V caches.
+    pub kv_format: crate::kernels::attention::KvFormat,
 }
 
 /// The converter's storage policy: routers, gates and the small mixing
@@ -745,6 +747,7 @@ pub fn load(
         Some(s) => super::model::session_bytes(
             config,
             drafts_under_cache,
+            s.kv_format,
             s.max_seq,
             s.checkpoints,
         )?,

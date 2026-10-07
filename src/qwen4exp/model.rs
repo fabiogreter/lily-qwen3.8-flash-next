@@ -21,8 +21,9 @@ use crate::engine::{
     VisionTower,
 };
 use crate::kernels::attention::{
-    MAX_SEQ, k_norm_rope_scatter_decode, q_norm_rope_split_decode, rope_neox,
-    scatter_kv, sdpa_decode, sdpa_prefill, sdpa_split_scratch_splits, split_q_gate,
+    Kv, KvCache, KvFormat, MAX_SEQ, k_norm_rope_scatter_decode, kv_dequant_q8,
+    q_norm_rope_split_decode, rope_neox, scatter_kv, sdpa_decode, sdpa_prefill,
+    sdpa_split_scratch_splits, split_q_gate,
 };
 use crate::kernels::elementwise::{
     add_bf16, copy_words, gather_row_bf16, sigmoid_mul_bf16,
@@ -352,6 +353,9 @@ pub struct Qwen4ExpModel {
     /// the GPU runs chunk k (paged table only; on by default, off for the
     /// bit-identity test of the staging pipeline).
     ngram_ahead: bool,
+    /// The attention K/V caches' element format (`--kv-cache`); states and
+    /// scratch made after [`Self::set_kv_format`] follow it.
+    kv_format: KvFormat,
 }
 
 pub(super) enum LayerState {
@@ -363,9 +367,9 @@ pub(super) enum LayerState {
         conv_windows: [Tensor; 2],
     },
     Attn {
-        /// `[KVH, max_seq, D]` bf16.
-        k_cache: Tensor,
-        v_cache: Tensor,
+        /// `[KVH, max_seq, D]`, bf16 or q8 (`--kv-cache`).
+        k_cache: KvCache,
+        v_cache: KvCache,
         /// Raw indexer keys, bf16 `[max_seq, INDEXER_D]`.
         idx_keys: Tensor,
         /// Normed, roped block keys, bf16 `[max_seq / ratio, INDEXER_D]`.
@@ -452,6 +456,7 @@ pub struct DecodeState {
     pub(super) ple: Option<PleState>,
     pub(super) mtp: Option<MtpState>,
     pub(super) spec: Option<SpecPending>,
+    kv_format: KvFormat,
     kv_heads: usize,
     head_dim: usize,
     ratio: usize,
@@ -531,6 +536,9 @@ fn block_key_rows(capacity: usize, ratio: usize) -> usize {
 enum AttnStore {
     K,
     V,
+    /// A q8 cache's group scales, `[heads, capacity, D / 32]`.
+    KScales,
+    VScales,
     IdxKeys,
     BlkKeys,
 }
@@ -548,8 +556,9 @@ struct PrefixRegion {
 }
 
 /// The regions of a `tokens`-token prefix of one attention layer, in the
-/// fixed persistence order: K per head, V per head, indexer keys, block keys
-/// of the blocks those tokens start. `written` is how many tokens the
+/// fixed persistence order: K per head, V per head, (a q8 cache's K scales
+/// per head, V scales per head,) indexer keys, block keys of the blocks
+/// those tokens start. `written` is how many tokens the
 /// persisted layout was produced for (`>= tokens`; writers pass `tokens` and
 /// skip nothing); `heads`, `capacity` and `block_rows` describe the state on
 /// this side of the layout.
@@ -565,6 +574,7 @@ struct PrefixRegion {
 fn attn_prefix_plan(
     heads: usize,
     capacity: usize,
+    q8: bool,
     block_rows: usize,
     ratio: usize,
     tokens: usize,
@@ -583,8 +593,13 @@ fn attn_prefix_plan(
         rows: tokens,
         skip: written - tokens,
     };
-    let mut out = Vec::with_capacity(2 * heads + 2);
-    for store in [AttnStore::K, AttnStore::V] {
+    let mut out = Vec::with_capacity(4 * heads + 2);
+    let per_head: &[AttnStore] = if q8 {
+        &[AttnStore::K, AttnStore::V, AttnStore::KScales, AttnStore::VScales]
+    } else {
+        &[AttnStore::K, AttnStore::V]
+    };
+    for &store in per_head {
         out.extend((0..heads).map(|h| per_token(store, h * capacity)));
     }
     out.push(per_token(AttnStore::IdxKeys, 0));
@@ -612,17 +627,34 @@ fn attn_prefix_regions(
     let LayerState::Attn { k_cache, v_cache, idx_keys, blk_keys } = lstate else {
         return Ok(());
     };
-    let (heads, capacity) = (k_cache.shape()[0], k_cache.shape()[1]);
-    ensure!(
-        v_cache.shape() == k_cache.shape() && idx_keys.shape()[0] == capacity,
-        "attention caches of mismatched capacity"
-    );
-    let plan =
-        attn_prefix_plan(heads, capacity, blk_keys.shape()[0], ratio, tokens, written)?;
+    let format = Kv::pair_format(&k_cache.kv(), &v_cache.kv())?;
+    let (heads, capacity, _) = k_cache.kv().shape();
+    ensure!(idx_keys.shape()[0] == capacity, "attention caches of mismatched capacity");
+    let plan = attn_prefix_plan(
+        heads,
+        capacity,
+        format == KvFormat::Q8,
+        blk_keys.shape()[0],
+        ratio,
+        tokens,
+        written,
+    )?;
+    let scales = |c: &'_ KvCache| -> Result<Tensor> {
+        c.scales.clone().ok_or_else(|| anyhow::anyhow!("q8 region of a bf16 cache"))
+    };
     for region in plan {
+        let owned;
         let store = match region.store {
-            AttnStore::K => k_cache,
-            AttnStore::V => v_cache,
+            AttnStore::K => &k_cache.values,
+            AttnStore::V => &v_cache.values,
+            AttnStore::KScales => {
+                owned = scales(k_cache)?;
+                &owned
+            }
+            AttnStore::VScales => {
+                owned = scales(v_cache)?;
+                &owned
+            }
             AttnStore::IdxKeys => idx_keys,
             AttnStore::BlkKeys => blk_keys,
         };
@@ -661,7 +693,7 @@ fn clone_tensors(ctx: &MetalContext, sources: &[&Tensor]) -> Result<Vec<Tensor>>
 }
 
 /// Copies the first `rows` rows of every `[heads, cap, d]` head block from
-/// `src` to `dst` (both bf16, possibly different capacities).
+/// `src` to `dst` (one dtype, possibly different capacities).
 fn head_block_copies<'t>(
     src: &'t Tensor,
     dst: &'t Tensor,
@@ -677,6 +709,7 @@ fn head_block_copies<'t>(
             && dst.shape()[2] == d,
         "cache copy shape mismatch"
     );
+    ensure!(src.dtype() == dst.dtype(), "cache copy between dtypes");
     let row_bytes = d * src.dtype().size();
     for h in 0..heads {
         out.push(BlitCopy {
@@ -686,6 +719,21 @@ fn head_block_copies<'t>(
             dst_offset: h * dst_cap * row_bytes,
             len: rows * row_bytes,
         });
+    }
+    Ok(())
+}
+
+/// [`head_block_copies`] of a K or V cache's values and, when q8, scales.
+fn kv_copies<'t>(
+    src: &'t KvCache,
+    dst: &'t KvCache,
+    rows: usize,
+    out: &mut Vec<BlitCopy<'t>>,
+) -> Result<()> {
+    ensure!(src.kv().format()? == dst.kv().format()?, "cache copy between K/V formats");
+    head_block_copies(&src.values, &dst.values, rows, out)?;
+    if let (Some(s), Some(d)) = (&src.scales, &dst.scales) {
+        head_block_copies(s, d, rows, out)?;
     }
     Ok(())
 }
@@ -746,14 +794,15 @@ impl DecodeState {
 
     fn attn_caches(
         ctx: &MetalContext,
+        kv_format: KvFormat,
         kv_heads: usize,
         head_dim: usize,
         ratio: usize,
         capacity: usize,
     ) -> Result<LayerState> {
         Ok(LayerState::Attn {
-            k_cache: Tensor::zeros(ctx, &[kv_heads, capacity, head_dim], DType::BF16)?,
-            v_cache: Tensor::zeros(ctx, &[kv_heads, capacity, head_dim], DType::BF16)?,
+            k_cache: KvCache::zeros(ctx, kv_format, kv_heads, capacity, head_dim)?,
+            v_cache: KvCache::zeros(ctx, kv_format, kv_heads, capacity, head_dim)?,
             idx_keys: Tensor::zeros(ctx, &[capacity, INDEXER_D], DType::BF16)?,
             blk_keys: Tensor::zeros(
                 ctx,
@@ -769,7 +818,8 @@ impl DecodeState {
         let attn_layers =
             self.layers.iter().filter(|l| matches!(l, LayerState::Attn { .. })).count()
                 + usize::from(self.mtp.is_some());
-        let per_token = 2 * self.kv_heads * self.head_dim * 2 + INDEXER_D * 2;
+        let per_token =
+            2 * self.kv_heads * self.kv_format.row_bytes(self.head_dim) + INDEXER_D * 2;
         let blocks = block_key_rows(capacity, self.ratio) * INDEXER_D * 2;
         attn_layers * (capacity * per_token + blocks)
     }
@@ -788,6 +838,7 @@ impl DecodeState {
         let LayerState::Attn { k_cache: k2, v_cache: v2, idx_keys: i2, blk_keys: b2 } =
             DecodeState::attn_caches(
                 ctx,
+                self.kv_format,
                 self.kv_heads,
                 self.head_dim,
                 self.ratio,
@@ -797,8 +848,8 @@ impl DecodeState {
             unreachable!()
         };
         let mut copies = Vec::new();
-        head_block_copies(k_cache, &k2, self.pos, &mut copies)?;
-        head_block_copies(v_cache, &v2, self.pos, &mut copies)?;
+        kv_copies(k_cache, &k2, self.pos, &mut copies)?;
+        kv_copies(v_cache, &v2, self.pos, &mut copies)?;
         row_copy(idx_keys, &i2, self.pos, &mut copies)?;
         row_copy(blk_keys, &b2, self.pos.div_ceil(self.ratio), &mut copies)?;
         ctx.blit_copy(&copies)?;
@@ -824,8 +875,8 @@ fn attn_prefix_copies<'t>(
         LayerState::Attn { k_cache: k0, v_cache: v0, idx_keys: i0, blk_keys: b0 },
     ) = (dst, src)
     {
-        head_block_copies(k0, k_cache, tokens, out)?;
-        head_block_copies(v0, v_cache, tokens, out)?;
+        kv_copies(k0, k_cache, tokens, out)?;
+        kv_copies(v0, v_cache, tokens, out)?;
         row_copy(i0, idx_keys, tokens, out)?;
         row_copy(b0, blk_keys, tokens.div_ceil(ratio), out)?;
     }
@@ -1239,6 +1290,10 @@ pub(super) struct PrefillScratch {
     /// with an image reads (its rows, the head's row before it and the first
     /// token of every block it completes, up to `ratio` rows earlier).
     positions: Tensor,
+    /// q8 caches only: K and V of the dense window as bf16
+    /// (`[KVH, dense_limit, D]` each), which the dense tensor-op prefill
+    /// kernel reads; rows past the indexer's dense limit never go dense.
+    kv_staging: Option<[Tensor; 2]>,
 }
 
 struct GdnStageScratch {
@@ -1301,6 +1356,7 @@ impl PrefillScratch {
         max_seq: usize,
         table: Option<&NgramTable>,
         with_mtp: bool,
+        kv_format: KvFormat,
     ) -> Result<Self> {
         ensure!(capacity > 0, "prefill scratch capacity must be nonzero");
         let m = capacity;
@@ -1363,6 +1419,16 @@ impl PrefillScratch {
                 &[m + cfg.indexer.compress_ratio, 3],
                 DType::U32,
             )?,
+            kv_staging: match kv_format {
+                KvFormat::Bf16 => None,
+                KvFormat::Q8 => {
+                    let shape = [nkv, cfg.indexer.dense_limit(), hd];
+                    Some([
+                        Tensor::zeros(ctx, &shape, bf)?,
+                        Tensor::zeros(ctx, &shape, bf)?,
+                    ])
+                }
+            },
         })
     }
 
@@ -1431,6 +1497,16 @@ impl PrefillScratch {
                 .transpose()?,
             // Full extent: the chunk's slice is viewed at upload.
             positions: self.positions.view(0, self.positions.shape())?,
+            kv_staging: self
+                .kv_staging
+                .as_ref()
+                .map(|[k, v]| {
+                    Ok::<_, anyhow::Error>([
+                        k.view(0, k.shape())?,
+                        v.view(0, v.shape())?,
+                    ])
+                })
+                .transpose()?,
         })
     }
 }
@@ -1531,6 +1607,7 @@ impl Qwen4ExpModel {
             hasher,
             prefill_chunk,
             ngram_ahead: true,
+            kv_format: KvFormat::Bf16,
         })
     }
 
@@ -1669,6 +1746,7 @@ impl Qwen4ExpModel {
                 }),
                 Mixer::Attn(_) => DecodeState::attn_caches(
                     ctx,
+                    self.kv_format,
                     cfg.num_key_value_heads,
                     cfg.head_dim,
                     ratio,
@@ -1695,6 +1773,7 @@ impl Qwen4ExpModel {
             Some(_) => Some(MtpState {
                 layer: DecodeState::attn_caches(
                     ctx,
+                    self.kv_format,
                     cfg.num_key_value_heads,
                     cfg.head_dim,
                     ratio,
@@ -1713,6 +1792,7 @@ impl Qwen4ExpModel {
             ple,
             mtp,
             spec: None,
+            kv_format: self.kv_format,
             kv_heads: cfg.num_key_value_heads,
             head_dim: cfg.head_dim,
             ratio,
@@ -1893,6 +1973,7 @@ impl Qwen4ExpModel {
                 MAX_SEQ,
                 self.ple_table(),
                 self.weights.mtp.is_some(),
+                self.kv_format,
             )?);
         }
         Ok(())
@@ -2178,6 +2259,17 @@ impl Qwen4ExpModel {
     /// while the GPU runs the current one (the default). Off, every chunk
     /// stages its rows before its commit, as before the pipeline; the
     /// gathered rows are the same either way (for tests and measurement).
+    /// The format of the attention K/V caches of the states and scratch
+    /// made from now on (states and scratch made before keep theirs, and
+    /// the kernels refuse to mix them).
+    pub fn set_kv_format(&mut self, format: KvFormat) {
+        self.kv_format = format;
+    }
+
+    pub fn kv_format(&self) -> KvFormat {
+        self.kv_format
+    }
+
     pub fn set_ngram_ahead(&mut self, on: bool) {
         self.ngram_ahead = on;
     }
@@ -2753,8 +2845,8 @@ impl Qwen4ExpModel {
         w: &AttnWeights,
         s: &Scratch,
         ps: &PrefillScratch,
-        k_cache: &Tensor,
-        v_cache: &Tensor,
+        k_cache: &KvCache,
+        v_cache: &KvCache,
         idx_keys: &Tensor,
         blk_keys: &Tensor,
         pos: usize,
@@ -2789,8 +2881,8 @@ impl Qwen4ExpModel {
         w: &AttnWeights,
         s: &Scratch,
         ps: &PrefillScratch,
-        k_cache: &Tensor,
-        v_cache: &Tensor,
+        k_cache: &KvCache,
+        v_cache: &KvCache,
         idx_keys: &Tensor,
         blk_keys: &Tensor,
         at: AttnPos<'_>,
@@ -2916,17 +3008,32 @@ impl Qwen4ExpModel {
         rope_neox(ctx, pass, &ps.q, nq, rot, pos, theta, rope)?;
         scatter_kv(ctx, pass, k_cache, &ps.k_new, pos)?;
         scatter_kv(ctx, pass, v_cache, &ps.v_new, pos)?;
-        pass.level_barrier(&[&ps.q, k_cache, v_cache])?;
+        pass.level_barrier(&[&ps.q, &k_cache.values, &v_cache.values])?;
+        // The caches the dense kernel reads for a window of `len` rows: the
+        // bf16 caches themselves, or a q8 cache's window staged as bf16 (the
+        // tensor-op kernel takes bf16 device tensors only).
+        let dense_kv = |len: usize| -> Result<(&Tensor, &Tensor)> {
+            match &ps.kv_staging {
+                None => Ok((&k_cache.values, &v_cache.values)),
+                Some([ks, vs]) => {
+                    kv_dequant_q8(ctx, pass, k_cache, ks, len)?;
+                    kv_dequant_q8(ctx, pass, v_cache, vs, len)?;
+                    pass.level_barrier(&[ks, vs])?;
+                    Ok((ks, vs))
+                }
+            }
+        };
 
         if pos.max + m <= idx.dense_limit() {
             // Every query sees at most the budget: the selection is the whole
             // causal window, so the dense kernel is exact.
+            let (k_dense, v_dense) = dense_kv(pos.max + m)?;
             sdpa_prefill(
                 ctx,
                 pass,
                 &ps.q,
-                k_cache,
-                v_cache,
+                k_dense,
+                v_dense,
                 &ps.attn_o,
                 pos,
                 self.attn_scale,
@@ -2940,12 +3047,13 @@ impl Qwen4ExpModel {
             if dense_rows > 0 {
                 let q = ps.q.view(0, &[dense_rows, nq, hd])?;
                 let out = ps.attn_o.view(0, &[dense_rows, nq, hd])?;
+                let (k_dense, v_dense) = dense_kv(pos.max + dense_rows)?;
                 sdpa_prefill(
                     ctx,
                     pass,
                     &q,
-                    k_cache,
-                    v_cache,
+                    k_dense,
+                    v_dense,
                     &out,
                     pos,
                     self.attn_scale,
@@ -3370,7 +3478,7 @@ impl Qwen4ExpModel {
         pass.level_barrier(&[&ps.k_new, blk_keys])?;
         scatter_kv(ctx, pass, k_cache, &ps.k_new, pos)?;
         scatter_kv(ctx, pass, v_cache, &ps.v_new, pos)?;
-        pass.level_barrier(&[k_cache, v_cache])
+        pass.level_barrier(&[&k_cache.values, &v_cache.values])
     }
 
     // --- decode -------------------------------------------------------------
@@ -3663,8 +3771,8 @@ impl Qwen4ExpModel {
         pass: &ComputePass<'_>,
         w: &AttnWeights,
         s: &Scratch,
-        k_cache: &Tensor,
-        v_cache: &Tensor,
+        k_cache: &KvCache,
+        v_cache: &KvCache,
         idx_keys: &Tensor,
         blk_keys: &Tensor,
         pos: usize,
@@ -3712,7 +3820,14 @@ impl Qwen4ExpModel {
             Rope::Delta(rope_delta),
         )?;
         qsa::qsa_scatter_keys(ctx, pass, &s.idx_qk, idx_keys, idx.n_heads, pos)?;
-        pass.level_barrier(&[&s.q, &s.gate, k_cache, v_cache, &s.idx_q, idx_keys])?;
+        pass.level_barrier(&[
+            &s.q,
+            &s.gate,
+            &k_cache.values,
+            &v_cache.values,
+            &s.idx_q,
+            idx_keys,
+        ])?;
         if len.is_multiple_of(idx.compress_ratio) {
             // This token completes a block: its key becomes selectable from
             // the next position on (and this one, beyond the dense limit).
@@ -3806,6 +3921,7 @@ impl Qwen4ExpModel {
 pub(crate) fn session_bytes(
     cfg: &Qwen4ExpConfig,
     mtp: bool,
+    kv_format: KvFormat,
     capacity: usize,
     checkpoints: usize,
 ) -> Result<u64> {
@@ -3815,7 +3931,8 @@ pub(crate) fn session_bytes(
         |kind: LayerType| cfg.layer_types.iter().filter(|t| **t == kind).count();
     // `DecodeState::cache_bytes`: every attention layer, the draft head's too.
     let attn_layers = count(LayerType::FullAttention) + usize::from(mtp);
-    let per_token = 2 * cfg.num_key_value_heads * cfg.head_dim * 2 + INDEXER_D * 2;
+    let per_token =
+        2 * cfg.num_key_value_heads * kv_format.row_bytes(cfg.head_dim) + INDEXER_D * 2;
     let blocks = block_key_rows(capacity, cfg.indexer.compress_ratio) * INDEXER_D * 2;
     let caches = attn_layers * (capacity * per_token + blocks);
     // `Qwen4ExpModel::new_state`: per GDN layer the state and two conv
@@ -4182,6 +4299,10 @@ impl LanguageModel for Qwen4ExpModel {
             expert_usage_out,
             options.session_context,
         )
+        .map(|mut model| {
+            model.set_kv_format(options.kv_format);
+            model
+        })
     }
 
     fn weight_buffers(&self) -> Vec<crate::metal::Buffer> {
@@ -4197,8 +4318,14 @@ impl LanguageModel for Qwen4ExpModel {
     }
 
     fn session_bytes(&self, capacity: usize, checkpoints: usize) -> Option<u64> {
-        session_bytes(&self.config, self.weights.mtp.is_some(), capacity, checkpoints)
-            .ok()
+        session_bytes(
+            &self.config,
+            self.weights.mtp.is_some(),
+            self.kv_format,
+            capacity,
+            checkpoints,
+        )
+        .ok()
     }
 
     fn vision_tower(&self) -> Option<VisionTower> {
@@ -4225,8 +4352,14 @@ impl LanguageModel for Qwen4ExpModel {
 
     fn persistence_format(&self) -> Option<String> {
         let cfg = &self.config;
+        // bf16 keeps the key it always had (its entries stay valid); a q8
+        // cache persists another layout, so its entries live apart.
+        let kv_format = match self.kv_format {
+            KvFormat::Bf16 => String::new(),
+            other => format!(";kv_format={}", other.name()),
+        };
         Some(format!(
-            "{};layers={};kv={}x{};indexer={}/{};mtp={}",
+            "{};layers={};kv={}x{};indexer={}/{};mtp={}{kv_format}",
             super::config::FORMAT,
             cfg.num_hidden_layers,
             cfg.num_key_value_heads,
@@ -4303,7 +4436,7 @@ impl LanguageModel for Qwen4ExpModel {
             .count()
             + usize::from(self.weights.mtp.is_some());
         attn_layers
-            * (2 * cfg.num_key_value_heads * cfg.head_dim * 2
+            * (2 * cfg.num_key_value_heads * self.kv_format.row_bytes(cfg.head_dim)
                 + INDEXER_D * 2
                 + INDEXER_D * 2 / cfg.indexer.compress_ratio)
     }

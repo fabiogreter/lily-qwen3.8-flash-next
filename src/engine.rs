@@ -350,6 +350,8 @@ pub struct LoadOptions {
     /// full session and the server budgets exactly that. `None` (the bench,
     /// the probes) reserves nothing.
     pub session_context: Option<crate::qwen4exp::weights::SessionContext>,
+    /// The attention K/V caches' element format (`--kv-cache`).
+    pub kv_format: crate::kernels::attention::KvFormat,
 }
 
 /// Which draw a decode pass ends with.
