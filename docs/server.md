@@ -35,6 +35,17 @@ ones decode without drafts. Prefills run one at a time; more requests queue,
 with 503 when the queue is full (`--queue`). `--max-batch 1` serves one
 request at a time.
 
+## Memory
+
+The session cache keeps recent conversations' state in GPU memory (by
+default what the working set leaves after the weights and 8 GiB of
+headroom, at least 8 GiB, `--cache-bytes`) and spills the rest to the disk
+tier (`--disk-cache-bytes`). `--kv-cache q8` stores the attention K/V caches
+in 8 bits (q8_0): 18 304 instead of 30 784 bytes per token of context, so
+the cache holds about 1.7 times as much, for a teacher-forced KL of about
+2e-3 to 4e-3 against bf16 and the same speed. bf16 is the default. See
+[architecture.md](architecture.md), "The 8-bit K/V cache".
+
 ## Thinking
 
 Thinking is on by default. `reasoning_effort` (`none`, `low`, `medium`,

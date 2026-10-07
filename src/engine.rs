@@ -594,6 +594,11 @@ pub trait LanguageModel: Sized {
     /// Bytes the per-token caches take per token of capacity, for budgeting.
     fn bytes_per_token(&self) -> usize;
 
+    /// The attention K/V caches' element format the model runs with.
+    fn kv_format(&self) -> crate::kernels::attention::KvFormat {
+        crate::kernels::attention::KvFormat::Bf16
+    }
+
     /// A tag identifying the on-disk layout of this model's sessions (model,
     /// cache shapes, optional heads); `None` when sessions cannot be
     /// persisted. Files written under a different tag are never read.

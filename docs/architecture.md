@@ -760,7 +760,7 @@ On a 128 GB machine with the full checkpoint:
 | resident weights without the table  | 71.1 GB  | GPU, one residency set             |
 | n-gram table                        | 32.0 GB  | page cache, memory-mapped, evictable |
 | draft head                          | 1.5 GB   | in the 71.1 GB above when converted |
-| per-token cache, all layers         | 28 416 B | session cache                      |
+| per-token cache, all layers         | 28 416 B | session cache (16 896 B with `--kv-cache q8`) |
 | GDN recurrent checkpoint            | 113 MB   | session cache, up to 3 + 4 per session |
 | prefill scratch                     | ~2.4 GB  | grown on demand to the 4 096-token chunk |
 
@@ -827,6 +827,61 @@ headroom for other applications, floored at 8 GiB. On a 128 GB machine that
 is 115.4 - 73.0 - 32.0 - 8.6 GB, so the floor applies and the budget is
 8 GiB, which is two full 131 072-token contexts. The disk tier holds the
 rest. The server logs the derivation at load.
+
+### The 8-bit K/V cache
+
+`--kv-cache q8` stores the attention K and V caches as signed bytes with
+one f16 scale per 32 values of a row, llama.cpp's q8_0: the scale is
+`absmax / 127` rounded to half, a value is `x / scale` rounded to nearest
+even and clamped to +-127. The indexer and block keys stay bf16 (they pick
+the sparse blocks, and they are a seventh of the bytes). A token of context
+then costs 18 304 bytes instead of 30 784 with the draft head (13 attention
+layers x (2 caches x 2 heads x (256 + 16) bytes + 256 + 64)), 40 % less, so
+the same session-cache budget holds about 1.7 times the context: more
+sessions stay in memory instead of on the disk tier, and the batch admits
+longer requests side by side (it holds a newcomer back while
+`in flight + (prompt + 8 192) x bytes per token` exceeds the budget).
+bf16 is the default.
+
+The writers quantize the value the bf16 cache would hold (the bf16-rounded
+normed, roped K and the bf16 V), each simdgroup's 32 lanes one group. The
+readers:
+
+- **Decode**, dense (a window up to the indexer's dense limit of 2 051
+  tokens): a q8 copy of the per-head split kernel for every length, the
+  short ones as one split. The folded and fixed-block routes start at 8 192
+  tokens, which dense decode never reaches, and refuse a q8 cache.
+- **Sparse attention** (decode, verify, batched rows and prefill
+  sub-batches): q8 copies of the split kernel and of the per-query
+  tensor-op kernel. The tensor-op kernel already loads K and V by hand in
+  32-dimension chunks, which is one q8 group: it loads bytes and the
+  chunk's scale and rounds the products to bf16, the operand type, exactly
+  as a dequantized bf16 cache would hold them (a test holds the two bit for
+  bit).
+- **Dense prefill**: the tensor-op flash kernel reads bf16 device tensors
+  and nothing else. Its window never passes the dense limit, so q8 mode
+  dequantizes that window (at most 2 051 rows a layer, 4 MB of scratch)
+  into a staging buffer right before it.
+
+The bf16 kernels are untouched (the q8 ones are copies, not templates:
+pipelines compile with fast math, and a restructured body could round
+differently), and every kernel entry checks the cache's format, so q8 bytes
+are never read as bf16. Per-step cost is the same as bf16 within noise
+(decode reads at most about 2 000 tokens of K/V a row and layer; the steps
+are MoE-bound), and so is prefill from 1K to 64K.
+
+Quality, teacher-forced against bf16 over 64 steps after a prompt (`lily-probe
+--follow`, `tools/reference/compare_runs.py`): mean KL 1.8e-3 on a short
+question, 3.0e-3 at 3.5K, 2.9e-3 at 16K and 3.9e-3 at 32K, medians 0.4 to
+1.3e-3, argmax flips only at near-ties (three, at top-1/top-2 margins of
+0.02 to 0.08). That is the size of MLX's own difference between two prefill
+chunk sizes (about 2.2e-3) and below lily's batched step against its decode
+step (9.5e-3).
+
+Disk-tier entries keep their layout per format: a q8 layer persists its K
+and V scales after the values, and q8 entries live under their own format
+key, so they never mix with bf16 ones (each directory has the full
+`--disk-cache-bytes`).
 
 ## The session cache
 

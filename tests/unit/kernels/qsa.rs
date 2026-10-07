@@ -1235,7 +1235,9 @@ fn q8_sparse_attention_matches_bf16_over_the_dequantized_cache() {
     let (kvh, group, d, ratio) = (2usize, 8usize, 256usize, 4usize);
     let nq = kvh * group;
     let scale = 1.0 / (d as f32).sqrt();
-    for (qb, base_pos, k_max) in [(37usize, 61usize, 6usize), (20, 4093, 512), (1, 5000, 512)] {
+    for (qb, base_pos, k_max) in
+        [(37usize, 61usize, 6usize), (20, 4093, 512), (1, 5000, 512)]
+    {
         let max_seq = base_pos + qb + 3;
         let q = cpu_ref::round_bf16(&random(&mut rng, qb * nq * d, -1.0, 1.0));
         let k = kv_like_rows(&mut rng, kvh * max_seq, d);
@@ -1243,39 +1245,47 @@ fn q8_sparse_attention_matches_bf16_over_the_dequantized_cache() {
         let (kq, ks) = q8_cache_of(&ctx, &k, (kvh, max_seq, d), max_seq);
         let (vq, vs) = q8_cache_of(&ctx, &v, (kvh, max_seq, d), max_seq);
         let hot: Vec<u32> = vec![2, 5, 11];
-        let (sel, n_sel) = random_selections(&mut rng, qb, k_max, base_pos, ratio, &hot);
+        let (sel, n_sel) =
+            random_selections(&mut rng, qb, k_max, base_pos, ratio, &hot);
         let t_q = Tensor::from_f32_as_bf16(&ctx, &q, &[qb, nq, d]).expect("q");
-        let t_sel =
-            Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[qb, k_max], DType::U32)
-                .expect("sel");
-        let t_n = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&n_sel), &[qb], DType::U32)
-            .expect("n");
+        let t_sel = Tensor::from_bytes(
+            &ctx,
+            bytemuck::cast_slice(&sel),
+            &[qb, k_max],
+            DType::U32,
+        )
+        .expect("sel");
+        let t_n =
+            Tensor::from_bytes(&ctx, bytemuck::cast_slice(&n_sel), &[qb], DType::U32)
+                .expect("n");
         let out = |_: ()| Tensor::zeros(&ctx, &[qb, nq, d], DType::BF16).expect("out");
-        let (query_q8, query_bf, split_q8, split_bf) = (out(()), out(()), out(()), out(()));
+        let (query_q8, query_bf, split_q8, split_bf) =
+            (out(()), out(()), out(()), out(()));
         let slots = split_scratch_slots(qb, k_max, ratio);
-        let partials = Tensor::zeros(&ctx, &[slots * nq, d], DType::F32).expect("partials");
+        let partials =
+            Tensor::zeros(&ctx, &[slots * nq, d], DType::F32).expect("partials");
         let stats = Tensor::zeros(&ctx, &[slots * nq, 2], DType::F32).expect("stats");
         let scratch = SparseSplitScratch { partials: &partials, stats: &stats };
         let pass = ctx.begin().expect("pass");
         qsa_attention_query(
-            &ctx, &pass, &t_q, &kq, &vq, &t_sel, &t_n, &query_q8, qb, k_max, ratio, base_pos,
-            scale,
+            &ctx, &pass, &t_q, &kq, &vq, &t_sel, &t_n, &query_q8, qb, k_max, ratio,
+            base_pos, scale,
         )
         .expect("q8 query attention");
         qsa_attention_query(
-            &ctx, &pass, &t_q, &ks, &vs, &t_sel, &t_n, &query_bf, qb, k_max, ratio, base_pos,
-            scale,
+            &ctx, &pass, &t_q, &ks, &vs, &t_sel, &t_n, &query_bf, qb, k_max, ratio,
+            base_pos, scale,
         )
         .expect("bf16 query attention");
         qsa_attention(
-            &ctx, &pass, &t_q, &kq, &vq, &t_sel, &t_n, &split_q8, &scratch, qb, k_max, ratio,
-            base_pos, scale,
+            &ctx, &pass, &t_q, &kq, &vq, &t_sel, &t_n, &split_q8, &scratch, qb, k_max,
+            ratio, base_pos, scale,
         )
         .expect("q8 split attention");
         pass.level_barrier(&[]).expect("barrier");
         qsa_attention(
-            &ctx, &pass, &t_q, &ks, &vs, &t_sel, &t_n, &split_bf, &scratch, qb, k_max, ratio,
-            base_pos, scale,
+            &ctx, &pass, &t_q, &ks, &vs, &t_sel, &t_n, &split_bf, &scratch, qb, k_max,
+            ratio, base_pos, scale,
         )
         .expect("bf16 split attention");
         pass.commit_wait().expect("commit");
@@ -1307,7 +1317,8 @@ fn q8_sparse_attention_matches_bf16_over_the_dequantized_cache() {
             scale,
         );
         let rms = |x: &mut dyn Iterator<Item = f32>| {
-            let (sum, n) = x.fold((0.0f64, 0usize), |(s, n), v| (s + f64::from(v * v), n + 1));
+            let (sum, n) =
+                x.fold((0.0f64, 0usize), |(s, n), v| (s + f64::from(v * v), n + 1));
             (sum / n as f64).sqrt()
         };
         let err = rms(&mut query_q8.iter().zip(&expected).map(|(a, b)| a - b));

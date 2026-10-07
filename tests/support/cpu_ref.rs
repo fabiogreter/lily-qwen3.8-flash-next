@@ -19,7 +19,9 @@ pub fn quantize_q8(x: &[f32], group: usize) -> (Vec<i8>, Vec<half::f16>) {
         let amax = g.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         let d = half::f16::from_f32(amax / 127.0);
         let id = if d.to_f32() != 0.0 { 1.0 / d.to_f32() } else { 0.0 };
-        values.extend(g.iter().map(|v| (v * id).round_ties_even().clamp(-127.0, 127.0) as i8));
+        values.extend(
+            g.iter().map(|v| (v * id).round_ties_even().clamp(-127.0, 127.0) as i8),
+        );
         scales.push(d);
     }
     (values, scales)

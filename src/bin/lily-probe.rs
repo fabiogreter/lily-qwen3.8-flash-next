@@ -45,6 +45,9 @@ struct Cli {
     /// Where to write the JSON record.
     #[arg(long)]
     out: Option<PathBuf>,
+    /// Element format of the attention K/V caches (`bf16` or `q8`).
+    #[arg(long, default_value = "bf16")]
+    kv_cache: lily::kernels::attention::KvFormat,
 }
 
 #[derive(Serialize)]
@@ -105,7 +108,11 @@ fn logsumexp(logits: &[f32]) -> f64 {
 fn probe<M: LanguageModel>(cli: &Cli) -> Result<Record> {
     let ctx = MetalContext::new()?;
     let started = Instant::now();
-    let model = M::load(&ctx, &cli.model, &LoadOptions::default())?;
+    let model = M::load(
+        &ctx,
+        &cli.model,
+        &LoadOptions { kv_format: cli.kv_cache, ..LoadOptions::default() },
+    )?;
     let load_seconds = started.elapsed().as_secs_f64();
     let mut generator = Generator::from_model_dir(&cli.model)?;
     generator.add_stop_tokens(&model.eos_token_ids());

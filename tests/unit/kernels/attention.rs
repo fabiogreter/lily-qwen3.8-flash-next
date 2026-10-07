@@ -564,7 +564,10 @@ fn assert_q8_row(values: &[i8], scales: &[half::f16], x: &[f32], at: &str) {
     let (want_v, want_s) = cpu_ref::quantize_q8(x, KV_Q8_GROUP);
     assert_eq!(scales, &want_s[..], "{at}: scales");
     for (i, (g, w)) in values.iter().zip(&want_v).enumerate() {
-        assert!((i16::from(*g) - i16::from(*w)).abs() <= 1, "{at}: value {i}: {g} vs {w}");
+        assert!(
+            (i16::from(*g) - i16::from(*w)).abs() <= 1,
+            "{at}: value {i}: {g} vs {w}"
+        );
     }
     // Every value within half a step of the input (plus the one-step slack).
     for (i, ((&q, &v), s)) in values
@@ -579,8 +582,9 @@ fn assert_q8_row(values: &[i8], scales: &[half::f16], x: &[f32], at: &str) {
 
 fn q8_parts(cache: &KvCache) -> (Vec<i8>, Vec<half::f16>) {
     let values = cache.values.raw_bytes().iter().map(|&b| b as i8).collect();
-    let scales = bytemuck::cast_slice(cache.scales.as_ref().expect("scales").raw_bytes())
-        .to_vec();
+    let scales =
+        bytemuck::cast_slice(cache.scales.as_ref().expect("scales").raw_bytes())
+            .to_vec();
     (values, scales)
 }
 
@@ -610,15 +614,20 @@ fn q8_scatter_matches_the_cpu_quantizer_and_dequantizes() {
     for h in 0..kvh {
         for t in 0..max_seq {
             let slot = h * max_seq + t;
-            let (v, s) = (&values[slot * d..(slot + 1) * d], &scales[slot * g..(slot + 1) * g]);
+            let (v, s) =
+                (&values[slot * d..(slot + 1) * d], &scales[slot * g..(slot + 1) * g]);
             if (base..base + m).contains(&t) {
-                let x = &rows[((t - base) * kvh + h) * d..((t - base) * kvh + h + 1) * d];
+                let x =
+                    &rows[((t - base) * kvh + h) * d..((t - base) * kvh + h + 1) * d];
                 assert_q8_row(v, s, x, &format!("head {h} slot {t}"));
             } else {
-                assert!(v.iter().all(|&b| b == 0) && s.iter().all(|s| s.to_f32() == 0.0));
+                assert!(
+                    v.iter().all(|&b| b == 0) && s.iter().all(|s| s.to_f32() == 0.0)
+                );
             }
             for i in 0..d {
-                let want = half::bf16::from_f32(f32::from(v[i]) * s[i / KV_Q8_GROUP].to_f32());
+                let want =
+                    half::bf16::from_f32(f32::from(v[i]) * s[i / KV_Q8_GROUP].to_f32());
                 assert_eq!(staged[slot * d + i], want.to_f32(), "dequant {h} {t} {i}");
             }
         }
@@ -684,11 +693,31 @@ fn q8_sdpa_decode_matches_bf16_over_the_dequantized_cache() {
         let out_q8 = Tensor::zeros(&ctx, &[nq, d], DType::BF16).expect("out");
         let out_bf = Tensor::zeros(&ctx, &[nq, d], DType::BF16).expect("out");
         let pass = ctx.begin().expect("pass");
-        sdpa_decode(&ctx, &pass, &t_q, &kq, &vq, &out_q8, len, scale, Some((&partials, &stats)))
-            .expect("q8 decode");
+        sdpa_decode(
+            &ctx,
+            &pass,
+            &t_q,
+            &kq,
+            &vq,
+            &out_q8,
+            len,
+            scale,
+            Some((&partials, &stats)),
+        )
+        .expect("q8 decode");
         pass.level_barrier(&[]).expect("barrier");
-        sdpa_decode(&ctx, &pass, &t_q, &ks, &vs, &out_bf, len, scale, Some((&partials, &stats)))
-            .expect("bf16 decode");
+        sdpa_decode(
+            &ctx,
+            &pass,
+            &t_q,
+            &ks,
+            &vs,
+            &out_bf,
+            len,
+            scale,
+            Some((&partials, &stats)),
+        )
+        .expect("bf16 decode");
         pass.commit_wait().expect("commit");
         cpu_ref::assert_close(
             &out_q8.to_f32().expect("q8"),
@@ -714,7 +743,9 @@ fn q8_caches_are_refused_where_no_q8_kernel_reads_them() {
     let stats = Tensor::zeros(&ctx, &[nq, 64, 2], DType::F32).expect("stats");
     let scratch = Some((&partials, &stats));
     let pass = ctx.begin().expect("pass");
-    assert!(sdpa_prefill(&ctx, &pass, &q, &q8.values, &q8.values, &out, 0, 1.0).is_err());
+    assert!(
+        sdpa_prefill(&ctx, &pass, &q, &q8.values, &q8.values, &out, 0, 1.0).is_err()
+    );
     assert!(sdpa_decode(&ctx, &pass, &q, &q8, &q8, &out, 10, 1.0, None).is_err());
     assert!(sdpa_decode(&ctx, &pass, &q, &q8, &bf, &out, 10, 1.0, scratch).is_err());
     assert!(sdpa_decode(&ctx, &pass, &q, &q8, &q8, &out, 8192, 1.0, scratch).is_err());

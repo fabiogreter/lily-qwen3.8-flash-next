@@ -79,8 +79,9 @@ const PREFILL_CHUNK: usize = 4096;
 /// matrix and the split partials while keeping the GPU busy.
 const QSA_QUERY_BATCH: usize = 256;
 
-/// Per-token caches grow in steps of this many tokens (192 MiB of KV plus
-/// indexer keys per step), so a session's footprint follows its length.
+/// Per-token caches grow in steps of this many tokens (the trunk's K/V take
+/// 192 MiB a step in bf16, 102 MiB in q8, plus the indexer keys), so a
+/// session's footprint follows its length.
 const CAPACITY_STEP: usize = 8192;
 
 /// Most draft tokens a speculative step may verify at once (the spec scratch
@@ -4287,6 +4288,14 @@ impl LanguageModel for Qwen4ExpModel {
             .map(|gb| (gb * (1u64 << 30) as f64) as u64)
             .or(options.memory_budget);
         let expert_usage_out = options.expert_usage_out.clone();
+        // `LILY_KV_CACHE` overrides the option (the tests and probes that
+        // load with defaults, run under q8); the plan's session follows.
+        let kv_format = match std::env::var("LILY_KV_CACHE") {
+            Ok(v) => v.parse()?,
+            Err(_) => options.kv_format,
+        };
+        let session_context =
+            options.session_context.map(|s| weights::SessionContext { kv_format, ..s });
         Qwen4ExpModel::load_with(
             ctx,
             dir,
@@ -4297,10 +4306,10 @@ impl LanguageModel for Qwen4ExpModel {
             expert_usage,
             memory_budget,
             expert_usage_out,
-            options.session_context,
+            session_context,
         )
         .map(|mut model| {
-            model.set_kv_format(options.kv_format);
+            model.set_kv_format(kv_format);
             model
         })
     }
@@ -4348,6 +4357,10 @@ impl LanguageModel for Qwen4ExpModel {
 
     fn vocab_size(&self) -> usize {
         self.config.vocab_size
+    }
+
+    fn kv_format(&self) -> KvFormat {
+        self.kv_format
     }
 
     fn persistence_format(&self) -> Option<String> {

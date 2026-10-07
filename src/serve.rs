@@ -940,11 +940,12 @@ impl<M: LanguageModel> Engine<M> {
         let per_request = model.bytes_per_token() * max_seq;
         eprintln!(
             "memory: {:.1} GB allocated, {:.1} GB recommended working set, {:.1} GB session cache budget \
-             ({} B/token of context; a full {}-token request needs {:.1} GB)",
+             ({} B/token of context with {} K/V caches; a full {}-token request needs {:.1} GB)",
             gb(allocated),
             gb(working_set),
             gb(budget),
             model.bytes_per_token(),
+            model.kv_format().name(),
             max_seq,
             gb(per_request),
         );
