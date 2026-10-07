@@ -512,6 +512,17 @@ pub struct ThinkingFields {
 }
 
 impl ThinkingFields {
+    /// Refuses a budget of 0 (`origin` names where it came from): a budget
+    /// is a positive token count, and a negative one turns a default off.
+    fn check(&self, origin: &str) -> Result<()> {
+        ensure!(
+            self.thinking_budget != Some(0),
+            "{origin}thinking_budget must be a positive token count, or negative to \
+             turn the server's default off; got 0"
+        );
+        Ok(())
+    }
+
     /// The fields of a `chat_template_kwargs` object (the others ignored).
     fn from_kwargs(kwargs: &serde_json::Map<String, Value>) -> Result<Self> {
         let bool_field = |name: &str| -> Result<Option<bool>> {
@@ -531,11 +542,13 @@ impl ThinkingFields {
                 )
             })?),
         };
-        Ok(Self {
+        let fields = Self {
             thinking_budget,
             thinking_nudges: bool_field("thinking_nudges")?,
             tool_call_ends_thinking: bool_field("tool_call_ends_thinking")?,
-        })
+        };
+        fields.check("chat_template_kwargs.")?;
+        Ok(fields)
     }
 
     /// `self` where set, `other` elsewhere.
@@ -590,6 +603,7 @@ impl ThinkingBudgets {
     pub fn parse(text: &str) -> Result<Self> {
         let text = text.trim();
         if let Ok(all) = text.parse::<usize>() {
+            ensure!(all > 0, "a thinking budget must be a positive token count");
             return Ok(Self { low: Some(all), medium: Some(all), xhigh: Some(all) });
         }
         let mut budgets = Self::default();
@@ -600,6 +614,10 @@ impl ThinkingBudgets {
             let value: usize = value.trim().parse().with_context(|| {
                 format!("thinking budget {part:?}: {value:?} is not a token count")
             })?;
+            ensure!(
+                value > 0,
+                "thinking budget {part:?}: a budget must be a positive token count"
+            );
             let slot = match level.trim() {
                 "low" => &mut budgets.low,
                 "medium" => &mut budgets.medium,
@@ -882,6 +900,7 @@ pub fn prepare_chat(
             preserve_thinking = Some(flag);
         }
     }
+    request.thinking_controls.check("")?;
     let thinking_fields = match kwargs {
         Some(kwargs) => {
             ThinkingFields::from_kwargs(kwargs)?.or(request.thinking_controls.clone())
@@ -1064,6 +1083,7 @@ pub fn prepare_completion(
     // A raw prompt gets exactly the controls it asks for: the server's
     // defaults are for chat, and the engine applies them only when the
     // prompt ends with `<think>\n`.
+    request.thinking_controls.check("")?;
     let thinking = request.thinking_controls.resolve(
         &ThinkingDefaults {
             grace: defaults.thinking_controls.grace,

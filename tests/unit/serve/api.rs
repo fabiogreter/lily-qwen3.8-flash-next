@@ -229,3 +229,19 @@ fn thinking_fields_deserialize_from_a_chat_request() {
     assert_eq!(request.thinking_controls.tool_call_ends_thinking, Some(true));
     assert_eq!(request.sampling.temperature, Some(0.6), "both flattened groups");
 }
+
+/// A budget of 0 would close the block at the first line end: refused, in
+/// the request, in `chat_template_kwargs` and in the server's flag.
+#[test]
+fn a_thinking_budget_of_zero_is_refused() {
+    let zero = ThinkingFields { thinking_budget: Some(0), ..Default::default() };
+    assert!(zero.check("").unwrap_err().to_string().contains("positive"));
+    let negative = ThinkingFields { thinking_budget: Some(-1), ..Default::default() };
+    assert!(negative.check("").is_ok(), "negative turns a default off");
+    let kwargs = serde_json::json!({"thinking_budget": 0});
+    let err = ThinkingFields::from_kwargs(kwargs.as_object().unwrap()).unwrap_err();
+    assert!(err.to_string().contains("chat_template_kwargs.thinking_budget"), "{err}");
+    assert!(ThinkingBudgets::parse("0").is_err());
+    assert!(ThinkingBudgets::parse("low=0,medium=8000").is_err());
+    assert!(ThinkingBudgets::parse("low=1").is_ok());
+}

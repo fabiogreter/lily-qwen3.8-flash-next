@@ -173,9 +173,11 @@ struct Cli {
 
     /// Default thinking budget of chat requests, by the template's reasoning
     /// effort: `low=4000,medium=8000,xhigh=16000` (`high` is `xhigh`), or
-    /// one number for all. Once the reasoning block holds that many tokens
-    /// it is closed at the next line end, with a short transition text.
-    /// Unset: no budget. A request's `thinking_budget` overrides it.
+    /// one number for all (positive counts). Once the reasoning block holds
+    /// that many tokens it is closed at the next line end, with a short
+    /// transition text, and an end of turn drawn inside the block is
+    /// replaced by the close. Unset: no budget. A request's
+    /// `thinking_budget` overrides it.
     #[arg(long)]
     thinking_budget: Option<String>,
 
