@@ -357,6 +357,9 @@ pub struct Qwen4ExpModel {
     /// The attention K/V caches' element format (`--kv-cache`); states and
     /// scratch made after [`Self::set_kv_format`] follow it.
     kv_format: KvFormat,
+    /// Which checkpoint this is ([`super::config::checkpoint_identity`]),
+    /// part of the disk tier's key.
+    checkpoint_id: String,
 }
 
 pub(super) enum LayerState {
@@ -1554,6 +1557,7 @@ impl Qwen4ExpModel {
         session_context: Option<weights::SessionContext>,
     ) -> Result<Self> {
         let config = Qwen4ExpConfig::from_model_dir(&dir)?;
+        let checkpoint_id = super::config::checkpoint_identity(dir.as_ref())?;
         ensure!(
             config.linear_key_head_dim == GDN_HEAD_DIM
                 && config.linear_value_head_dim == GDN_HEAD_DIM,
@@ -1609,6 +1613,7 @@ impl Qwen4ExpModel {
             prefill_chunk,
             ngram_ahead: true,
             kv_format: kv_format_from_env()?.unwrap_or_default(),
+            checkpoint_id,
         })
     }
 
@@ -4369,21 +4374,24 @@ impl LanguageModel for Qwen4ExpModel {
 
     fn persistence_format(&self) -> Option<String> {
         let cfg = &self.config;
-        // bf16 keeps the key it always had (its entries stay valid); a q8
-        // cache persists another layout, so its entries live apart.
+        // A q8 cache persists another layout than bf16 (the key of bf16
+        // has no format part); the checkpoint's identity keeps two
+        // conversions of one architecture (q4, q4-xl) apart, whose sessions
+        // hold different models' caches.
         let kv_format = match self.kv_format {
             KvFormat::Bf16 => String::new(),
             other => format!(";kv_format={}", other.name()),
         };
         Some(format!(
-            "{};layers={};kv={}x{};indexer={}/{};mtp={}{kv_format}",
+            "{};layers={};kv={}x{};indexer={}/{};mtp={}{kv_format};checkpoint={}",
             super::config::FORMAT,
             cfg.num_hidden_layers,
             cfg.num_key_value_heads,
             cfg.head_dim,
             INDEXER_D,
             cfg.indexer.compress_ratio,
-            self.weights.mtp.is_some()
+            self.weights.mtp.is_some(),
+            self.checkpoint_id
         ))
     }
 

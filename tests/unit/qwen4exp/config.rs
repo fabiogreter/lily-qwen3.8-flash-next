@@ -277,3 +277,48 @@ fn the_mrope_layout_is_checked_when_the_tower_is_present() {
     assert!(cfg.vision.is_none());
     assert_eq!(cfg.rope_parameters.mrope_section, None);
 }
+
+/// The checkpoint identity tells conversions apart by their config and
+/// tensor index (or, without an index, their shard names and sizes), and
+/// is stable for one checkpoint.
+#[test]
+fn checkpoint_identity_tells_conversions_apart() {
+    let root =
+        std::env::temp_dir().join(format!("lily-checkpoint-id-{}", std::process::id()));
+    let dir = |name: &str, files: &[(&str, &[u8])]| {
+        let d = root.join(name);
+        std::fs::create_dir_all(&d).expect("dir");
+        for (f, bytes) in files {
+            std::fs::write(d.join(f), bytes).expect("write");
+        }
+        d
+    };
+    let index = br#"{"weight_map":{"a":"model-00001.safetensors"}}"#;
+    let q4 = dir(
+        "q4",
+        &[("config.json", b"{\"q8\":[]}"), ("model.safetensors.index.json", index)],
+    );
+    let xl = dir(
+        "xl",
+        &[
+            ("config.json", b"{\"q8\":[\"attn\"]}"),
+            ("model.safetensors.index.json", index),
+        ],
+    );
+    let moved = dir(
+        "moved",
+        &[("config.json", b"{\"q8\":[]}"), ("model.safetensors.index.json", index)],
+    );
+    let bare = dir("bare", &[("config.json", b"{}"), ("model.safetensors", &[0u8; 8])]);
+    let bare_bigger =
+        dir("bare2", &[("config.json", b"{}"), ("model.safetensors", &[0u8; 9])]);
+    let id = |d: &std::path::Path| checkpoint_identity(d).expect("identity");
+    assert_eq!(id(&q4).len(), 12);
+    assert_eq!(id(&q4), id(&q4), "stable");
+    assert_eq!(id(&q4), id(&moved), "the content, not the path");
+    assert_ne!(id(&q4), id(&xl), "another storage policy");
+    assert_ne!(id(&bare), id(&bare_bigger), "another shard without an index");
+    let empty = dir("empty", &[("config.json", b"{}")]);
+    assert!(checkpoint_identity(&empty).is_err(), "no shard at all");
+    let _ = std::fs::remove_dir_all(&root);
+}

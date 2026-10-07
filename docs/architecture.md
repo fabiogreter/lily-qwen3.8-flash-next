@@ -886,7 +886,10 @@ step (9.5e-3).
 Disk-tier entries keep their layout per format: a q8 layer persists its K
 and V scales after the values, and q8 entries live under their own format
 key, so they never mix with bf16 ones (each directory has the full
-`--disk-cache-bytes`).
+`--disk-cache-bytes`). The key also carries the checkpoint's identity (the
+SHA-256 of its `config.json` and tensor index, 12 hex digits), so two
+conversions of the architecture, q4 and q4-xl, never resume each other's
+sessions either.
 
 ## The session cache
 

@@ -493,6 +493,51 @@ pub const VISION_PREFIX: &str = "model.visual.";
 
 pub const FORMAT: &str = "qwen4_exp-affine-v1";
 
+/// Hex digits of [`checkpoint_identity`] kept in the disk tier's key.
+const CHECKPOINT_ID_HEX: usize = 12;
+
+/// An identity of the checkpoint in `dir`, for the disk tier's key: two
+/// conversions of the same architecture (q4 and q4-xl, a re-conversion, a
+/// checkpoint with the draft head or the vision tower appended) must never
+/// resume each other's persisted sessions, which hold one model's caches
+/// and recurrent state. The SHA-256 of `config.json` (its storage policy
+/// among the rest) and `model.safetensors.index.json` (every tensor's
+/// shard), or of the shard names and sizes when there is no index; a few
+/// hundred KB read once per load.
+pub fn checkpoint_identity(dir: &Path) -> Result<String> {
+    let read = |name: &str| {
+        std::fs::read(dir.join(name))
+            .with_context(|| format!("reading {}", dir.join(name).display()))
+    };
+    let mut hash = crate::sha256::Sha256::new();
+    hash.update(&read("config.json")?);
+    match read("model.safetensors.index.json") {
+        Ok(index) => hash.update(&index),
+        Err(_) => {
+            let mut shards = std::fs::read_dir(dir)
+                .with_context(|| format!("listing {}", dir.display()))?
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".safetensors"))
+                .map(|e| {
+                    Ok((
+                        e.file_name().to_string_lossy().into_owned(),
+                        e.metadata()?.len(),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            ensure!(!shards.is_empty(), "{} holds no safetensors shard", dir.display());
+            shards.sort();
+            for (name, len) in shards {
+                hash.update(name.as_bytes());
+                hash.update(&len.to_le_bytes());
+            }
+        }
+    }
+    let mut id = crate::sha256::hex(&hash.finish());
+    id.truncate(CHECKPOINT_ID_HEX);
+    Ok(id)
+}
+
 /// Rotary pairs per (temporal, height, width) axis of the text model's
 /// M-RoPE, the only layout the vision path is written for (VISION.md).
 pub const MROPE_SECTION: &[usize] = &[11, 11, 10];
