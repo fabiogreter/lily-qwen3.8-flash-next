@@ -7,9 +7,8 @@ than mlx-lm ([their write-up](https://www.perplexity.ai/hub/blog/optimizing-on-d
 
 This fork ports that engine to Qwen3.8-Flash-Next and tunes it for this
 model: hand-written Metal kernels, pipelined decode steps, speculative
-decoding with the model's own draft head, conversations cached across
-requests and restarts, and an expert cache that runs the model on half the
-memory it needs.
+decoding with the model's own draft head, and conversations cached across
+requests and restarts.
 
 Against Unsloth's llama.cpp fork on the same machine and prompts, prefill is
 2.7 to 4.2 times faster and decode 2.1 to 3.6 times faster, more so at longer
@@ -20,6 +19,12 @@ keeps the dense tensors every token passes through at 8 bits and is
 noticeably more reliable on long agent turns; **q4** is faster, by a few
 percent for a request decoding alone and about 15 % for batched ones.
 [The model](#the-model) has the details.
+
+On machines with less memory, lily switches to a small-machine mode that
+keeps the most used experts in GPU memory and streams the rest from disk.
+This makes it possible to run Qwen3.8-Flash-Next on a 64 GB machine with
+the same checkpoint, without falling back to a smaller quantization or
+pruning experts ([Smaller machines](#smaller-machines)).
 
 ## Running it
 
