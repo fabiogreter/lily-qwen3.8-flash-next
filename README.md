@@ -211,9 +211,13 @@ performance may be worse, as there is additional RAM required to hold the sessio
 KV cache. If anyone wants to test with a real 64 GB machine, your feedback is welcome.
 Less than 64 GB is probably impractical.
 
-The cache sizes itself from physical memory; `--memory-gb 64` plans for
-64 GB instead, which is also how to try the mode on a bigger machine.
-Details: [docs/low-ram-experts.md](docs/low-ram-experts.md).
+The cache sizes itself from physical memory, keeping 12 GB free for the
+system, other apps and the page cache. If you run more next to lily (an
+IDE, containers, a browser), `--memory-limit-gb 44` keeps lily's own
+footprint at about 44 GB instead; a limit can only lower what lily takes,
+never give it the reserve. To try the mode on a bigger machine,
+`LILY_MEMORY_GB=64` plans as if the machine had 64 GB. Details:
+[docs/low-ram-experts.md](docs/low-ram-experts.md).
 
 ## Converting a checkpoint
 

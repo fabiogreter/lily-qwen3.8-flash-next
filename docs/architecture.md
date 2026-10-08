@@ -1484,8 +1484,8 @@ held" above): the idle engine signals the GPU once a second while the pin
 is held and stops when it is released.
 
 Whether to pin is a pure function (`serve::pin::decide`) of the planned
-memory (`--memory-gb` when given, else physical, and never more than
-physical), the wire limit (the smaller of `vm.user_wire_limit` and
+memory (`LILY_MEMORY_GB` when set, else physical, and never more than
+physical; `--memory-limit-gb` does not enter), the wire limit (the smaller of `vm.user_wire_limit` and
 `vm.global_user_wire_limit`, 116.8 GB each on 128 GB), the bytes to pin and
 whether the expert cache is active. `auto` skips when the expert cache is
 active (`pin skipped: expert cache active`): the plan (`auto_expert_slots`)

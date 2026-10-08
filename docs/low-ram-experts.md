@@ -50,10 +50,25 @@ GPU memory have no such constraint.
 
 Nothing to set on the small machine: at load the engine compares the
 checkpoint with `hw.memsize` and engages the cache when it does not fit.
-`lily serve --memory-gb 64` (or `LILY_MEMORY_GB=64`, and `lily-bench
---memory-gb`) plans for that much memory instead of the machine's, which
-is also how to try the mode here: a 64 GB budget picks 16 441 slots
-(42.3 GB) and turns speculative decoding off. Copy
+`LILY_MEMORY_GB=64` (for `lily` and `lily-bench` alike) plans for that
+much memory instead of the machine's, which is how to try the mode here:
+a 64 GB machine picks 16 441 slots (42.3 GB) and turns speculative
+decoding off. Before 2026-10-08 this was `--memory-gb`, which now refuses
+to start and names its replacements.
+
+`--memory-limit-gb G` is the other knob: the most lily should take. The
+plan sizes the process for the machine's memory less its reserve (12 GB,
+or a sixth of memory, for the OS, other apps and the page cache); a limit
+below that lowers the target, GB for GB out of the slab, and a limit above
+it changes nothing, so it can never hand lily the reserve. The target
+covers the process footprint (weights, scratch, the session cache), not
+the page cache that serves the paged n-gram table and the streamed
+experts. On a machine that holds the checkpoint, a limit that leaves less
+than one full session (or the session cache's floor, 5 GiB with q8 caches)
+beside the weights engages the cache; otherwise the server's session budget
+is lowered to what the limit leaves after the load. The two compose:
+`LILY_MEMORY_GB=64 lily --memory-limit-gb 44` is a 64 GB machine whose
+user keeps 20 GB for other work. Copy
 `tools/bench/expert-usage-qwen38-flash-next.json` next to the checkpoint
 as `expert-usage.json` (or point `LILY_EXPERT_USAGE` at it) so the
 busiest experts are the resident ones; without it the placement is

@@ -102,7 +102,7 @@ const BUDGET_FLOOR_Q8_BYTES: usize = 5 << 30;
 const DEFAULT_MAX_BATCH: usize = 4;
 
 /// The derived budget's floor for a K/V format.
-fn budget_floor(format: KvFormat) -> usize {
+pub(crate) fn budget_floor(format: KvFormat) -> usize {
     match format {
         KvFormat::Bf16 => BUDGET_FLOOR_BF16_BYTES,
         KvFormat::Q8 => BUDGET_FLOOR_Q8_BYTES,
@@ -170,6 +170,25 @@ fn derive_cache_budget(
         .saturating_sub(BUDGET_HEADROOM_BYTES);
     (derived.max(floor), derived < floor)
 }
+
+/// The derived budget under `--memory-limit-gb`: no more than what the
+/// load's footprint target (`LanguageModel::memory_limit`) leaves after
+/// what is allocated. The page cache is outside the target, so the paged
+/// weights do not count here. Returns the budget and whether the limit
+/// lowered it.
+fn cap_cache_budget(
+    budget: usize,
+    limit: Option<u64>,
+    allocated: usize,
+) -> (usize, bool) {
+    match limit {
+        Some(limit) => {
+            let room = (limit as usize).saturating_sub(allocated);
+            (budget.min(room), room < budget)
+        }
+        None => (budget, false),
+    }
+}
 /// How long a running request may keep going after a stop signal before it
 /// is cancelled at its next token or prefill chunk.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
@@ -222,8 +241,9 @@ pub struct ServeOptions {
     pub ngram_lock: bool,
     /// Draft tokens per speculative step (0 disables the draft head).
     pub mtp_drafts: usize,
-    /// Memory the engine may plan for, in bytes (`None`: the machine's).
-    pub memory_budget: Option<u64>,
+    /// The most the process should take, in bytes (`--memory-limit-gb`;
+    /// `None`: planned from the machine's memory alone).
+    pub memory_limit: Option<u64>,
     /// Whether to load the vision tower when the checkpoint has one.
     pub vision: VisionMode,
     /// An image with more pixels is scaled down to fit before the tower.
@@ -833,7 +853,7 @@ impl<M: LanguageModel> Engine<M> {
                 vision: options.vision,
                 expert_slots: None,
                 expert_usage: None,
-                memory_budget: options.memory_budget,
+                memory_limit: options.memory_limit,
                 // The usage the cache measures goes next to the disk tier.
                 expert_usage_out: options
                     .disk_cache_dir
@@ -974,13 +994,15 @@ impl<M: LanguageModel> Engine<M> {
             }
             (None, None) => {
                 let floor = budget_floor(model.kv_format());
-                let (budget, floored) =
+                let (derived, floored) =
                     derive_cache_budget(working_set, allocated, paged, floor);
+                let (budget, limited) =
+                    cap_cache_budget(derived, model.memory_limit(), allocated);
                 eprintln!(
                     "session cache budget: {:.1} GB = {:.1} GB recommended working set - {:.1} GB allocated \
                      (weights, scratch) - {:.1} GB paged weights in the page cache - {:.1} GB headroom for \
                      other applications{}; override with --cache-bytes",
-                    gb(budget),
+                    gb(derived),
                     gb(working_set),
                     gb(allocated),
                     gb(paged),
@@ -995,6 +1017,15 @@ impl<M: LanguageModel> Engine<M> {
                         String::new()
                     },
                 );
+                if limited {
+                    eprintln!(
+                        "session cache budget: lowered to {:.1} GB = the {:.1} GB footprint target of \
+                         --memory-limit-gb - {:.1} GB allocated",
+                        gb(budget),
+                        gb(model.memory_limit().unwrap_or(0) as usize),
+                        gb(allocated),
+                    );
+                }
                 budget
             }
         };

@@ -11,7 +11,29 @@ const EXPERTS: u64 = SLICES * SLICE;
 const OTHER: u64 = 3_100_000_000;
 
 fn plan(ram: u64, session: u64) -> Option<usize> {
-    plan_expert_slots(ram, EXPERTS, OTHER, SLICES, NUM_EXPERTS, session)
+    plan_expert_slots(
+        footprint_target(ram, None),
+        EXPERTS,
+        OTHER,
+        SLICES,
+        NUM_EXPERTS,
+        session,
+        0,
+    )
+}
+
+/// The plan under `--memory-limit-gb`, with `fit` the sessions' room that
+/// the checkpoint must leave to count as fitting.
+fn plan_limited(ram: u64, limit: u64, session: u64, fit: u64) -> Option<usize> {
+    plan_expert_slots(
+        footprint_target(ram, Some(limit)),
+        EXPERTS,
+        OTHER,
+        SLICES,
+        NUM_EXPERTS,
+        session,
+        fit,
+    )
 }
 
 #[test]
@@ -189,6 +211,56 @@ fn a_longer_context_keeps_fewer_experts_resident() {
     let at_131k = plan(64 * GB, 4_900_000_000).unwrap();
     let at_262k = plan(64 * GB, 9_000_000_000).unwrap();
     assert!(at_262k < at_131k, "{at_262k} vs {at_131k}");
+}
+
+#[test]
+fn the_footprint_target_is_memory_less_the_reserve_lowered_by_a_limit() {
+    // 12 GB up to 72 GB of memory, a sixth above.
+    assert_eq!(footprint_target(64 * GB, None), 52 * GB);
+    assert_eq!(footprint_target(128 * GB, None), 128 * GB - 128 * GB / 6);
+    assert_eq!(footprint_target(64 * GB, Some(44 * GB)), 44 * GB);
+    // A limit never hands out the reserve.
+    assert_eq!(footprint_target(64 * GB, Some(56 * GB)), 52 * GB);
+    assert_eq!(footprint_target(8 * GB, None), 0);
+}
+
+#[test]
+fn a_limit_at_or_above_the_reserve_changes_nothing() {
+    // The field report's `--memory-gb 56` on 64 GB, read as a limit.
+    for limit in [52 * GB, 56 * GB, 64 * GB, 1024 * GB] {
+        assert_eq!(
+            plan_limited(64 * GB, limit, 2_700_000_000, 5 * GB),
+            plan(64 * GB, 2_700_000_000)
+        );
+    }
+}
+
+#[test]
+fn a_limit_below_the_reserve_comes_out_of_the_slab_gb_for_gb() {
+    let session = 2_700_000_000;
+    let full = plan(64 * GB, session).unwrap();
+    let limited = plan_limited(64 * GB, 44 * GB, session, 5 * GB).unwrap();
+    let expected = (8 * GB / SLICE) as usize;
+    assert!(
+        (full - limited).abs_diff(expected) <= 1,
+        "{} slots fewer, expected {expected}",
+        full - limited
+    );
+}
+
+#[test]
+fn a_limit_engages_the_cache_on_a_machine_that_holds_the_checkpoint() {
+    assert_eq!(plan(128 * GB, 0), None);
+    assert!(plan_limited(128 * GB, 60 * GB, 0, 5 * GB).is_some());
+}
+
+#[test]
+fn under_a_limit_the_checkpoint_fits_only_with_room_for_the_sessions() {
+    // Weights and scratch take 71.7 GB: 72 GB holds them, not a session.
+    let limit = 72_000_000_000;
+    assert_eq!(plan_limited(128 * GB, limit, 0, 0), None);
+    assert!(plan_limited(128 * GB, limit, 0, 5 * GB).is_some());
+    assert_eq!(plan_limited(128 * GB, limit + 6 * GB, 0, 5 * GB), None);
 }
 
 #[test]

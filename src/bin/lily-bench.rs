@@ -59,9 +59,16 @@ struct Cli {
     /// Sampler seed under `--sample`.
     #[arg(long, default_value_t = 0)]
     seed: u64,
-    /// Memory the engine may plan for, in GB (default: the machine's): below
-    /// what the checkpoint needs the experts are cached (docs/low-ram-experts.md).
+    /// The most memory the load should take, in GB (default: the machine's
+    /// less the plan's reserve): below what the checkpoint needs, however
+    /// little, the load switches to small-machine mode, caching part of the
+    /// experts and reading the rest from the checkpoint, with speculative
+    /// decoding off (docs/low-ram-experts.md). LILY_MEMORY_GB plans as if
+    /// the machine had that much memory instead.
     #[arg(long)]
+    memory_limit_gb: Option<f64>,
+    /// Retired: refuses to start and says what replaced it.
+    #[arg(long, hide = true)]
     memory_gb: Option<f64>,
     /// Where the expert cache writes the usage it measured (the next load
     /// prefers that file over the shipped ranking); nothing by default.
@@ -372,7 +379,10 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
         &cli.model,
         &LoadOptions {
             mtp_drafts: cli.drafts,
-            memory_budget: cli.memory_gb.map(|gb| (gb * (1u64 << 30) as f64) as u64),
+            memory_limit: lily::engine::memory_limit_bytes(
+                cli.memory_limit_gb,
+                cli.memory_gb,
+            )?,
             expert_usage_out: cli.expert_usage_out.clone(),
             kv_format: cli.kv_cache,
             ..LoadOptions::default()

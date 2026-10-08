@@ -92,8 +92,10 @@ impl FromStr for PinMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PinInputs {
     pub mode: PinMode,
-    /// The memory the load planned for: `--memory-gb` when given, else the
-    /// physical memory (`LanguageModel::planned_memory`).
+    /// The machine memory the load planned for: `LILY_MEMORY_GB` when set,
+    /// else the physical memory (`LanguageModel::planned_memory`).
+    /// `--memory-limit-gb` does not enter: under it the pinned weights are
+    /// part of the footprint the plan already kept to.
     pub planned_memory: Option<u64>,
     /// `hw.memsize`.
     pub physical_memory: Option<u64>,
@@ -149,8 +151,8 @@ fn gb(bytes: u64) -> f64 {
 ///   wiring them would come out of the reserve the plan keeps for the page
 ///   cache that streams the other experts. Otherwise it pins only when the
 ///   pinned bytes leave `memory_margin` free of the planned memory (the
-///   smaller of the plan and the physical memory, so `--memory-gb 64` on a
-///   128 GB machine decides like a 64 GB machine).
+///   smaller of the plan and the physical memory, so `LILY_MEMORY_GB=64` on
+///   a 128 GB machine decides like a 64 GB machine).
 /// - `auto` and `always` both pin only when the pinned bytes plus what the
 ///   process locks otherwise leave `wire_margin` below the wire limit.
 ///   An unreadable limit counts as half the physical memory (too little

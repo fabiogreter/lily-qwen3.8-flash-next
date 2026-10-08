@@ -52,7 +52,7 @@ fn auto_skips_a_real_64_gb_machine_with_the_expert_cache() {
 }
 
 #[test]
-fn memory_gb_64_on_128_gb_decides_like_a_64_gb_machine() {
+fn a_simulated_64_gb_machine_decides_like_one() {
     let i = PinInputs {
         planned_memory: Some(64 * GIB),
         pin_bytes: NON_EXPERT,

@@ -776,7 +776,8 @@ The expert cache: a slab of expert slots on the GPU, a slot table per layer,
 a service thread that resolves each MoE layer's routed experts between the
 router and the gather through a shared-event handshake, placement by a
 usage ranking with a small LRU region, misses read straight into the slot
-on 16 threads. Engaged from physical memory, or `--memory-gb`; nothing
+on 16 threads. Engaged from physical memory, `--memory-limit-gb` or
+`LILY_MEMORY_GB` (a simulated smaller machine); nothing
 changes on a machine that fits the checkpoint. `docs/low-ram-experts.md`.
 
 ## What was tried and dropped
@@ -1080,7 +1081,7 @@ target/release/lily-bench \
 | `--decode-steps N` | generated tokens (96 for the matrix below)                              |
 | `--drafts N`       | measure speculative decoding with N drafts per step and report acceptance instead of the one-token loop |
 | `--sample`         | draw with the checkpoint's sampler defaults instead of greedily (`--seed`) |
-| `--memory-gb G`    | plan for a machine with this much memory (engages the expert cache)     |
+| `--memory-limit-gb G` | keep the load's footprint under G GB (engages the expert cache when the checkpoint does not fit); `LILY_MEMORY_GB=G` plans for a machine with G GB instead (`--memory-gb` before 2026-10-08) |
 | `--ngram-preload`  | stream the paged n-gram table through the page cache before measuring   |
 | `--gpu-timing`     | add command-buffer GPU timestamps and host marks, and print the levels per step |
 | `--kernel-profile` | per-kernel GPU times per pass; wall-clock results under this flag are not comparable to a normal run |

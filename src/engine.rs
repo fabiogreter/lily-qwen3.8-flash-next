@@ -318,6 +318,31 @@ pub enum VisionTower {
     Loaded { bytes: usize, blocks: usize },
 }
 
+/// `--memory-limit-gb` in bytes for `LoadOptions::memory_limit`, refusing
+/// the old `--memory-gb` (`retired`), which meant the machine's memory and
+/// is now `LILY_MEMORY_GB`, instead of reading it as a limit.
+pub fn memory_limit_bytes(
+    limit_gb: Option<f64>,
+    retired: Option<f64>,
+) -> anyhow::Result<Option<u64>> {
+    if let Some(gb) = retired {
+        anyhow::bail!(
+            "--memory-gb {gb} is gone: --memory-limit-gb {gb} caps what lily uses (the plan still keeps \
+             its 12 GB reserve free), LILY_MEMORY_GB={gb} plans as if the machine had {gb} GB \
+             (trying the small-machine mode on a bigger machine)"
+        );
+    }
+    limit_gb
+        .map(|gb| {
+            anyhow::ensure!(
+                gb.is_finite() && gb > 0.0,
+                "--memory-limit-gb {gb}: a positive size in GB"
+            );
+            Ok((gb * (1u64 << 30) as f64) as u64)
+        })
+        .transpose()
+}
+
 /// Engine-wide load options; architectures ignore what does not apply.
 #[derive(Clone, Debug, Default)]
 pub struct LoadOptions {
@@ -335,11 +360,12 @@ pub struct LoadOptions {
     /// cache; `None` looks for `expert-usage.json` next to the checkpoint
     /// and falls back to uniform. `LILY_EXPERT_USAGE` overrides it.
     pub expert_usage: Option<std::path::PathBuf>,
-    /// Memory the engine may plan for, in bytes; `None` is the machine's
-    /// physical memory. Below what the checkpoint needs, the routed experts
-    /// are cached and served from disk (`docs/low-ram-experts.md`).
-    /// `LILY_MEMORY_GB` overrides it.
-    pub memory_budget: Option<u64>,
+    /// The most the process should take, in bytes (`--memory-limit-gb`);
+    /// `None` plans from the machine's memory alone. It only lowers what
+    /// the plan would use: below what the checkpoint needs, the routed
+    /// experts are cached and served from disk (`docs/low-ram-experts.md`).
+    /// `LILY_MEMORY_GB` stands in for the machine's memory, not for this.
+    pub memory_limit: Option<u64>,
     /// Where the expert cache persists the usage it measures while serving
     /// (the loader prefers this file, when present, over the shipped
     /// ranking); `None` persists nothing. `LILY_EXPERT_USAGE_OUT` overrides
@@ -652,9 +678,16 @@ pub trait LanguageModel: Sized {
         Vec::new()
     }
 
-    /// The memory the load planned for (`LoadOptions::memory_budget`, else
-    /// the machine's physical memory); `None` when unknown.
+    /// The machine memory the load planned for (`LILY_MEMORY_GB`, else the
+    /// physical memory); `None` when unknown.
     fn planned_memory(&self) -> Option<u64> {
+        None
+    }
+
+    /// The footprint the load kept to under `LoadOptions::memory_limit`,
+    /// never more than the machine's memory less the plan's reserve; `None`
+    /// without a limit.
+    fn memory_limit(&self) -> Option<u64> {
         None
     }
 

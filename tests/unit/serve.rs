@@ -93,6 +93,16 @@ fn default_cache_budget_leaves_room_for_the_paged_table_and_other_apps() {
 /// (small-machine mode), a bf16 budget below its floor. Defaults and q8
 /// budgets of any size start.
 #[test]
+fn a_memory_limit_lowers_the_derived_budget_to_what_it_leaves() {
+    const GB: usize = 1 << 30;
+    let limit = Some(90 * GB as u64);
+    assert_eq!(cap_cache_budget(20 * GB, None, 80 * GB), (20 * GB, false));
+    assert_eq!(cap_cache_budget(20 * GB, limit, 80 * GB), (10 * GB, true));
+    assert_eq!(cap_cache_budget(5 * GB, limit, 80 * GB), (5 * GB, false));
+    assert_eq!(cap_cache_budget(5 * GB, limit, 95 * GB), (0, true));
+}
+
+#[test]
 fn memory_options_the_configuration_cannot_honour_fail_the_start() {
     const GB: usize = 1 << 30;
     let check = check_memory_options;
@@ -433,7 +443,7 @@ fn warm_up_on_load_and_reload() {
         vision: VisionMode::Off,
         expert_slots: None,
         expert_usage: None,
-        memory_budget: None,
+        memory_limit: None,
         expert_usage_out: None,
         session_context: None,
         kv_format: Default::default(),

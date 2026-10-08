@@ -101,3 +101,19 @@ fn a_parked_steps_phases_measure_its_release() {
     assert!(close(p.gpu_ms, 15.0) && close(p.wake_ms, 0.1), "{p:?}");
     assert!(close(p.finish_ms, 0.1), "{p:?}");
 }
+
+#[test]
+fn the_memory_limit_is_gib_and_the_retired_flag_says_what_replaced_it() {
+    assert_eq!(memory_limit_bytes(None, None).unwrap(), None);
+    assert_eq!(memory_limit_bytes(Some(44.0), None).unwrap(), Some(44 << 30));
+    let err = memory_limit_bytes(None, Some(64.0)).unwrap_err().to_string();
+    assert!(
+        err.contains("--memory-limit-gb 64") && err.contains("LILY_MEMORY_GB=64"),
+        "{err}"
+    );
+    // Even with the new flag beside it: the old one meant something else.
+    assert!(memory_limit_bytes(Some(44.0), Some(64.0)).is_err());
+    for bad in [0.0, -4.0, f64::NAN, f64::INFINITY] {
+        assert!(memory_limit_bytes(Some(bad), None).is_err(), "{bad}");
+    }
+}

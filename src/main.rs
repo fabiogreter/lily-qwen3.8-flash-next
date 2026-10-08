@@ -35,7 +35,7 @@ struct Cli {
     bind: String,
 
     /// Maximum prompt plus completion length per request. With the expert
-    /// cache (a machine that cannot hold the checkpoint, or `--memory-gb`)
+    /// cache (a machine that cannot hold the checkpoint, or `--memory-limit-gb`)
     /// it also sizes the session reserve the plan keeps free: one full
     /// session with q8 K/V caches, 2.7 GB at 131072 and 4.9 GB at 262144,
     /// taken from the expert slots. 131072 is the sensible choice on 64 GB.
@@ -158,12 +158,30 @@ struct Cli {
     #[arg(long, default_value_t = 2)]
     mtp_drafts: usize,
 
-    /// Memory the engine may plan for, in GB (default: the machine's
-    /// physical memory). Below what the checkpoint needs, the routed experts
-    /// are cached in memory and the rest served from the checkpoint files
-    /// as they are routed to, and speculative decoding is off; see
-    /// docs/low-ram-experts.md. Also how to try that mode on a big machine.
+    /// The most memory lily should take, in GB (default: what the machine
+    /// leaves after a reserve of 12 GB, or a sixth of memory, for the OS,
+    /// other apps and the page cache). It can only lower that, never give
+    /// lily the reserve. The target covers the process footprint (weights,
+    /// scratch, the session cache), not the page cache that serves the
+    /// paged n-gram table and streamed experts.
+    ///
+    /// A limit too small for the whole checkpoint (its weights, about 5 GB
+    /// of scratch and room for one full session: about 80 GB for q4-xl at
+    /// the default --max-seq) switches lily into small-machine mode
+    /// automatically, however little is missing. In that mode only part of
+    /// the routed experts stays in memory and the rest is read from the
+    /// checkpoint files as requests route to them, which costs prefill and
+    /// decode speed the more experts are left out; speculative decoding is
+    /// off, requests are served one at a time (--max-batch above 1 refuses
+    /// to start), the K/V caches are q8 only and the session cache holds
+    /// one full session, the rest spilling to the disk tier. See
+    /// docs/low-ram-experts.md. To try that mode on a bigger machine,
+    /// LILY_MEMORY_GB=64 plans as if the machine had 64 GB.
     #[arg(long)]
+    memory_limit_gb: Option<f64>,
+
+    /// Retired: refuses to start and says what replaced it.
+    #[arg(long, hide = true)]
     memory_gb: Option<f64>,
 
     /// The vision tower of a Qwen3.8-Flash-Next conversion that carries it:
@@ -308,7 +326,10 @@ fn run() -> Result<()> {
         ngram_preload: cli.ngram_preload,
         ngram_lock: cli.ngram_lock,
         mtp_drafts: cli.mtp_drafts,
-        memory_budget: cli.memory_gb.map(|gb| (gb * (1u64 << 30) as f64) as u64),
+        memory_limit: lily::engine::memory_limit_bytes(
+            cli.memory_limit_gb,
+            cli.memory_gb,
+        )?,
         vision: cli.vision,
         image_max_pixels: cli.image_max_pixels,
         image_min_pixels: cli.image_min_pixels,

@@ -1537,6 +1537,7 @@ impl Qwen4ExpModel {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -1552,7 +1553,8 @@ impl Qwen4ExpModel {
         vision: VisionMode,
         expert_slots: Option<usize>,
         expert_usage: Option<std::path::PathBuf>,
-        memory_budget: Option<u64>,
+        machine_memory: Option<u64>,
+        memory_limit: Option<u64>,
         expert_usage_out: Option<std::path::PathBuf>,
         session_context: Option<weights::SessionContext>,
     ) -> Result<Self> {
@@ -1578,7 +1580,8 @@ impl Qwen4ExpModel {
             vision == VisionMode::Auto,
             expert_slots,
             expert_usage,
-            memory_budget,
+            machine_memory,
+            memory_limit,
             expert_usage_out,
             session_context,
         )?;
@@ -4295,11 +4298,13 @@ impl LanguageModel for Qwen4ExpModel {
         let expert_usage = std::env::var_os("LILY_EXPERT_USAGE")
             .map(std::path::PathBuf::from)
             .or_else(|| options.expert_usage.clone());
-        let memory_budget = std::env::var("LILY_MEMORY_GB")
+        // `LILY_MEMORY_GB` plans as if the machine had that much memory
+        // (trying the small-machine mode on a big one); `--memory-limit-gb`
+        // is a separate cap on what lily itself uses.
+        let machine_memory = std::env::var("LILY_MEMORY_GB")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
-            .map(|gb| (gb * (1u64 << 30) as f64) as u64)
-            .or(options.memory_budget);
+            .map(|gb| (gb * (1u64 << 30) as f64) as u64);
         let expert_usage_out = options.expert_usage_out.clone();
         // The plan's session follows the format in effect.
         let kv_format = kv_format_from_env()?.unwrap_or(options.kv_format);
@@ -4313,7 +4318,8 @@ impl LanguageModel for Qwen4ExpModel {
             options.vision,
             expert_slots,
             expert_usage,
-            memory_budget,
+            machine_memory,
+            options.memory_limit,
             expert_usage_out,
             session_context,
         )
@@ -4329,6 +4335,10 @@ impl LanguageModel for Qwen4ExpModel {
 
     fn planned_memory(&self) -> Option<u64> {
         self.weights.planned_memory
+    }
+
+    fn memory_limit(&self) -> Option<u64> {
+        self.weights.memory_limit
     }
 
     fn session_reserve(&self) -> Option<u64> {
