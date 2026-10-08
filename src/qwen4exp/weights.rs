@@ -382,8 +382,9 @@ fn plan_expert_slots(
 /// scratch, `session` (the server's session cache, one full session at its
 /// context length) and a 12 GB reserve for the OS, other apps and the page
 /// cache, at least two layers' worth. A 64 GB machine keeps about 13 GB
-/// free; the session takes 4.2 GB of what would be experts at a 131 072-token
-/// context and 7.9 GB at 262 144. `session` does not count toward whether the checkpoint fits:
+/// free; the session (q8 K/V caches, the only format the expert cache runs)
+/// takes 2.7 GB of what would be experts at a 131 072-token context and
+/// 4.9 GB at 262 144. `session` does not count toward whether the checkpoint fits:
 /// a machine that holds it keeps its usual session budget.
 fn auto_expert_slots(
     ckpt: &Checkpoint,
