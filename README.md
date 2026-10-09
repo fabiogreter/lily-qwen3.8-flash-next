@@ -199,9 +199,9 @@ dropped and why is in [docs/performance.md](docs/performance.md).
 
 On smaller machines, lily automatically employs an expert cache that
 keeps only the most used experts in GPU memory and streams the rest from
-disk. Expert usage is tracked during runtime, so the cache adapts to your
-usage. The cached configuration then gets saved to disk and reused on the
-next run.
+disk. Expert usage is tracked during runtime, with recent work weighing
+most, so the cache adapts to what you are doing. The cached configuration
+then gets saved to disk and reused on the next run.
 
 Moving experts around between RAM and disk does of course cost time. On a
 simulated 64 GB machine with the checkpoint's pages cold, prefill was measured
