@@ -303,6 +303,99 @@ impl PrefillMoeScratch {
     }
 }
 
+/// The prefill router's projection: `x` `[m, h]` through the router `gate`
+/// into `logits` `[m, E]` (bf16), on the route `project_mat` picks for `m`.
+/// [`prefill_moe`] and the cross-layer prediction log
+/// (`Qwen4ExpModel::enable_expert_prediction`) both route through here and
+/// [`router_select_rows`], so a prediction runs the real router's kernels.
+pub(crate) fn router_project_rows(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    gate: &LinearWeights,
+    x: &Tensor,
+    logits: &Tensor,
+    dequant: &Tensor,
+) -> Result<()> {
+    project_mat(ctx, pass, x, gate, logits, dequant)
+}
+
+/// The prefill routing decision over `logits` `[m, E]`: per-row softmax,
+/// top-k into `indices`/`scores` `[m, k]`, renormalised when the model
+/// says so.
+pub(crate) fn router_select_rows(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    dims: &MoeDims,
+    logits: &Tensor,
+    indices: &Tensor,
+    scores: &Tensor,
+) -> Result<()> {
+    moe::moe_router_topk_rows(ctx, pass, logits, indices, scores, dims.norm_topk_prob)
+}
+
+/// [`router_project_rows`] then [`router_select_rows`], with the barrier
+/// between them; leaves `indices`/`scores` unordered for the caller.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn route_rows(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    dims: &MoeDims,
+    gate: &LinearWeights,
+    x: &Tensor,
+    logits: &Tensor,
+    indices: &Tensor,
+    scores: &Tensor,
+    dequant: &Tensor,
+) -> Result<()> {
+    router_project_rows(ctx, pass, gate, x, logits, dequant)?;
+    pass.level_barrier(&[logits])?;
+    router_select_rows(ctx, pass, dims, logits, indices, scores)
+}
+
+/// The decode router's projection: one row `x` `[h]` through the router
+/// `gate` into `logits` `[E]` (f32). Shared with the prediction log as
+/// [`router_project_rows`] is.
+pub(crate) fn router_project_decode(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    gate: &LinearWeights,
+    x: &Tensor,
+    logits: &Tensor,
+) -> Result<()> {
+    quant::gemv_quant(ctx, pass, gate, x, logits)
+}
+
+/// The decode routing decision over `logits` `[E]` (see
+/// [`router_select_rows`]).
+pub(crate) fn router_select_decode(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    dims: &MoeDims,
+    logits: &Tensor,
+    indices: &Tensor,
+    scores: &Tensor,
+) -> Result<()> {
+    moe::moe_router_topk(ctx, pass, logits, indices, scores, dims.norm_topk_prob)
+}
+
+/// [`router_project_decode`] then [`router_select_decode`], with the
+/// barrier between them; leaves `indices`/`scores` unordered.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn route_decode(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    dims: &MoeDims,
+    gate: &LinearWeights,
+    x: &Tensor,
+    logits: &Tensor,
+    indices: &Tensor,
+    scores: &Tensor,
+) -> Result<()> {
+    router_project_decode(ctx, pass, gate, x, logits)?;
+    pass.level_barrier(&[logits])?;
+    router_select_decode(ctx, pass, dims, logits, indices, scores)
+}
+
 /// The per-chunk tensors the prefill FFN reads and writes.
 pub(crate) struct PrefillMoeIo<'a> {
     /// `[m, h]` FFN input.
@@ -366,7 +459,7 @@ pub(crate) fn prefill_moe(
     // are encoded alongside the router and the two chains meet at the final
     // gated add.
     let shared = &moe_w.shared;
-    project_mat(ctx, pass, io.x, &moe_w.gate, &ms.router_logits, io.dequant)?;
+    router_project_rows(ctx, pass, &moe_w.gate, io.x, &ms.router_logits, io.dequant)?;
     // The shared expert's gate|up as one stacked GEMM when eligible: its
     // SwiGLU then reads the two halves in place (no split copy).
     let inter_s = io.mlp_gate.numel() / m;
@@ -390,14 +483,7 @@ pub(crate) fn prefill_moe(
         io.mlp_up,
         &ms.shared_gate,
     ])?;
-    moe::moe_router_topk_rows(
-        ctx,
-        pass,
-        &ms.router_logits,
-        &ms.indices,
-        &ms.scores,
-        dims.norm_topk_prob,
-    )?;
+    router_select_rows(ctx, pass, dims, &ms.router_logits, &ms.indices, &ms.scores)?;
     match &stacked_gu {
         Some(gu) => silu_mul_rows_bf16(ctx, pass, gu, io.mlp_act)?,
         None => silu_mul_bf16(ctx, pass, io.mlp_gate, io.mlp_up, io.mlp_act)?,
@@ -609,7 +695,7 @@ pub(crate) fn decode_moe(
     }
     // Level 0 — everything whose only input is `x`.
     if !crate::ablate::on(crate::ablate::Group::Router) {
-        quant::gemv_quant(ctx, pass, &moe_w.gate, io.x, &ms.router_logits)?;
+        router_project_decode(ctx, pass, &moe_w.gate, io.x, &ms.router_logits)?;
     }
     if !crate::ablate::on(crate::ablate::Group::Shared) {
         quant::gemv_quant(ctx, pass, &shared.gate_up_proj, io.x, io.mlp_gu)?;
@@ -619,13 +705,13 @@ pub(crate) fn decode_moe(
 
     // Level 1 — the routing decision, and the shared expert's activation.
     if !crate::ablate::on(crate::ablate::Group::Topk) {
-        moe::moe_router_topk(
+        router_select_decode(
             ctx,
             pass,
+            dims,
             &ms.router_logits,
             &ms.indices,
             &ms.scores,
-            dims.norm_topk_prob,
         )?;
         silu_mul_bf16(ctx, pass, io.mlp_gate, io.mlp_up, io.mlp_act)?;
         pass.level_barrier(&[&ms.indices, &ms.scores, io.mlp_act])?;

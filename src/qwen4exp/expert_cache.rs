@@ -176,12 +176,14 @@ impl ExpertCacheStats {
 
 /// Resolutions between promotion passes: about ten decoded tokens at 48
 /// cached layers, or ten prefill chunks; a pass over the slots costs a
-/// few tens of microseconds.
+/// few tens of microseconds. The replays (`expert_replay`, `cache_replay`)
+/// use it too.
 pub(crate) const PROMOTE_EVERY: u64 = 480;
 /// Seconds between writes of the usage file while serving.
 const PERSIST_SECS: u64 = 300;
 /// Routed ids per resolution up to which a pass counts as decode-class
-/// (a step, a verify pass of a few rows), above it as prefill.
+/// (a step, a verify pass of a few rows), above it as prefill. The replays
+/// (`expert_replay`, `cache_replay`) classify their requests by it too.
 pub(crate) const DECODE_IDS: usize = 256;
 
 /// What a cached layer's `MoeWeights` holds: the events of the protocol

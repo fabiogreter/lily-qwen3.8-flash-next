@@ -53,7 +53,8 @@ use crate::metal::{
 };
 use crate::moe_ffn::{
     DecodeMoeIo, MoeDims, MoeScratch, PrefillMoeIo, PrefillMoeScratch, decode_moe,
-    prefill_moe, prefix_rows, project_mat, project_stack_or_slices,
+    prefill_moe, prefix_rows, project_mat, project_stack_or_slices, route_decode,
+    route_rows,
 };
 use crate::tensor::{DType, Tensor};
 
@@ -1144,6 +1145,9 @@ pub struct Scratch {
     /// `U32 [layers, capacity, top_k]`, the experts each prefilled position
     /// was routed to, per MoE layer.
     pub(super) expert_log: Option<Tensor>,
+    /// Cross-layer routing prediction log for measurement
+    /// (`Qwen4ExpModel::enable_expert_prediction`).
+    pub(super) expert_pred: Option<ExpertPredLog>,
     /// Batched decode across sessions (`batch`): per-slot samplers and
     /// per-row attention scratch, allocated by the first batched step.
     pub(super) batch: Option<batch::BatchScratch>,
@@ -1159,6 +1163,56 @@ impl Scratch {
     pub fn resumed_probe(&self) -> Option<&SharedEvent> {
         self.sync.resumed.as_ref()
     }
+}
+
+/// Lookaheads the prediction log holds per variant: 0 (the plumbing check,
+/// which must reproduce the logged routing exactly), 1 and 2.
+pub const EXPERT_PRED_LOOKAHEADS: usize = 3;
+
+/// Predictor variants in the prediction log. A: layer `l + d`'s router on
+/// layer `l`'s gate input (the single-stream papers' form). B: layer
+/// `l + d`'s own MoE read-in (hyper-connection read, its norm included) on
+/// the four streams right after layer `l`'s MoE inject, then its router.
+pub const EXPERT_PRED_VARIANTS: usize = 2;
+
+/// Predicted experts the prediction log keeps per row, in units of the
+/// model's top-k: the predicting router selects `EXPERT_PRED_WIDTH *
+/// top_k` (the real routing stays top-k), so wider predicted sets and score
+/// thresholds can be measured from one run.
+pub const EXPERT_PRED_WIDTH: usize = 2;
+
+/// The cross-layer prediction log and the scratch its predictions run in,
+/// kept apart from the real layer's so a prediction never touches what the
+/// layer itself consumes.
+pub(super) struct ExpertPredLog {
+    /// `U32 [EXPERT_PRED_VARIANTS, EXPERT_PRED_LOOKAHEADS, layers, capacity,
+    /// w]` with `w = EXPERT_PRED_WIDTH * top_k`: entry `(v, d, l, p)` holds
+    /// the top-`w` that variant `v` with lookahead `d` predicts for layer
+    /// `l` at position `p`, from layer `l - d`, in the router kernel's
+    /// selection order (score descending, ties to the lowest id; the host
+    /// takes its top-k by score, `route_predict::top_by_score`). Entries
+    /// with `l < d` are never written. Lookahead 0 is the check: A reruns
+    /// layer `l`'s router on its own gate input, B reruns layer `l`'s
+    /// read-in and router on the streams its real read consumed (before its
+    /// MoE inject); the top-k of either must be the logged routing.
+    log: Tensor,
+    /// `F32`, the shape of `log`: each pick's router score as the top-k
+    /// kernel writes it (with the model's renormalisation, over the `w`
+    /// picks, so it ranks like the real router's but is not its value).
+    scores: Tensor,
+    /// Prefill rows (`rows` the prefill chunk at enable time): bf16
+    /// `[rows, E]` logits, U32 `[rows, w]` indices, F32 `[rows, w]` scores,
+    /// and a hyper-connection read's intermediates.
+    rows_logits: Tensor,
+    rows_indices: Tensor,
+    rows_scores: Tensor,
+    rows_hc: HcScratch,
+    /// Decode: F32 `[E]` logits, U32 `[w]` indices, F32 `[w]` picked
+    /// scores, one read's intermediates.
+    logits: Tensor,
+    indices: Tensor,
+    picked_scores: Tensor,
+    hc: HcScratch,
 }
 
 /// What a verify pass records so a draft pass can roll the recurrent state
@@ -1812,13 +1866,12 @@ impl Qwen4ExpModel {
         })
     }
 
-    /// Scratch whose split-decode and sparse-attention buffers are sized for
-    /// `capacity_tokens` of context rather than the engine's ceiling.
-    /// Records, during prefill, which experts every position of every MoE
-    /// layer was routed to, into `U32 [layers, capacity, top_k]` scratch
-    /// (measurement: expert usage skew for weight offloading). The log
-    /// covers positions below the scratch's capacity; the draft head's own
-    /// routing is not logged.
+    /// Records which experts every position of every MoE layer was routed
+    /// to, into `U32 [layers, capacity, top_k]` scratch (measurement: expert
+    /// usage skew for weight offloading), from the batched passes (prefill,
+    /// verify) and the plain single-token decode step, each position at its
+    /// sequence index. The log covers positions below `capacity`; the draft
+    /// head's own routing and batched decode across sessions are not logged.
     pub fn enable_expert_log(
         &self,
         ctx: &MetalContext,
@@ -1835,6 +1888,254 @@ impl Qwen4ExpModel {
     /// The routing log enabled by [`Self::enable_expert_log`].
     pub fn expert_log<'s>(&self, scratch: &'s Scratch) -> Option<&'s Tensor> {
         scratch.expert_log.as_ref()
+    }
+
+    /// [`Self::enable_expert_log`] plus the cross-layer prediction log
+    /// (measurement: can expert loads be issued a layer or two ahead?).
+    /// After each MoE layer `l` the two variants (`EXPERT_PRED_VARIANTS`)
+    /// predict layers `l + 1` and `l + 2` through the real router's kernels
+    /// (`moe_ffn::route_rows` in the batched passes, `route_decode` in the
+    /// decode step) and the real read-in's (`hc_read_rows`, `hc_read_one`),
+    /// and log their top `EXPERT_PRED_WIDTH * top_k` with scores at the
+    /// layer they predict ([`Self::expert_pred_log`],
+    /// [`Self::expert_pred_scores`]). Batched passes may not exceed the
+    /// prefill chunk set at this call. Off by default; disabled, no pass
+    /// encodes anything for it.
+    pub fn enable_expert_prediction(
+        &self,
+        ctx: &MetalContext,
+        scratch: &mut Scratch,
+        capacity: usize,
+    ) -> Result<()> {
+        self.enable_expert_log(ctx, scratch, capacity)?;
+        let cfg = &self.config;
+        let layers = self.weights.layers.len();
+        let (e, w) = (cfg.num_experts, EXPERT_PRED_WIDTH * cfg.num_experts_per_tok);
+        ensure!(w <= e, "a prediction of {w} picks from {e} experts");
+        let rows = self.prefill_chunk;
+        let shape = [EXPERT_PRED_VARIANTS, EXPERT_PRED_LOOKAHEADS, layers, capacity, w];
+        scratch.expert_pred = Some(ExpertPredLog {
+            log: Tensor::zeros(ctx, &shape, DType::U32)?,
+            scores: Tensor::zeros(ctx, &shape, DType::F32)?,
+            rows_logits: Tensor::zeros(ctx, &[rows, e], DType::BF16)?,
+            rows_indices: Tensor::zeros(ctx, &[rows, w], DType::U32)?,
+            rows_scores: Tensor::zeros(ctx, &[rows, w], DType::F32)?,
+            rows_hc: HcScratch::new(ctx, cfg, rows)?,
+            logits: Tensor::zeros(ctx, &[e], DType::F32)?,
+            indices: Tensor::zeros(ctx, &[w], DType::U32)?,
+            picked_scores: Tensor::zeros(ctx, &[w], DType::F32)?,
+            hc: HcScratch::new(ctx, cfg, 1)?,
+        });
+        Ok(())
+    }
+
+    /// The prediction log enabled by [`Self::enable_expert_prediction`]:
+    /// the predicted ids, `U32 [EXPERT_PRED_VARIANTS,
+    /// EXPERT_PRED_LOOKAHEADS, layers, capacity, EXPERT_PRED_WIDTH *
+    /// top_k]`.
+    pub fn expert_pred_log<'s>(&self, scratch: &'s Scratch) -> Option<&'s Tensor> {
+        scratch.expert_pred.as_ref().map(|p| &p.log)
+    }
+
+    /// The router scores of [`Self::expert_pred_log`]'s picks, `F32` of
+    /// the same shape.
+    pub fn expert_pred_scores<'s>(&self, scratch: &'s Scratch) -> Option<&'s Tensor> {
+        scratch.expert_pred.as_ref().map(|p| &p.scores)
+    }
+
+    /// Routes `x` (`m` rows at positions `pos..pos + m`) through layer
+    /// `target`'s router on the route the layer itself takes for `m` rows
+    /// (`decode`: the single-token GEMV, f32 logits; else the chunk's GEMM,
+    /// bf16 logits) and logs the picks and their scores at `(variant,
+    /// lookahead, target)`. Ends ordered.
+    #[allow(clippy::too_many_arguments)]
+    fn log_prediction(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        s: &Scratch,
+        pred: &ExpertPredLog,
+        (variant, lookahead): (usize, usize),
+        target: usize,
+        x: &Tensor,
+        pos: usize,
+        m: usize,
+        decode: bool,
+    ) -> Result<()> {
+        let dims = moe_dims(&self.config);
+        let e = dims.num_experts;
+        let layers = self.weights.layers.len();
+        let (capacity, w) = (pred.log.shape()[3], pred.log.shape()[4]);
+        ensure!(pos + m <= capacity, "prediction log holds {capacity} positions");
+        let gate = &self.weights.layers[target].ffn.gate;
+        let (picked, scores) = if decode {
+            route_decode(
+                ctx,
+                pass,
+                &dims,
+                gate,
+                x,
+                &pred.logits,
+                &pred.indices,
+                &pred.picked_scores,
+            )?;
+            (pred.indices.view(0, &[w])?, pred.picked_scores.view(0, &[w])?)
+        } else {
+            let rows = pred.rows_indices.shape()[0];
+            ensure!(
+                m <= rows,
+                "prediction scratch holds {rows} rows (enable after set_prefill_chunk)"
+            );
+            let picked = pred.rows_indices.view(0, &[m, w])?;
+            let scores = pred.rows_scores.view(0, &[m, w])?;
+            route_rows(
+                ctx,
+                pass,
+                &dims,
+                gate,
+                x,
+                &pred.rows_logits.view(0, &[m, e])?,
+                &picked,
+                &scores,
+                &s.dequant,
+            )?;
+            (picked, scores)
+        };
+        pass.level_barrier(&[&picked, &scores])?;
+        let plane = (variant * EXPERT_PRED_LOOKAHEADS + lookahead) * layers + target;
+        let at = (plane * capacity + pos) * w;
+        copy_words(
+            ctx,
+            pass,
+            &picked.view(0, &[m * w])?,
+            &pred.log.view(at, &[m * w])?,
+        )?;
+        copy_words(
+            ctx,
+            pass,
+            &scores.view(0, &[m * w])?,
+            &pred.scores.view(at, &[m * w])?,
+        )?;
+        // The next prediction's router rewrites the scratch the copies read.
+        pass.level_barrier(&[&pred.log, &pred.scores])
+    }
+
+    /// Variant B's input: layer `target`'s MoE read-in over the streams
+    /// `hyper` (`m` rows) into the prediction's own read scratch, on the
+    /// route the real read takes for `m` rows. Returns the mixed view,
+    /// ordered.
+    #[allow(clippy::too_many_arguments)]
+    fn prediction_read(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        s: &Scratch,
+        pred: &ExpertPredLog,
+        target: usize,
+        hyper: &Tensor,
+        m: usize,
+        decode: bool,
+    ) -> Result<Tensor> {
+        let hc = &self.weights.layers[target].mlp_hc;
+        if decode {
+            self.hc_read_one(ctx, pass, hc, hyper, &pred.hc)?;
+            return pred.hc.mixed.view(0, pred.hc.mixed.shape());
+        }
+        let rows = pred.rows_indices.shape()[0];
+        ensure!(
+            m <= rows,
+            "prediction scratch holds {rows} rows (enable after set_prefill_chunk)"
+        );
+        let out = pred.rows_hc.rows(m)?;
+        self.hc_read_rows(ctx, pass, hc, hyper, &out, m, &s.dequant)?;
+        Ok(out.mixed)
+    }
+
+    /// Measurement, before layer `layer`'s MoE inject (no-op unless
+    /// [`Self::enable_expert_prediction`]): variant B's lookahead-0 check,
+    /// the layer's own read-in and router rerun on the streams `hyper` its
+    /// real read consumed. Ends ordered.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_read_check(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        s: &Scratch,
+        layer: usize,
+        hyper: &Tensor,
+        pos: usize,
+        m: usize,
+        decode: bool,
+    ) -> Result<()> {
+        let Some(pred) = &s.expert_pred else { return Ok(()) };
+        let x = self.prediction_read(ctx, pass, s, pred, layer, hyper, m, decode)?;
+        self.log_prediction(ctx, pass, s, pred, (1, 0), layer, &x, pos, m, decode)
+    }
+
+    /// Measurement only (no-op unless [`Self::enable_expert_log`]), after
+    /// layer `layer`'s MoE inject: copies the layer's routed ids
+    /// (`indices`, `m` rows at positions `pos..pos + m`) into the routing
+    /// log; with the prediction log enabled, logs variant A (lookaheads 0
+    /// to 2: routers on the layer's gate input `x`) and variant B
+    /// (lookaheads 1 and 2: the later layers' read-ins on the streams
+    /// `hyper`, then their routers). `decode` selects the single-token
+    /// kernels, as the layer itself ran. Must come before the next layer
+    /// overwrites `x` and `indices`; ends ordered.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_routing_log(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        s: &Scratch,
+        layer: usize,
+        x: &Tensor,
+        hyper: &Tensor,
+        indices: &Tensor,
+        pos: usize,
+        m: usize,
+        decode: bool,
+    ) -> Result<()> {
+        let Some(log) = &s.expert_log else { return Ok(()) };
+        let k = self.config.num_experts_per_tok;
+        let capacity = log.shape()[1];
+        ensure!(pos + m <= capacity, "expert log holds {capacity} positions");
+        copy_words(
+            ctx,
+            pass,
+            &indices.view(0, &[m * k])?,
+            &log.view((layer * capacity + pos) * k, &[m * k])?,
+        )?;
+        pass.level_barrier(&[log])?;
+        let Some(pred) = &s.expert_pred else { return Ok(()) };
+        let layers = self.weights.layers.len();
+        for d in 0..EXPERT_PRED_LOOKAHEADS {
+            let target = layer + d;
+            if target >= layers {
+                break;
+            }
+            self.log_prediction(ctx, pass, s, pred, (0, d), target, x, pos, m, decode)?;
+        }
+        for d in 1..EXPERT_PRED_LOOKAHEADS {
+            let target = layer + d;
+            if target >= layers {
+                break;
+            }
+            let read =
+                self.prediction_read(ctx, pass, s, pred, target, hyper, m, decode)?;
+            self.log_prediction(
+                ctx,
+                pass,
+                s,
+                pred,
+                (1, d),
+                target,
+                &read,
+                pos,
+                m,
+                decode,
+            )?;
+        }
+        Ok(())
     }
 
     /// Prompt tokens per batched prefill pass (see `prefill_chunk`).
@@ -1868,6 +2169,8 @@ impl Qwen4ExpModel {
         )
     }
 
+    /// Scratch whose split-decode and sparse-attention buffers are sized for
+    /// `capacity_tokens` of context rather than the engine's ceiling.
     pub fn new_scratch_with_capacity(
         &self,
         ctx: &MetalContext,
@@ -1957,6 +2260,7 @@ impl Qwen4ExpModel {
             prefill: None,
             vision: None,
             expert_log: None,
+            expert_pred: None,
             batch: None,
             spec: self
                 .weights
@@ -2408,6 +2712,7 @@ impl Qwen4ExpModel {
             self.block_batched(
                 ctx,
                 &pass,
+                layer_index,
                 layer,
                 lstate,
                 &ps.hyper,
@@ -2419,20 +2724,20 @@ impl Qwen4ExpModel {
                 capture.as_ref(),
                 rope,
             )?;
-            if let Some(log) = &s.expert_log {
-                // Keep this layer's routing before the next layer's router
-                // overwrites the shared indices.
-                let top_k = cfg.num_experts_per_tok;
-                let capacity = log.shape()[1];
-                ensure!(pos + m <= capacity, "expert log holds {capacity} positions");
-                copy_words(
-                    ctx,
-                    &pass,
-                    &ps.moe.indices.view(0, &[m * top_k])?,
-                    &log.view((layer_index * capacity + pos) * top_k, &[m * top_k])?,
-                )?;
-                pass.level_barrier(&[log])?;
-            }
+            // Keep this layer's routing (and, enabled, the predictions from
+            // its gate input) before the next layer overwrites both.
+            self.encode_routing_log(
+                ctx,
+                &pass,
+                s,
+                layer_index,
+                &ps.hc.mixed,
+                &ps.hyper,
+                &ps.moe.indices,
+                pos,
+                m,
+                false,
+            )?;
         }
 
         match mode {
@@ -2541,6 +2846,7 @@ impl Qwen4ExpModel {
         &self,
         ctx: &MetalContext,
         pass: &ComputePass<'_>,
+        layer_index: usize,
         layer: &LayerWeights,
         lstate: &LayerState,
         hyper: &Tensor,
@@ -2617,6 +2923,7 @@ impl Qwen4ExpModel {
             &ps.moe,
         )?;
         pass.level_barrier(&[&ps.branch_out])?;
+        self.encode_read_check(ctx, pass, s, layer_index, hyper, pos, ps.m, false)?;
         hc_inject_bf16(ctx, pass, hyper, &ps.branch_out, &ps.hc.inj, h, g)?;
         pass.level_barrier(&[hyper])
     }
@@ -2636,9 +2943,25 @@ impl Qwen4ExpModel {
         s: &Scratch,
         ps: &PrefillScratch,
     ) -> Result<()> {
+        self.hc_read_rows(ctx, pass, hc, hyper, &ps.hc, ps.m, &s.dequant)
+    }
+
+    /// [`Self::hc_read_batched`] into any `m`-row hyper-connection scratch
+    /// (the prediction log runs a later layer's read into its own).
+    #[allow(clippy::too_many_arguments)]
+    fn hc_read_rows(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        hc: &HcWeights,
+        hyper: &Tensor,
+        out: &HcScratch,
+        m: usize,
+        dequant: &Tensor,
+    ) -> Result<()> {
         let cfg = &self.config;
         let (h, g) = (cfg.hidden_size, cfg.hc_count);
-        if ps.m <= HC_FUSED_MAX_ROWS
+        if m <= HC_FUSED_MAX_ROWS
             && fused_read_supported(&hc.down, &hc.up, hc.inject.as_ref(), h, g)
         {
             hc_read_down_q8_rows(
@@ -2648,30 +2971,30 @@ impl Qwen4ExpModel {
                 &hc.norm,
                 &hc.down,
                 hc.inject.as_ref(),
-                &ps.hc.down,
-                &ps.hc.inj,
-                &ps.hc.inv_rms,
-                &ps.hc.act,
+                &out.down,
+                &out.inj,
+                &out.inv_rms,
+                &out.act,
                 h,
                 g,
                 cfg.rms_norm_eps,
                 NORM_WEIGHT_BIAS,
             )?;
-            pass.level_barrier(&[&ps.hc.down, &ps.hc.inj, &ps.hc.inv_rms, &ps.hc.act])?;
+            pass.level_barrier(&[&out.down, &out.inj, &out.inv_rms, &out.act])?;
             hc_read_up_mix_q8_rows(
                 ctx,
                 pass,
                 &hc.up,
-                &ps.hc.act,
+                &out.act,
                 hyper,
                 &hc.norm,
-                &ps.hc.inv_rms,
-                &ps.hc.mixed,
+                &out.inv_rms,
+                &out.mixed,
                 h,
                 g,
                 NORM_WEIGHT_BIAS,
             )?;
-            return pass.level_barrier(&[&ps.hc.mixed]);
+            return pass.level_barrier(&[&out.mixed]);
         }
         let inv_g = 1.0 / g as f32;
         rmsnorm_grouped_bf16(
@@ -2679,24 +3002,24 @@ impl Qwen4ExpModel {
             pass,
             hyper,
             &hc.norm,
-            &ps.hc.hn,
+            &out.hn,
             h,
             g,
             cfg.rms_norm_eps,
             NORM_WEIGHT_BIAS,
         )?;
-        pass.level_barrier(&[&ps.hc.hn])?;
-        project_mat(ctx, pass, &ps.hc.hn, &hc.down, &ps.hc.down, &s.dequant)?;
+        pass.level_barrier(&[&out.hn])?;
+        project_mat(ctx, pass, &out.hn, &hc.down, &out.down, dequant)?;
         if let Some(inject) = &hc.inject {
-            project_mat(ctx, pass, &ps.hc.hn, inject, &ps.hc.inj, &s.dequant)?;
+            project_mat(ctx, pass, &out.hn, inject, &out.inj, dequant)?;
         }
-        pass.level_barrier(&[&ps.hc.down, &ps.hc.inj])?;
-        silu_scaled_bf16(ctx, pass, &ps.hc.down, &ps.hc.act, inv_g)?;
-        pass.level_barrier(&[&ps.hc.act])?;
-        project_mat(ctx, pass, &ps.hc.act, &hc.up, &ps.hc.up, &s.dequant)?;
-        pass.level_barrier(&[&ps.hc.up])?;
-        hc_mix_bf16(ctx, pass, &ps.hc.up, &ps.hc.hn, &ps.hc.mixed, h, g)?;
-        pass.level_barrier(&[&ps.hc.mixed])
+        pass.level_barrier(&[&out.down, &out.inj])?;
+        silu_scaled_bf16(ctx, pass, &out.down, &out.act, inv_g)?;
+        pass.level_barrier(&[&out.act])?;
+        project_mat(ctx, pass, &out.act, &hc.up, &out.up, dequant)?;
+        pass.level_barrier(&[&out.up])?;
+        hc_mix_bf16(ctx, pass, &out.up, &out.hn, &out.mixed, h, g)?;
+        pass.level_barrier(&[&out.mixed])
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3522,7 +3845,9 @@ impl Qwen4ExpModel {
         hc_broadcast_bf16(ctx, pass, &s.x, &s.hyper, h, g)?;
         pass.level_barrier(&[&s.hyper])?;
 
-        for (layer, lstate) in self.weights.layers.iter().zip(state.layers.iter()) {
+        for (layer_index, (layer, lstate)) in
+            self.weights.layers.iter().zip(state.layers.iter()).enumerate()
+        {
             if let (Some(ple_w), Some(ple_s), Some(pst)) =
                 (&layer.ple, &s.ple, &state.ple)
             {
@@ -3591,10 +3916,32 @@ impl Qwen4ExpModel {
                 &s.moe,
             )?;
             pass.level_barrier(&[&s.branch_out])?;
+            self.encode_read_check(
+                ctx,
+                pass,
+                s,
+                layer_index,
+                &s.hyper,
+                state.pos,
+                1,
+                true,
+            )?;
             if !crate::ablate::on(crate::ablate::Group::Inject) {
                 hc_inject_bf16(ctx, pass, &s.hyper, &s.branch_out, &s.hc.inj, h, g)?;
                 pass.level_barrier(&[&s.hyper])?;
             }
+            self.encode_routing_log(
+                ctx,
+                pass,
+                s,
+                layer_index,
+                &s.hc.mixed,
+                &s.hyper,
+                &s.moe.indices,
+                state.pos,
+                1,
+                true,
+            )?;
         }
 
         self.hc_read_decode(ctx, pass, &self.weights.final_mixer, s)?;
@@ -3627,41 +3974,54 @@ impl Qwen4ExpModel {
         hc: &HcWeights,
         s: &Scratch,
     ) -> Result<()> {
-        let cfg = &self.config;
-        let (h, g) = (cfg.hidden_size, cfg.hc_count);
         if crate::ablate::on(crate::ablate::Group::Hc) {
             return Ok(());
         }
+        self.hc_read_one(ctx, pass, hc, &s.hyper, &s.hc)
+    }
+
+    /// [`Self::hc_read_decode`] of the one-row `hyper` into `out` (the
+    /// prediction log runs a later layer's read into its own scratch).
+    fn hc_read_one(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        hc: &HcWeights,
+        hyper: &Tensor,
+        out: &HcScratch,
+    ) -> Result<()> {
+        let cfg = &self.config;
+        let (h, g) = (cfg.hidden_size, cfg.hc_count);
         hc_read_down_q8(
             ctx,
             pass,
-            &s.hyper,
+            hyper,
             &hc.norm,
             &hc.down,
             hc.inject.as_ref(),
-            &s.hc.down,
-            &s.hc.inj,
-            &s.hc.inv_rms,
+            &out.down,
+            &out.inj,
+            &out.inv_rms,
             h,
             g,
             cfg.rms_norm_eps,
             NORM_WEIGHT_BIAS,
         )?;
-        pass.level_barrier(&[&s.hc.down, &s.hc.inj, &s.hc.inv_rms])?;
+        pass.level_barrier(&[&out.down, &out.inj, &out.inv_rms])?;
         hc_read_up_mix_q8(
             ctx,
             pass,
             &hc.up,
-            &s.hc.down,
-            &s.hyper,
+            &out.down,
+            hyper,
             &hc.norm,
-            &s.hc.inv_rms,
-            &s.hc.mixed,
+            &out.inv_rms,
+            &out.mixed,
             h,
             g,
             NORM_WEIGHT_BIAS,
         )?;
-        pass.level_barrier(&[&s.hc.mixed])
+        pass.level_barrier(&[&out.mixed])
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4755,3 +5115,7 @@ mod prefill_tests;
 #[cfg(test)]
 #[path = "../../tests/unit/qwen4exp/prefix.rs"]
 mod prefix_tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/qwen4exp/expert_pred_log.rs"]
+mod expert_pred_log_tests;

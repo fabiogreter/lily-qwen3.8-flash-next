@@ -6,6 +6,10 @@ using namespace metal;
 
 constant uint MOE_MAX_E = 1024;
 constant uint MOE_MAX_K = 16;
+// The router's own limit: the cross-layer prediction log selects 2 * top_k
+// (Qwen4ExpModel::enable_expert_prediction); the expert kernels keep
+// MOE_MAX_K.
+constant uint MOE_ROUTER_MAX_K = 32;
 
 // ---- Router top-k ----------------------------------------------------------
 // One simdgroup selects: lane `l` holds experts l, l + 32, ... in registers
@@ -170,8 +174,8 @@ static inline void moe_router_topk_body(device const T* row_logits,
         uint lane [[thread_index_in_simdgroup]]) {                             \
         threadgroup float probs[MOE_MAX_E];                                    \
         threadgroup float red[32];                                             \
-        threadgroup float sel_val[MOE_MAX_K];                                  \
-        threadgroup uint  sel_idx[MOE_MAX_K];                                  \
+        threadgroup float sel_val[MOE_ROUTER_MAX_K];                           \
+        threadgroup uint  sel_idx[MOE_ROUTER_MAX_K];                           \
         moe_router_topk_body<EPL>(logits, indices, scores, E, K, renorm, tid,  \
                                   tg_size, sg, lane, probs, red, sel_val,      \
                                   sel_idx);                                    \
@@ -190,8 +194,8 @@ static inline void moe_router_topk_body(device const T* row_logits,
         uint lane [[thread_index_in_simdgroup]]) {                             \
         threadgroup float probs[MOE_MAX_E];                                    \
         threadgroup float red[32];                                             \
-        threadgroup float sel_val[MOE_MAX_K];                                  \
-        threadgroup uint  sel_idx[MOE_MAX_K];                                  \
+        threadgroup float sel_val[MOE_ROUTER_MAX_K];                           \
+        threadgroup uint  sel_idx[MOE_ROUTER_MAX_K];                           \
         moe_router_topk_body<EPL>(logits + (ulong)row * E,                     \
                                   indices + (ulong)row * K,                    \
                                   scores + (ulong)row * K, E, K, renorm, tid,  \

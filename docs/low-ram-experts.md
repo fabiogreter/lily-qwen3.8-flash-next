@@ -464,6 +464,227 @@ re-read check on the routed ids found no stale reads). A run on a real
   skips the wait when nothing is missing would reduce it, and Metal has
   no conditional wait.
 
+## Cross-layer prediction measurement
+
+Prefetching a decode token's cold experts needs their ids a layer or two
+before the router picks them. FATE and HOBBIT take them from the next
+layer's router applied to the current layer's input, on the argument
+that the residual stream changes little between adjacent layers. This
+model has four streams and every block reads its own mixed view of them,
+so `lily-experts --predict-out` measures two predictors side by side.
+Measured 2026-10-09 (results at the end of this section).
+
+```sh
+lily-experts --model <checkpoint> --text <corpus> --prompts 4 \
+  --json-out usage.json --predict-out predict.json \
+  --global-usage tools/bench/expert-usage-qwen38-flash-next.json
+```
+
+Each prompt is prefilled, then `--predict-decode-tokens` (256) greedy
+tokens are decoded with the plain decode step (no draft head), stopping
+early at an end-of-sequence draw. Both passes log, per MoE layer and
+position, the routed top-k and the predictions for that layer
+(`Qwen4ExpModel::enable_expert_prediction`):
+
+- **A**: the router of layer `l + d` on layer `l`'s gate input (the
+  hyper-connection read layer `l`'s router consumed).
+- **B**: layer `l + d`'s own MoE read-in (its hyper-connection read with
+  the norm it contains) on the four streams right after layer `l`'s MoE
+  inject, then its router. Layer `l + d`'s attention has not run, and
+  neither has the n-gram embedding when `l + d` is its layer.
+
+`d` is 1 or 2. Both run the real kernels on their own scratch: the router
+GEMM (prefill, the chunk's route) or GEMV (decode), the softmax top-k
+kernel with the model's renormalisation, and the same read-in function
+the layers call. Lookahead 0 is the plumbing check: A reruns layer `l`'s
+router on its own input, B reruns layer `l`'s read-in and router on the
+streams its real read consumed, and both must reproduce the logged
+routing exactly (`self_check`, and a warning on stdout if not). The
+draft head and batched decode across sessions are not logged. Without
+the flag nothing is encoded for it and the counts output is unchanged.
+
+Since the replay below, the predicting router selects 20 experts
+(`EXPERT_PRED_WIDTH` times top-k; the real routing stays top-10) and
+the log keeps their router scores beside them (`expert_pred_scores`,
+renormalised over the 20 picks where the model renormalises, so they rank
+like the real router's scores but are not their values). The router
+top-k kernels take k from the indices tensor and select up to 32 now
+(`MOE_ROUTER_MAX_K`; the expert kernels keep their limit of 16); the
+first 10 of a 20-wide selection are exactly the 10-wide selection, ties
+included (`router_topk_wider_selection_extends_the_narrow_one`). The
+summary below scores each prediction's top-10 by score
+(`route_predict::top_by_score`, stable on ties, so the kernel's order
+decides them), and the lookahead-0 check compares the top-10 by score
+with the routed set.
+
+The JSON has a `prefill` and a `decode` section, each with `A` and `B`,
+each with lookaheads `"1"` and `"2"`:
+
+- `all_layers` and `per_layer` (`null` for the layers without a source
+  layer, which are not counted as misses): `overlap`, the mean of
+  `|pred ∩ actual| / k`; `exact`, the share of exact top-k matches;
+  `covered`, the share with `actual ⊆ pred`. With predicted sets of size
+  k, `covered` equals `exact`.
+- `missing_pairs_per_token` and `missing_layers_per_token`: histograms
+  over tokens (index = count) of the (layer, expert) pairs routed to but
+  not predicted, and of the layers with at least one, over all applicable
+  layers of the token.
+- `prefetch`, against the global top `--resident-slices` (16 384) of the
+  `--global-usage` ranking: `reads_per_token` (histogram of predicted
+  slices outside that set, the reads a prefetcher would issue),
+  `reads_per_layer`, `cold_actual_per_token`, `cold_covered_per_token`,
+  `cold_recall` (covered over actual cold) and `read_precision` (covered
+  over reads). The SSD serves about 0.6 expert reads per layer-time, so
+  `reads_per_layer` above that cannot be issued ahead in time.
+
+`residency` is the per-prompt test of re-ranking after the prefill: the
+share of the prompt's decode lookups inside the top N slices ranked by
+(own) the prompt's own prefill counts, (global) the global ranking, and
+(mix) both normalised and mixed 50/50, per prompt and averaged. Ties in
+the own and mixed rankings go by the global order.
+
+The shipped ranking was counted over 40 prompts of
+`docs/bench/prompts/corpus.txt`; prompts from that corpus are in its
+sample, which favours the global set. `--skip-prompts 40` starts past
+them when the corpus is long enough; another text avoids the question.
+
+### Measured 2026-10-09
+
+Six prompts of 8 192 tokens from `docs/bench/2026-10-01-long-context-prefill/
+prompt-mixed.txt` (not the ranking's corpus), 128 greedy tokens decoded after
+each (768 in all), against the shipped ranking's top 16 384 slices. The
+lookahead-0 self-check of both variants is exact over all 36 864 rows.
+
+| phase   | variant | ahead | overlap | covered | missing layers/token | reads/token | cold recall | read precision |
+|---------|---------|------:|--------:|--------:|---------------------:|------------:|------------:|---------------:|
+| decode  | A       | 1     | 62.8%   | 1.3%    | 46.4 of 47           | 44.7        | 59.8%       | 38.1%          |
+| decode  | A       | 2     | 53.5%   | 0.4%    | 45.8 of 46           | 50.9        | 49.8%       | 27.5%          |
+| decode  | B       | 1     | 78.9%   | 10.3%   | 42.1 of 47           | 37.9        | 77.4%       | 58.2%          |
+| decode  | B       | 2     | 66.2%   | 2.2%    | 45.0 of 46           | 45.3        | 62.0%       | 38.5%          |
+
+Prefill rows are within a point of decode on overlap and coverage (cold
+recall is lower there: 74.4% against 77.4% for B one ahead). So the
+papers' 90%+ does not transfer to this model as measured: the
+hyper-connection read-in matters (B over A by 16 points of overlap, though
+A and B differ in the observation point as well as the read-in), but even
+B one layer ahead predicts 8 of a layer's 10 experts on average and the
+full set only one token in ten. The "missing layers" column counts every
+mispredicted expert, resident ones included; what an optimistic scheme
+would pay for is a routed expert that is neither resident nor prefetched,
+and against the static top 16 384 that is 28.5 cold slices less the 22.0
+covered, about 6.4 (layer, expert) pairs per token, so at most that many
+layers to re-run per token: not ruled out, but at about 1 ms per
+re-entered layer it would not pay as it stands. Per layer, B's overlap runs
+from 45% (layer 1) and 53% (layer 31) to 90 to 92% at layers 40, 41 and 43
+(85% at 42), where the full set is right for a third of the tokens. The
+log kept only the predicted top-10 then, so a wider predicted set (the
+top-20 of the predicted router), a score threshold, or a learned predictor
+are not measured here (the log holds the top-20 with scores since; the
+replay below uses them). As a prefetcher against the static top
+16 384, B one layer ahead would cover 22.0 of a token's 28.5 cold slices
+for 37.9 reads, 0.81 per layer against the 0.6 the SSD serves in a layer's
+time, so it could not be issued in time without a confidence cut on the
+router scores.
+
+Residency is the more promising lever: the share of a prompt's decode
+lookups inside the top 16 384 slices is 94.0% ranked by the shipped
+counts, 97.5% ranked by the prompt's own prefill counts, 97.0% by the
+50/50 mix (mean over the six prompts). The own ranking uses only the
+prompt's prefill, so a cache could apply it before decoding; re-ranking
+the pinned set when a prompt's prefill ends would cut the static misses
+by more than half. It is a comparison of static sets: the live cache has
+16 246 slots of which 14 621 are pinned, an LRU region and promotion, so
+what re-ranking adds over that policy needs a replay of the same traces
+through both.
+
+### Replay of the live policy
+
+The figures above score prefetch and residency against the static top
+16 384, which lily never runs: the live cache misses about 10 of a
+token's 480 lookups, not the 28.5 cold slices the static set implies.
+`--replay-out` replays the cache's own policy code over each prompt's
+logged routing, host side, and compares three policies on the same
+traces:
+
+```sh
+lily-experts --model <checkpoint> --text <corpus> --prompts 6 \
+  --predict-decode-tokens 128 --json-out usage.json \
+  --predict-out predict.json --replay-out replay.json \
+  --global-usage tools/bench/expert-usage-qwen38-flash-next.json
+```
+
+What it reproduces (`expert_replay.rs`): the request stream the service
+thread sees for a plain run, one request per MoE layer per prefill chunk
+(`Qwen4ExpModel::prefill_chunk`, 4 096 unless `LILY_PREFILL_CHUNK` says
+otherwise; `lily-experts` prefills through the same chunking) carrying
+the union of the chunk's rows' routed ids, then one request per layer
+per decoded token with its 10 ids. Each request is resolved as `serve`
+resolves it: ids deduplicated, every id counted in `LiveUsage::record`
+as decode- or prefill-class by the request's routed-id count
+(`DECODE_IDS`), looked up through `SlotPolicy::lookup` at a tick that
+rises by one per request (the service's sequence number), and a
+promotion pass every `PROMOTE_EVERY` (480) requests. The cache is
+`--replay-slots` (16 246, the 64 GB plan) with `--replay-lru-share`
+(0.10) clamped as the loader clamps it (`SlotPolicy::lru_share_for`),
+placed by `--global-usage`, filled fresh per prompt as a fresh process
+would be (`--replay-carry` keeps each policy's slab and usage across
+prompts instead). Not reproduced: the server's warm-up pass (two prompt
+tokens and two decode steps, 144 small requests before the first
+prompt), the draft head's verify passes (the logged decode is plain,
+one row per pass), batched decode across sessions, the prompt's chat
+template, and timing: a replayed miss is a count, not a stall.
+
+The policies:
+
+- **live**: as shipped.
+- **rerank-own**, **rerank-mix**: when the prompt's decode starts, a
+  fresh `SlotPolicy` with the same slots and share from a ranking of the
+  prompt's own prefill counts with the global ranking as tie-break
+  (own), or of the two normalised and mixed 50/50 (mix), the orders the
+  residency test uses (`expert_replay::rerank_ranking`); the new
+  `LiveUsage` takes that ranking as its prior, and the decode runs live
+  from there. The one-off cost is `pinned_reads`, the new pinned slices
+  not resident in the slab before, and `lru_fill_reads`, the new LRU
+  region's initial contents not resident before (a real re-rank could
+  leave the LRU region as it was and skip those).
+- **prefetch-V-SET-BUDGET-LAYERS**: live, plus after each decode request
+  for layer `l` is resolved, the picks of predictor V (B or A, lookahead
+  1) for layer `l + 1` that are not resident are looked up through
+  `SlotPolicy::lookup` at layer `l + 1`'s tick, highest score first, so
+  they take LRU slots (and evict) exactly as a real load would, and the
+  layer's own request then cannot evict them. SET is `top10`, `top20`, or
+  `score>=τx`, the picks scoring at least τ times the predictor's mean
+  10th-highest score over the decode rows (`--replay-thresholds`, 0.5, 1
+  and 2: a higher τ gives a smaller set; `mean_set_size` reports what
+  each gave). BUDGET is unlimited, 2 or 1 reads per layer; LAYERS is
+  `all` (layers 1 and up; layer 0 has no source layer and is left to the
+  live policy) or `deep` (layers 36 and up, `--replay-deep-from`, where
+  B's overlap is 85 to 92%). A read is useful when the layer's request
+  for that token routes to the slice, wasted otherwise; the request's
+  misses are the ones the prefetch did not hide.
+
+`replay.json` holds the configuration (`slots`, the clamped `lru_share`,
+`pinned`, `prefill_chunk`, `carry`, the `mean_kth_score` per predictor
+and the resulting `thresholds`) and `policies`, one entry per policy with
+`prefill` and `decode` over all prompts and `per_prompt`. Each phase
+has `tokens`, `requests`, `lookups` (distinct ids per request, summed),
+`misses`, `misses_per_token` and `miss_rate`; decode adds
+`layers_with_miss_per_token` (mean and histogram over tokens, index =
+layers whose request missed: what optimistic execution would re-run),
+`mean_misses_per_token_over_prompts`, and for prefetch `reads`,
+`useful`, `wasted` (each also per token), `precision` (useful over
+reads), `mean_set_size` and `gave_up_full` (prefetches stopped because
+every LRU slot was in use at that tick). Re-ranks add `rerank` with the
+one-off reads; `promotions` counts the promotion passes' swaps. The
+policies run in parallel, spread over the cores; the headline rows are
+printed to stdout.
+
+`--predict-raw <dir>` writes, per prompt, `prompt-NNN-tokens.u32`,
+`-routing.u32` (`[layers, positions, 10]`), `-pred-ids.u32` and
+`-pred-scores.f32` (`[2 variants, 3 lookaheads, layers, positions, 20]`),
+little-endian, and `prompt-NNN.json` describing shapes, dtypes and axes,
+so later analysis needs no GPU run: about 400 MB per 8K prompt.
+
 ## Design: a host-driven expert cache
 
 Only on machines whose physical memory cannot hold the checkpoint (or
@@ -497,3 +718,47 @@ misses, about 40 tok/s against 90 here; a 4 096-token prefill chunk reads
 about 23 GB of cold experts at 5 to 7 GB/s, 4 to 5 s on top of its 2 s of
 compute, about 600 tok/s against 2 000. Not a cliff, and prefill can
 overlap the reads with the grouped GEMM's expert loop later.
+
+### Replay results 2026-10-09
+
+The same six prompts and 768 decoded tokens as above, replayed through the
+real policy code at 16 246 slots (14 621 pinned, 1 625 LRU), fresh fill per
+prompt; a miss is a count, not a stall. Per decoded token:
+
+| policy                                   | decode misses | layers with a miss | reads | useful | wasted | one-off reads per prompt |
+|------------------------------------------|--------------:|-------------------:|------:|-------:|-------:|-------------------------:|
+| live (as shipped)                        | 10.74         | 8.03               |       |        |        |                          |
+| re-rank at prefill end, own counts       | 5.41          | 4.48               |       |        |        | 1 654 pinned + 723 LRU   |
+| re-rank at prefill end, 50/50 mix        | 6.37          | 5.18               |       |        |        | 896 pinned + 651 LRU     |
+| prefetch B top-10, unlimited, all layers | 3.19          | 2.80               | 14.1  | 6.4    | 7.7    |                          |
+| prefetch B top-10, 2 per layer           | 3.66          | 3.07               | 13.1  | 6.0    | 7.2    |                          |
+| prefetch B top-10, 1 per layer           | 4.84          | 3.85               | 10.6  | 5.0    | 5.7    |                          |
+| prefetch B top-20, unlimited             | 1.30          | 1.05               | 48.7  | 7.1    | 41.5   |                          |
+| prefetch B score >= 2x mean 10th         | 9.86          | 7.64               | 0.9   | 0.9    | 0.05   |                          |
+| prefetch B top-10, deep layers only      | 9.42          | 7.14               | 2.4   | 1.2    | 1.3    |                          |
+| prefetch A top-10, unlimited, all layers | 5.50          | 4.65               | 14.4  | 4.1    | 10.3   |                          |
+
+So the live policy misses 10.7 of a token's 480 lookups (2.2%, the bench's
+2.1%), on about 8 layers, not the 28.5 the static set implied; what the
+reviews asked for changes the picture in both directions. Re-ranking the
+pinned set from the prompt's own prefill counts halves the misses for
+about 2 400 bulk reads per prompt (6.5 GB, about a second at the SSD's
+rate, off the critical path), the mix for about 1 550 reads and 40% fewer
+misses. Prefetching B's top-10 one layer ahead takes 70% of the misses
+away at 14 reads per token (39 MB, about 6 ms of SSD time per token, half
+of them wasted); a budget of two per layer keeps 66% at 13 reads. The
+wider sets are not worth their reads (top-20: 49 per token for 88%
+fewer misses) and the strict score cut reads almost nothing and saves
+almost nothing. Variant A is worth half of B. Deep layers only barely
+moves the count: the live policy's misses sit mostly below layer 36. The
+layers a token would still miss after unlimited top-10 prefetch are 2.8,
+so optimistic execution would re-enter about three layers per token.
+
+Against the cold numbers above (plain decode 19.6 ms per token cold
+against 15.1 warm, the difference being the 10.7 misses' SSD reads, about
+0.4 ms each, so 5 to 6 ms of a cold token), halving the misses is worth
+about 15% of cold decode and prefetching two per layer about 20%, if the
+reads land in time; re-rank and prefetch were replayed separately, not
+combined. The re-rank was then built, cut the bench's misses by 29 to 39%,
+added 3% on recorded agent sessions, and was dropped ("The re-rank at the
+end of a prefill" above).

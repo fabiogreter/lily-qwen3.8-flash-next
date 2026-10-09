@@ -1659,3 +1659,62 @@ fn down_combine_variants_bit_identical() {
         }
     }
 }
+
+/// The prediction log's wider selection (`2 * top_k`, past the expert
+/// kernels' `MAX_K`): its first `k` entries are the `k`-wide selection's
+/// indices, in its order (the rounds do not depend on how many follow), and
+/// the scores are descending. Without renormalisation the shared entries'
+/// scores are the same probabilities bit for bit.
+#[test]
+fn router_topk_wider_selection_extends_the_narrow_one() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(78);
+    let (e, k, wide) = (512usize, 10usize, 20usize);
+    for renorm in [true, false] {
+        for style in ["random", "ties", "neg_inf"] {
+            let pass = ctx.begin().expect("pass");
+            let logits = router_logits(&mut rng, e, style);
+            let t = Tensor::from_f32(&ctx, &logits, &[e]).expect("logits");
+            let rows = Tensor::from_f32_as_bf16(&ctx, &logits, &[1, e]).expect("rows");
+            let mk = |n: usize| {
+                (
+                    Tensor::zeros(&ctx, &[n], DType::U32).expect("idx"),
+                    Tensor::zeros(&ctx, &[n], DType::F32).expect("scores"),
+                )
+            };
+            let (ni, ns) = mk(k);
+            let (wi, ws) = mk(wide);
+            let (rni, rns) = mk(k);
+            let (rwi, rws) = mk(wide);
+            moe_router_topk(&ctx, &pass, &t, &ni, &ns, renorm).expect("narrow");
+            moe_router_topk(&ctx, &pass, &t, &wi, &ws, renorm).expect("wide");
+            let r = |x: &Tensor| x.view(0, &[1, x.numel()]).expect("view");
+            moe_router_topk_rows(&ctx, &pass, &rows, &r(&rni), &r(&rns), renorm)
+                .expect("narrow rows");
+            moe_router_topk_rows(&ctx, &pass, &rows, &r(&rwi), &r(&rws), renorm)
+                .expect("wide rows");
+            pass.commit_wait().expect("commit");
+            for (tag, (n_idx, n_sc), (w_idx, w_sc)) in [
+                ("vector", (&ni, &ns), (&wi, &ws)),
+                ("rows", (&rni, &rns), (&rwi, &rws)),
+            ] {
+                let tag = format!("{tag} renorm={renorm} {style}");
+                let (n_idx, w_idx) =
+                    (n_idx.to_u32().expect("idx"), w_idx.to_u32().expect("idx"));
+                assert_eq!(&w_idx[..k], &n_idx[..], "indices {tag}");
+                let mut distinct = w_idx.clone();
+                distinct.sort_unstable();
+                distinct.dedup();
+                assert_eq!(distinct.len(), wide, "distinct {tag}");
+                let w_sc = w_sc.to_f32().expect("scores");
+                assert!(w_sc.windows(2).all(|p| p[0] >= p[1]), "descending {tag}");
+                if !renorm {
+                    let n_sc = n_sc.to_f32().expect("scores");
+                    let bits =
+                        |s: &[f32]| s.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                    assert_eq!(bits(&w_sc[..k]), bits(&n_sc), "scores {tag}");
+                }
+            }
+        }
+    }
+}

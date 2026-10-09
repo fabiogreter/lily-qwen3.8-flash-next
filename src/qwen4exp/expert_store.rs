@@ -356,7 +356,10 @@ pub enum Lookup {
 /// ranking is pinned into slots `0..pinned`, the rest form an LRU region
 /// for cold experts, which prefill's sweep over every expert then cannot
 /// evict from the pinned set. Host mirrors of the GPU slot tables live
-/// here; the model uploads [`Self::slot_table`] after each change.
+/// here; the model uploads [`Self::slot_table`] after each change. Cloned
+/// only by the host-side replay (`expert_replay`), which forks one state
+/// into several policies.
+#[derive(Clone)]
 pub struct SlotPolicy {
     experts: usize,
     /// Pinned slots; how many, and which (a role that
@@ -375,6 +378,14 @@ pub struct SlotPolicy {
 impl SlotPolicy {
     /// Slot table entry of an expert that is not resident.
     pub const NONE: u32 = u32::MAX;
+
+    /// The LRU share the loader gives a cache of `n_slots` for `experts`
+    /// per layer when `requested` is asked for (0.1 by default): at least a
+    /// layer's routing plus a decode step's (prefill routes nearly every
+    /// expert of a layer per chunk), at most half.
+    pub fn lru_share_for(requested: f64, experts: usize, n_slots: usize) -> f64 {
+        requested.max((experts + 64) as f64 / n_slots as f64).min(0.5)
+    }
 
     /// Pins the top `n_slots * (1 - lru_share)` (rounded) ranked slices into
     /// slots `0..pinned` and prefills the LRU slots with the next ranked
@@ -525,6 +536,7 @@ impl SlotPolicy {
 /// the loaded ranking scaled to the score [`Self::PRIOR_TOKENS`] decoded
 /// tokens would accumulate, so it decides the placement until about that
 /// much live decoding has been seen and the live counts dominate after.
+#[derive(Clone)]
 pub struct LiveUsage {
     layers: usize,
     experts: usize,

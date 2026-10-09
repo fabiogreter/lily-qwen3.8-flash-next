@@ -92,7 +92,7 @@ impl CacheSim {
         let (layers, experts) = (ranking.layers, ranking.experts);
         ensure!(config.slots >= 2 * experts, "at least two layers' worth of slots");
         let lru_share =
-            config.lru_share.max((experts + 64) as f64 / config.slots as f64).min(0.5);
+            SlotPolicy::lru_share_for(config.lru_share, experts, config.slots);
         Ok(Self {
             config,
             layers,

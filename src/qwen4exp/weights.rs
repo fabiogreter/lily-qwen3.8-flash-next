@@ -858,12 +858,14 @@ pub fn load(
             // The LRU region must hold a whole layer's routing (prefill
             // routes every expert of a layer) plus a decode step's.
             // `LILY_EXPERT_LRU_SHARE` overrides the share for measurement.
-            let lru_share = std::env::var("LILY_EXPERT_LRU_SHARE")
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(0.1)
-                .max((e + 64) as f64 / n_slots as f64)
-                .min(0.5);
+            let lru_share = SlotPolicy::lru_share_for(
+                std::env::var("LILY_EXPERT_LRU_SHARE")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(0.1),
+                e,
+                n_slots,
+            );
             let policy = SlotPolicy::new(n_slots, layers, e, &ranking, lru_share)?;
             let mut cache = ExpertCache::new(
                 ctx,

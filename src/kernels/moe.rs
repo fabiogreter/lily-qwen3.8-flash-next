@@ -12,6 +12,9 @@ const SOURCE: &str = include_str!("metal/moe.metal");
 /// Router limits compiled into moe.metal.
 const MAX_E: usize = 1024;
 const MAX_K: usize = 16;
+/// Experts the router top-k kernels select at most (`MOE_ROUTER_MAX_K`):
+/// above `MAX_K` only for the prediction log's wider selection.
+const ROUTER_MAX_K: usize = 32;
 
 /// Softmax top-k routing from F32 logits; ties choose the lowest expert id.
 pub fn moe_router_topk(
@@ -29,8 +32,8 @@ pub fn moe_router_topk(
         "logits must be F32 [<= {MAX_E}]"
     );
     ensure!(
-        k <= MAX_K && k <= e && indices.dtype() == DType::U32,
-        "indices must be U32 [<= {MAX_K}]"
+        k <= ROUTER_MAX_K && k <= e && indices.dtype() == DType::U32,
+        "indices must be U32 [<= {ROUTER_MAX_K}]"
     );
     ensure!(
         scores.numel() == k && scores.dtype() == DType::F32,
@@ -470,7 +473,7 @@ pub fn moe_router_topk_rows(
         "indices must be U32 [m, k]"
     );
     let k = indices.numel() / m;
-    ensure!(k <= MAX_K && k <= e, "k {k} out of range");
+    ensure!(k <= ROUTER_MAX_K && k <= e, "k {k} out of range");
     ensure!(
         scores.numel() == m * k && scores.dtype() == DType::F32,
         "scores must be F32 [m, k]"
