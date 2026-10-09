@@ -50,12 +50,14 @@ pub struct ReplayConfig {
     pub prefetch: Option<PrefetchReplay>,
 }
 
-/// A cross-layer prefetch during decode: after layer `l`'s request, read the
-/// `top` best-scored predictions for layer `l + lookahead` that are not
-/// resident, at most `budget` per layer.
+/// A prefetch during decode: after layer `l`'s request, read the `top`
+/// best-scored predictions for layer `l + lookahead` that are not resident,
+/// at most `budget` per layer. Lookahead 0 reads for every layer at the
+/// token's start instead, from the predictions' first plane (a whole-token
+/// predictor such as [`TokenRouting`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrefetchReplay {
-    /// 1 or 2: which of the logged predictions drives it.
+    /// 0 (token start, every layer), 1 or 2.
     pub lookahead: usize,
     pub top: usize,
     pub budget: Option<usize>,
@@ -90,6 +92,11 @@ pub struct ReplayCounts {
     pub prefetch_useful: u64,
     /// Prefetches given up because no LRU slot was free at the tick.
     pub prefetch_full: u64,
+    /// Decode misses whose expert the same layer routed to within the last
+    /// 64 (1 024) positions of the session: what a predictor from recent
+    /// routing could have known.
+    pub decode_misses_recent_64: u64,
+    pub decode_misses_recent_1024: u64,
 }
 
 impl ReplayCounts {
@@ -106,6 +113,8 @@ impl ReplayCounts {
         self.prefetch_reads += o.prefetch_reads;
         self.prefetch_useful += o.prefetch_useful;
         self.prefetch_full += o.prefetch_full;
+        self.decode_misses_recent_64 += o.decode_misses_recent_64;
+        self.decode_misses_recent_1024 += o.decode_misses_recent_1024;
     }
 }
 
@@ -119,6 +128,11 @@ pub struct CacheSim {
     /// prefetch reads.
     layer_misses: Vec<u64>,
     layer_useful: Vec<u64>,
+    /// The last request's missed experts.
+    missed: Vec<u32>,
+    /// `[layer * experts + expert]` -> 1 + the last position of the current
+    /// session that routed to it, 0 for none.
+    last_seen: Vec<usize>,
     policy: SlotPolicy,
     usage: LiveUsage,
     tick: u64,
@@ -142,6 +156,8 @@ impl CacheSim {
             experts,
             layer_misses: vec![0; layers],
             layer_useful: vec![0; layers],
+            missed: Vec::new(),
+            last_seen: vec![0; layers * experts],
             policy: SlotPolicy::new(config.slots, layers, experts, ranking, lru_share)?,
             usage: LiveUsage::new(ranking, config.slots, top_k),
             tick: 0,
@@ -176,14 +192,19 @@ impl CacheSim {
         self.ids.sort_unstable();
         self.ids.dedup();
         let mut misses = 0;
+        self.missed.clear();
         for i in 0..self.ids.len() {
             let expert = self.ids[i] as usize;
             self.usage.record(layer, expert, decode);
             match self.policy.lookup(layer, expert, self.tick) {
                 Lookup::Hit(_) => {}
-                Lookup::Miss { .. } => misses += 1,
+                Lookup::Miss { .. } => {
+                    misses += 1;
+                    self.missed.push(self.ids[i]);
+                }
                 Lookup::Full => {
                     misses += 1;
+                    self.missed.push(self.ids[i]);
                     counts.full += 1;
                 }
             }
@@ -213,8 +234,8 @@ impl CacheSim {
         prefetched: &mut Vec<u32>,
         counts: &mut ReplayCounts,
     ) -> Result<()> {
-        let at =
-            (((p.lookahead - 1) * self.layers + target) * tokens + pos) * pred.width;
+        let plane = p.lookahead.max(1) - 1;
+        let at = ((plane * self.layers + target) * tokens + pos) * pred.width;
         // The read happens at the next request's tick, so that request's own
         // misses cannot take the slot, as they cannot take one a pass reads.
         let tick = self.tick + 1;
@@ -266,8 +287,8 @@ impl CacheSim {
             (None, _) => None,
             (Some(p), Some(pred)) => {
                 ensure!(
-                    (1..=2).contains(&p.lookahead),
-                    "lookahead {} (1 or 2 are logged)",
+                    p.lookahead <= 2,
+                    "lookahead {} (0, token start, or 1 or 2)",
                     p.lookahead
                 );
                 ensure!(
@@ -285,6 +306,8 @@ impl CacheSim {
         let at = |layer: usize, pos: usize| (layer * tokens + pos) * top_k;
         let mut pass: Vec<u32> = Vec::new();
         let mut prefetched: Vec<Vec<u32>> = vec![Vec::new(); self.layers];
+        self.last_seen.fill(0);
+        let experts = self.experts;
         for r in requests {
             ensure!(
                 r.prefill.start <= r.prefill.end
@@ -300,12 +323,25 @@ impl CacheSim {
                     pass.clear();
                     pass.extend_from_slice(&routing[at(layer, pos)..at(layer, end)]);
                     self.request(layer, &pass, counts);
+                    for (row, ids) in pass.chunks(top_k).enumerate() {
+                        for &e in ids {
+                            self.last_seen[layer * experts + e as usize] =
+                                pos + row + 1;
+                        }
+                    }
                 }
                 counts.prefill_tokens += (end - pos) as u64;
                 pos = end;
             }
             for pos in r.decode.clone() {
                 let mut missed = 0;
+                if let Some((p, pred)) = &prefetch
+                    && p.lookahead == 0
+                {
+                    for (target, read) in prefetched.iter_mut().enumerate() {
+                        self.prefetch(*p, pred, (target, pos, tokens), read, counts)?;
+                    }
+                }
                 for layer in 0..self.layers {
                     let ids = &routing[at(layer, pos)..at(layer, pos + 1)];
                     pass.clear();
@@ -329,10 +365,24 @@ impl CacheSim {
                     }
                     let misses = self.request(layer, &pass, counts);
                     self.layer_misses[layer] += misses;
+                    for &e in &self.missed {
+                        let last = self.last_seen[layer * experts + e as usize];
+                        if last > 0 && pos + 1 - last <= 64 {
+                            counts.decode_misses_recent_64 += 1;
+                        }
+                        if last > 0 && pos + 1 - last <= 1024 {
+                            counts.decode_misses_recent_1024 += 1;
+                        }
+                    }
+                    for &e in &pass {
+                        self.last_seen[layer * experts + e as usize] = pos + 1;
+                    }
                     if misses > 0 {
                         missed += 1;
                     }
-                    if let Some((p, pred)) = &prefetch {
+                    if let Some((p, pred)) = &prefetch
+                        && p.lookahead > 0
+                    {
                         let target = layer + p.lookahead;
                         if target < self.layers {
                             let mut read = std::mem::take(&mut prefetched[target]);
@@ -352,6 +402,81 @@ impl CacheSim {
             }
         }
         Ok(())
+    }
+}
+
+/// Routing counted by input token id, the whole-token predictor
+/// candidate: how often a position whose input was token `t` routed to
+/// expert `e` at layer `l`. Known when a pass starts (the sampled token, or
+/// a draft), so every layer's reads could be issued before the pass reaches
+/// it. Rows exist for the tokens given at construction only.
+pub struct TokenRouting {
+    layers: usize,
+    experts: usize,
+    rows: std::collections::HashMap<u32, usize>,
+    /// `[row][layer][expert]`.
+    counts: Vec<u32>,
+}
+
+impl TokenRouting {
+    /// Rows for `tokens` (the ids predictions will be asked for).
+    pub fn new(
+        layers: usize,
+        experts: usize,
+        tokens: impl IntoIterator<Item = u32>,
+    ) -> Self {
+        let mut rows = std::collections::HashMap::new();
+        for t in tokens {
+            let n = rows.len();
+            rows.entry(t).or_insert(n);
+        }
+        let counts = vec![0; rows.len() * layers * experts];
+        Self { layers, experts, rows, counts }
+    }
+
+    /// Counts (`add`) or uncounts every position of a session: `ids` its
+    /// tokens, `routing` `[layers][tokens][top_k]`. Tokens without a row
+    /// are skipped.
+    pub fn count(&mut self, ids: &[u32], routing: &[u32], top_k: usize, add: bool) {
+        let (layers, experts, tokens) = (self.layers, self.experts, ids.len());
+        for (p, t) in ids.iter().enumerate() {
+            let Some(&row) = self.rows.get(t) else { continue };
+            for l in 0..layers {
+                let base = (row * layers + l) * experts;
+                for &e in &routing[(l * tokens + p) * top_k..][..top_k] {
+                    let c = &mut self.counts[base + e as usize];
+                    *c = if add { *c + 1 } else { *c - 1 };
+                }
+            }
+        }
+    }
+
+    /// Predictions for `positions` of a session in the layout
+    /// [`Predictions`] reads, in its first plane (lookahead 0): for each
+    /// layer, the `width` experts the position's token routed to most often,
+    /// best first, ties to the lower id; zero for a token never counted.
+    pub fn predict(&self, ids: &[u32], positions: &[usize], width: usize) -> Vec<u16> {
+        let (layers, experts, tokens) = (self.layers, self.experts, ids.len());
+        let mut out = vec![0u16; 2 * layers * tokens * width];
+        let mut order: Vec<u16> = Vec::with_capacity(experts);
+        for &p in positions {
+            let Some(&row) = self.rows.get(&ids[p]) else { continue };
+            for l in 0..layers {
+                let c = &self.counts[(row * layers + l) * experts..][..experts];
+                if c.iter().all(|&x| x == 0) {
+                    continue;
+                }
+                order.clear();
+                order.extend(0..experts as u16);
+                let key = |&e: &u16| (std::cmp::Reverse(c[e as usize]), e);
+                order.select_nth_unstable_by_key(width - 1, key);
+                order.truncate(width);
+                order.sort_unstable_by_key(key);
+                let at = (l * tokens + p) * width;
+                out[at..at + width].copy_from_slice(&order);
+            }
+        }
+        out
     }
 }
 

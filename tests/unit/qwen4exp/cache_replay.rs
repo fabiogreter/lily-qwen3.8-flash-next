@@ -162,3 +162,76 @@ fn transitions_predict_what_followed_and_uncount_exactly() {
     let empty = t.predict(&routing, tokens, 1, &[2], 2);
     assert_eq!(&empty[at(0, 1, 2)..at(0, 1, 2) + 2], &[0, 1]);
 }
+
+#[test]
+fn token_routing_predicts_what_a_token_routed_to() {
+    // Two layers of 8 experts, top-1; token 7 routes to 3 then 5, token 9
+    // to 1 then 2.
+    let ids = [7u32, 9, 7, 7];
+    let routing: Vec<u32> = vec![3, 1, 3, 4, /* layer 1 */ 5, 2, 5, 5];
+    let mut t = TokenRouting::new(2, 8, [7, 9, 11]);
+    t.count(&ids, &routing, 1, true);
+    let pred = t.predict(&[7, 11], &[0, 1], 2);
+    // Position 0 (token 7): layer 0 saw 3 twice and 4 once; layer 1 saw 5.
+    assert_eq!(&pred[0..2], &[3, 4]);
+    assert_eq!(&pred[4..6], &[5, 0]);
+    // Position 1 (token 11, never counted) stays zero.
+    assert_eq!(&pred[2..4], &[0, 0]);
+    // Uncounting leaves no prediction.
+    t.count(&ids, &routing, 1, false);
+    assert!(t.predict(&[7], &[0], 2).iter().all(|&e| e == 0));
+}
+
+#[test]
+fn a_token_start_prefetch_reads_every_layer_before_the_pass() {
+    // As `prefetched`, but lookahead 0 from the first plane: all three
+    // layers find (62, 63) read ahead, layer 0 included.
+    let r = UsageRanking {
+        layers: 3,
+        experts: 64,
+        counts: vec![(0..64).rev().collect(); 3],
+    };
+    let cfg = ReplayConfig {
+        slots: 128,
+        lru_share: 0.1,
+        adapt: false,
+        prefill_chunk: 4096,
+        prefetch: Some(PrefetchReplay { lookahead: 0, top: 4, budget: None }),
+    };
+    let mut sim = CacheSim::new(&r, 2, cfg).expect("sim");
+    let routing: Vec<u32> = (0..3).flat_map(|_| [62, 63]).collect();
+    let mut ids: Vec<u16> = (0..3).flat_map(|_| [62u16, 63, 0, 1]).collect();
+    ids.extend([0u16; 12]);
+    let pred = Predictions { ids: &ids, width: 4 };
+    let req = [TraceRequest { prefill: 0..0, decode: 0..1 }];
+    let mut c = ReplayCounts::default();
+    sim.session(&routing, Some(&pred), 1, 2, &req, &mut c).expect("replay");
+    assert_eq!((c.decode_misses, c.prefetch_reads, c.prefetch_useful), (0, 6, 6));
+}
+
+#[test]
+fn misses_are_classed_by_how_recently_the_layer_used_the_expert() {
+    // Experts 62 and 63 are not resident in any layer and were never
+    // routed before, so their misses at position 0 are not recent.
+    let r = UsageRanking {
+        layers: 3,
+        experts: 64,
+        counts: vec![(0..64).rev().collect(); 3],
+    };
+    let cfg = ReplayConfig {
+        slots: 128,
+        lru_share: 0.1,
+        adapt: false,
+        prefill_chunk: 4096,
+        prefetch: None,
+    };
+    let mut sim = CacheSim::new(&r, 2, cfg).expect("sim");
+    // Two decoded positions routed to (62, 63) in every layer: the first
+    // misses all six, the second finds them in the LRU region.
+    let routing: Vec<u32> = (0..3).flat_map(|_| [62, 63, 62, 63]).collect();
+    let req = [TraceRequest { prefill: 0..0, decode: 0..2 }];
+    let mut c = ReplayCounts::default();
+    sim.session(&routing, None, 2, 2, &req, &mut c).expect("replay");
+    assert_eq!(c.decode_misses, 6);
+    assert_eq!((c.decode_misses_recent_64, c.decode_misses_recent_1024), (0, 0));
+}

@@ -9,15 +9,18 @@
 //! unless `--fresh` starts every session from the loaded ranking. A
 //! prefetch reads `STEM.pred.u16` (`lily-trace-routing --predict`), or with
 //! `--predictor transitions` predicts from cross-layer transition counts
-//! (`cache_replay::Transitions`) learned on the other sessions given.
+//! (`cache_replay::Transitions`) learned on the other sessions given, or
+//! with `--predictor token` from the routing of each input token id
+//! (`cache_replay::TokenRouting`, reading `STEM.u32`), for a prefetch at
+//! the token's start (`0:TOP`).
 
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result, ensure};
 use clap::Parser;
 use lily::qwen4exp::cache_replay::{
-    CacheSim, Predictions, PrefetchReplay, ReplayConfig, ReplayCounts, TraceRequest,
-    Transitions,
+    CacheSim, Predictions, PrefetchReplay, ReplayConfig, ReplayCounts, TokenRouting,
+    TraceRequest, Transitions,
 };
 use lily::qwen4exp::expert_store::UsageRanking;
 
@@ -42,17 +45,19 @@ struct Cli {
     top_k: usize,
     #[arg(long, default_value_t = 4096)]
     prefill_chunk: usize,
-    /// Prefetches to sweep: `off`, or `LOOKAHEAD:TOP[:BUDGET]` (predictor
-    /// B's `TOP` best for the layer `LOOKAHEAD` ahead, at most `BUDGET`
-    /// reads per layer).
+    /// Prefetches to sweep: `off`, or `LOOKAHEAD:TOP[:BUDGET]` (the
+    /// predictor's `TOP` best for the layer `LOOKAHEAD` ahead, at most
+    /// `BUDGET` reads per layer; lookahead 0 reads every layer at the
+    /// token's start).
     #[arg(long, value_delimiter = ',', default_value = "off")]
     prefetch: Vec<String>,
-    /// What the prefetch predicts from: `b` (the logged predictor B) or
+    /// What the prefetch predicts from: `b` (the logged predictor B),
     /// `transitions` (each session's decode predicted from the transition
-    /// counts of all the other sessions' positions).
+    /// counts of all the other sessions' positions) or `token` (from the
+    /// other sessions' routing per input token id).
     #[arg(long, default_value = "b")]
     predictor: String,
-    /// Picks kept per row by `--predictor transitions`.
+    /// Picks kept per row by the learned predictors.
     #[arg(long, default_value_t = 20)]
     learned_width: usize,
     /// Start every session from the loaded ranking.
@@ -143,6 +148,57 @@ fn learn_predictions(
     })
 }
 
+/// Fills each trace's predictions (lookahead 0) from the routing per input
+/// token id of all the other traces (leave one session out), for its
+/// decoded positions.
+fn learn_token_predictions(
+    stems: &[PathBuf],
+    traces: &mut [Trace],
+    ranking: &UsageRanking,
+    top_k: usize,
+    width: usize,
+) -> Result<()> {
+    let (layers, experts) = (ranking.layers, ranking.experts);
+    ensure!((1..=experts).contains(&width), "--learned-width 1 to {experts}");
+    let ids = stems
+        .iter()
+        .map(|stem| -> Result<Vec<u32>> {
+            let path = PathBuf::from(format!("{}.u32", stem.display()));
+            let bytes =
+                std::fs::read(&path).with_context(|| format!("{}", path.display()))?;
+            Ok(bytes
+                .chunks_exact(4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let decoded = |t: &Trace| -> Vec<usize> {
+        t.requests.iter().flat_map(|r| r.decode.clone()).collect()
+    };
+    let wanted: Vec<u32> = traces
+        .iter()
+        .zip(&ids)
+        .flat_map(|(t, ids)| decoded(t).into_iter().map(|p| ids[p]).collect::<Vec<_>>())
+        .collect();
+    let mut table = TokenRouting::new(layers, experts, wanted);
+    for (t, ids) in traces.iter().zip(&ids) {
+        ensure!(
+            ids.len() == t.tokens,
+            "{}: {} token ids for {} positions",
+            t.name,
+            ids.len(),
+            t.tokens
+        );
+        table.count(ids, &t.routing, top_k, true);
+    }
+    for (t, ids) in traces.iter_mut().zip(&ids) {
+        table.count(ids, &t.routing, top_k, false);
+        t.predicted = table.predict(ids, &decoded(t), width);
+        table.count(ids, &t.routing, top_k, true);
+    }
+    Ok(())
+}
+
 fn load_trace(stem: &std::path::Path, predicted: bool) -> Result<Trace> {
     let with = |ext: &str| PathBuf::from(format!("{}.{ext}", stem.display()));
     let meta: serde_json::Value = serde_json::from_slice(
@@ -191,17 +247,26 @@ fn main() -> Result<()> {
         cli.prefetch.iter().map(|p| parse_prefetch(p)).collect::<Result<Vec<_>>>()?;
     let predicted = prefetches.iter().any(Option::is_some);
     ensure!(
-        matches!(cli.predictor.as_str(), "b" | "transitions"),
-        "--predictor b or transitions"
+        matches!(cli.predictor.as_str(), "b" | "transitions" | "token"),
+        "--predictor b, transitions or token"
     );
-    let learned = cli.predictor == "transitions";
+    let learned = cli.predictor != "b";
     let mut traces = cli
         .trace
         .iter()
         .map(|t| load_trace(t, predicted && !learned))
         .collect::<Result<Vec<_>>>()?;
-    if predicted && learned {
+    if predicted && cli.predictor == "transitions" {
         learn_predictions(&mut traces, &ranking, cli.top_k, cli.learned_width)?;
+    }
+    if predicted && cli.predictor == "token" {
+        learn_token_predictions(
+            &cli.trace,
+            &mut traces,
+            &ranking,
+            cli.top_k,
+            cli.learned_width,
+        )?;
     }
     let mut configs = Vec::new();
     for &lru_share in &cli.lru_shares {
@@ -271,7 +336,7 @@ fn main() -> Result<()> {
         if cli.fresh { "fresh per session" } else { "one cache across sessions" }
     );
     println!(
-        "lru share | pinned | prefetch | decode miss/tok | layers missed/tok | prefetch reads/tok | useful/tok | prefill miss/tok | promotions | full"
+        "lru share | pinned | prefetch | decode miss/tok | layers missed/tok | prefetch reads/tok | useful/tok | recent 64/1024 | prefill miss/tok | promotions | full"
     );
     let mut json = Vec::new();
     for (config, result) in configs.iter().zip(results) {
@@ -281,7 +346,7 @@ fn main() -> Result<()> {
             all.plus(c);
         }
         println!(
-            "{:9.2} | {:6} | {:8} | {:15.2} | {:17.2} | {:18.2} | {:10.2} | {:16.3} | {:10} | {}",
+            "{:9.2} | {:6} | {:8} | {:15.2} | {:17.2} | {:18.2} | {:10.2} | {:6.2} {:6.2} | {:16.3} | {:10} | {}",
             config.lru_share,
             pinned,
             label(config.prefetch),
@@ -289,6 +354,8 @@ fn main() -> Result<()> {
             rate(all.decode_layers_missed, all.decode_tokens),
             rate(all.prefetch_reads, all.decode_tokens),
             rate(all.prefetch_useful, all.decode_tokens),
+            rate(all.decode_misses_recent_64, all.decode_tokens),
+            rate(all.decode_misses_recent_1024, all.decode_tokens),
             rate(all.prefill_misses, all.prefill_tokens),
             all.promotions,
             all.full
@@ -301,6 +368,8 @@ fn main() -> Result<()> {
                 "decode_layers_missed": c.decode_layers_missed, "full": c.full,
                 "promotions": c.promotions, "prefetch_reads": c.prefetch_reads,
                 "prefetch_useful": c.prefetch_useful, "prefetch_full": c.prefetch_full,
+                "decode_misses_recent_64": c.decode_misses_recent_64,
+                "decode_misses_recent_1024": c.decode_misses_recent_1024,
             })
         };
         json.push(serde_json::json!({
