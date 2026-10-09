@@ -377,14 +377,19 @@ cold runs, two tools replay recorded sessions:
   a session's `meta.json`) resident and writes which experts every
   position of every MoE layer routed to, `[layers][tokens][top_k]`. About
   2 000 tokens per second on the M5 Max. Prefill routes a position as the
-  decode step would up to rounding.
+  decode step would up to rounding. `--predict` also enables the
+  cross-layer prediction log ("Cross-layer prediction measurement" below)
+  and writes predictor B's top 20 for lookaheads 1 and 2, ordered by
+  score, to `<stem>.pred.u16`.
 - `lily-cache-replay --usage <ranking> --trace <stem>...` replays them
   through the cache's own policy code (`qwen4exp::cache_replay`:
   `SlotPolicy`, `LiveUsage`, promotion), host only, sweeping the LRU
-  share. `<stem>.json` gives the requests as `[p0, p1, p2]`:
-  `p0..p1` prefilled (the suffix after the session's cached prefix),
-  `p1..p2` generated. Sessions replay in order through one cache, as one
-  server serves them; `--fresh` starts each from the loaded ranking.
+  share and, with `--prefetch off,1:10,2:10:2,...`, a decode-time
+  prefetch (lookahead, top, optional reads per layer). `<stem>.json` gives
+  the requests as `[p0, p1, p2]`: `p0..p1` prefilled (the suffix after the
+  session's cached prefix), `p1..p2` generated. Sessions replay in order
+  through one cache, as one server serves them; `--fresh` starts each from
+  the loaded ranking.
 
 The requests come from the chat template: every `<|im_start|>assistant\n`
 ends a request's prefill and the matching `<|im_end|>` its generated
@@ -416,14 +421,80 @@ it is flat between 5 and 20% with its low at 10%, the default, which
 stays. Replayed in another session order the figures move by about 1%
 (10.78 and 4.07 at 10%) and the verdict holds. The re-rank, replayed in
 that order with its background loads landing at the measured rate, added
-decode misses at every share: 11.12 against 10.78 per token at 10% (+3%), per session from 0 to +23%, with a 3% gain in prefill
-misses; 33 re-ranks fired, about 88 000 background loads. A ranking taken
+decode misses at every share: 11.12 against 10.78 per token at 10% (+3%),
+per session from 0 to +23%, with a 3% gain in prefill misses; 33
+re-ranks fired, about 88 000 background loads. A ranking taken
 from the prompt helps only where the output continues the prompt (long
 document summaries, continuation), not an agent, whose most common use
 here does not justify the code; it was removed.
 
 The traces themselves stay out of the repository (they are a client's
 code and conversations); only these counts are recorded.
+
+### Cross-layer prefetch on agent sessions, and what it costs (2026-10-09)
+
+The same seven sessions with predictor B's picks logged at every position
+(`lily-trace-routing --predict`; the routing written alongside matched the
+earlier logs bit for bit), replayed at 10% LRU with a decode-time prefetch:
+after a token's request for layer `l`, B's best picks for layer `l + d`
+that are not resident are read into LRU slots. Reads land instantly in the
+replay. Per decoded token:
+
+| prefetch                       | decode misses | layers with a miss | reads | useful |
+|--------------------------------|--------------:|-------------------:|------:|-------:|
+| none                           | 10.66         | 7.76               |       |        |
+| B top 5, one layer ahead       | 8.42          | 6.54               | 4.1   | 2.3    |
+| B top 10, one layer ahead      | 5.18          | 4.13               | 15.0  | 5.7    |
+| the same, 2 reads per layer    | 5.55          | 4.30               | 13.7  | 5.3    |
+| the same, 1 read per layer     | 6.46          | 4.83               | 10.8  | 4.3    |
+| B top 20, one layer ahead      | 2.87          | 2.20               | 57.3  | 8.4    |
+| B top 10, two layers ahead     | 7.73          | 5.83               | 18.1  | 3.7    |
+| B top 20, two layers ahead     | 6.10          | 4.53               | 62.4  | 6.2    |
+
+At 20% LRU the figures move by up to 0.4 per token. Agent traffic keeps
+most of what the bench prompts showed (top 10 one ahead: -51% against
+-70% there). The misses are spread over the layers evenly (0.13 to 0.30 per
+token in every layer, the eight best layers hold a quarter of the useful
+reads), so predicting only some layers would not change the ratio below.
+
+A predictor without GPU work was tried as well: transition counts
+`P(f at layer l + d | e at layer l)` learned from the routing of the other
+six sessions (`cache_replay::Transitions`, `--predictor transitions`),
+which the service thread could evaluate at layer `l`'s handshake. It
+predicts the popular experts, which are resident: top 10 one ahead reads
+1.2 experts per token of which 0.18 are routed to; 96 wide, 73 reads for
+2.9 useful, and the wasted reads evict as much as they save (10.28 misses).
+
+B is a GPU computation: per layer, the next layer's MoE read-in and its
+router. Its cost, measured with a temporary switch that encodes the routing
+log plus one predictor alone (`docs/bench/2026-10-09-prefetch-cost/`, not
+in the tree), `lily-bench`, q4, resident, a 1K real-text prompt, 256 greedy
+tokens, two runs each, identical tokens in every run:
+
+| encoded in the decode pass | plain step | plain tok/s | 2 drafts tok/s |
+|----------------------------|-----------:|------------:|---------------:|
+| nothing                    | 10.6 ms    | 92.3        | 104.5          |
+| the routing log            | 10.6 to 10.7 | 89.5 to 92.6 | 104.5        |
+| log + B one ahead          | 12.0 ms    | 82.2        | 95.7           |
+| log + B two ahead          | 12.1 to 12.6 | 77.8 to 80.8 | 95.3         |
+| log + A one ahead          | 11.3 ms    | 86.4        |                |
+
+So B one layer ahead costs 1.35 ms per token (8.5% with two drafts), B two
+ahead 1.7, A one ahead 0.7. Against that, a useful prefetch saves at most
+the 0.4 ms a cold read costs, and only the part of it that lands before
+the layer's handshake: B one ahead is known after layer `l`'s MoE and needed
+at layer `l + 1`'s router, a mixer's time later (a read takes about as
+long as a whole layer), so at best 5.7 x 0.4 = 2.3 ms per token if every
+read landed, realistically under its 1.35 ms. B two ahead has the time but
+saves at most 3.7 x 0.4 = 1.5 ms for its 1.7. A is known at layer `l`'s
+handshake, a layer before it is needed, but predicts worse (on the bench
+prompts it was worth about two thirds of B), roughly 1.1 ms for 0.7, before
+its ten wasted reads per token compete with the demand misses for the SSD.
+Cross-layer prefetch is therefore not built: on this model it would move
+cold decode by -5 to +2%, which does not carry an asynchronous loader in
+the service thread. It would reopen with a predictor that costs a fraction
+of a router pass (fused into a level the pass already has), or a drive fast
+enough that a read fits in a mixer's time.
 
 ### Prefill chunks of 8 192 tokens
 
@@ -457,6 +528,9 @@ re-read check on the routed ids found no stale reads). A run on a real
 - **Prefill** is bound by reading the cold third per chunk; a chunk of
   8 192 tokens would halve that per token at twice the activation
   scratch.
+- **Prefetching** a token's cold experts from a cross-layer prediction
+  was replayed and costed on agent sessions ("Cross-layer prefetch on
+  agent sessions" above): the predictor costs about what it saves.
 - **The handshake** (7% of a 2-draft step at zero misses when first
   measured, 11% of a plain token and 6% of a step on 2026-10-09) is 48
   sequential host-GPU
@@ -761,4 +835,7 @@ about 15% of cold decode and prefetching two per layer about 20%, if the
 reads land in time; re-rank and prefetch were replayed separately, not
 combined. The re-rank was then built, cut the bench's misses by 29 to 39%,
 added 3% on recorded agent sessions, and was dropped ("The re-rank at the
-end of a prefill" above).
+end of a prefill" above). Prefetch was then replayed on agent sessions and
+its predictor's GPU time measured: the predictor costs about what the
+reads save, so it was not built ("Cross-layer prefetch on agent sessions"
+above).

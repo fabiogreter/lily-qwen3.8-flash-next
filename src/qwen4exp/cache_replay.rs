@@ -14,6 +14,13 @@
 //! speculative verify passes (the pending token plus drafts) route a few
 //! more experts per pass, rejected drafts included, which a trace does not
 //! hold.
+//!
+//! A decode-time prefetch can be replayed from logged predictions
+//! (`lily-trace-routing --predict`), as `expert_replay` replays it for one
+//! prompt: after a decoded token's request for layer `l`, the predicted
+//! experts for layer `l + d` that are not resident are looked up at the
+//! next request's tick, taking LRU slots as a real load would. Reads land
+//! instantly here; whether they would in time is for a live run.
 
 use std::ops::Range;
 
@@ -39,6 +46,28 @@ pub struct ReplayConfig {
     pub adapt: bool,
     /// Prompt tokens per prefill pass.
     pub prefill_chunk: usize,
+    /// The decode-time prefetch; `None`: off.
+    pub prefetch: Option<PrefetchReplay>,
+}
+
+/// A cross-layer prefetch during decode: after layer `l`'s request, read the
+/// `top` best-scored predictions for layer `l + lookahead` that are not
+/// resident, at most `budget` per layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrefetchReplay {
+    /// 1 or 2: which of the logged predictions drives it.
+    pub lookahead: usize,
+    pub top: usize,
+    pub budget: Option<usize>,
+}
+
+/// Logged predictions of one session (`lily-trace-routing --predict`):
+/// `[2][layers][tokens][width]` expert ids, row-wise best first; plane
+/// `d - 1` holds lookahead `d`.
+#[derive(Clone, Copy, Debug)]
+pub struct Predictions<'a> {
+    pub ids: &'a [u16],
+    pub width: usize,
 }
 
 /// What a replay counted.
@@ -55,6 +84,12 @@ pub struct ReplayCounts {
     /// Lookups the policy could not place (the LRU region too small).
     pub full: u64,
     pub promotions: u64,
+    /// Prefetch loads issued.
+    pub prefetch_reads: u64,
+    /// Of those, the ones the target layer's request then routed to.
+    pub prefetch_useful: u64,
+    /// Prefetches given up because no LRU slot was free at the tick.
+    pub prefetch_full: u64,
 }
 
 impl ReplayCounts {
@@ -68,6 +103,9 @@ impl ReplayCounts {
         self.decode_layers_missed += o.decode_layers_missed;
         self.full += o.full;
         self.promotions += o.promotions;
+        self.prefetch_reads += o.prefetch_reads;
+        self.prefetch_useful += o.prefetch_useful;
+        self.prefetch_full += o.prefetch_full;
     }
 }
 
@@ -76,6 +114,11 @@ impl ReplayCounts {
 pub struct CacheSim {
     config: ReplayConfig,
     layers: usize,
+    experts: usize,
+    /// Per layer, over everything replayed: decode misses and useful
+    /// prefetch reads.
+    layer_misses: Vec<u64>,
+    layer_useful: Vec<u64>,
     policy: SlotPolicy,
     usage: LiveUsage,
     tick: u64,
@@ -96,12 +139,21 @@ impl CacheSim {
         Ok(Self {
             config,
             layers,
+            experts,
+            layer_misses: vec![0; layers],
+            layer_useful: vec![0; layers],
             policy: SlotPolicy::new(config.slots, layers, experts, ranking, lru_share)?,
             usage: LiveUsage::new(ranking, config.slots, top_k),
             tick: 0,
             served: 0,
             ids: Vec::new(),
         })
+    }
+
+    /// Decode misses and useful prefetch reads per layer, summed over
+    /// everything replayed.
+    pub fn by_layer(&self) -> (&[u64], &[u64]) {
+        (&self.layer_misses, &self.layer_useful)
     }
 
     /// The pinned slots (after the loader's clamp of the LRU share).
@@ -150,13 +202,55 @@ impl CacheSim {
         misses
     }
 
+    /// The prefetch for layer `target` of the decoded token at `pos`, after
+    /// the request of layer `target - lookahead`: the experts read go to
+    /// `prefetched`.
+    fn prefetch(
+        &mut self,
+        p: PrefetchReplay,
+        pred: &Predictions<'_>,
+        (target, pos, tokens): (usize, usize, usize),
+        prefetched: &mut Vec<u32>,
+        counts: &mut ReplayCounts,
+    ) -> Result<()> {
+        let at =
+            (((p.lookahead - 1) * self.layers + target) * tokens + pos) * pred.width;
+        // The read happens at the next request's tick, so that request's own
+        // misses cannot take the slot, as they cannot take one a pass reads.
+        let tick = self.tick + 1;
+        for &e in &pred.ids[at..at + p.top.min(pred.width)] {
+            if p.budget.is_some_and(|b| prefetched.len() >= b) {
+                break;
+            }
+            let expert = usize::from(e);
+            ensure!(expert < self.experts, "predicted id {e} out of range");
+            if self.policy.slot_of(target, expert).is_some() {
+                continue;
+            }
+            match self.policy.lookup(target, expert, tick) {
+                Lookup::Miss { .. } => {
+                    counts.prefetch_reads += 1;
+                    prefetched.push(u32::from(e));
+                }
+                Lookup::Hit(_) => unreachable!("checked not resident"),
+                Lookup::Full => {
+                    counts.prefetch_full += 1;
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Replays one recorded session: `routing` is `[layers][tokens][top_k]`
     /// (the layout `lily-trace-routing` writes), `requests` its requests in
     /// order. Prefill passes cover up to a prefill chunk of a request's new
-    /// tokens each; decode passes one token each.
+    /// tokens each; decode passes one token each. `predicted` drives the
+    /// prefetch, and is required when the configuration has one.
     pub fn session(
         &mut self,
         routing: &[u32],
+        predicted: Option<&Predictions<'_>>,
         tokens: usize,
         top_k: usize,
         requests: &[TraceRequest],
@@ -168,8 +262,29 @@ impl CacheSim {
             routing.len(),
             self.layers
         );
+        let prefetch = match (self.config.prefetch, predicted) {
+            (None, _) => None,
+            (Some(p), Some(pred)) => {
+                ensure!(
+                    (1..=2).contains(&p.lookahead),
+                    "lookahead {} (1 or 2 are logged)",
+                    p.lookahead
+                );
+                ensure!(
+                    pred.ids.len() == 2 * self.layers * tokens * pred.width,
+                    "predictions hold {} ids, 2 x {} layers x {tokens} tokens x {} \
+                     expected",
+                    pred.ids.len(),
+                    self.layers,
+                    pred.width
+                );
+                Some((p, *pred))
+            }
+            (Some(_), None) => anyhow::bail!("a prefetch needs the predictions"),
+        };
         let at = |layer: usize, pos: usize| (layer * tokens + pos) * top_k;
         let mut pass: Vec<u32> = Vec::new();
+        let mut prefetched: Vec<Vec<u32>> = vec![Vec::new(); self.layers];
         for r in requests {
             ensure!(
                 r.prefill.start <= r.prefill.end
@@ -195,8 +310,41 @@ impl CacheSim {
                     let ids = &routing[at(layer, pos)..at(layer, pos + 1)];
                     pass.clear();
                     pass.extend_from_slice(ids);
-                    if self.request(layer, &pass, counts) > 0 {
+                    let read = &mut prefetched[layer];
+                    if !read.is_empty() {
+                        pass.sort_unstable();
+                        pass.dedup();
+                        // Read for this layer, routed to and still resident.
+                        let policy = &self.policy;
+                        let useful = read
+                            .iter()
+                            .filter(|&&e| {
+                                pass.contains(&e)
+                                    && policy.slot_of(layer, e as usize).is_some()
+                            })
+                            .count() as u64;
+                        counts.prefetch_useful += useful;
+                        self.layer_useful[layer] += useful;
+                        read.clear();
+                    }
+                    let misses = self.request(layer, &pass, counts);
+                    self.layer_misses[layer] += misses;
+                    if misses > 0 {
                         missed += 1;
+                    }
+                    if let Some((p, pred)) = &prefetch {
+                        let target = layer + p.lookahead;
+                        if target < self.layers {
+                            let mut read = std::mem::take(&mut prefetched[target]);
+                            self.prefetch(
+                                *p,
+                                pred,
+                                (target, pos, tokens),
+                                &mut read,
+                                counts,
+                            )?;
+                            prefetched[target] = read;
+                        }
                     }
                 }
                 counts.decode_tokens += 1;
@@ -204,6 +352,111 @@ impl CacheSim {
             }
         }
         Ok(())
+    }
+}
+
+/// Cross-layer transition counts learned from routing, the host-side
+/// predictor candidate: how often a position routed to expert `e` at
+/// layer `l` routed to `f` at layer `l + d`, for `d` 1 and 2. A service
+/// thread holding layer `l`'s routed ids at its handshake could predict
+/// layers `l + 1` and `l + 2` from them without any GPU work.
+#[derive(Clone)]
+pub struct Transitions {
+    layers: usize,
+    experts: usize,
+    /// `[d - 1][l][e][f]`.
+    counts: Vec<u32>,
+    /// `[d - 1][l][e]`: the positions that routed to `e` at layer `l`
+    /// with a layer `l + d`.
+    from: Vec<u32>,
+}
+
+impl Transitions {
+    pub fn new(layers: usize, experts: usize) -> Self {
+        Self {
+            layers,
+            experts,
+            counts: vec![0; 2 * layers * experts * experts],
+            from: vec![0; 2 * layers * experts],
+        }
+    }
+
+    /// Counts (`add`) or uncounts every position of `routing`
+    /// (`[layers][tokens][top_k]`).
+    pub fn count(&mut self, routing: &[u32], tokens: usize, top_k: usize, add: bool) {
+        let (layers, experts) = (self.layers, self.experts);
+        let at = |l: usize, p: usize| (l * tokens + p) * top_k;
+        for d in 1..=2 {
+            for l in 0..layers.saturating_sub(d) {
+                let base = (d - 1) * layers + l;
+                for p in 0..tokens {
+                    let src = &routing[at(l, p)..at(l, p) + top_k];
+                    let dst = &routing[at(l + d, p)..at(l + d, p) + top_k];
+                    for &e in src {
+                        let e = e as usize;
+                        let row = (base * experts + e) * experts;
+                        let from = &mut self.from[base * experts + e];
+                        *from = if add { *from + 1 } else { *from - 1 };
+                        for &f in dst {
+                            let c = &mut self.counts[row + f as usize];
+                            *c = if add { *c + 1 } else { *c - 1 };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Predictions for `positions` of `routing` in the layout
+    /// [`Predictions`] reads (`[2][layers][tokens][width]`, zero elsewhere):
+    /// for layer `t`, the `width` experts with the highest
+    /// `sum over e routed at t - d of P(f at t | e at t - d)`, best first,
+    /// ties to the lower id.
+    pub fn predict(
+        &self,
+        routing: &[u32],
+        tokens: usize,
+        top_k: usize,
+        positions: &[usize],
+        width: usize,
+    ) -> Vec<u16> {
+        let (layers, experts) = (self.layers, self.experts);
+        let probs: Vec<f32> = (0..self.counts.len())
+            .map(|i| {
+                let from = self.from[i / experts];
+                if from == 0 { 0.0 } else { self.counts[i] as f32 / from as f32 }
+            })
+            .collect();
+        let mut out = vec![0u16; 2 * layers * tokens * width];
+        let mut score = vec![0f32; experts];
+        let mut order: Vec<u16> = Vec::with_capacity(experts);
+        for d in 1..=2 {
+            for t in d..layers {
+                let l = t - d;
+                let base = (d - 1) * layers + l;
+                for &p in positions {
+                    score.fill(0.0);
+                    let src = &routing[(l * tokens + p) * top_k..][..top_k];
+                    for &e in src {
+                        let row = &probs[(base * experts + e as usize) * experts..]
+                            [..experts];
+                        for (s, &q) in score.iter_mut().zip(row) {
+                            *s += q;
+                        }
+                    }
+                    order.clear();
+                    order.extend(0..experts as u16);
+                    let key =
+                        |&f: &u16| (std::cmp::Reverse(score[f as usize].to_bits()), f);
+                    order.select_nth_unstable_by_key(width - 1, key);
+                    order.truncate(width);
+                    order.sort_unstable_by_key(key);
+                    let at = (((d - 1) * layers + t) * tokens + p) * width;
+                    out[at..at + width].copy_from_slice(&order);
+                }
+            }
+        }
+        out
     }
 }
 
