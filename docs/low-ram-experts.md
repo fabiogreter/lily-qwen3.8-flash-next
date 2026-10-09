@@ -592,6 +592,71 @@ the service thread. It would reopen with a predictor that costs a fraction
 of a router pass (fused into a level the pass already has), or a drive fast
 enough that a read fits in a mixer's time.
 
+### A whole-token predictor from the hidden state (2026-10-09)
+
+The cross-layer predictors above pay per layer and leave a read less than
+a layer's time to land. A predictor run once per token, at the end of the
+pass before, avoids both: the deeper a layer, the longer its read has.
+Its input has to carry information neither the token id nor the recent
+routing does (both measured above), so it is the final hidden state of
+position p, the LM head's input, and optionally token p+1's id; its
+output is position p+1's routing at every layer, 48 x 512 probabilities.
+
+`lily-trace-routing --hidden` writes every position's final hidden state
+(`Qwen4ExpModel::enable_hidden_log`: prefill runs the final read over all
+rows, where normally only the last row's feeds the head). Hidden states
+can largely be inverted back to tokens, so they stay outside the
+repository with the traces. Two checks: the
+routing logged alongside matched the earlier logs bit for bit in all seven
+sessions, and a 3 000-token prefix dumped with prefill chunks of 4 096 and
+1 024 tokens gave identical rows (cosine 1.0000, chunk boundaries
+included; neighbouring rows 0.45). `tools/bench/expert_predictor.py`
+trains a two-layer MLP (layer norm, 2 560 to 1 024, GELU, 1 024 to
+24 576; 28M parameters) on six sessions' positions (about 450 000) for
+two epochs, binary cross-entropy (the script's defaults), and predicts the seventh's decoded
+positions, for each of the seven; `lily-cache-replay --prefetch 0:TOP`
+replays the top predictions per layer as reads issued at the token's
+start. Top-10 overlap with the routing actually taken: 46 to 51% per
+held-out session (B one layer ahead, same token: 79%).
+
+Timed replay of the seven sessions, 500-token half-life, per decoded token:
+
+| prefetch                                    | decode misses | reads | stall    |
+|---------------------------------------------|--------------:|------:|---------:|
+| none                                        | 8.29          |       | 3.42 ms  |
+| B one layer ahead, top 10                   | 3.70          | 9.9   | 3.14 ms  |
+| B two layers ahead, top 10                  | 5.48          | 12.5  | 3.11 ms  |
+| token id table at token start, top 10       | 8.01          | 9.0   | 3.62 ms  |
+| MLP at token start, top 10                  | 7.38          | 2.9   | 3.18 ms  |
+| MLP at token start, top 20                  | 6.69          | 7.8   | 3.10 ms  |
+| MLP at token start, top 40                  | 5.96          | 18.7  | 3.30 ms  |
+| MLP with the next token's id, top 20        | 6.58          | 8.4   | 3.07 ms  |
+
+Timed, B looks worse than its miss count suggests: 4.5 of its useful
+reads per token land after their layer asks (a mixer's time against a
+0.42 ms read), so it saves 0.3 ms for 1.35 ms of GPU work. The MLP is the
+first predictor whose reads mostly land: 0.32 to 0.35 ms saved per token,
+about 10% of the stall and 1.7% of a cold token. Weighting the loss 8:1
+toward the slices the loaded ranking leaves unpinned changed nothing (3.11
+ms; the pinned set drifts under decay), nor did a per-layer read budget
+(3.09 to 3.26 ms), nor, on one held-out session, twice the width and four
+epochs (overlap +2.4 points, stall 3.10 against 3.12 ms). Wider predicted
+sets cut more misses but queue more reads ahead of the demand misses, and
+the stall rises again past about 8 reads per token.
+
+What building it would cost: the model at the end of every pass, next to
+the LM head that reads the same hidden state (28M parameters, about 56 MB
+per token in bf16, 14 MB at 4 bits, a fraction of a millisecond, no new
+level on the trunk), and a background loader in the service thread with
+in-flight tracking and cancellation (the dropped re-rank had most of it,
+`docs/bench/2026-10-09-expert-rerank/`, ignored). Under speculative
+decoding a verify pass routes three positions and the model predicts the
+first, so the shipped mode would gain less than the replay's 1.7% of a
+plain cold token. That is not worth the loader today; it would
+reopen with a predictor that sees more than one position back (the draft
+head's states, for the verify pass's other rows) or a drive with lower
+read latency, where the late reads stop dominating.
+
 ### Prefill chunks of 8 192 tokens
 
 `LILY_PREFILL_CHUNK=8192` (a per-model value now, `Qwen4ExpModel::
@@ -626,7 +691,10 @@ re-read check on the routed ids found no stale reads). A run on a real
   scratch.
 - **Prefetching** a token's cold experts from a cross-layer prediction
   was replayed and costed on agent sessions ("Cross-layer prefetch on
-  agent sessions" above): the predictor costs about what it saves.
+  agent sessions" above): the predictor costs about what it saves; a
+  whole-token predictor from the previous hidden state saves about 0.35
+  ms per cold token for little GPU time ("A whole-token predictor from the
+  hidden state"), not enough yet for the loader it needs.
 - **The handshake** (7% of a 2-draft step at zero misses when first
   measured, 11% of a plain token and 6% of a step on 2026-10-09) is 48
   sequential host-GPU

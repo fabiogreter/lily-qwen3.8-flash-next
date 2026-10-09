@@ -1148,6 +1148,9 @@ pub struct Scratch {
     /// Cross-layer routing prediction log for measurement
     /// (`Qwen4ExpModel::enable_expert_prediction`).
     pub(super) expert_pred: Option<ExpertPredLog>,
+    /// Final hidden-state log for measurement, `BF16 [capacity, hidden]`
+    /// (`Qwen4ExpModel::enable_hidden_log`).
+    pub(super) hidden_log: Option<Tensor>,
     /// Batched decode across sessions (`batch`): per-slot samplers and
     /// per-row attention scratch, allocated by the first batched step.
     pub(super) batch: Option<batch::BatchScratch>,
@@ -1929,6 +1932,60 @@ impl Qwen4ExpModel {
         Ok(())
     }
 
+    /// Records every prefilled position's final hidden state (the LM head's
+    /// input: the final hyper-connection read, its norm included) into
+    /// `BF16 [capacity, hidden]` scratch, for measurement (the input of a
+    /// whole-token expert predictor trained offline): prefill passes then
+    /// run the final read over all their rows, where normally only the last
+    /// row's feeds the head. Off by default; disabled, no pass encodes
+    /// anything for it.
+    pub fn enable_hidden_log(
+        &self,
+        ctx: &MetalContext,
+        scratch: &mut Scratch,
+        capacity: usize,
+    ) -> Result<()> {
+        scratch.hidden_log = Some(Tensor::zeros(
+            ctx,
+            &[capacity, self.config.hidden_size],
+            DType::BF16,
+        )?);
+        Ok(())
+    }
+
+    /// The log enabled by [`Self::enable_hidden_log`].
+    pub fn hidden_log<'s>(&self, scratch: &'s Scratch) -> Option<&'s Tensor> {
+        scratch.hidden_log.as_ref()
+    }
+
+    /// Measurement only (no-op unless [`Self::enable_hidden_log`]), after a
+    /// prefill chunk's last layer: the final read over its rows into the
+    /// chunk's own read scratch (free by then, as in a verify pass; what
+    /// follows reads only the streams), copied into the hidden log at
+    /// positions `pos..pos + ps.m`. Ends ordered.
+    fn encode_hidden_log(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        s: &Scratch,
+        ps: &PrefillScratch,
+        pos: usize,
+    ) -> Result<()> {
+        let Some(log) = &s.hidden_log else { return Ok(()) };
+        let (h, m) = (self.config.hidden_size, ps.m);
+        let capacity = log.shape()[0];
+        ensure!(pos + m <= capacity, "hidden log holds {capacity} positions");
+        // Ends with a barrier on the mixed rows.
+        self.hc_read_batched(ctx, pass, &self.weights.final_mixer, &ps.hyper, s, ps)?;
+        copy_words(
+            ctx,
+            pass,
+            &ps.hc.mixed.view(0, &[m * h])?,
+            &log.view(pos * h, &[m * h])?,
+        )?;
+        pass.level_barrier(&[log])
+    }
+
     /// The prediction log enabled by [`Self::enable_expert_prediction`]:
     /// the predicted ids, `U32 [EXPERT_PRED_VARIANTS,
     /// EXPERT_PRED_LOOKAHEADS, layers, capacity, EXPERT_PRED_WIDTH *
@@ -2261,6 +2318,7 @@ impl Qwen4ExpModel {
             vision: None,
             expert_log: None,
             expert_pred: None,
+            hidden_log: None,
             batch: None,
             spec: self
                 .weights
@@ -2742,6 +2800,7 @@ impl Qwen4ExpModel {
 
         match mode {
             BatchMode::Prefill { draw, vision } => {
+                self.encode_hidden_log(ctx, &pass, s, ps, pos)?;
                 if let Some(draw) = draw {
                     // Only the last prompt token feeds decoding: pull its stream
                     // row into the single-token scratch and reuse the decode
@@ -5119,3 +5178,7 @@ mod prefix_tests;
 #[cfg(test)]
 #[path = "../../tests/unit/qwen4exp/expert_pred_log.rs"]
 mod expert_pred_log_tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/qwen4exp/hidden_log.rs"]
+mod hidden_log_tests;

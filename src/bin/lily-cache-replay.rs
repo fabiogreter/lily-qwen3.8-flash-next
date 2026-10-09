@@ -9,7 +9,8 @@
 //! unless `--fresh` starts every session from the loaded ranking (or with
 //! `--persist` from the usage the previous session's cache would have
 //! persisted, as a server restarted between sessions would). A
-//! prefetch reads `STEM.pred.u16` (`lily-trace-routing --predict`), or with
+//! prefetch reads `STEM.pred.u16` (`lily-trace-routing --predict`, or
+//! `tools/bench/expert_predictor.py` for a token-start prefetch), or with
 //! `--predictor transitions` predicts from cross-layer transition counts
 //! (`cache_replay::Transitions`) learned on the other sessions given, or
 //! with `--predictor token` from the routing of each input token id

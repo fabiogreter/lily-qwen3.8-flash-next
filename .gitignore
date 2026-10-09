@@ -31,3 +31,11 @@ docs/continuous-batching-draft.md
 
 # Claude Code agent worktrees.
 /.claude/worktrees/
+
+# Recorded-session traces and what is derived from them (lily-trace-routing,
+# tools/bench/expert_predictor.py): token ids, routing, hidden states and
+# predictions of real conversations. Kept out of the repository wherever
+# they are written.
+*.routing.u32
+*.pred.u16
+*.hidden.bf16

@@ -244,6 +244,26 @@ tools/bench/timeline.sh --commit 37cc34c --commit HEAD --prompt-text docs/bench/
 tools/bench/timeline.sh --dry-run --commit HEAD                       # print the commands only
 ```
 
+## bench/expert_predictor.py
+
+Trains and evaluates a whole-token expert predictor for the expert cache,
+leave one session out: position p's final hidden state predicts position
+p+1's routing at every layer. It reads recorded sessions as
+`lily-trace-routing --hidden` writes them and writes predictions that
+`lily-cache-replay --prefetch 0:TOP` replays; method and results in
+`docs/low-ram-experts.md`, "A whole-token predictor from the hidden state".
+Runs on the GPU through PyTorch's MPS backend, about 2.5 minutes per held-out
+session of about 450 000 training positions. The hidden states are as
+sensitive as the sessions they come from (they can largely be inverted back
+to tokens): keep the traces, the hidden states and the output directory
+outside the repository.
+
+```sh
+.venv/bin/python tools/bench/expert_predictor.py <traces> <hidden> <out> \
+    --usage tools/bench/expert-usage-qwen38-flash-next.json \
+    --sessions t04,t05,t12 [--ids] [--cold 8] [--epochs 2] [--only t04]
+```
+
 ## service/lily-service.sh
 
 Not Python: a bash script and a launchd plist template that run the server as

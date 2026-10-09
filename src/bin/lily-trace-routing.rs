@@ -17,6 +17,11 @@
 //! `(d - 1, l, p)` is what B predicts for layer `l` at position `p` from
 //! layer `l - d`; rows with `l < d` are zero. Predicted in the prefill
 //! pass, with the prefill router's bf16 logits where decode's are f32.
+//!
+//! With `--hidden`, every position's final hidden state (the LM head's
+//! input, `Qwen4ExpModel::enable_hidden_log`) goes to `<stem>.hidden.bf16`:
+//! `[tokens][hidden]` little-endian bf16, the input of a whole-token expert
+//! predictor trained offline.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -49,6 +54,9 @@ struct Cli {
     /// Also write predictor B's lookahead 1 and 2 picks, `<stem>.pred.u16`.
     #[arg(long, default_value_t = false)]
     predict: bool,
+    /// Also write every position's final hidden state, `<stem>.hidden.bf16`.
+    #[arg(long, default_value_t = false)]
+    hidden: bool,
 }
 
 /// Exits 75 when another lily instance holds the lock (`lily::instance`).
@@ -94,6 +102,9 @@ fn run() -> Result<()> {
         } else {
             model.enable_expert_log(&ctx, &mut scratch, capacity)?;
         }
+        if cli.hidden {
+            model.enable_hidden_log(&ctx, &mut scratch, capacity)?;
+        }
         let mut state = model.new_state(&ctx, capacity)?;
         let started = Instant::now();
         LanguageModel::prefill(&model, &ctx, &mut state, &mut scratch, &ids, None)?;
@@ -113,6 +124,13 @@ fn run() -> Result<()> {
         let dst = cli.out_dir.join(format!("{stem}.routing.u32"));
         std::fs::write(&dst, &out)
             .with_context(|| format!("writing {}", dst.display()))?;
+        if cli.hidden {
+            let log = model.hidden_log(&scratch).expect("enabled");
+            let row = log.shape()[1] * log.dtype().size();
+            let dst = cli.out_dir.join(format!("{stem}.hidden.bf16"));
+            std::fs::write(&dst, &log.contents()[..n * row])
+                .with_context(|| format!("writing {}", dst.display()))?;
+        }
         if cli.predict {
             let pred = model.expert_pred_log(&scratch).expect("enabled");
             let width = pred.shape()[4];
