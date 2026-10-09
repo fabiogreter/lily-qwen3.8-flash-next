@@ -73,6 +73,9 @@ struct Service {
     decode_misses: AtomicU64,
     promotions: AtomicU64,
     stale: AtomicU64,
+    /// Requests skipped because their pass was dropped (`QueuedRequests`),
+    /// counted at the thread, so the ones the queue purge did not catch.
+    skipped: AtomicU64,
 }
 
 impl Service {
@@ -134,6 +137,8 @@ pub struct ExpertCacheStats {
     pub decode_misses: u64,
     /// Cold experts promoted into the pinned set.
     pub promotions: u64,
+    /// Requests of dropped passes the thread skipped (after the queue purge).
+    pub skipped: u64,
 }
 
 impl ExpertCacheStats {
@@ -145,6 +150,7 @@ impl ExpertCacheStats {
             decode_lookups: self.decode_lookups - earlier.decode_lookups,
             decode_misses: self.decode_misses - earlier.decode_misses,
             promotions: self.promotions - earlier.promotions,
+            skipped: self.skipped - earlier.skipped,
         }
     }
 
@@ -152,17 +158,18 @@ impl ExpertCacheStats {
         100.0 * misses as f64 / lookups.max(1) as f64
     }
 
-    /// `misses of lookups (x%), decode m of n (y%), p promotions`.
+    /// `misses of lookups (x%), decode m of n (y%), p promotions, s skipped`.
     pub fn describe(&self) -> String {
         format!(
-            "{} misses of {} lookups ({:.1}%), decode {} of {} ({:.1}%), {} promotions",
+            "{} misses of {} lookups ({:.1}%), decode {} of {} ({:.1}%), {} promotions, {} skipped",
             self.misses,
             self.lookups,
             Self::rate(self.misses, self.lookups),
             self.decode_misses,
             self.decode_lookups,
             Self::rate(self.decode_misses, self.decode_lookups),
-            self.promotions
+            self.promotions,
+            self.skipped
         )
     }
 }
@@ -231,6 +238,7 @@ impl ExpertCacheLink {
             decode_lookups: s.decode_lookups.load(Ordering::Relaxed),
             decode_misses: s.decode_misses.load(Ordering::Relaxed),
             promotions: s.promotions.load(Ordering::Relaxed),
+            skipped: s.skipped.load(Ordering::Relaxed),
         }
     }
 }
@@ -311,6 +319,7 @@ impl ExpertCache {
                 decode_misses: AtomicU64::new(0),
                 promotions: AtomicU64::new(0),
                 stale: AtomicU64::new(0),
+                skipped: AtomicU64::new(0),
             }),
         });
         Ok(Self {
@@ -615,6 +624,7 @@ fn serve(
         // layers never signal, and the ids at its buffer belong to whatever
         // pass runs next.
         if service.is_cancelled(request.seq) {
+            service.skipped.fetch_add(1, Ordering::Relaxed);
             continue;
         }
         // The GPU is stalled behind this request from the moment it
@@ -637,7 +647,11 @@ fn serve(
                 std::hint::spin_loop();
             }
         }
-        if cancelled {
+        // The signal that ended the spin may have come from the pass that
+        // cancelled this request (its first layer runs ahead of its parked
+        // wait), so check once more.
+        if cancelled || service.is_cancelled(request.seq) {
+            service.skipped.fetch_add(1, Ordering::Relaxed);
             continue;
         }
         // SAFETY: the pass wrote `count` ids at `ids` before signalling.

@@ -145,9 +145,11 @@ scratch, caches and pipelines); a 64 GB machine therefore gets about
    accepted count (`spec.rs`, `prepare_variants`) enqueue their cached
    layers' requests while they are encoded, and the variants that are not
    committed hand them back (`QueuedRequests`, dropped with the `Prepared`
-   pass); without that the service thread resolved up to 96 requests per
-   step for passes that never ran, which was the 14 tok/s of 2026-09-18
-   ("Speculative decoding under the cache" below).
+   pass, before the matching one is committed: a committed pass runs its
+   first layer and that layer's handshake ahead of its parked wait); without
+   that the service thread resolved up to 96 requests per step for passes
+   that never ran, which was the 14 tok/s of 2026-09-18 ("Speculative
+   decoding under the cache" below).
 5. **Live usage, promotion and persistence.** The service thread counts
    every resolved (layer, expert), decode-class passes (up to 256 routed
    ids: a step, a verify pass) apart from prefill. A slice's score is the
@@ -245,13 +247,31 @@ pass's layer index: 3 739 decode-class lookups per step instead of about
 1 150, a miss rate of 10.8% against 2.1% for plain decode, about 400 loads
 per step of experts nobody needed, and evictions of ones that were. The
 handle `QueuedRequests` now cancels a dropped variant's requests (queued
-ones are removed, the one the thread may hold is skipped).
+ones are removed, the one the thread may hold is skipped, checked again
+after the signal that ends its wait). The variants have to be dropped
+before the matching one is committed: a committed pass runs its first
+layer, handshake included, ahead of its parked wait, and a first version
+of the fix that dropped them afterwards still served about 17 000 stale
+lookups over a 256-token run when the service thread was fast (everything
+resident: 127 102 decode-class lookups against 109 984 for the same
+tokens with misses to serve), found by a review on 2026-10-09. With the
+order fixed, the same three configurations count 106 359 decode-class
+lookups each, 159 of the dropped variants' requests reached the thread
+after the queue purge and were skipped there, misses are 3 570 (3.4%), and
+the rates are 110.7 through the protocol, 82.4 warm and 57.1 cold (the
+warm run's prefill was also slower that time, 1 690 against 2 156 tok/s:
+page-cache state). The process peaked at 53 GB of RSS under the 64 GB plan
+with the draft head loaded, about 1 GB over the plan's 52 GB target, and at
+31 GB under the balloon, which pages lily's own buffers out as well as the
+checkpoint's: the cold rows carry that cost too.
 
 Measured at `13f7b54` plus the fix on `docs/bench/2026-10-01-expert-gemm/
 prompt-lily.txt` (8K tokens, 256 decoded, greedy, the shipped ranking, no
 n-gram preload), "cold" under a 60 GiB locked balloon; every row's token
 digest equals the resident path's for its draft count (the fix changes
-which requests are served, not what any pass computes):
+which requests are served, not what any pass computes; a token digest
+shows the drawn tokens agree, not that logits or states are identical,
+and no resident 3-draft row was run):
 
 | configuration                               | plain decode | 2 drafts, before | 2 drafts, after | 3 drafts, after |
 |---------------------------------------------|-------------:|-----------------:|----------------:|----------------:|
@@ -260,9 +280,10 @@ which requests are served, not what any pass computes):
 | 16 246 slots, checkpoint pages warm         | 66.2         | 38.8             | 87.3            | 92.9            |
 | 16 246 slots, cold                          | 50.9         | 13.2             | 58.1            | 57.4            |
 
-Decode-class misses over the 256 tokens: 2 607 plain, 40 148 with two
-drafts before the fix, 3 964 after (3.5% of lookups: the draft rows of a
-verify pass route a little colder than a decoded token); acceptance 79.3%
+Decode-class misses over the 256 tokens (the measured run, without the
+warm-up): 2 607 plain, 40 148 with two drafts before the fix, 3 782 after
+(3.4% of 109 984 lookups: the draft rows of a verify pass route a little
+colder than a decoded token); acceptance 79.3%
 with two drafts, 78.9% with three. The first two rows also measure the
 handshake alone: about 1.4 ms per trunk pass, 11% of a plain token and 6%
 of a speculative step, not the 0.1 ms per layer the design estimated. So
@@ -304,7 +325,9 @@ re-read check on the routed ids found no stale reads). A run on a real
 - **Prefill** is bound by reading the cold third per chunk; a chunk of
   8 192 tokens would halve that per token at twice the activation
   scratch.
-- **The handshake** (7% at zero misses) is 48 sequential host-GPU
+- **The handshake** (7% of a 2-draft step at zero misses when first
+  measured, 11% of a plain token and 6% of a step on 2026-10-09) is 48
+  sequential host-GPU
   exchanges per pass; only fewer cached layers or a GPU-side check that
   skips the wait when nothing is missing would reduce it, and Metal has
   no conditional wait.

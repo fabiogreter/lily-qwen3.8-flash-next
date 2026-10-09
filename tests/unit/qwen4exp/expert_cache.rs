@@ -19,6 +19,7 @@ fn service() -> Arc<Service> {
         decode_misses: AtomicU64::new(0),
         promotions: AtomicU64::new(0),
         stale: AtomicU64::new(0),
+        skipped: AtomicU64::new(0),
     })
 }
 

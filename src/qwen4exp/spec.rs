@@ -250,7 +250,15 @@ impl Qwen4ExpModel {
                 // Encoding a cached layer enqueues its request; all but the
                 // variant that gets committed must take theirs back.
                 let first = link.as_ref().map_or(0, |l| l.last_seq() + 1);
-                let verify = self.encode_batch(ctx, state, s, &ps, mode)?.detach();
+                let verify = match self.encode_batch(ctx, state, s, &ps, mode) {
+                    Ok(pass) => pass.detach(),
+                    Err(e) => {
+                        // Whatever the failed encode enqueued is cancelled
+                        // with the handle it never got to keep.
+                        drop(link.as_ref().and_then(|l| l.queued_since(first)));
+                        return Err(e);
+                    }
+                };
                 let cache = link.as_ref().and_then(|l| l.queued_since(first));
                 prepared.push(Prepared { verify, park, drafts: chain, cache });
             }
@@ -291,6 +299,17 @@ impl Qwen4ExpModel {
             "accepted {accepted} rows but only {gpu_accepted} drafts were confirmed"
         );
         let chain = pending.chain;
+        // The variants encoded ahead for the other outcomes: dropped now,
+        // before the matching one is committed, because a committed pass
+        // runs its first layer (and that layer's expert-cache handshake)
+        // ahead of its parked wait, and the losers' cache requests sit ahead
+        // of its own in the service queue until their handles cancel them
+        // (`Prepared::cache`). The matching variant is kept aside first.
+        let ahead = (next.is_some()
+            && pending.prepared.len() == m
+            && pending.prepared[accepted].drafts == chain)
+            .then(|| pending.prepared.swap_remove(accepted));
+        pending.prepared.clear();
 
         // Host-side rollback: position, hash history, penalty counts of the
         // rejected rows' draws. (The running draft pass never touches the
@@ -348,9 +367,6 @@ impl Qwen4ExpModel {
                     "the step continues past a row the GPU did not confirm"
                 );
                 ensure!(chain > 0, "the draft pass proposed nothing to verify next");
-                let ahead = (pending.prepared.len() == m
-                    && pending.prepared[accepted].drafts == chain)
-                    .then(|| pending.prepared.swap_remove(accepted));
                 match ahead {
                     Some(mut prep) => {
                         // Encoded ahead, ids written by the draft pass: commit
@@ -369,9 +385,8 @@ impl Qwen4ExpModel {
                                 return Err(e);
                             }
                         };
-                        // Committed: its cached layers' requests stand. The
-                        // other variants cancel theirs when `pending.prepared`
-                        // is dropped below.
+                        // Committed: its cached layers' requests stand (the
+                        // other variants cancelled theirs above).
                         if let Some(queued) = prep.cache.take() {
                             queued.keep();
                         }
@@ -411,7 +426,6 @@ impl Qwen4ExpModel {
                 }
             }
         };
-        drop(pending.prepared);
         let s = &*s;
         if profiling() {
             eprintln!(
