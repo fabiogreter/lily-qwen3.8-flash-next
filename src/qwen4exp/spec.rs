@@ -236,6 +236,7 @@ impl Qwen4ExpModel {
             .ok_or_else(|| anyhow::anyhow!("prefill scratch missing"))?;
         let pos_after = state.pos;
         let park = s.sync.peek();
+        let link = self.weights.expert_cache.as_ref().map(|c| c.link());
         let mut prepared = Vec::with_capacity(m);
         let result = (|| -> Result<()> {
             for a in 0..m {
@@ -246,8 +247,12 @@ impl Qwen4ExpModel {
                     step0: step0 + a + 1,
                     park: Some(park),
                 };
+                // Encoding a cached layer enqueues its request; all but the
+                // variant that gets committed must take theirs back.
+                let first = link.as_ref().map_or(0, |l| l.last_seq() + 1);
                 let verify = self.encode_batch(ctx, state, s, &ps, mode)?.detach();
-                prepared.push(Prepared { verify, park, drafts: chain });
+                let cache = link.as_ref().and_then(|l| l.queued_since(first));
+                prepared.push(Prepared { verify, park, drafts: chain, cache });
             }
             Ok(())
         })();
@@ -347,7 +352,7 @@ impl Qwen4ExpModel {
                     && pending.prepared[accepted].drafts == chain)
                     .then(|| pending.prepared.swap_remove(accepted));
                 match ahead {
-                    Some(prep) => {
+                    Some(mut prep) => {
                         // Encoded ahead, ids written by the draft pass: commit
                         // it parked, then read the proposals.
                         let s = &*s;
@@ -364,6 +369,12 @@ impl Qwen4ExpModel {
                                 return Err(e);
                             }
                         };
+                        // Committed: its cached layers' requests stand. The
+                        // other variants cancel theirs when `pending.prepared`
+                        // is dropped below.
+                        if let Some(queued) = prep.cache.take() {
+                            queued.keep();
+                        }
                         let proposals =
                             self.collect_drafts(s, draft, chain, &pending)?;
                         (proposals, Some(parked))

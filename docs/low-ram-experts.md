@@ -52,9 +52,9 @@ Nothing to set on the small machine: at load the engine compares the
 checkpoint with `hw.memsize` and engages the cache when it does not fit.
 `LILY_MEMORY_GB=64` (for `lily` and `lily-bench` alike) plans for that
 much memory instead of the machine's, which is how to try the mode here:
-a 64 GB machine picks 16 441 slots (42.3 GB) and turns speculative
-decoding off. Before 2026-10-08 this was `--memory-gb`, which now refuses
-to start and names its replacements.
+a 64 GB machine picks about 16 250 slots on this checkpoint (the load
+prints the number) and keeps speculative decoding on. Before 2026-10-08 this
+was `--memory-gb`, which now refuses to start and names its replacements.
 
 `--memory-limit-gb G` is the other knob: the most lily should take. The
 plan sizes the process for the machine's memory less its reserve (12 GB,
@@ -81,8 +81,9 @@ The server's session cache comes out of the same memory as the slab. The
 plan keeps exactly one full session at `--max-seq` free before it sizes
 the slab, and the server's session budget is then exactly that session
 (`--cache-bytes` still overrides): its per-token caches, the recurrent
-state and three checkpoints of it, without the draft head, which the cache
-leaves unloaded. The K/V caches are always q8 here (`--kv-cache bf16`
+state and three checkpoints of it, the draft head's own caches included
+(drafts run under the cache since 2026-10-09, below). The K/V caches are
+always q8 here (`--kv-cache bf16`
 refuses to start), and requests are served one at a time (`--max-batch`
 above 1 refuses to start). More sessions spill to the disk tier and come back from
 it, synchronously: the full machine's write ahead of evictions is off here,
@@ -137,10 +138,16 @@ scratch, caches and pipelines); a 64 GB machine therefore gets about
    evicting a slot used at the current sequence number. Misses are read
    with positioned reads on up to 16 threads, each expert's nine regions
    spread over them, straight into the slot.
-4. **No draft head under the cache** unless `LILY_EXPERT_CACHE_DRAFTS` is
-   set: a speculative step runs three trunk passes through the cached
-   layers (two drafts, one verify) where plain decode runs one, and the
-   handshakes and misses scale with passes.
+4. **Drafts under the cache.** The draft head loads as on the full
+   machine. Its own experts are resident, not slots, so a speculative
+   step's draft pass pays no handshakes; only the verify pass's 48 do, as
+   for a plain token. The verify passes encoded ahead for every possible
+   accepted count (`spec.rs`, `prepare_variants`) enqueue their cached
+   layers' requests while they are encoded, and the variants that are not
+   committed hand them back (`QueuedRequests`, dropped with the `Prepared`
+   pass); without that the service thread resolved up to 96 requests per
+   step for passes that never ran, which was the 14 tok/s of 2026-09-18
+   ("Speculative decoding under the cache" below).
 5. **Live usage, promotion and persistence.** The service thread counts
    every resolved (layer, expert), decode-class passes (up to 256 routed
    ids: a step, a verify pass) apart from prefill. A slice's score is the
@@ -222,6 +229,48 @@ decodes 11% faster, and prefill misses fall too (33 166 against 36 321
 over the run). The persisted counts are the merged scores, so they rank
 by this machine's routing rather than by the 40 corpus prompts the
 shipped file was measured on.
+
+### Speculative decoding under the cache (2026-10-09)
+
+Until today the draft head stayed unloaded under the cache
+(`LILY_EXPERT_CACHE_DRAFTS=1` loaded it) because a step with two drafts
+decoded at 14 tok/s cold against 55 plain, which the design notes above
+attributed to the passes. The cause was elsewhere: the speculative step
+encodes the next verify pass for every possible accepted count while the
+verify pass runs and commits only the matching one, and encoding a cached
+layer enqueues its request at once. The dropped variants left 96 requests
+per step in the queue, which the service thread resolved when the next pass
+signalled, reading the ids that pass had just routed under the dropped
+pass's layer index: 3 739 decode-class lookups per step instead of about
+1 150, a miss rate of 10.8% against 2.1% for plain decode, about 400 loads
+per step of experts nobody needed, and evictions of ones that were. The
+handle `QueuedRequests` now cancels a dropped variant's requests (queued
+ones are removed, the one the thread may hold is skipped).
+
+Measured at `13f7b54` plus the fix on `docs/bench/2026-10-01-expert-gemm/
+prompt-lily.txt` (8K tokens, 256 decoded, greedy, the shipped ranking, no
+n-gram preload), "cold" under a 60 GiB locked balloon; every row's token
+digest equals the resident path's for its draft count (the fix changes
+which requests are served, not what any pass computes):
+
+| configuration                               | plain decode | 2 drafts, before | 2 drafts, after | 3 drafts, after |
+|---------------------------------------------|-------------:|-----------------:|----------------:|----------------:|
+| resident, no cache                          | 88.1         | 118.7            |                 |                 |
+| all 24 576 slots through the protocol       | 78.4         | 111.4            | 111.9           |                 |
+| 16 246 slots, checkpoint pages warm         | 66.2         | 38.8             | 87.3            | 92.9            |
+| 16 246 slots, cold                          | 50.9         | 13.2             | 58.1            | 57.4            |
+
+Decode-class misses over the 256 tokens: 2 607 plain, 40 148 with two
+drafts before the fix, 3 964 after (3.5% of lookups: the draft rows of a
+verify pass route a little colder than a decoded token); acceptance 79.3%
+with two drafts, 78.9% with three. The first two rows also measure the
+handshake alone: about 1.4 ms per trunk pass, 11% of a plain token and 6%
+of a speculative step, not the 0.1 ms per layer the design estimated. So
+drafts are on under the cache as everywhere (`--mtp-drafts 0` turns them
+off) and `LILY_EXPERT_CACHE_DRAFTS` is gone. The draft head's 1.5 GB was
+always among the plan's resident weights; its session caches now count in
+the server's reserve. Cold, the gain is 15% at two drafts and the third
+draft returns nothing; warm, 32% and 40%.
 
 ### Prefill chunks of 8 192 tokens
 

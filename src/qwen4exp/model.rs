@@ -57,7 +57,7 @@ use crate::moe_ffn::{
 };
 use crate::tensor::{DType, Tensor};
 
-use super::expert_cache::ExpertCacheStats;
+use super::expert_cache::{ExpertCacheStats, QueuedRequests};
 use super::vision::{self, VisionScratch};
 
 use super::config::{GateAct, Qwen4ExpConfig};
@@ -429,6 +429,10 @@ pub(super) struct Prepared {
     pub(super) park: u64,
     /// Drafts the pair was encoded for.
     pub(super) drafts: usize,
+    /// Under an expert cache, the requests the pass's cached layers
+    /// enqueued while it was encoded: cancelled when the pass is dropped
+    /// instead of committed (`expert_cache::QueuedRequests`).
+    pub(super) cache: Option<QueuedRequests>,
 }
 
 impl PleState {

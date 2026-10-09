@@ -512,9 +512,12 @@ on the 8K real-text prompt with 256 generated tokens, digests identical to
 the resident path: 929 tok/s prefill and 64.4 tok/s plain
 decode at commit `38d2642` (977 and 54.6 at `37cc34c` the day before; the
 cold runs' misses depend on what the page cache still holds), against 2 257 and
-87 with everything resident. Speculative decoding is off under the cache
-because its three trunk passes per step each pay the per-layer handshake
-and the misses (14 to 15 tok/s with it on).
+87 with everything resident. Speculative decoding runs under the cache
+since 2026-10-09: 58.1 tok/s cold with two drafts against 50.7 plain, 87.3
+against 66.2 warm (`docs/low-ram-experts.md`, "Speculative decoding under
+the cache"). Before, the verify passes encoded ahead for the other accepted
+counts left their cache requests behind when dropped, and a step collapsed
+to 14 tok/s.
 
 ## What was done
 

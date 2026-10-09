@@ -789,12 +789,9 @@ pub fn load(
     // the machine's memory when the checkpoint does not fit it.
     // The server's session cache under an expert cache: one full session at
     // its context length, which the plan keeps free and the server then
-    // budgets exactly (`ModelWeights::session_reserve`). The draft head only
-    // stays loaded under the cache when asked for (below), so only then does
-    // its cache count.
-    let drafts_under_cache = with_mtp
-        && config.mtp.is_some()
-        && std::env::var_os("LILY_EXPERT_CACHE_DRAFTS").is_some();
+    // budgets exactly (`ModelWeights::session_reserve`), the draft head's
+    // caches included when it is loaded.
+    let drafts_under_cache = with_mtp && config.mtp.is_some();
     let session = match session_context {
         Some(s) => super::model::session_bytes(
             config,
@@ -919,19 +916,13 @@ pub fn load(
         layers.push(LayerWeights { ple, attn_hc, mixer, mlp_hc, ffn });
     }
 
-    // Under an expert cache every trunk pass pays a handshake per MoE
-    // layer plus its misses, and a speculative step runs three trunk passes
-    // (two drafts, one verify) where plain decode runs one: measured 14 to
-    // 15 tok/s against 55 with the reads cold (docs/low-ram-experts.md).
-    // So the draft head stays unloaded there unless asked for.
-    let with_mtp = with_mtp
-        && (expert_cache.is_none()
-            || std::env::var_os("LILY_EXPERT_CACHE_DRAFTS").is_some());
-    if expert_cache.is_some() && config.mtp.is_some() && !with_mtp {
-        eprintln!(
-            "expert cache: speculative decoding off (plain decode is faster here; LILY_EXPERT_CACHE_DRAFTS=1 keeps it)"
-        );
-    }
+    // The draft head loads under an expert cache as everywhere: its own
+    // experts are resident, a speculative step's verify pass pays the same
+    // 48 handshakes as a plain token, and with the requests of the verify
+    // passes encoded ahead for the other outcomes cancelled when those are
+    // dropped (`expert_cache::QueuedRequests`) it decodes 58 tok/s cold
+    // against 51 plain, 87 against 66 warm (docs/low-ram-experts.md,
+    // "Speculative decoding under the cache"). `--mtp-drafts 0` turns it off.
     let mtp = match (&config.mtp, with_mtp) {
         (Some(_), true) => Some(Box::new(load_mtp(&loader, config)?)),
         _ => None,

@@ -204,12 +204,13 @@ usage. The cached configuration then gets saved to disk and reused on the
 next run.
 
 Moving experts around between RAM and disk does of course cost time. On a
-simulated 64 GB machine, prefill was measured at about 930 tok/s, and decode
-at around 50-65 tok/s. Speculative decoding is off in this mode, as it requires
-additional expert reads and thus slows down the process. Note that in practice,
-performance may be worse, as there is additional RAM required to hold the session
-KV cache. If anyone wants to test with a real 64 GB machine, your feedback is welcome.
-Less than 64 GB is probably impractical.
+simulated 64 GB machine with the checkpoint's pages cold, prefill was measured
+at about 880 tok/s and decode at about 51 tok/s plain and 58 tok/s with
+speculative decoding, which runs in this mode as everywhere (against about
+2 600 and 118 with everything resident). Note that in practice, performance
+may be worse, as there is additional RAM required to hold the session KV
+cache. If anyone wants to test with a real 64 GB machine, your feedback is
+welcome. Less than 64 GB is probably impractical.
 
 The cache sizes itself from physical memory, keeping 12 GB free for the
 system, other apps and the page cache. If you run more next to lily (an

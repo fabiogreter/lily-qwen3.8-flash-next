@@ -62,6 +62,10 @@ struct Request {
 struct Service {
     requests: Mutex<VecDeque<Request>>,
     wake: Condvar,
+    /// Sequence ranges (inclusive) of passes that were encoded but will
+    /// never run (`QueuedRequests`), for the request the thread may already
+    /// hold; queued ones are removed at cancellation. Pruned as served.
+    cancelled: Mutex<Vec<(u64, u64)>>,
     stop: AtomicBool,
     lookups: AtomicU64,
     misses: AtomicU64,
@@ -69,6 +73,54 @@ struct Service {
     decode_misses: AtomicU64,
     promotions: AtomicU64,
     stale: AtomicU64,
+}
+
+impl Service {
+    /// Forgets the requests with sequence numbers in `from..=to`: those
+    /// still queued are dropped, and the one the thread may hold is skipped
+    /// when it checks [`Self::is_cancelled`].
+    fn cancel(&self, from: u64, to: u64) {
+        let mut queue = self.requests.lock().unwrap_or_else(|e| e.into_inner());
+        queue.retain(|r| r.seq < from || r.seq > to);
+        drop(queue);
+        let mut cancelled = self.cancelled.lock().unwrap_or_else(|e| e.into_inner());
+        cancelled.push((from, to));
+    }
+
+    /// Whether `seq` was cancelled. Requests are served in rising order, so
+    /// ranges entirely below `seq` are pruned here.
+    fn is_cancelled(&self, seq: u64) -> bool {
+        let mut cancelled = self.cancelled.lock().unwrap_or_else(|e| e.into_inner());
+        cancelled.retain(|&(_, to)| to >= seq);
+        cancelled.iter().any(|&(from, to)| from <= seq && seq <= to)
+    }
+}
+
+/// The requests a pass enqueued while it was encoded, held by a pass that
+/// may never be committed (a verify pass prepared for one of several
+/// outcomes). Dropped, it cancels them, so the service thread never resolves
+/// a layer the GPU will not run with whatever the indices buffer holds at
+/// the time; [`Self::keep`] lets them stand once the pass is committed.
+pub struct QueuedRequests {
+    service: Arc<Service>,
+    from: u64,
+    to: u64,
+    armed: bool,
+}
+
+impl QueuedRequests {
+    /// The pass was committed: its requests are served as encoded.
+    pub fn keep(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for QueuedRequests {
+    fn drop(&mut self) {
+        if self.armed {
+            self.service.cancel(self.from, self.to);
+        }
+    }
 }
 
 /// Counters of the cache's service so far.
@@ -152,6 +204,24 @@ impl ExpertCacheLink {
         seq
     }
 
+    /// The sequence number of the last request enqueued (0 before any).
+    pub fn last_seq(&self) -> u64 {
+        self.next_seq.get()
+    }
+
+    /// A handle on the requests enqueued since `first` (the value
+    /// [`Self::last_seq`] returned plus one before the pass was encoded):
+    /// `None` when the pass enqueued nothing.
+    pub fn queued_since(&self, first: u64) -> Option<QueuedRequests> {
+        let to = self.next_seq.get();
+        (to >= first).then(|| QueuedRequests {
+            service: self.service.clone(),
+            from: first,
+            to,
+            armed: true,
+        })
+    }
+
     /// The counters so far.
     pub fn stats(&self) -> ExpertCacheStats {
         let s = &self.service;
@@ -233,6 +303,7 @@ impl ExpertCache {
             service: Arc::new(Service {
                 requests: Mutex::new(VecDeque::new()),
                 wake: Condvar::new(),
+                cancelled: Mutex::new(Vec::new()),
                 stop: AtomicBool::new(false),
                 lookups: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
@@ -540,20 +611,34 @@ fn serve(
                 queue = service.wake.wait(queue).unwrap_or_else(|e| e.into_inner());
             }
         };
+        // A pass encoded ahead that was dropped instead of committed: its
+        // layers never signal, and the ids at its buffer belong to whatever
+        // pass runs next.
+        if service.is_cancelled(request.seq) {
+            continue;
+        }
         // The GPU is stalled behind this request from the moment it
         // signals, so the wait spins: a blocking wait wakes tens of
         // microseconds late and there are 48 of these per token.
         let mut spins = 0u32;
+        let mut cancelled = false;
         while routed.signaled_value() < request.seq {
             spins += 1;
             if spins.is_multiple_of(4096) {
                 if service.stop.load(Ordering::Acquire) {
                     return;
                 }
+                if service.is_cancelled(request.seq) {
+                    cancelled = true;
+                    break;
+                }
                 std::thread::yield_now();
             } else {
                 std::hint::spin_loop();
             }
+        }
+        if cancelled {
+            continue;
         }
         // SAFETY: the pass wrote `count` ids at `ids` before signalling.
         let routed_ids = unsafe {
@@ -652,3 +737,7 @@ fn serve(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/qwen4exp/expert_cache.rs"]
+mod tests;
