@@ -496,6 +496,7 @@ dependencies = [
  "objc2-metal",
  "png",
  "rand 0.8.8",
+ "rayon",
  "serde",
  "serde_json",
  "tokenizers",

@@ -34,7 +34,7 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
@@ -442,9 +442,13 @@ impl ExpertCache {
         let started = std::time::Instant::now();
         let fill: Vec<(u32, usize, usize)> = policy.initial_fill().collect();
         let filled = fill.len();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(LOAD_THREADS)
+            .thread_name(|i| format!("expert-read-{i}"))
+            .build()?;
         // SAFETY: nothing reads the slab before this function returns, and
         // every entry names a distinct slot and expert.
-        unsafe { load_slots(&store, &slab, &tables, self.experts, &fill)? };
+        unsafe { load_slots(&pool, &store, &slab, &tables, self.experts, &fill)? };
         eprintln!(
             "expert cache: {filled} of {} slots filled ({} pinned) in {:.1}s",
             self.n_slots,
@@ -459,6 +463,7 @@ impl ExpertCache {
             Some(std::thread::Builder::new().name("expert-cache".into()).spawn(
                 move || {
                     serve(
+                        pool,
                         store,
                         &mut policy,
                         &mut usage,
@@ -512,15 +517,17 @@ impl Drop for ExpertCache {
 }
 
 /// Loads every `(slot, layer, expert)` of `entries`: the reads (nine
-/// regions per expert) are spread over up to [`LOAD_THREADS`] threads, so
-/// a resolution with a few misses pays about one region's read latency,
-/// then the tables are pointed at the slots.
+/// regions per expert) are spread over `pool`'s threads ([`LOAD_THREADS`],
+/// started once with the cache), so a resolution with a few misses pays
+/// about one region's read latency, then the tables are pointed at the
+/// slots.
 ///
 /// # Safety
 ///
 /// As [`load_slot`], for every entry; the entries name distinct slots and
 /// distinct experts.
 unsafe fn load_slots(
+    pool: &rayon::ThreadPool,
     store: &ExpertStore,
     slab: &SlabPointers,
     tables: &[usize],
@@ -530,11 +537,9 @@ unsafe fn load_slots(
     if entries.is_empty() {
         return Ok(());
     }
-    let tasks: Vec<(usize, usize)> =
-        (0..entries.len()).flat_map(|i| (0..REGIONS).map(move |r| (i, r))).collect();
-    let threads = tasks.len().min(LOAD_THREADS);
-    let per = tasks.len().div_ceil(threads);
-    let read = |&(i, r): &(usize, usize)| -> Result<()> {
+    // Task `k` reads region `k % REGIONS` of entry `k / REGIONS`.
+    let read = |k: usize| -> Result<()> {
+        let (i, r) = (k / REGIONS, k % REGIONS);
         let (slot, layer, expert) = entries[i];
         // SAFETY: shared-storage slab region of n_slots * len bytes; the
         // caller guarantees no reader and distinct slots per entry, and
@@ -547,24 +552,7 @@ unsafe fn load_slots(
         };
         store.read_region(layer, expert, r, dst)
     };
-    if threads == 1 {
-        for task in &tasks {
-            read(task)?;
-        }
-    } else {
-        std::thread::scope(|scope| {
-            let workers: Vec<_> = tasks
-                .chunks(per)
-                .map(|chunk| scope.spawn(move || chunk.iter().try_for_each(read)))
-                .collect();
-            for worker in workers {
-                worker
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("expert load thread panicked"))??;
-            }
-            Ok::<(), anyhow::Error>(())
-        })?;
-    }
+    run_claimed(pool, entries.len() * REGIONS, read)?;
     for &(slot, layer, expert) in entries {
         // SAFETY: the table is a shared-storage U32 [E] buffer.
         unsafe { set_entry(tables, experts, layer, expert, slot) };
@@ -572,8 +560,50 @@ unsafe fn load_slots(
     Ok(())
 }
 
-/// Threads a batch of expert reads is spread over.
+/// Threads in the read pool; the service thread reads alongside them.
 const LOAD_THREADS: usize = 16;
+
+/// Runs `task(0)` to `task(tasks - 1)`, each once, on the calling thread and
+/// up to `pool`'s thread count of pool jobs, every one claiming the next task
+/// from a shared counter until none is left, and returns when all have
+/// finished: the first error, or an error for a panicking task. The caller
+/// starts on the first task at once instead of waiting for pool threads to
+/// wake; a parallel iterator's work stealing, or a broadcast that blocks the
+/// caller, measured no faster on a few blocking reads than the threads this
+/// pool replaced ("The read threads" in `docs/low-ram-experts.md`).
+pub(crate) fn run_claimed(
+    pool: &rayon::ThreadPool,
+    tasks: usize,
+    task: impl Fn(usize) -> Result<()> + Sync,
+) -> Result<()> {
+    let next = AtomicUsize::new(0);
+    let failed: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    let claim = || {
+        loop {
+            let k = next.fetch_add(1, Ordering::Relaxed);
+            if k >= tasks {
+                return;
+            }
+            if let Err(e) = task(k) {
+                failed.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(e);
+                return;
+            }
+        }
+    };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pool.in_place_scope(|scope| {
+            for _ in 1..tasks.min(pool.current_num_threads() + 1) {
+                scope.spawn(|_| claim());
+            }
+            claim();
+        })
+    }))
+    .map_err(|_| anyhow::anyhow!("an expert read panicked"))?;
+    match failed.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
 
 /// # Safety
 ///
@@ -592,6 +622,7 @@ unsafe fn set_entry(
 
 #[allow(clippy::too_many_arguments)]
 fn serve(
+    pool: rayon::ThreadPool,
     store: ExpertStore,
     policy: &mut SlotPolicy,
     usage: &mut LiveUsage,
@@ -727,7 +758,8 @@ fn serve(
         }
         // SAFETY: the GPU waits at this layer; the slots were just taken
         // from experts whose readers have completed, and are distinct.
-        if let Err(e) = unsafe { load_slots(&store, &slab, &tables, experts, &misses) }
+        if let Err(e) =
+            unsafe { load_slots(&pool, &store, &slab, &tables, experts, &misses) }
         {
             eprintln!("expert cache: loading layer {}: {e:#}", request.layer);
             std::process::abort();

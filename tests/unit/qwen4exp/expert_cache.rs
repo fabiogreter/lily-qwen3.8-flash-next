@@ -1,5 +1,6 @@
 //! Host-side tests of the expert cache's request queue: cancellation of the
-//! requests a never-committed pass enqueued (`QueuedRequests`).
+//! requests a never-committed pass enqueued (`QueuedRequests`); and of the
+//! read pool's dispatch (`run_claimed`).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -90,4 +91,52 @@ fn an_empty_range_is_never_cancelled() {
     drop(handle);
     assert_eq!(queued(&service), vec![1, 2, 3]);
     assert!(service.cancelled.lock().unwrap().is_empty());
+}
+
+/// The read pool's dispatch runs every task once across the caller and the
+/// pool, batch after batch, and fails a batch on an error or a panic without
+/// losing the other tasks or the pool.
+#[test]
+fn run_claimed_runs_every_task_once_and_reports_failures() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().expect("pool");
+    for tasks in [0, 1, 2, 9, 37, 144] {
+        let hits: Vec<AtomicUsize> = (0..tasks).map(|_| AtomicUsize::new(0)).collect();
+        let threads = Mutex::new(std::collections::HashSet::new());
+        super::run_claimed(&pool, tasks, |k| {
+            hits[k].fetch_add(1, Ordering::Relaxed);
+            threads.lock().expect("set").insert(std::thread::current().id());
+            std::thread::sleep(std::time::Duration::from_micros(200));
+            Ok(())
+        })
+        .expect("batch");
+        assert!(hits.iter().all(|h| h.load(Ordering::Relaxed) == 1), "{tasks} tasks");
+        if tasks >= 37 {
+            assert!(
+                threads.lock().expect("set").len() > 1,
+                "{tasks} tasks on one thread"
+            );
+        }
+    }
+    let err = super::run_claimed(&pool, 20, |k| {
+        if k == 7 { Err(anyhow::anyhow!("region {k} unreadable")) } else { Ok(()) }
+    })
+    .expect_err("task 7 fails");
+    assert!(err.to_string().contains("region 7"), "{err}");
+    let err =
+        super::run_claimed(
+            &pool,
+            20,
+            |k| if k == 3 { panic!("bad read") } else { Ok(()) },
+        )
+        .expect_err("task 3 panics");
+    assert!(err.to_string().contains("panicked"), "{err}");
+    let after = AtomicUsize::new(0);
+    super::run_claimed(&pool, 10, |_| {
+        after.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    })
+    .expect("the pool still runs batches");
+    assert_eq!(after.load(Ordering::Relaxed), 10);
 }

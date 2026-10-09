@@ -459,6 +459,21 @@ impl SlotPolicy {
         self.is_pinned[d] = false;
     }
 
+    /// Unmaps `expert` of `layer`, whose data never arrived (a cancelled
+    /// prefetch in the replay): its slot joins the LRU region empty, so the
+    /// next miss takes it first. Returns the slot, `None` if not resident.
+    pub fn forget(&mut self, layer: usize, expert: usize) -> Option<u32> {
+        let slot = self.slot_of(layer, expert)?;
+        let s = slot as usize;
+        self.slot_of[layer * self.experts + expert] = Self::NONE;
+        self.slice_in[s] = None;
+        if self.is_pinned[s] {
+            self.is_pinned[s] = false;
+            self.pinned -= 1;
+        }
+        Some(slot)
+    }
+
     /// The slot holding `expert` of `layer`, if resident.
     pub fn slot_of(&self, layer: usize, expert: usize) -> Option<u32> {
         match self.slot_of[layer * self.experts + expert] {

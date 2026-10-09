@@ -292,3 +292,51 @@ fn a_timed_replay_charges_reads_and_credits_landed_prefetches() {
     let c = timed(Some(PrefetchReplay { lookahead: 1, top: 4, budget: None }));
     assert_eq!((c.decode_misses, c.decode_stall_us, c.prefetch_late), (2, 500, 0));
 }
+
+/// As [`timed`], with 1 ms reads and layers, and every layer's prediction
+/// `row`, from the token's start.
+fn timed_slow(row: [u16; 4]) -> ReplayCounts {
+    let r = UsageRanking {
+        layers: 3,
+        experts: 64,
+        counts: vec![(0..64).rev().collect(); 3],
+    };
+    let cfg = ReplayConfig {
+        slots: 128,
+        lru_share: 0.1,
+        adapt: false,
+        prefill_chunk: 4096,
+        prefetch: Some(PrefetchReplay { lookahead: 0, top: 4, budget: None }),
+        half_life: None,
+        timing: Some(SsdTiming { layer_ms: 1.0, mixer_share: 0.5, read_ms: 1.0 }),
+    };
+    let mut sim = CacheSim::new(&r, 2, cfg).expect("sim");
+    let routing: Vec<u32> = (0..3).flat_map(|_| [62, 63]).collect();
+    let mut ids: Vec<u16> = (0..3).flat_map(|_| row).collect();
+    ids.extend([0u16; 12]);
+    let pred = Predictions { ids: &ids, width: 4 };
+    let req = [TraceRequest { prefill: 0..0, decode: 0..1 }];
+    let mut c = ReplayCounts::default();
+    sim.session(&routing, Some(&pred), 1, 2, &req, &mut c).expect("replay");
+    c
+}
+
+#[test]
+fn a_timed_replay_waits_for_late_prefetches_and_cancels_stale_ones() {
+    // Six reads queued at t = 0. Layer 0 asks at 0.5 ms: its first read
+    // lands at 1.0 (late), its second, still queued, becomes a demand read
+    // landing at 2.0 (late): 1.5 ms of stall, the layer ends at 2.5. Layer
+    // 1 asks at 3.0: one read started at 2.0 has landed, the other becomes
+    // a demand read to 4.0. Layer 2 likewise: 1.0 ms each. 3.5 ms, 4 late.
+    let c = timed_slow([62, 63, 0, 1]);
+    assert_eq!(c.decode_misses, 0);
+    assert_eq!((c.prefetch_reads, c.prefetch_cancelled), (6, 0));
+    assert_eq!((c.decode_stall_us, c.prefetch_late), (3500, 4));
+    // Two wrong picks per layer (50 and 51, not resident) are read too:
+    // layer 0's are still queued when it has passed, so they are cancelled,
+    // and their slots emptied, rather than read.
+    let c = timed_slow([62, 63, 50, 51]);
+    assert!(c.prefetch_cancelled >= 2, "{c:?}");
+    assert_eq!(c.prefetch_reads + c.prefetch_cancelled, 12);
+    assert_eq!(c.decode_misses, 0);
+}

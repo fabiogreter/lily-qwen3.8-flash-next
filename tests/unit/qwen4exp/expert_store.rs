@@ -315,9 +315,37 @@ fn live_usage_halves_every_score_after_its_half_life() {
     assert!(u.score(1, 1).abs_diff(expected) <= 1, "{} vs {expected}", u.score(1, 1));
     assert_eq!(u.score(1, 2), fresh.score(1, 2) / 2 + 5);
     // No half-life, or zero: no decay.
-    let mut never = fresh.clone().with_half_life(Some(0));
-    for _ in 0..100 {
-        never.record(0, 0, true);
+    for half_life in [None, Some(0)] {
+        let mut never = fresh.clone().with_half_life(half_life);
+        for _ in 0..100 {
+            never.record(0, 0, true);
+        }
+        assert_eq!(never.score(0, 0), prior + 100 * LiveUsage::DECODE_WEIGHT);
     }
-    assert_eq!(never.score(0, 0), prior + 100 * LiveUsage::DECODE_WEIGHT);
+}
+
+/// A forgotten expert's slot is empty and taken first by the next miss; a
+/// pinned slot gives up its role.
+#[test]
+fn forget_empties_the_slot_for_the_next_miss() {
+    // Two layers of three experts, six slots: four pinned, two LRU.
+    let r = ranking(&[&[50, 40, 30], &[20, 10, 0]]);
+    let mut p = SlotPolicy::new(6, 2, 3, &r, 1.0 / 3.0).expect("policy");
+    // LRU: (1,1) in slot 4, (1,2) in slot 5; (0,0) is pinned in slot 0.
+    assert_eq!(p.forget(1, 1), Some(4));
+    assert_eq!(p.slot_of(1, 1), None);
+    assert_eq!(p.slice_in(4), None);
+    assert_eq!(p.forget(1, 1), None, "already gone");
+    assert_eq!(p.forget(0, 0), Some(0));
+    assert!(!p.is_pinned(0));
+    assert_eq!(p.pinned(), 3);
+    // The next miss in layer 1 takes an empty slot, never the resident (1,2).
+    match p.lookup(1, 1, 7) {
+        Lookup::Miss { slot, evicted } => {
+            assert!(slot == 4 || slot == 0, "slot {slot}");
+            assert_eq!(evicted, None);
+        }
+        other => panic!("expected a miss, got {other:?}"),
+    }
+    assert!(p.slot_of(1, 2).is_some());
 }

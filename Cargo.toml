@@ -64,6 +64,9 @@ serde = { version = "1.0.228", features = ["derive"] }
 # arguments parsed from the model's tool calls keep the generated order.
 serde_json = { version = "1.0.150", features = ["preserve_order"] }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+# The expert cache's read threads (`qwen4exp::expert_cache`): one pool for
+# the life of the cache instead of threads started per resolution.
+rayon = "1.12.0"
 
 # Metal and the Objective-C runtime. The engine is macOS-only; `lib.rs` gates
 # every GPU module on `target_os = "macos"` so the crate still type-checks

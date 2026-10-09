@@ -69,8 +69,9 @@ struct Cli {
     /// the previous one's cache would persist (`LiveUsage::merged`).
     #[arg(long, default_value_t = false, requires = "fresh")]
     persist: bool,
-    /// Usage half-lives to sweep, in decoded tokens (`off`: no decay).
-    #[arg(long, value_delimiter = ',', default_value = "off")]
+    /// Usage half-lives to sweep, in decoded tokens (`off`: no decay); the
+    /// default is the server's (`LiveUsage::HALF_LIFE_TOKENS`).
+    #[arg(long, value_delimiter = ',', default_value = "500")]
     half_lives: Vec<String>,
     /// Time the decode against a modelled SSD (`cache_replay::SsdTiming`).
     #[arg(long, default_value_t = false)]
@@ -421,6 +422,7 @@ fn main() -> Result<()> {
                 "decode_layers_missed": c.decode_layers_missed, "full": c.full,
                 "promotions": c.promotions, "prefetch_reads": c.prefetch_reads,
                 "prefetch_useful": c.prefetch_useful, "prefetch_full": c.prefetch_full,
+                "prefetch_cancelled": c.prefetch_cancelled,
                 "decode_misses_recent_64": c.decode_misses_recent_64,
                 "decode_misses_recent_1024": c.decode_misses_recent_1024,
                 "decode_stall_us": c.decode_stall_us, "prefetch_late": c.prefetch_late,

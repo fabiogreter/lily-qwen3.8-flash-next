@@ -136,8 +136,10 @@ scratch, caches and pipelines); a 64 GB machine therefore gets about
    one) pins the top slices; an LRU region (10% by default, at least a
    layer's worth, `LILY_EXPERT_LRU_SHARE`) takes the cold ones, never
    evicting a slot used at the current sequence number. Misses are read
-   with positioned reads on up to 16 threads, each expert's nine regions
-   spread over them, straight into the slot.
+   with positioned reads straight into the slot, each expert's nine
+   regions spread over a pool of 16 threads started with the cache
+   (rayon) and the service thread, which reads too ("The read threads"
+   below).
 4. **Drafts under the cache.** The draft head loads as on the full
    machine. Its own experts are resident, not slots, so a speculative
    step's draft pass pays no handshakes; only the verify pass's 48 do, as
@@ -452,7 +454,9 @@ in 0.42 ms (2.76 MB at about 6.5 GB/s), demand reads before queued
 prefetches; a layer waits for its reads. Without prefetch it charges 4.41
 ms of stall per token, against the 4.5 ms by which a cold token measured
 slower than a warm one on the bench: the model is calibrated where it can
-be. Prefill is not timed, and decoding is one token per pass.
+be. A prefetch still queued when its layer has passed is cancelled and its
+slot emptied, as a real loader would. Prefill is not timed, and decoding
+is one token per pass.
 
 The seven agent sessions, 16 246 slots, one cache across them, per decoded
 token:
@@ -480,10 +484,48 @@ promotion swaps two slots' roles, no data moves, and a pass runs every
 about 8% of the prefill misses and loses 1% at decode, about 3% of all
 reads, within what the sessions vary by.
 
-The starting ranking matters less than the decay: starting each session
-from the previous one's persisted usage gives 9.79 misses without decay
-and 9.02 with a 4 000-token half-life, against 8.29 for one cache with a
-500-token half-life.
+The starting ranking matters less than the decay. What is persisted is the
+decayed score, so the file a restart loads reflects the last thousand or
+two decoded tokens, not the history since the first load; starting each
+session from the previous one's persisted usage gives 8.33 misses at a
+500-token half-life, against 8.29 for one cache never restarted, 9.02 at
+4 000 tokens and 9.79 without decay.
+
+The half-life is counted in decode lookups, a token's worth being
+`top_k` per layer, and the replay decodes one token per pass. Under
+speculative decoding a verify pass resolves the distinct experts of its
+three rows, about 22.9 per layer, for about 2.6 accepted tokens at agent
+traffic's 79% acceptance: about 8.9 lookups per accepted token instead of
+10, so 500 tokens' worth lasts about 560 accepted tokens, inside the flat
+range. The decay was chosen on the replay alone; no live A/B against
+`LILY_EXPERT_HALF_LIFE=0` on recorded traffic has been run.
+
+### The read threads (2026-10-09)
+
+The service thread used to start and join a thread per slice of a
+resolution's reads (up to 16, nine per missed expert) every time a layer
+missed, about eight times per decoded token. A persistent pool replaced
+that. Under the 64 GB plan with the 60 GiB balloon, an 8K mixed-text
+prompt, 512 greedy tokens, tokens identical in every run, decode tok/s:
+
+| loader                                              | cold, plain | cold, 2 drafts |
+|-----------------------------------------------------|------------:|---------------:|
+| threads started per resolution (before)             | 50.4, 49.4  | 57.0, 56.6     |
+| rayon pool, service thread reads too (shipped)      | 50.4, 49.7  | 58.4, 57.9     |
+
+Starting threads cost less than expected: plain decode does not move, and
+with drafts, whose verify passes miss several experts per layer, the pool
+gains 1.5 to 3.5% in this pair. Two runs per cell sit inside the decode
+noise band of single runs, but the gain held in three separate A/Bs that
+evening (a hand-written pool with the same scheme: 60.3 and 60.1 against
+58.2 and 58.5, then 58.5 and 58.4 against 56.9 and 57.7). The initial fill
+of 16 246 slots took 4.7 to 6.2 s, against 5.4 to 6.5 s before. How the pool starts its work mattered: a rayon parallel
+iterator over the reads measured 1 to 2% slower than the old threads, and
+a broadcast to every pool thread no faster, both because the service
+thread waits for pool threads to wake before the first read starts; with
+the service thread claiming reads itself from the same counter as the
+pool jobs (`expert_cache::run_claimed`), the first read starts at once. A
+hand-written pool doing the same measured the same.
 
 ### Cross-layer prefetch on agent sessions, and what it costs (2026-10-09)
 

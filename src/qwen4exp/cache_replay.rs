@@ -62,7 +62,9 @@ pub struct ReplayConfig {
 /// at about 6.5 GB/s), demand reads before queued prefetches, a read once
 /// started not interrupted. A layer waits for its missed experts and for
 /// prefetched ones still in flight; a prefetch still queued when its layer
-/// asks becomes a demand read. Prefill is not timed.
+/// asks becomes a demand read, and the ones its layer did not route to are
+/// cancelled and their slots emptied ([`SlotPolicy::forget`]). Prefill is
+/// not timed.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SsdTiming {
     pub layer_ms: f64,
@@ -113,14 +115,16 @@ impl Clock {
     }
 
     /// `layer`'s request at `t` with its routed experts (distinct) and the
-    /// ones the policy missed: the stall, and how many prefetched experts
-    /// had not landed.
+    /// ones the policy missed: the stall, how many prefetched experts had
+    /// not landed, and (into `cancelled`) the prefetches for `layer` still
+    /// queued, which no longer serve any purpose.
     fn resolve(
         &mut self,
         layer: usize,
         t: f64,
         routed: &[u32],
         missed: &[u32],
+        cancelled: &mut Vec<u32>,
     ) -> (f64, u64) {
         self.run_queue(t);
         let (mut done, mut late) = (t, 0);
@@ -141,6 +145,14 @@ impl Clock {
             }
         }
         self.landing.retain(|_, &mut land| land > t);
+        cancelled.clear();
+        self.queue.retain(|&(l, e, _)| {
+            let stale = l == layer;
+            if stale {
+                cancelled.push(e);
+            }
+            !stale
+        });
         (done - t, late)
     }
 }
@@ -187,6 +199,9 @@ pub struct ReplayCounts {
     pub prefetch_useful: u64,
     /// Prefetches given up because no LRU slot was free at the tick.
     pub prefetch_full: u64,
+    /// Timed replay: prefetches still queued when their layer had passed,
+    /// cancelled unread (not in `prefetch_reads`).
+    pub prefetch_cancelled: u64,
     /// Timed replay: decode stall, in microseconds, and prefetched experts
     /// a layer had to wait for.
     pub decode_stall_us: u64,
@@ -212,6 +227,7 @@ impl ReplayCounts {
         self.prefetch_reads += o.prefetch_reads;
         self.prefetch_useful += o.prefetch_useful;
         self.prefetch_full += o.prefetch_full;
+        self.prefetch_cancelled += o.prefetch_cancelled;
         self.decode_stall_us += o.decode_stall_us;
         self.prefetch_late += o.prefetch_late;
         self.decode_misses_recent_64 += o.decode_misses_recent_64;
@@ -415,6 +431,7 @@ impl CacheSim {
         let mut prefetched: Vec<Vec<u32>> = vec![Vec::new(); self.layers];
         self.last_seen.fill(0);
         let mut clock = self.config.timing.map(Clock::new);
+        let mut cancelled: Vec<u32> = Vec::new();
         let experts = self.experts;
         for r in requests {
             ensure!(
@@ -488,8 +505,18 @@ impl CacheSim {
                     let mut layer_end = 0.0;
                     if let Some(c) = &mut clock {
                         let t = c.now + c.timing.mixer_share * c.timing.layer_ms;
-                        let (stall, late) =
-                            c.resolve(layer, t, &self.ids, &self.missed);
+                        let (stall, late) = c.resolve(
+                            layer,
+                            t,
+                            &self.ids,
+                            &self.missed,
+                            &mut cancelled,
+                        );
+                        for &e in &cancelled {
+                            self.policy.forget(layer, e as usize);
+                        }
+                        counts.prefetch_reads -= cancelled.len() as u64;
+                        counts.prefetch_cancelled += cancelled.len() as u64;
                         counts.decode_stall_us += (stall * 1000.0).round() as u64;
                         counts.prefetch_late += late;
                         layer_end = t
@@ -518,6 +545,7 @@ impl CacheSim {
                         let target = layer + p.lookahead;
                         if target < self.layers {
                             let mut read = std::mem::take(&mut prefetched[target]);
+                            let before = read.len();
                             self.prefetch(
                                 *p,
                                 pred,
@@ -528,7 +556,9 @@ impl CacheSim {
                             // The prediction is ready when layer `l` ends.
                             if let Some(c) = &mut clock {
                                 c.queue.extend(
-                                    read.iter().map(|&e| (target, e, layer_end)),
+                                    read[before..]
+                                        .iter()
+                                        .map(|&e| (target, e, layer_end)),
                                 );
                             }
                             prefetched[target] = read;
