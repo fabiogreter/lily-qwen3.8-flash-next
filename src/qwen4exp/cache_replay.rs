@@ -48,6 +48,101 @@ pub struct ReplayConfig {
     pub prefill_chunk: usize,
     /// The decode-time prefetch; `None`: off.
     pub prefetch: Option<PrefetchReplay>,
+    /// [`LiveUsage::with_half_life`], in decoded tokens; `None`: no decay.
+    pub half_life: Option<u64>,
+    /// Times the decode against a modelled SSD; `None`: counts only.
+    pub timing: Option<SsdTiming>,
+}
+
+/// The decode timeline of a timed replay. A decoded token runs its layers
+/// in order, each taking `layer_ms` when nothing is missing (the warm
+/// per-layer time under the cache, handshake included); a layer's request
+/// comes `mixer_share` into it, after its attention or DeltaNet mixer. The
+/// SSD reads one expert at a time in `read_ms` (bandwidth bound: 2.76 MB
+/// at about 6.5 GB/s), demand reads before queued prefetches, a read once
+/// started not interrupted. A layer waits for its missed experts and for
+/// prefetched ones still in flight; a prefetch still queued when its layer
+/// asks becomes a demand read. Prefill is not timed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SsdTiming {
+    pub layer_ms: f64,
+    pub mixer_share: f64,
+    pub read_ms: f64,
+}
+
+/// The SSD and the clock of a timed replay ([`SsdTiming`]).
+struct Clock {
+    timing: SsdTiming,
+    now: f64,
+    /// When the read in service ends.
+    ssd_free: f64,
+    /// Prefetches not started: `(layer, expert, issued at)`, in issue order.
+    queue: std::collections::VecDeque<(usize, u32, f64)>,
+    /// Prefetches started: `(layer, expert)` -> when they land.
+    landing: std::collections::HashMap<(usize, u32), f64>,
+}
+
+impl Clock {
+    fn new(timing: SsdTiming) -> Self {
+        Self {
+            timing,
+            now: 0.0,
+            ssd_free: 0.0,
+            queue: Default::default(),
+            landing: Default::default(),
+        }
+    }
+
+    /// Starts queued prefetches the SSD reaches before `until`.
+    fn run_queue(&mut self, until: f64) {
+        while let Some(&(layer, expert, issued)) = self.queue.front() {
+            let start = self.ssd_free.max(issued);
+            if start >= until {
+                break;
+            }
+            self.queue.pop_front();
+            self.ssd_free = start + self.timing.read_ms;
+            self.landing.insert((layer, expert), self.ssd_free);
+        }
+    }
+
+    /// One demand read asked for at `t`: when it lands.
+    fn demand(&mut self, t: f64) -> f64 {
+        self.ssd_free = self.ssd_free.max(t) + self.timing.read_ms;
+        self.ssd_free
+    }
+
+    /// `layer`'s request at `t` with its routed experts (distinct) and the
+    /// ones the policy missed: the stall, and how many prefetched experts
+    /// had not landed.
+    fn resolve(
+        &mut self,
+        layer: usize,
+        t: f64,
+        routed: &[u32],
+        missed: &[u32],
+    ) -> (f64, u64) {
+        self.run_queue(t);
+        let (mut done, mut late) = (t, 0);
+        for &e in routed {
+            if missed.contains(&e) {
+                done = done.max(self.demand(t));
+            } else if let Some(land) = self.landing.get(&(layer, e)).copied() {
+                if land > t {
+                    done = done.max(land);
+                    late += 1;
+                }
+            } else if let Some(i) =
+                self.queue.iter().position(|&(l, x, _)| l == layer && x == e)
+            {
+                self.queue.remove(i);
+                done = done.max(self.demand(t));
+                late += 1;
+            }
+        }
+        self.landing.retain(|_, &mut land| land > t);
+        (done - t, late)
+    }
 }
 
 /// A prefetch during decode: after layer `l`'s request, read the `top`
@@ -92,6 +187,10 @@ pub struct ReplayCounts {
     pub prefetch_useful: u64,
     /// Prefetches given up because no LRU slot was free at the tick.
     pub prefetch_full: u64,
+    /// Timed replay: decode stall, in microseconds, and prefetched experts
+    /// a layer had to wait for.
+    pub decode_stall_us: u64,
+    pub prefetch_late: u64,
     /// Decode misses whose expert the same layer routed to within the last
     /// 64 (1 024) positions of the session: what a predictor from recent
     /// routing could have known.
@@ -113,6 +212,8 @@ impl ReplayCounts {
         self.prefetch_reads += o.prefetch_reads;
         self.prefetch_useful += o.prefetch_useful;
         self.prefetch_full += o.prefetch_full;
+        self.decode_stall_us += o.decode_stall_us;
+        self.prefetch_late += o.prefetch_late;
         self.decode_misses_recent_64 += o.decode_misses_recent_64;
         self.decode_misses_recent_1024 += o.decode_misses_recent_1024;
     }
@@ -159,11 +260,17 @@ impl CacheSim {
             missed: Vec::new(),
             last_seen: vec![0; layers * experts],
             policy: SlotPolicy::new(config.slots, layers, experts, ranking, lru_share)?,
-            usage: LiveUsage::new(ranking, config.slots, top_k),
+            usage: LiveUsage::new(ranking, config.slots, top_k)
+                .with_half_life(config.half_life),
             tick: 0,
             served: 0,
             ids: Vec::new(),
         })
+    }
+
+    /// The usage the cache would persist now ([`LiveUsage::merged`]).
+    pub fn merged_usage(&self) -> UsageRanking {
+        self.usage.merged()
     }
 
     /// Decode misses and useful prefetch reads per layer, summed over
@@ -307,6 +414,7 @@ impl CacheSim {
         let mut pass: Vec<u32> = Vec::new();
         let mut prefetched: Vec<Vec<u32>> = vec![Vec::new(); self.layers];
         self.last_seen.fill(0);
+        let mut clock = self.config.timing.map(Clock::new);
         let experts = self.experts;
         for r in requests {
             ensure!(
@@ -333,13 +441,25 @@ impl CacheSim {
                 counts.prefill_tokens += (end - pos) as u64;
                 pos = end;
             }
+            // Prefill is not timed: the SSD is taken to be idle when the
+            // request starts decoding.
+            if let Some(c) = &mut clock {
+                c.now = c.now.max(c.ssd_free);
+            }
             for pos in r.decode.clone() {
                 let mut missed = 0;
                 if let Some((p, pred)) = &prefetch
                     && p.lookahead == 0
                 {
                     for (target, read) in prefetched.iter_mut().enumerate() {
+                        let before = read.len();
                         self.prefetch(*p, pred, (target, pos, tokens), read, counts)?;
+                        if let Some(c) = &mut clock {
+                            let now = c.now;
+                            c.queue.extend(
+                                read[before..].iter().map(|&e| (target, e, now)),
+                            );
+                        }
                     }
                 }
                 for layer in 0..self.layers {
@@ -365,6 +485,18 @@ impl CacheSim {
                     }
                     let misses = self.request(layer, &pass, counts);
                     self.layer_misses[layer] += misses;
+                    let mut layer_end = 0.0;
+                    if let Some(c) = &mut clock {
+                        let t = c.now + c.timing.mixer_share * c.timing.layer_ms;
+                        let (stall, late) =
+                            c.resolve(layer, t, &self.ids, &self.missed);
+                        counts.decode_stall_us += (stall * 1000.0).round() as u64;
+                        counts.prefetch_late += late;
+                        layer_end = t
+                            + stall
+                            + (1.0 - c.timing.mixer_share) * c.timing.layer_ms;
+                        c.now = layer_end;
+                    }
                     for &e in &self.missed {
                         let last = self.last_seen[layer * experts + e as usize];
                         if last > 0 && pos + 1 - last <= 64 {
@@ -393,6 +525,12 @@ impl CacheSim {
                                 &mut read,
                                 counts,
                             )?;
+                            // The prediction is ready when layer `l` ends.
+                            if let Some(c) = &mut clock {
+                                c.queue.extend(
+                                    read.iter().map(|&e| (target, e, layer_end)),
+                                );
+                            }
                             prefetched[target] = read;
                         }
                     }

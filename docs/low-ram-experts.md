@@ -173,10 +173,14 @@ scratch, caches and pipelines); a 64 GB machine therefore gets about
    lily/sessions/` by default; `lily-bench --expert-usage-out`;
    `LILY_EXPERT_USAGE_OUT` overrides both), and the loader prefers that
    file over the ranking next to the checkpoint, so the next load places
-   experts by what this machine actually ran. `LILY_EXPERT_ADAPT=0` keeps
-   the counts but never promotes; the load line says which ranking was
-   used and where the usage goes, and the cache statistics report
-   decode-class misses and promotions.
+   experts by what this machine actually ran. Every score, the prior
+   included, halves each 500 decoded tokens' worth of decode lookups
+   (`LiveUsage::HALF_LIFE_TOKENS`, since 2026-10-09; "Usage that decays"
+   below), so the placement follows recent traffic; `LILY_EXPERT_HALF_LIFE`
+   sets another half-life in decoded tokens, 0 none. `LILY_EXPERT_ADAPT=0`
+   keeps the counts but never promotes; the load line says which ranking
+   was used, the half-life and where the usage goes, and the cache
+   statistics report decode-class misses and promotions.
 
 ### Measured
 
@@ -430,6 +434,56 @@ here does not justify the code; it was removed.
 
 The traces themselves stay out of the repository (they are a client's
 code and conversations); only these counts are recorded.
+
+### Usage that decays, the starting ranking, a timed replay (2026-10-09)
+
+Until 2026-10-09 the live counts never decayed: after a few sessions the
+pinned set followed everything since the load, and the replay showed that
+restarting each session from the shipped ranking (10.09 decode misses per
+token) beat one cache carried across all seven (10.66). `lily-cache-replay
+--half-lives` sweeps a half-life on every score
+(`LiveUsage::with_half_life`); `--fresh --persist` starts each session from
+the usage the previous one's cache would have persisted, as a server
+restarted between sessions does. `--timed` adds a timeline
+(`cache_replay::SsdTiming`): a decoded token's layers take 0.315 ms each
+with nothing missing (the warm token under the cache over 48 layers), a
+layer's request comes halfway in, and the SSD reads one expert at a time
+in 0.42 ms (2.76 MB at about 6.5 GB/s), demand reads before queued
+prefetches; a layer waits for its reads. Without prefetch it charges 4.41
+ms of stall per token, against the 4.5 ms by which a cold token measured
+slower than a warm one on the bench: the model is calibrated where it can
+be. Prefill is not timed, and decoding is one token per pass.
+
+The seven agent sessions, 16 246 slots, one cache across them, per decoded
+token:
+
+| half-life (decoded tokens) | LRU 5% misses | LRU 10% misses | stall at 10% | LRU 20% misses |
+|---------------------------:|--------------:|---------------:|-------------:|---------------:|
+| none                       | 11.56         | 10.66          | 4.41 ms      | 10.16          |
+| 64 000                     |               | 10.61          | 4.39 ms      |                |
+| 16 000                     |               | 10.10          | 4.17 ms      |                |
+| 4 000                      |               | 9.16           | 3.78 ms      |                |
+| 1 000                      | 8.48          | 8.38           | 3.46 ms      | 8.69           |
+| 500                        | 8.36          | 8.29           | 3.42 ms      | 8.65           |
+| 250                        | 8.74          | 8.53           | 3.52 ms      | 8.73           |
+| 125                        | 11.35         | 10.53          | 4.35 ms      | 9.99           |
+| 60                         | 14.02         | 12.75          | 5.26 ms      | 11.87          |
+
+A half-life of 500 tokens takes 22% off the decode misses and about 1 ms
+off a cold token's stall, in every session (-13 to -31%), with prefill
+misses within 5% either way; it is the default since. Between 250 and
+1 000 the figures are flat; below 125 the cache forgets what it needs
+again within a few hundred tokens. Promotions rise from 4 600 to about
+250 000 over the 201 000 tokens, which costs nothing measurable: a
+promotion swaps two slots' roles, no data moves, and a pass runs every
+480 resolutions either way. With decay the 10% LRU share stays: 5% saves
+about 8% of the prefill misses and loses 1% at decode, about 3% of all
+reads, within what the sessions vary by.
+
+The starting ranking matters less than the decay: starting each session
+from the previous one's persisted usage gives 9.79 misses without decay
+and 9.02 with a 4 000-token half-life, against 8.29 for one cache with a
+500-token half-life.
 
 ### Cross-layer prefetch on agent sessions, and what it costs (2026-10-09)
 

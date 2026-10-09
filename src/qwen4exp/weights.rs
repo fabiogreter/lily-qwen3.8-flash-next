@@ -849,7 +849,14 @@ pub fn load(
                 None => UsageRanking::uniform(layers, e),
             };
             let adapt = std::env::var("LILY_EXPERT_ADAPT").map_or(true, |v| v != "0");
-            let live = LiveUsage::new(&ranking, n_slots, config.num_experts_per_tok);
+            // `LILY_EXPERT_HALF_LIFE` overrides the usage half-life in
+            // decoded tokens for measurement (0: no decay).
+            let half_life = std::env::var("LILY_EXPERT_HALF_LIFE")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(LiveUsage::HALF_LIFE_TOKENS);
+            let live = LiveUsage::new(&ranking, n_slots, config.num_experts_per_tok)
+                .with_half_life(Some(half_life));
             ensure!(
                 n_slots >= 2 * e,
                 "an expert cache needs at least {} slots (two layers' worth), got {n_slots}",
@@ -877,12 +884,17 @@ pub fn load(
                 config.quantization,
             )?;
             eprintln!(
-                "expert cache: {n_slots} slots for {} experts, usage {}, live promotion {}, persisted to {}",
+                "expert cache: {n_slots} slots for {} experts, usage {}, live promotion {}, usage half-life {}, persisted to {}",
                 layers * e,
                 usage
                     .as_ref()
                     .map_or("uniform".to_string(), |p| p.display().to_string()),
                 if adapt { "on" } else { "off (LILY_EXPERT_ADAPT=0)" },
+                if half_life == 0 {
+                    "off".to_string()
+                } else {
+                    format!("{half_life} tokens")
+                },
                 usage_out
                     .as_ref()
                     .map_or("nowhere".to_string(), |p| p.display().to_string())

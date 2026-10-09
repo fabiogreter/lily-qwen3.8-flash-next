@@ -536,6 +536,11 @@ impl SlotPolicy {
 /// the loaded ranking scaled to the score [`Self::PRIOR_TOKENS`] decoded
 /// tokens would accumulate, so it decides the placement until about that
 /// much live decoding has been seen and the live counts dominate after.
+///
+/// With a half-life ([`Self::with_half_life`]) every part of the score,
+/// the prior included, is halved each time that many decoded tokens' worth
+/// of decode lookups (`top_k` per cached layer) have been counted, so the
+/// placement follows recent traffic rather than everything since the load.
 #[derive(Clone)]
 pub struct LiveUsage {
     layers: usize,
@@ -547,6 +552,10 @@ pub struct LiveUsage {
     /// `[slot]` -> the tick a slot was last pinned by a promotion.
     pinned_at: Vec<u64>,
     promotions: u64,
+    /// Decode lookups between halvings; `None`: no decay.
+    halve_every: Option<u64>,
+    /// Decode lookups counted since the last halving.
+    since_halving: u64,
 }
 
 impl LiveUsage {
@@ -563,6 +572,11 @@ impl LiveUsage {
     pub const PROTECT_TICKS: u64 = 9_600;
     /// Candidates compared per promotion pass.
     const PAIRS: usize = 16;
+    /// The cache's default half-life, in decoded tokens: replayed on
+    /// recorded agent sessions on 2026-10-09, decode misses fell by 22%
+    /// against no decay (13 to 31% per session), flat from 250 to 1 000
+    /// (`docs/low-ram-experts.md`, "Usage that decays").
+    pub const HALF_LIFE_TOKENS: u64 = 500;
 
     pub fn new(ranking: &UsageRanking, n_slots: usize, top_k: usize) -> Self {
         let (layers, experts) = (ranking.layers, ranking.experts);
@@ -585,7 +599,18 @@ impl LiveUsage {
             prefill: vec![0; layers * experts],
             pinned_at: vec![0; n_slots],
             promotions: 0,
+            halve_every: None,
+            since_halving: 0,
         }
+    }
+
+    /// Halves every score each `tokens` decoded tokens (see the type's
+    /// documentation); `None` or 0 keeps every count.
+    pub fn with_half_life(mut self, tokens: Option<u64>) -> Self {
+        self.halve_every = tokens
+            .filter(|&t| t > 0)
+            .map(|t| t * (self.layers as u64) * (self.top_k as u64));
+        self
     }
 
     /// Counts one lookup of `expert` in `layer`, at decode or at prefill.
@@ -593,6 +618,15 @@ impl LiveUsage {
         let i = layer * self.experts + expert;
         let counts = if decode { &mut self.decode } else { &mut self.prefill };
         counts[i] = counts[i].saturating_add(1);
+        if decode && let Some(every) = self.halve_every {
+            self.since_halving += 1;
+            if self.since_halving >= every {
+                self.since_halving = 0;
+                self.prior.iter_mut().for_each(|c| *c /= 2);
+                self.decode.iter_mut().for_each(|c| *c /= 2);
+                self.prefill.iter_mut().for_each(|c| *c /= 2);
+            }
+        }
     }
 
     /// The slice's score (see the type's documentation).

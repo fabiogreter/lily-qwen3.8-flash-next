@@ -287,3 +287,37 @@ fn live_usage_promotes_by_score_with_hysteresis() {
     assert_eq!(back.ranked()[0], (1, 0), "the most-used slice ranks first");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// With a half-life every part of the score halves once that many decoded
+/// tokens' worth of decode lookups have been counted, the prior included;
+/// prefill lookups do not advance the clock, and without a half-life
+/// nothing decays.
+#[test]
+fn live_usage_halves_every_score_after_its_half_life() {
+    // Two layers, top-2: one decoded token is four decode lookups.
+    let r = ranking(&[&[50, 40, 30], &[20, 10, 0]]);
+    let fresh = LiveUsage::new(&r, 6, 2);
+    let prior = fresh.score(0, 0);
+    let mut u = fresh.clone().with_half_life(Some(2));
+    for _ in 0..10 {
+        u.record(1, 2, false);
+    }
+    // Seven decode lookups: below the eight of two tokens.
+    for _ in 0..7 {
+        u.record(1, 1, true);
+    }
+    assert_eq!(u.score(0, 0), prior);
+    let before = u.score(1, 1);
+    u.record(1, 1, true);
+    assert_eq!(u.score(0, 0), prior / 2);
+    // (1, 1): its prior and its eight decode lookups, halved.
+    let expected = (before + LiveUsage::DECODE_WEIGHT) / 2;
+    assert!(u.score(1, 1).abs_diff(expected) <= 1, "{} vs {expected}", u.score(1, 1));
+    assert_eq!(u.score(1, 2), fresh.score(1, 2) / 2 + 5);
+    // No half-life, or zero: no decay.
+    let mut never = fresh.clone().with_half_life(Some(0));
+    for _ in 0..100 {
+        never.record(0, 0, true);
+    }
+    assert_eq!(never.score(0, 0), prior + 100 * LiveUsage::DECODE_WEIGHT);
+}

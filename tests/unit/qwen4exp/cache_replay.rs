@@ -20,6 +20,8 @@ fn config() -> ReplayConfig {
         adapt: false,
         prefill_chunk: 4,
         prefetch: None,
+        half_life: None,
+        timing: None,
     }
 }
 
@@ -71,6 +73,8 @@ fn a_small_slab_misses_and_counts_layers() {
         adapt: false,
         prefill_chunk: 4096,
         prefetch: None,
+        half_life: None,
+        timing: None,
     };
     let mut sim = CacheSim::new(&r, 2, cfg).expect("sim");
     let mut c = ReplayCounts::default();
@@ -100,6 +104,8 @@ fn prefetched(prefetch: PrefetchReplay) -> ReplayCounts {
         adapt: false,
         prefill_chunk: 4096,
         prefetch: Some(prefetch),
+        half_life: None,
+        timing: None,
     };
     let mut sim = CacheSim::new(&r, 2, cfg).expect("sim");
     let routing: Vec<u32> = (0..3).flat_map(|_| [62, 63]).collect();
@@ -197,6 +203,8 @@ fn a_token_start_prefetch_reads_every_layer_before_the_pass() {
         adapt: false,
         prefill_chunk: 4096,
         prefetch: Some(PrefetchReplay { lookahead: 0, top: 4, budget: None }),
+        half_life: None,
+        timing: None,
     };
     let mut sim = CacheSim::new(&r, 2, cfg).expect("sim");
     let routing: Vec<u32> = (0..3).flat_map(|_| [62, 63]).collect();
@@ -224,6 +232,8 @@ fn misses_are_classed_by_how_recently_the_layer_used_the_expert() {
         adapt: false,
         prefill_chunk: 4096,
         prefetch: None,
+        half_life: None,
+        timing: None,
     };
     let mut sim = CacheSim::new(&r, 2, cfg).expect("sim");
     // Two decoded positions routed to (62, 63) in every layer: the first
@@ -234,4 +244,51 @@ fn misses_are_classed_by_how_recently_the_layer_used_the_expert() {
     sim.session(&routing, None, 2, 2, &req, &mut c).expect("replay");
     assert_eq!(c.decode_misses, 6);
     assert_eq!((c.decode_misses_recent_64, c.decode_misses_recent_1024), (0, 0));
+}
+
+/// One decoded token over three layers of 64 experts, routed to (62, 63)
+/// everywhere, which no layer holds, timed: every layer waits for two reads
+/// in a row; a prefetch from the token's start has them landed for the
+/// later layers but not for layer 0.
+fn timed(prefetch: Option<PrefetchReplay>) -> ReplayCounts {
+    let r = UsageRanking {
+        layers: 3,
+        experts: 64,
+        counts: vec![(0..64).rev().collect(); 3],
+    };
+    let cfg = ReplayConfig {
+        slots: 128,
+        lru_share: 0.1,
+        adapt: false,
+        prefill_chunk: 4096,
+        prefetch,
+        half_life: None,
+        timing: Some(SsdTiming { layer_ms: 1.0, mixer_share: 0.5, read_ms: 0.25 }),
+    };
+    let mut sim = CacheSim::new(&r, 2, cfg).expect("sim");
+    let routing: Vec<u32> = (0..3).flat_map(|_| [62, 63]).collect();
+    let mut ids: Vec<u16> = (0..3).flat_map(|_| [62u16, 63, 0, 1]).collect();
+    ids.extend([0u16; 12]);
+    let pred = Predictions { ids: &ids, width: 4 };
+    let req = [TraceRequest { prefill: 0..0, decode: 0..1 }];
+    let mut c = ReplayCounts::default();
+    sim.session(&routing, Some(&pred), 1, 2, &req, &mut c).expect("replay");
+    c
+}
+
+#[test]
+fn a_timed_replay_charges_reads_and_credits_landed_prefetches() {
+    // Without a prefetch: three layers, two reads of 0.25 ms each.
+    let c = timed(None);
+    assert_eq!((c.decode_misses, c.decode_stall_us, c.prefetch_late), (6, 1500, 0));
+    // From the token's start, the six reads queue in layer order at t = 0:
+    // layer 0 asks at 0.5 ms with both of its reads landed (0.25, 0.5),
+    // layer 1 at 1.5 ms, layer 2 at 2.5 ms: no stall at all.
+    let c = timed(Some(PrefetchReplay { lookahead: 0, top: 4, budget: None }));
+    assert_eq!((c.decode_misses, c.prefetch_reads, c.decode_stall_us), (0, 6, 0));
+    // One layer ahead: layer 0 misses both (0.5 ms of stall) and ends at
+    // 1.5 ms, when layer 1's prefetch is issued; layer 1 asks at 2 ms, its
+    // reads land at 1.75 and 2.0: no stall. Layer 2 likewise.
+    let c = timed(Some(PrefetchReplay { lookahead: 1, top: 4, budget: None }));
+    assert_eq!((c.decode_misses, c.decode_stall_us, c.prefetch_late), (2, 500, 0));
 }

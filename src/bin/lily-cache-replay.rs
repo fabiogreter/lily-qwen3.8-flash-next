@@ -6,7 +6,9 @@
 //! and `STEM.json`: `{"tokens": N, "requests": [[p0, p1, p2], ...]}`, a
 //! request prefilling `p0..p1` and generating `p1..p2`. Sessions replay in
 //! the order given through one cache, as one server would serve them,
-//! unless `--fresh` starts every session from the loaded ranking. A
+//! unless `--fresh` starts every session from the loaded ranking (or with
+//! `--persist` from the usage the previous session's cache would have
+//! persisted, as a server restarted between sessions would). A
 //! prefetch reads `STEM.pred.u16` (`lily-trace-routing --predict`), or with
 //! `--predictor transitions` predicts from cross-layer transition counts
 //! (`cache_replay::Transitions`) learned on the other sessions given, or
@@ -19,8 +21,8 @@ use std::path::PathBuf;
 use anyhow::{Context as _, Result, ensure};
 use clap::Parser;
 use lily::qwen4exp::cache_replay::{
-    CacheSim, Predictions, PrefetchReplay, ReplayConfig, ReplayCounts, TokenRouting,
-    TraceRequest, Transitions,
+    CacheSim, Predictions, PrefetchReplay, ReplayConfig, ReplayCounts, SsdTiming,
+    TokenRouting, TraceRequest, Transitions,
 };
 use lily::qwen4exp::expert_store::UsageRanking;
 
@@ -63,6 +65,26 @@ struct Cli {
     /// Start every session from the loaded ranking.
     #[arg(long, default_value_t = false)]
     fresh: bool,
+    /// With `--fresh`: start each session after the first from the usage
+    /// the previous one's cache would persist (`LiveUsage::merged`).
+    #[arg(long, default_value_t = false, requires = "fresh")]
+    persist: bool,
+    /// Usage half-lives to sweep, in decoded tokens (`off`: no decay).
+    #[arg(long, value_delimiter = ',', default_value = "off")]
+    half_lives: Vec<String>,
+    /// Time the decode against a modelled SSD (`cache_replay::SsdTiming`).
+    #[arg(long, default_value_t = false)]
+    timed: bool,
+    /// Per-layer decode time with nothing missing, ms (15.1 ms warm token
+    /// under the cache over 48 layers).
+    #[arg(long, default_value_t = 0.315)]
+    layer_ms: f64,
+    /// Where in a layer its request comes (after the mixer).
+    #[arg(long, default_value_t = 0.5)]
+    mixer_share: f64,
+    /// One expert read, ms (2.76 MB at about 6.5 GB/s).
+    #[arg(long, default_value_t = 0.42)]
+    read_ms: f64,
     #[arg(long)]
     json_out: Option<PathBuf>,
 }
@@ -268,16 +290,35 @@ fn main() -> Result<()> {
             cli.learned_width,
         )?;
     }
+    let half_lives = cli
+        .half_lives
+        .iter()
+        .map(|h| -> Result<Option<u64>> {
+            if h == "off" {
+                return Ok(None);
+            }
+            Ok(Some(h.parse().with_context(|| format!("half-life {h}"))?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let timing = cli.timed.then_some(SsdTiming {
+        layer_ms: cli.layer_ms,
+        mixer_share: cli.mixer_share,
+        read_ms: cli.read_ms,
+    });
     let mut configs = Vec::new();
     for &lru_share in &cli.lru_shares {
         for &prefetch in &prefetches {
-            configs.push(ReplayConfig {
-                slots: cli.slots,
-                lru_share,
-                adapt: true,
-                prefill_chunk: cli.prefill_chunk,
-                prefetch,
-            });
+            for &half_life in &half_lives {
+                configs.push(ReplayConfig {
+                    slots: cli.slots,
+                    lru_share,
+                    adapt: true,
+                    prefill_chunk: cli.prefill_chunk,
+                    prefetch,
+                    half_life,
+                    timing,
+                });
+            }
         }
     }
     let results: Vec<Result<Replayed>> = std::thread::scope(|scope| {
@@ -299,7 +340,12 @@ fn main() -> Result<()> {
                     for t in traces {
                         if cli.fresh {
                             take(&sim);
-                            sim = CacheSim::new(ranking, cli.top_k, config)?;
+                            let next = if cli.persist {
+                                sim.merged_usage()
+                            } else {
+                                ranking.clone()
+                            };
+                            sim = CacheSim::new(&next, cli.top_k, config)?;
                         }
                         let mut c = ReplayCounts::default();
                         let pred = (!t.predicted.is_empty()).then(|| Predictions {
@@ -333,10 +379,14 @@ fn main() -> Result<()> {
         "{} sessions, {} slots, {}",
         traces.len(),
         cli.slots,
-        if cli.fresh { "fresh per session" } else { "one cache across sessions" }
+        match (cli.fresh, cli.persist) {
+            (false, _) => "one cache across sessions",
+            (true, false) => "fresh per session from the loaded ranking",
+            (true, true) => "fresh per session from the previous session's usage",
+        }
     );
     println!(
-        "lru share | pinned | prefetch | decode miss/tok | layers missed/tok | prefetch reads/tok | useful/tok | recent 64/1024 | prefill miss/tok | promotions | full"
+        "lru share | pinned | prefetch | half-life | decode miss/tok | layers missed/tok | prefetch reads/tok | useful/tok | stall ms/tok | late/tok | recent 64/1024 | prefill miss/tok | promotions | full"
     );
     let mut json = Vec::new();
     for (config, result) in configs.iter().zip(results) {
@@ -346,14 +396,17 @@ fn main() -> Result<()> {
             all.plus(c);
         }
         println!(
-            "{:9.2} | {:6} | {:8} | {:15.2} | {:17.2} | {:18.2} | {:10.2} | {:6.2} {:6.2} | {:16.3} | {:10} | {}",
+            "{:9.2} | {:6} | {:8} | {:9} | {:15.2} | {:17.2} | {:18.2} | {:10.2} | {:12.3} | {:8.2} | {:6.2} {:6.2} | {:16.3} | {:10} | {}",
             config.lru_share,
             pinned,
             label(config.prefetch),
+            config.half_life.map_or("off".into(), |h| h.to_string()),
             rate(all.decode_misses, all.decode_tokens),
             rate(all.decode_layers_missed, all.decode_tokens),
             rate(all.prefetch_reads, all.decode_tokens),
             rate(all.prefetch_useful, all.decode_tokens),
+            rate(all.decode_stall_us, all.decode_tokens) / 1000.0,
+            rate(all.prefetch_late, all.decode_tokens),
             rate(all.decode_misses_recent_64, all.decode_tokens),
             rate(all.decode_misses_recent_1024, all.decode_tokens),
             rate(all.prefill_misses, all.prefill_tokens),
@@ -370,6 +423,7 @@ fn main() -> Result<()> {
                 "prefetch_useful": c.prefetch_useful, "prefetch_full": c.prefetch_full,
                 "decode_misses_recent_64": c.decode_misses_recent_64,
                 "decode_misses_recent_1024": c.decode_misses_recent_1024,
+                "decode_stall_us": c.decode_stall_us, "prefetch_late": c.prefetch_late,
             })
         };
         json.push(serde_json::json!({
@@ -378,6 +432,7 @@ fn main() -> Result<()> {
             "decode_misses_by_layer": misses,
             "prefetch_useful_by_layer": useful,
             "prefetch": label(config.prefetch),
+            "half_life": config.half_life,
             "all": counts(&all),
             "sessions": traces.iter().zip(&per)
                 .map(|(t, c)| serde_json::json!({"name": t.name, "counts": counts(c)}))
@@ -389,6 +444,10 @@ fn main() -> Result<()> {
             "usage": cli.usage.display().to_string(),
             "slots": cli.slots,
             "fresh": cli.fresh,
+            "persist": cli.persist,
+            "timing": timing.map(|t| serde_json::json!({
+                "layer_ms": t.layer_ms, "mixer_share": t.mixer_share, "read_ms": t.read_ms,
+            })),
             "predictor": cli.predictor,
             "results": json,
         });
