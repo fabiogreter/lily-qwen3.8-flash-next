@@ -4,6 +4,7 @@
 //! hyper-connections, the per-layer n-gram embedding, and Qwen Sparse
 //! Attention on top.
 
+pub mod cache_replay;
 pub mod config;
 pub mod expert_cache;
 pub mod expert_store;

@@ -309,6 +309,122 @@ always among the plan's resident weights; its session caches now count in
 the server's reserve. Cold, the gain is 15% at two drafts and the third
 draft returns nothing; warm, 32% and 40%.
 
+### The re-rank at the end of a prefill: built, measured, dropped (2026-10-09)
+
+The replay of the live policy over logged routing (6 prompts of 8K, 128
+decoded tokens each) had the slab ranked by the prompt's own prefill
+counts halving decode misses, 5.4 against 10.7 per token. So the re-rank
+was built: the service thread counted every routed id of a prompt's
+prefill passes, repeats included, and at the prompt's first decode-class
+request after a prefill of at least 2 048 tokens moved the whole slab to
+that prompt's ranking (its counts, ties by the live score). Target experts
+already in the LRU region took pinned roles from slots whose experts left
+the target, with no data moved; the rest were read by four background
+threads into slots taken out of service one at a time, unmapped so that no
+miss could take them, and an expert routed before its read landed came in
+through an ordinary miss, which the finished read deferred to. Promotion
+was biased toward the prompt, with what is persisted left unbiased. It was
+measured with `lily-bench --warmup-text` (the warm-up prefills a
+different 8K text, so the measured prompt arrives at a cache placed for
+another one, as a server's next request does, and its own re-rank and
+background reads fall inside the measurement), the 64 GB plan, the
+mixed-text 8K prompt, greedy. Token digests were identical with the
+re-rank on and off in every pair, plain and with two drafts.
+
+| decoded tokens, cache state | decode misses off | on | change |
+|-----------------------------|------------------:|---:|-------:|
+| 128, warm                   | 1 347             | 827   | -39% |
+| 512, warm                   | 4 871             | 3 306 | -32% |
+| 512, cold                   | 4 871             | 3 456 to 3 462 | -29% |
+| 512, cold, 2 drafts         | 5 276             | 3 989 to 4 004 | -24% |
+
+| 512 tokens, cold (60 GiB balloon) | off | on |
+|-----------------------------------|----:|---:|
+| plain decode, tok/s               | 50.1, 50.6 | 53.9, 53.0 |
+| 2 drafts, tok/s                   | 58.3, 55.0 | 64.1, 62.2 |
+
+About 2 150 to 2 500 background loads per prompt (about 400 role swaps),
+all landed within the first 128 tokens; 16 read threads instead of 4
+changed nothing. Prefill moved within the cold runs' noise (the pinned set
+the measured prompt starts from is the warm-up prompt's). Promotion does
+not undo the re-rank: with the bias at 0, 1, 4 or 16 times the prior's
+weight, or promotion off, the 512-token warm misses stay between 3 325 and
+3 486 against 4 871 off. The first version re-ranked the pinned set only
+(3 432 misses at 512, 933 at 128); taking the LRU region's contents into
+the target as well brought the 128-token figure to 827. The replay's
+halving is not reached: it counted six prompts, and its policy started
+each prompt from a fresh fill.
+
+In agent use the trigger is the question, not the gain: the server log
+shows that 13% of requests prefill 2 048 or more new tokens (median 87 to
+224), since the session cache supplies the prefix. The re-rank therefore
+acts at a session's start and on large tool results; between them the
+live promotion is what adapts. "Replaying agent sessions" below measures
+that on recorded traffic, where it does not pay, so it was removed again.
+
+### Replaying agent sessions (2026-10-09)
+
+The bench continues the text it prefilled, which is the case most
+favourable to a ranking learned from the prefill. Agent traffic is not
+that: a long prefill there is mostly a tool result (a file, test output),
+and the decode that follows is the model's own reasoning and tool calls.
+To measure the cache on real traffic without a 64 GB machine or hours of
+cold runs, two tools replay recorded sessions:
+
+- `lily-trace-routing --model <checkpoint> --tokens <file.u32>...
+  --out-dir <dir>` prefills each recorded session (little-endian `u32`
+  token ids, the whole conversation as the server's disk tier stores it in
+  a session's `meta.json`) resident and writes which experts every
+  position of every MoE layer routed to, `[layers][tokens][top_k]`. About
+  2 000 tokens per second on the M5 Max. Prefill routes a position as the
+  decode step would up to rounding.
+- `lily-cache-replay --usage <ranking> --trace <stem>...` replays them
+  through the cache's own policy code (`qwen4exp::cache_replay`:
+  `SlotPolicy`, `LiveUsage`, promotion), host only, sweeping the LRU
+  share. `<stem>.json` gives the requests as `[p0, p1, p2]`:
+  `p0..p1` prefilled (the suffix after the session's cached prefix),
+  `p1..p2` generated. Sessions replay in order through one cache, as one
+  server serves them; `--fresh` starts each from the loaded ranking.
+
+The requests come from the chat template: every `<|im_start|>assistant\n`
+ends a request's prefill and the matching `<|im_end|>` its generated
+span, so a request prefills exactly what the server prefilled (tool
+results, the user's message) and decodes what the model sampled. Decoding
+is replayed one token per pass; a speculative verify pass also routes its
+rejected drafts, which a trace does not hold.
+
+Measured on seven opencode sessions of 2026-10-07 on a client codebase
+(34 000 to 119 000 tokens each, 520 000 in all, 201 000 of them
+generated with the server's sampling, 320 000 prefilled in 456 requests),
+16 246 slots, the shipped ranking, one cache across the sessions in the
+order they were served:
+
+| LRU share | pinned | decode misses per token | prefill misses per token | all reads against 10% |
+|----------:|-------:|------------------------:|-------------------------:|----------------------:|
+| 3.5%      | 15 670 | 12.12 | 3.57 | +4.8%  |
+| 5%        | 15 434 | 11.56 | 3.67 | +2.4%  |
+| 10%       | 14 621 | 10.66 | 3.98 | 0      |
+| 20%       | 12 997 | 10.16 | 4.49 | +1.9%  |
+| 30%       | 11 372 | 10.10 | 4.92 | +5.6%  |
+| 40%       |  9 748 | 10.28 | 5.29 | +10.1% |
+
+A larger LRU region takes up to 5% off the decode misses and adds up to
+32% to prefill's; a decode miss and a prefill miss cost about the same
+SSD time (a decode miss waits for one 2.76 MB read, a prefill pass reads
+hundreds at the drive's bandwidth), so the total is what to minimise, and
+it is flat between 5 and 20% with its low at 10%, the default, which
+stays. Replayed in another session order the figures move by about 1%
+(10.78 and 4.07 at 10%) and the verdict holds. The re-rank, replayed in
+that order with its background loads landing at the measured rate, added
+decode misses at every share: 11.12 against 10.78 per token at 10% (+3%), per session from 0 to +23%, with a 3% gain in prefill
+misses; 33 re-ranks fired, about 88 000 background loads. A ranking taken
+from the prompt helps only where the output continues the prompt (long
+document summaries, continuation), not an agent, whose most common use
+here does not justify the code; it was removed.
+
+The traces themselves stay out of the repository (they are a client's
+code and conversations); only these counts are recorded.
+
 ### Prefill chunks of 8 192 tokens
 
 `LILY_PREFILL_CHUNK=8192` (a per-model value now, `Qwen4ExpModel::
@@ -335,9 +451,9 @@ re-read check on the routed ids found no stale reads). A run on a real
 
 - **Decode misses** cost a cold region read per resolution (about 0.35
   ms with the nine regions in flight). The live ranking above lowers the
-  count run over run; a larger LRU region (30% measured 6.9% against 8.8%
-  of decode lookups missing, at the price of prefill misses) is the other
-  knob, to sweep on a real 64 GB machine.
+  count run over run; the LRU share is swept on recorded agent sessions
+  in "Replaying agent sessions" (10% stays), and a ranking taken from the
+  prompt was tried and dropped there.
 - **Prefill** is bound by reading the cold third per chunk; a chunk of
   8 192 tokens would halve that per token at twice the activation
   scratch.

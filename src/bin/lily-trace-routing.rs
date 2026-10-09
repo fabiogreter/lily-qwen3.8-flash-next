@@ -1,0 +1,102 @@
+//! Logs which experts every position of every MoE layer routes to, for
+//! recorded token sequences: the input of `lily-cache-replay`.
+//!
+//! Each `--tokens` file is a sequence of little-endian `u32` token ids (a
+//! whole session as the server's disk tier stores it, chat template and
+//! generated turns included). The sequence is prefilled once, resident,
+//! and the routing log is written to `--out-dir` as `<stem>.routing.u32`:
+//! `[layers][tokens][top_k]` little-endian `u32`. Prefill routes a position
+//! as the decode step would up to rounding (near-ties can pick another
+//! expert), which is close enough for cache statistics.
+
+use std::path::PathBuf;
+use std::time::Instant;
+
+use anyhow::{Context as _, Result, ensure};
+use clap::Parser;
+use lily::engine::{LanguageModel, LoadOptions};
+use lily::metal::MetalContext;
+use lily::qwen4exp::Qwen4ExpModel;
+
+#[derive(Parser)]
+#[command(
+    name = "lily-trace-routing",
+    about = "Expert routing of recorded token sequences"
+)]
+struct Cli {
+    #[arg(long)]
+    model: PathBuf,
+    /// Token files (little-endian u32 ids), one session each.
+    #[arg(long, required = true)]
+    tokens: Vec<PathBuf>,
+    /// Where `<stem>.routing.u32` goes for each token file.
+    #[arg(long)]
+    out_dir: PathBuf,
+}
+
+/// Exits 75 when another lily instance holds the lock (`lily::instance`).
+fn main() -> std::process::ExitCode {
+    lily::instance::exit_code(run())
+}
+
+fn run() -> Result<()> {
+    let cli = Cli::parse();
+    std::fs::create_dir_all(&cli.out_dir)
+        .with_context(|| format!("creating {}", cli.out_dir.display()))?;
+    let ctx = MetalContext::new()?;
+    let model = <Qwen4ExpModel as LanguageModel>::load(
+        &ctx,
+        &cli.model,
+        &LoadOptions::default(),
+    )?;
+    let (layers, _experts, top_k) = model.moe_shape();
+    let vocab = u32::try_from(model.vocab_size())?;
+    for path in &cli.tokens {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        ensure!(
+            !bytes.is_empty() && bytes.len().is_multiple_of(4),
+            "{}: {} bytes is not a sequence of u32 ids",
+            path.display(),
+            bytes.len()
+        );
+        let ids: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        ensure!(
+            ids.iter().all(|&t| t < vocab),
+            "{}: a token id is outside the vocabulary of {vocab}",
+            path.display()
+        );
+        let n = ids.len();
+        let capacity = n + 1;
+        let mut scratch = model.new_scratch_with_capacity(&ctx, capacity)?;
+        model.enable_expert_log(&ctx, &mut scratch, capacity)?;
+        let mut state = model.new_state(&ctx, capacity)?;
+        let started = Instant::now();
+        LanguageModel::prefill(&model, &ctx, &mut state, &mut scratch, &ids, None)?;
+        let secs = started.elapsed().as_secs_f64();
+        let log = model.expert_log(&scratch).expect("enabled").to_u32()?;
+        let mut out = Vec::with_capacity(layers * n * top_k * 4);
+        for layer in 0..layers {
+            let base = layer * capacity * top_k;
+            for &id in &log[base..base + n * top_k] {
+                out.extend_from_slice(&id.to_le_bytes());
+            }
+        }
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .context("token file without a name")?;
+        let dst = cli.out_dir.join(format!("{stem}.routing.u32"));
+        std::fs::write(&dst, &out)
+            .with_context(|| format!("writing {}", dst.display()))?;
+        eprintln!(
+            "{stem}: {n} tokens in {secs:.1}s ({:.0} tok/s) -> {}",
+            n as f64 / secs,
+            dst.display()
+        );
+    }
+    Ok(())
+}

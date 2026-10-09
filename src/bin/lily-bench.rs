@@ -31,6 +31,14 @@ struct Cli {
     /// Real text is what draft acceptance and expert routing depend on.
     #[arg(long)]
     prompt_text: Option<PathBuf>,
+    /// The warm-up's prompt: the first `--prompt-len` tokens of this text
+    /// instead of the measured prompt (the one-token and speculative
+    /// loops). The warm-up compiles the same shapes either way; with a
+    /// different text the expert cache enters the measured prompt the way a
+    /// server enters a new request, placed for another one, rather than
+    /// already adapted to it.
+    #[arg(long)]
+    warmup_text: Option<PathBuf>,
     #[arg(long, default_value_t = 64)]
     decode_steps: usize,
     #[arg(long, default_value_t = false)]
@@ -101,9 +109,29 @@ fn prompt_tokens(cli: &Cli, vocab: u32) -> Result<Vec<u32>> {
     prompt_tokens_of(cli, vocab, cli.prompt_len)
 }
 
+/// The warm-up's prompt: `--warmup-text`'s first `--prompt-len` tokens, or
+/// the measured prompt.
+fn warmup_tokens(cli: &Cli, vocab: u32, prompt: &[u32]) -> Result<Vec<u32>> {
+    match &cli.warmup_text {
+        Some(path) => text_tokens(cli, Some(path), vocab, cli.prompt_len),
+        None => Ok(prompt.to_vec()),
+    }
+}
+
 /// [`prompt_tokens`] for `len` tokens.
 fn prompt_tokens_of(cli: &Cli, vocab: u32, len: usize) -> Result<Vec<u32>> {
-    let Some(path) = &cli.prompt_text else {
+    text_tokens(cli, cli.prompt_text.as_ref(), vocab, len)
+}
+
+/// The first `len` tokens of `text` under the checkpoint's tokenizer, or
+/// the synthetic sequence without one.
+fn text_tokens(
+    cli: &Cli,
+    text: Option<&PathBuf>,
+    vocab: u32,
+    len: usize,
+) -> Result<Vec<u32>> {
+    let Some(path) = text else {
         let token = |index: usize| (index as u32).wrapping_mul(2_654_435_761) % vocab;
         return Ok((0..len).map(token).collect());
     };
@@ -405,6 +433,7 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
     }
     let vocab = u32::try_from(model.vocab_size())?;
     let prompt = prompt_tokens(cli, vocab)?;
+    let warm_prompt = warmup_tokens(cli, vocab, &prompt)?;
     let mut scratch = model.new_scratch_with_capacity(&ctx, max_seq)?;
 
     // Warm the exact prompt shape and production cadence: one delivered decode
@@ -412,7 +441,13 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
     // shape-specialized Metal pipeline before the measured state is created.
     {
         let mut warm_state = model.new_state(&ctx, cli.prompt_len + 2)?;
-        model.prefill(&ctx, &mut warm_state, &mut scratch, &prompt, Some(draw(0)))?;
+        model.prefill(
+            &ctx,
+            &mut warm_state,
+            &mut scratch,
+            &warm_prompt,
+            Some(draw(0)),
+        )?;
         let first = submit_step(&model, &ctx, &mut warm_state, &scratch, 0, 1, 1)?;
         let lookahead = submit_step(&model, &ctx, &mut warm_state, &scratch, 1, 0, 2)?;
         first.wait()?;
@@ -664,49 +699,52 @@ fn bench_speculative<M: LanguageModel>(
     let max_seq = cli.prompt_len + cli.decode_steps + 2 * cli.drafts + 2;
     let vocab = u32::try_from(model.vocab_size())?;
     let prompt = prompt_tokens(cli, vocab)?;
+    let warm_prompt = warmup_tokens(cli, vocab, &prompt)?;
     let mut scratch = model.new_scratch_with_capacity(ctx, max_seq)?;
     let never_stop = |_: u32| false;
-    let mut run = |steps: usize| -> Result<(f64, f64, usize, usize, Vec<u32>)> {
-        let mut state = model.new_state(ctx, max_seq)?;
-        let cache_before = model.expert_cache_stats();
-        let prefill_start = Instant::now();
-        model.prefill(ctx, &mut state, &mut scratch, &prompt, Some(draw(0)))?;
-        let first = scratch.next_token().view(0, &[1])?.to_u32()?[0];
-        let prefill_secs = prefill_start.elapsed().as_secs_f64();
-        let cache_after_prefill = model.expert_cache_stats();
-        let mut tokens = vec![first];
-        let decode_start = Instant::now();
-        let outcome = speculate(
-            ctx,
-            model,
-            &mut state,
-            &mut scratch,
-            sampler(),
-            cli.drafts,
-            steps + 1,
-            &mut tokens,
-            &never_stop,
-            &mut |_| Ok(true),
-        )?;
-        let decode_secs = decode_start.elapsed().as_secs_f64();
-        if let (Some(s0), Some(s1), Some(s2)) =
-            (cache_before, cache_after_prefill, model.expert_cache_stats())
-        {
-            eprintln!(
-                "expert cache: prefill: {}; decode: {}",
-                s1.since(s0).describe(),
-                s2.since(s1).describe()
-            );
-        }
-        Ok((prefill_secs, decode_secs, outcome.drafted, outcome.accepted, tokens))
-    };
+    let mut run =
+        |steps: usize, prompt: &[u32]| -> Result<(f64, f64, usize, usize, Vec<u32>)> {
+            let mut state = model.new_state(ctx, max_seq)?;
+            let cache_before = model.expert_cache_stats();
+            let prefill_start = Instant::now();
+            model.prefill(ctx, &mut state, &mut scratch, prompt, Some(draw(0)))?;
+            let first = scratch.next_token().view(0, &[1])?.to_u32()?[0];
+            let prefill_secs = prefill_start.elapsed().as_secs_f64();
+            let cache_after_prefill = model.expert_cache_stats();
+            let mut tokens = vec![first];
+            let decode_start = Instant::now();
+            let outcome = speculate(
+                ctx,
+                model,
+                &mut state,
+                &mut scratch,
+                sampler(),
+                cli.drafts,
+                steps + 1,
+                &mut tokens,
+                &never_stop,
+                &mut |_| Ok(true),
+            )?;
+            let decode_secs = decode_start.elapsed().as_secs_f64();
+            if let (Some(s0), Some(s1), Some(s2)) =
+                (cache_before, cache_after_prefill, model.expert_cache_stats())
+            {
+                eprintln!(
+                    "expert cache: prefill: {}; decode: {}",
+                    s1.since(s0).describe(),
+                    s2.since(s1).describe()
+                );
+            }
+            Ok((prefill_secs, decode_secs, outcome.drafted, outcome.accepted, tokens))
+        };
     // Warm-up compiles the pipelines for every shape the loop uses.
-    run(4)?;
+    run(4, &warm_prompt)?;
     if ctx.profiling() {
         // The tables cover the measured run only.
         profile::take();
     }
-    let (prefill_secs, decode_secs, drafted, accepted, tokens) = run(cli.decode_steps)?;
+    let (prefill_secs, decode_secs, drafted, accepted, tokens) =
+        run(cli.decode_steps, &prompt)?;
     let kernel_profile =
         ctx.profiling().then(|| kernel_profile_report(&profile::take()));
     let generated = tokens.len() - 1;

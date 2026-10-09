@@ -1582,10 +1582,11 @@ every process that loads the weights refuses to run next to another one
 (`src/instance.rs`). The load path itself (`qwen4exp::weights::load`, and
 `VisionTower::load_from_dir` for the tower alone) takes an exclusive
 `flock(LOCK_EX | LOCK_NB)` on `~/Library/Caches/lily/instance.lock`, so the
-server, `lily-bench`, `lily-probe`, `lily-vision-probe`, `lily-experts` and
-the ignored tests that load a real checkpoint are all covered; the server
-takes it again, first thing, before it binds the port, so a second server
-names the holder instead of failing on "address in use". A process takes it
+server, `lily-bench`, `lily-probe`, `lily-vision-probe`, `lily-experts`,
+`lily-trace-routing` and the ignored tests that load a real checkpoint are
+all covered; the server takes it again, first thing, before it binds the
+port, so a second server names the holder instead of failing on "address
+in use". A process takes it
 once and keeps it until it exits: the idle unload and the reloads (after an
 idle unload or a GPU fault) find it held, and the kernel drops it on any
 exit, a crash or a SIGKILL included, so no stale lock can block a start.
