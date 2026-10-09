@@ -265,6 +265,22 @@ with the draft head loaded, about 1 GB over the plan's 52 GB target, and at
 31 GB under the balloon, which pages lily's own buffers out as well as the
 checkpoint's: the cold rows carry that cost too.
 
+Whether drafts pay cold on other text and under sampling (the reviews
+asked): the same 64 GB plan and balloon, 8K prompts, 256 tokens, plain
+against 2 drafts, `--sample` with the checkpoint's sampler defaults:
+
+| prompt                                          | greedy plain | greedy 2 drafts (accepted) | sampled plain | sampled 2 drafts (accepted) |
+|-------------------------------------------------|-------------:|---------------------------:|--------------:|----------------------------:|
+| `2026-10-01-http-prefill-gap/bench-prompt.txt`  | 39.7         | 47.4 (86.2%)               | 38.8          | 46.9 (74.3%)                |
+| `2026-10-01-long-context-prefill/prompt-mixed.txt` | 45.2      | 53.1 (63.3%)               | 49.2          | 50.4 (52.4%)                |
+| `mlx-parity/nested/prompts/n32k.txt`            | 51.4         | 59.0 (75.5%)               | 42.2          | 58.1 (80.6%)                |
+
+Drafts came out ahead in all six, by 2 to 38%, including the sampled
+mixed prompt at 52% acceptance, where the two are within the noise band;
+so the break-even sits below the acceptance any of these prompts showed.
+Decode-class misses with drafts ran 2.0 to 4.9% of lookups against 1.4 to
+4.0% plain. One run per cell.
+
 Measured at `13f7b54` plus the fix on `docs/bench/2026-10-01-expert-gemm/
 prompt-lily.txt` (8K tokens, 256 decoded, greedy, the shipped ranking, no
 n-gram preload), "cold" under a 60 GiB locked balloon; every row's token
