@@ -1837,12 +1837,42 @@ instead of after the long answer: 150 tokens in 2.6 s next to a
 
 **Drafting.** Kept for a request decoding alone (about 30 % for the common
 single-agent case); rows that share a step decode plainly. Speculation
-inside the batch would need per-session spec scratch, one GPU-side
-accepted count and control block per session, per-session rollback and
-parked next passes for every combination of accepted counts, and would put
-2 to 3 more rows per session into every pass, past the fused kernels' four
-rows from two sessions on. At two to four clients the plain batch already
-matches what drafting adds to one, so it is left as a `TODO(batch)`.
+inside the batch was measured on 2026-10-09 and rejected. Decode here is
+expert bandwidth: the dense weights are read once per pass and shared by
+its rows, but every row pays its own ten experts. A session's draft rows
+route to 6 to 7 new experts per layer each, a second session's row to 9 to
+10, so a draft row costs 80 to 90 % of another session's row (both about
+3.4 ms per row up to eight rows) while it yields a token only when
+accepted. Giving drafts to a session already in the batch beats adding a
+session only above about 75 % acceptance. Agent traffic sits right there:
+the server log of 2026-10-05 and 2026-10-07 (opencode sessions, sampled,
+1.45 million drafts) shows 78.6 to 78.8 % accepted, against 66 % over the
+86 000 tokens of code and prose measured in September. Estimated from
+measured pass costs against the plain batched step:
+
+| sessions x drafts | rows | gain at 66 % | gain at 79 % |
+| --- | --- | --- | --- |
+| 1 x 2 (today's solo loop) | 3 | +12 to +23 % | +25 to +37 % |
+| 2 x 1 | 4 | -2 to -17 % | +6 to -10 % |
+| 2 x 2 | 6 | +1 to -12 % | +12 to -2 % |
+| 4 x 1 | 8 | -8 to -26 % | 0 to -21 % |
+| 4 x 2 | 12 | -18 to -26 % | -9 to -18 % |
+
+At agent acceptance two sessions with two drafts land between a small loss
+and +12 %, and four sessions still lose, so a ragged verify pass, per-slot
+spec scratch and a host-decided draft pass (about two weeks of engine work)
+would buy at most a few percent for two concurrent requests.
+
+Three or four sessions with two drafts also cross an 8-row cliff: the
+ninth row of a pass costs 14 to 17.5 ms instead of 3.4, because the MoE
+leaves the fused small-m route for the grouped prefill route
+(`MOE_SMALLM_MAX_M = 8`), the register-A skinny GEMM stops at 8 rows too,
+and the LM head goes from 1.4 to 3.7 ms. The same cliff would meet any
+batched decode above eight rows. SGLang and vLLM batch their drafts on GPUs
+where extra rows up to a tensor-core tile are nearly free; that does not
+transfer to a bandwidth-bound MoE. What would reopen it: an MoE path past
+eight rows without the cliff, or routing that shares experts across a
+token and its drafts.
 
 Not batched yet: the expert cache (small-machine mode serves one request
 at a time), and admission's host work (a synchronous spill, a disk

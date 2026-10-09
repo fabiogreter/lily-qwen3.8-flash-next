@@ -835,6 +835,7 @@ none is kept behind a knob. The reason is what the measurement said.
 | the GDN step with 16- or 32-row register blocks, or the head split over thread groups or column groups | equal, not bit-identical; 15 to 16 us | no faster than eight rows |
 | the pacer's sleeps scaled by the measured 25% `nanosleep` overshoot | 93.1 against 93.1 tok/s | the shipped pacer's own adaptation already covers it |
 | three drafts per step | 100.8 against 113.9 tok/s greedy, 96.6 to 106.1 against 101.3 to 111.9 sampled | the third draft is accepted too rarely for its verify row and draft pass |
+| speculation inside the continuous batch (estimated from measured pass costs, 2026-10-09: 1 to 16 rows of the trunk graph, the verify pass, the batched step and the draft pass, four real sessions, 1K and 8K) | at 66 % acceptance (prose) 2 sessions x 2 drafts +1 to -12 %, 4 x 2 -18 to -26 % against the plain batched step; at 79 % (agent traffic) +12 to -2 % and -9 to -18 %; one session +12 to +23 % and +25 to +37 % | a draft row routes to 6 to 7 new experts per layer and costs 80 to 90 % of another session's row (about 3.4 ms each up to 8 rows), and the ninth row of a pass costs 14 to 17.5 ms (the small-m MoE route and the register-A GEMM stop at 8); `docs/architecture.md`, "Continuous batching" |
 
 ### Smaller machines
 

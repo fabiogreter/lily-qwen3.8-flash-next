@@ -880,15 +880,12 @@ impl<M: LanguageModel> Engine<M> {
         max_steps: usize,
         admission: &dyn Fn() -> bool,
     ) -> Result<usize> {
-        // TODO(batch): speculation inside a batch. A row shares a step
-        // plainly and speculates again once it is alone; batching the
-        // verify pass (rows = the sum of 1 + drafts over sessions) needs a
-        // per-session spec scratch (mid-step GDN states, conv inputs), one
-        // GPU-side accepted count and control block per session in the draft
-        // pass, per-session rollback, and parked next passes for every
-        // combination of accepted counts. That is a second engine-shape
-        // change, and the measured gain does not ask for it yet; see
-        // docs/architecture.md, "Continuous batching".
+        // Rows share a step plainly and speculate again once alone.
+        // Speculation inside the batch was measured on 2026-10-09 and does
+        // not pay on this model: a draft row routes to 6 to 7 new experts
+        // per layer and costs 80 to 90% of another session's row, so even
+        // at agent traffic's 79% acceptance two sessions gain at most 12%
+        // and four lose; see docs/architecture.md, "Continuous batching".
         let Engine { ctx, model, scratch, shutdown, .. } = self;
         let parking = model.supports_rows_parking();
         let members: Vec<u64> = rows.iter().map(|r| r.seq).collect();
