@@ -1020,6 +1020,47 @@ The shared model now tracks the server at both plans and is the
 replay's default; the replay's warm layer time (0.315 ms, 15.1 ms over
 48 layers) matches the reference's 15.0 ms.
 
+### The predictors on the calibrated drive (2026-10-10)
+
+The predictors retrained (same shapes and sample; sessions held out
+untouched for a final check), replayed on the shared drive model, per
+decoded token, held-out sessions only. The three recorded sessions as
+served (one cache), the others each from the loaded ranking (`--fresh`):
+
+| prefetch (cuts after 3, 7, 15, 23, replacing) | recorded, 64 GB | recorded, 40 GB | others, 64 GB | others, 40 GB |
+|---|---:|---:|---:|---:|
+| none | 4.65 ms | 13.04 ms | 4.14 ms | 11.43 ms |
+| previous hidden state only, top 20, depth 2 | 3.80 ms | 11.37 ms | 3.98 ms | 11.64 ms |
+| cuts, top 20, depth 1 | 3.39 ms | 10.31 ms | 3.55 ms | 10.26 ms |
+| cuts, top 20, depth 2 | 3.37 ms | 10.36 ms | 3.63 ms | 10.64 ms |
+| cuts, top 20, depth 4 | 3.59 ms | 11.25 ms | 3.95 ms | 11.85 ms |
+| cuts, top 20, depth 8 | 4.12 ms | 13.99 ms | 4.77 ms | 15.51 ms |
+| cuts, top 10, depth 1 | 3.69 ms | 10.37 ms | 3.60 ms | 10.02 ms |
+| the routing itself (ceiling) | 0.33 ms | 2.34 ms | 0.29 ms | 1.88 ms |
+
+Prefetch depth decides it now that wrong reads take bandwidth from
+demand reads: one or two prefetches in flight; at eight, prefetching is
+worse than none. Only one read in six to eight is useful (top 20). By
+source, cuts at depth 1, top 20, 64 / 40 GB: the recorded sessions
+-27% / -21%, generated agent runs -24% / -20%, public agent
+trajectories -23% / -17%, personal sessions -18% / -13%, the text
+probes (prose and code read as if decoded, not agent traffic) -7% / -3%;
+about a quarter of the room to the ceiling on agent traffic.
+
+Two cache policies replayed against these predictions, neither kept
+(code in `docs/bench/2026-10-10-evict-layer-slots/`, ignored):
+
+- **Eviction by predicted need**: a victim is never an expert the
+  latest issued plane predicts for its layer. Under 1% (recorded, 64 GB
+  3.37 to 3.36 ms, 40 GB 10.36 to 10.27; with the routing itself as
+  prediction about 5%).
+- **Slots per layer**: soft per-layer capacities, allocated from
+  training sessions by exact per-layer LRU miss curves and a dynamic
+  programme. They lose about 5% to the single pool the cache has today,
+  whose LRU region floats between layers (no prefetch 4.65 against
+  4.92 ms at 64 GB, 13.04 against 13.68 at 40 GB); uniform capacities
+  lose 18%.
+
 ### Prefill chunks of 8 192 tokens
 
 `LILY_PREFILL_CHUNK=8192` (a per-model value now, `Qwen4ExpModel::
