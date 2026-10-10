@@ -819,8 +819,10 @@ re-read check on the routed ids found no stale reads). A run on a real
   weight. Where such a low-ranked pick misses and an expert scoring
   nearly as high is resident, computing with the resident one would
   avoid the read (published as cache-conditional routing and expert
-  substitution: always read a high-scoring miss, substitute only below
-  a score margin). It changes outputs, so it needs a quality evaluation
+  substitution; MoE-CORE, https://arxiv.org/abs/2610.01950: "The main
+  configuration executes router-selected experts exactly; an optional
+  score-based substitution path handles eligible low-score misses").
+  It changes outputs, so it needs a quality evaluation
   beside its speed; a first count of how many misses have a resident
   alternative within a margin needs only `lily-trace-routing
   --router-top` and the replay.
