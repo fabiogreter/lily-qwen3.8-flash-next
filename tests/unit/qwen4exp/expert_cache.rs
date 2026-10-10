@@ -1,12 +1,14 @@
 //! Host-side tests of the expert cache's request queue: cancellation of the
-//! requests a never-committed pass enqueued (`QueuedRequests`); and of the
-//! read pool's dispatch (`run_claimed`).
+//! requests a never-committed pass enqueued (`QueuedRequests`); of the
+//! read pool's dispatch (`run_claimed`); and of the GPU warmer (`Warmer`).
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use super::{QueuedRequests, REGIONS, Request, Service};
+use super::{
+    QueuedRequests, REGIONS, Request, Service, WARM_OFF, WARM_ON, WARM_STARTING, Warmer,
+};
 
 fn service() -> Arc<Service> {
     Arc::new(Service {
@@ -209,4 +211,98 @@ fn claim_order_covers_every_read_once_large_regions_first() {
             "n {n}: {order:?}"
         );
     }
+}
+
+/// Waits up to 10 s for the warm thread to leave `from`; returns the state.
+fn warm_state_after(warmer: &Warmer, from: u8) -> u8 {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let state = warmer.shared.state.load(Ordering::Acquire);
+        if state != from || std::time::Instant::now() > until {
+            return state;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// A warm pass that fails, or panics, turns warming off; the thread stays
+/// parked, and the service thread's releases and the drop still write the
+/// flag the Warmer owns.
+#[test]
+fn a_failed_warm_pass_turns_warming_off_and_releases_stay_safe() {
+    fn fails() -> anyhow::Result<()> {
+        anyhow::bail!("injected for the test")
+    }
+    fn panics() -> anyhow::Result<()> {
+        panic!("injected for the test")
+    }
+    for inject in [fails as fn() -> anyhow::Result<()>, panics] {
+        let mut warmer = Warmer::spawn_with(Some(inject)).expect("spawn");
+        assert_eq!(warm_state_after(&warmer, WARM_STARTING), WARM_ON);
+        warmer.start();
+        assert_eq!(warmer.generation, 1);
+        assert_eq!(warm_state_after(&warmer, WARM_ON), WARM_OFF);
+        warmer.release();
+        assert_eq!(warmer.shared.flag.flag().load(Ordering::Acquire), 1);
+        // Off: no more passes are asked for.
+        warmer.start();
+        assert_eq!(warmer.generation, 1);
+        warmer.release();
+        assert!(warmer.handle.as_ref().is_some_and(|h| !h.is_finished()));
+        drop(warmer);
+    }
+}
+
+/// Warm passes run while asked for and end at the release; the thread
+/// stops at the drop.
+#[test]
+fn warm_passes_end_at_their_release() {
+    let mut warmer = Warmer::spawn().expect("spawn");
+    // Asked for before the thread is ready: nothing is.
+    warmer.start();
+    assert!(warmer.generation <= 1);
+    assert_eq!(warm_state_after(&warmer, WARM_STARTING), WARM_ON);
+    for _ in 0..20 {
+        warmer.start();
+        std::thread::sleep(std::time::Duration::from_micros(300));
+        warmer.release();
+    }
+    assert_eq!(warmer.shared.state.load(Ordering::Acquire), WARM_ON);
+    drop(warmer);
+}
+
+/// A warm pass nobody releases ends at `Warmer::CAP` polls; prints how long
+/// that takes on the GPU.
+#[test]
+fn a_warm_pass_nobody_releases_ends_at_its_cap() {
+    use crate::metal::{Grid, MetalContext, MslVersion};
+    use crate::tensor::{DType, Tensor};
+    let ctx = MetalContext::new_with_profile(false).expect("metal context");
+    let kernel = ctx
+        .pipeline("expert_cache_warm", super::WARM_SRC, MslVersion::V3_1)
+        .expect("kernel");
+    let flag = Tensor::zeros(&ctx, &[1], DType::U32).expect("flag");
+    let mut times = Vec::new();
+    for _ in 0..10 {
+        let pass = ctx.begin().expect("pass");
+        pass.dispatch_at(
+            &kernel,
+            &[flag.binding()],
+            &[&1u32.to_ne_bytes(), &Warmer::CAP.to_ne_bytes()],
+            Grid::Threads { grid: (32, 1, 1), threadgroup: (32, 1, 1) },
+        )
+        .expect("dispatch");
+        let t = pass.commit().expect("commit").wait_retain().expect("wait");
+        let t = t.timing().expect("timing");
+        times.push((t.gpu_end_secs - t.gpu_start_secs) * 1e3);
+    }
+    times.sort_by(f64::total_cmp);
+    println!(
+        "a warm pass of {} polls: {:.3} to {:.3} ms on the GPU (median {:.3})",
+        Warmer::CAP,
+        times[0],
+        times[times.len() - 1],
+        times[times.len() / 2]
+    );
+    assert!(times[times.len() / 2] < 20.0, "{times:?}");
 }

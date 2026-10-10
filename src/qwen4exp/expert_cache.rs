@@ -37,8 +37,11 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::ptr::NonNull;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
@@ -515,123 +518,196 @@ kernel void expert_cache_warm(device atomic_uint* flag [[buffer(0)]],
 /// clock up. The service thread calls [`Self::start`] before a resolution's
 /// reads and [`Self::release`] before it signals `ready`; a thread of its
 /// own (with its own Metal context, so its submissions never wait behind
-/// the model's) commits the polling pass.
+/// the model's) commits the polling pass. The thread builds its context
+/// while the service thread goes on: until it is ready, and for good once a
+/// warm pass failed, [`Self::start`] asks for nothing.
 struct Warmer {
-    /// The generation the GPU-side poll ends at, written by the host.
-    flag: usize,
-    /// The generation a pass was asked for (0: none yet).
-    want: Arc<AtomicU64>,
+    shared: Arc<WarmShared>,
     thread: std::thread::Thread,
+    /// The generation of the last pass asked for (0: none yet).
     generation: u32,
-    stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
+/// What the service thread and the warm thread share.
+struct WarmShared {
+    /// The generation the GPU-side poll ends at, written by the host.
+    flag: FlagPage,
+    /// The generation a pass was asked for (0: none yet).
+    want: AtomicU64,
+    stop: AtomicBool,
+    /// [`WARM_STARTING`], [`WARM_ON`] or [`WARM_OFF`].
+    state: AtomicU8,
+}
+
+const WARM_STARTING: u8 = 0;
+const WARM_ON: u8 = 1;
+const WARM_OFF: u8 = 2;
+
+/// One page of host memory holding the word a warm pass polls. The
+/// [`Warmer`] owns it (shared with its thread), so it outlives every writer
+/// ([`Warmer::release`], also from `Drop`) whatever becomes of the thread,
+/// and the thread's no-copy buffer over it, dropped after its last pass.
+struct FlagPage {
+    ptr: NonNull<u8>,
+    layout: std::alloc::Layout,
+}
+
+// SAFETY: plain memory, accessed only through `AtomicU32` on the host (and
+// by the GPU's atomic loads).
+unsafe impl Send for FlagPage {}
+unsafe impl Sync for FlagPage {}
+
+impl FlagPage {
+    fn new() -> Result<Self> {
+        // SAFETY: sysconf has no preconditions.
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })?;
+        let layout = std::alloc::Layout::from_size_align(page, page)?;
+        // SAFETY: a nonzero size.
+        let ptr = NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) })
+            .ok_or_else(|| anyhow::anyhow!("allocating the warm pass's flag page"))?;
+        Ok(Self { ptr, layout })
+    }
+
+    fn flag(&self) -> &AtomicU32 {
+        // SAFETY: page-aligned, zeroed, allocated while `self` lives.
+        unsafe { &*self.ptr.as_ptr().cast::<AtomicU32>() }
+    }
+}
+
+impl Drop for FlagPage {
+    fn drop(&mut self) {
+        // SAFETY: allocated in `new` with this layout.
+        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
+    }
+}
+
 impl Warmer {
-    /// Polls per warm pass at most: a few milliseconds, so a lost release
-    /// never holds a GPU core for long.
+    /// Polls per warm pass at most, so a lost release never holds a GPU
+    /// core for long: a pass nobody releases ends after about 7 ms on the
+    /// GPU (6.5 to 16 ms, `a_warm_pass_nobody_releases_ends_at_its_cap`).
     const CAP: u32 = 1 << 16;
 
+    /// Starts the warm thread without waiting for it.
     fn spawn() -> Result<Self> {
-        let want = Arc::new(AtomicU64::new(0));
-        let stop = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = std::sync::mpsc::channel::<Result<usize>>();
-        let (w, st) = (want.clone(), stop.clone());
-        let handle = std::thread::Builder::new().name("expert-warm".into()).spawn(
-            move || {
-                let setup = (|| -> Result<_> {
-                    let ctx = MetalContext::new()?;
-                    let kernel = ctx.pipeline(
-                        "expert_cache_warm",
-                        WARM_SRC,
-                        crate::metal::MslVersion::V3_1,
-                    )?;
-                    let flag = Tensor::zeros(&ctx, &[1], DType::U32)?;
-                    Ok((ctx, kernel, flag))
-                })();
-                let (ctx, kernel, flag) = match setup {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let _ = tx.send(Err(e));
-                        return;
-                    }
-                };
-                let _ = tx.send(Ok(flag.contents_ptr() as usize));
-                let mut done = 0u64;
-                let mut stats = WarmStats::default();
-                while !st.load(Ordering::Acquire) {
-                    let generation = w.load(Ordering::Acquire);
-                    if generation == done {
-                        std::thread::park();
-                        continue;
-                    }
-                    done = generation;
-                    let run = || -> Result<crate::metal::CompletedPass> {
-                        let pass = ctx.begin()?;
-                        pass.dispatch_at(
-                            &kernel,
-                            &[flag.binding()],
-                            &[
-                                &(generation as u32).to_ne_bytes(),
-                                &Self::CAP.to_ne_bytes(),
-                            ],
-                            crate::metal::Grid::Threads {
-                                grid: (32, 1, 1),
-                                threadgroup: (32, 1, 1),
-                            },
-                        )?;
-                        pass.commit()?.wait_retain()
-                    };
-                    match run() {
-                        Ok(pass) => stats.record(pass.timing().ok()),
-                        Err(e) => {
-                            eprintln!(
-                                "expert cache: warm pass failed, warming off: {e:#}"
-                            );
-                            return;
-                        }
-                    }
-                }
-                if stats.passes > 0 && std::env::var_os("LILY_EXPERT_TRACE").is_some() {
-                    eprintln!(
-                        "expert cache: {} warm passes, GPU {:.3} ms each on average",
-                        stats.passes,
-                        stats.gpu_secs * 1e3 / stats.passes as f64
-                    );
-                }
-            },
-        )?;
-        let flag = rx.recv().map_err(|_| anyhow::anyhow!("warm thread ended"))??;
+        Self::spawn_with(None)
+    }
+
+    /// Like [`Self::spawn`]; tests have every warm pass run `inject` first,
+    /// to make it fail.
+    fn spawn_with(inject: Option<fn() -> Result<()>>) -> Result<Self> {
+        let shared = Arc::new(WarmShared {
+            flag: FlagPage::new()?,
+            want: AtomicU64::new(0),
+            stop: AtomicBool::new(false),
+            state: AtomicU8::new(WARM_STARTING),
+        });
+        let s = shared.clone();
+        let handle = std::thread::Builder::new()
+            .name("expert-warm".into())
+            .spawn(move || Self::run(&s, inject))?;
         Ok(Self {
-            flag,
-            want,
+            shared,
             thread: handle.thread().clone(),
             generation: 0,
-            stop,
             handle: Some(handle),
         })
     }
 
-    /// Asks for a warm pass for the resolution about to read.
+    /// The warm thread: passes as asked until stopped. When one fails (or
+    /// the setup does, or anything panics) warming is off, and the thread
+    /// stays parked until stopped.
+    fn run(shared: &WarmShared, inject: Option<fn() -> Result<()>>) {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Self::passes(shared, inject)
+        }));
+        let failure = match outcome {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(format!("{e:#}")),
+            Err(_) => Some("the warm thread panicked".to_owned()),
+        };
+        if let Some(why) = failure {
+            shared.state.store(WARM_OFF, Ordering::Release);
+            eprintln!("expert cache: GPU warming off: {why}");
+            while !shared.stop.load(Ordering::Acquire) {
+                std::thread::park();
+            }
+        }
+    }
+
+    fn passes(shared: &WarmShared, inject: Option<fn() -> Result<()>>) -> Result<()> {
+        // Never in the per-kernel profile, which would count warm passes
+        // as the model's.
+        let ctx = MetalContext::new_with_profile(false)?;
+        let kernel = ctx.pipeline(
+            "expert_cache_warm",
+            WARM_SRC,
+            crate::metal::MslVersion::V3_1,
+        )?;
+        // SAFETY: one page, page-aligned, which `shared` keeps allocated
+        // past this function; the buffer is dropped at its end, after the
+        // last pass completed.
+        let buffer = unsafe {
+            ctx.new_buffer_no_copy(shared.flag.ptr.cast(), shared.flag.layout.size())?
+        };
+        let flag = Tensor::from_buffer(buffer, &[1], DType::U32)?;
+        shared.state.store(WARM_ON, Ordering::Release);
+        let mut done = 0u64;
+        let mut stats = WarmStats::default();
+        while !shared.stop.load(Ordering::Acquire) {
+            let generation = shared.want.load(Ordering::Acquire);
+            if generation == done {
+                std::thread::park();
+                continue;
+            }
+            done = generation;
+            if let Some(inject) = inject {
+                inject()?;
+            }
+            let pass = ctx.begin()?;
+            pass.dispatch_at(
+                &kernel,
+                &[flag.binding()],
+                &[&(generation as u32).to_ne_bytes(), &Self::CAP.to_ne_bytes()],
+                crate::metal::Grid::Threads {
+                    grid: (32, 1, 1),
+                    threadgroup: (32, 1, 1),
+                },
+            )?;
+            let pass = pass.commit()?.wait_retain()?;
+            stats.record(pass.timing().ok());
+        }
+        if stats.passes > 0 && std::env::var_os("LILY_EXPERT_TRACE").is_some() {
+            eprintln!(
+                "expert cache: {} warm passes, GPU {:.3} ms each on average",
+                stats.passes,
+                stats.gpu_secs * 1e3 / stats.passes as f64
+            );
+        }
+        Ok(())
+    }
+
+    /// Asks for a warm pass for the resolution about to read, once the warm
+    /// thread is ready and while warming is on.
     fn start(&mut self) {
+        if self.shared.state.load(Ordering::Acquire) != WARM_ON {
+            return;
+        }
         self.generation = self.generation.wrapping_add(1).max(1);
-        self.want.store(u64::from(self.generation), Ordering::Release);
+        self.shared.want.store(u64::from(self.generation), Ordering::Release);
         self.thread.unpark();
     }
 
     /// Ends the current warm pass's poll.
     fn release(&self) {
-        // SAFETY: a live shared U32 buffer the warm thread keeps until it
-        // is stopped, which happens only after the service thread is done.
-        let flag = unsafe { &*(self.flag as *const std::sync::atomic::AtomicU32) };
-        flag.store(self.generation, Ordering::Release);
+        self.shared.flag.flag().store(self.generation, Ordering::Release);
     }
 }
 
 impl Drop for Warmer {
     fn drop(&mut self) {
         self.release();
-        self.stop.store(true, Ordering::Release);
+        self.shared.stop.store(true, Ordering::Release);
         self.thread.unpark();
         if let Some(h) = self.handle.take() {
             let _ = h.join();
@@ -891,12 +967,19 @@ unsafe fn set_entry(
 /// misses and had signalled `ready`; per region read its start, end and
 /// reading thread. Written as `<path>.layers.csv` and `<path>.reads.csv`
 /// when the service stops; nanoseconds since the service started. Off, the
-/// thread pays one branch per resolution and per read.
+/// thread pays one branch per resolution and per read. On, it perturbs what
+/// it measures a little: a clock read per mark, a lock per region read, and
+/// now and then a vector growing. The first [`MissTrace::MAX_LAYERS`]
+/// resolutions and [`MissTrace::MAX_READS`] reads are kept (about 40 MB
+/// each at most), the rest counted.
 struct MissTrace {
     path: PathBuf,
     base: std::time::Instant,
     layers: Vec<LayerTiming>,
     reads: Mutex<Vec<ReadTiming>>,
+    /// Resolutions and reads past the caps.
+    dropped_layers: u64,
+    dropped_reads: AtomicU64,
 }
 
 struct LayerTiming {
@@ -922,14 +1005,30 @@ struct ReadTiming {
 }
 
 impl MissTrace {
+    /// Resolutions kept: about 10 000 decoded tokens of 48 layers.
+    const MAX_LAYERS: usize = 1 << 19;
+    /// Region reads kept: about 116 000 misses of nine regions.
+    const MAX_READS: usize = 1 << 20;
+
     fn from_env() -> Option<Self> {
         let path = std::env::var_os("LILY_EXPERT_TRACE")?;
         Some(Self {
             path: PathBuf::from(path),
             base: std::time::Instant::now(),
-            layers: Vec::with_capacity(1 << 20),
-            reads: Mutex::new(Vec::with_capacity(1 << 20)),
+            layers: Vec::with_capacity(1 << 14),
+            reads: Mutex::new(Vec::with_capacity(1 << 14)),
+            dropped_layers: 0,
+            dropped_reads: AtomicU64::new(0),
         })
+    }
+
+    /// Records a resolution, unless the cap is reached.
+    fn layer(&mut self, timing: LayerTiming) {
+        if self.layers.len() < Self::MAX_LAYERS {
+            self.layers.push(timing);
+        } else {
+            self.dropped_layers += 1;
+        }
     }
 
     fn now(&self) -> u64 {
@@ -940,13 +1039,12 @@ impl MissTrace {
     fn read(&self, seq: u64, task: usize, start: u64) {
         let end = self.now();
         let thread = rayon::current_thread_index().map_or(-1, |i| i as i64);
-        self.reads.lock().unwrap_or_else(|e| e.into_inner()).push(ReadTiming {
-            seq,
-            task,
-            thread,
-            start,
-            end,
-        });
+        let mut reads = self.reads.lock().unwrap_or_else(|e| e.into_inner());
+        if reads.len() < Self::MAX_READS {
+            reads.push(ReadTiming { seq, task, thread, start, end });
+        } else {
+            self.dropped_reads.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn write(&self) -> std::io::Result<()> {
@@ -990,9 +1088,11 @@ impl Drop for MissTrace {
     fn drop(&mut self) {
         match self.write() {
             Ok(()) => eprintln!(
-                "expert cache: {} resolutions traced to {}.*.csv",
+                "expert cache: {} resolutions traced to {}.*.csv ({} resolutions and {} reads past the caps not traced)",
                 self.layers.len(),
-                self.path.display()
+                self.path.display(),
+                self.dropped_layers,
+                self.dropped_reads.load(Ordering::Relaxed)
             ),
             Err(e) => eprintln!("expert cache: writing the trace: {e}"),
         }
@@ -1194,7 +1294,7 @@ fn serve(
         ready.signal(request.seq);
         if let Some(t) = trace.as_mut() {
             let ready = t.now();
-            t.layers.push(LayerTiming {
+            t.layer(LayerTiming {
                 seq: request.seq,
                 layer: request.layer,
                 count: request.count,
