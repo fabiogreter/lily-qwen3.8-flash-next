@@ -1004,10 +1004,11 @@ miss at both plans, where the probe reads a layer's misses (1.4 and 2.9
 on average) in less. The serial model underestimates the server by about
 27%, the shared model more; relative comparisons between predictors hold,
 absolute savings scale up with it. The difference was the server's, not
-the drive's ("Where an expert-cache miss's time goes" below): with the
+the drive's ("Where a miss's time goes" above): with the
 GPU kept clocked, milestone pacing and reads started at once, the same
 runs (40 GB now with the reference's tokens, its earlier tokens having
-been changed by the timed-out waits fixed there):
+been changed by the timed-out waits fixed in "Timed-out waits in long
+prefill passes"):
 
 | plan | decode | stall over the reference | shared model | serial model |
 |------|-------:|-------------------------:|-------------:|-------------:|
