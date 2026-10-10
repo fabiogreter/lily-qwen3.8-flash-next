@@ -527,6 +527,103 @@ the service thread claiming reads itself from the same counter as the
 pool jobs (`expert_cache::run_claimed`), the first read starts at once. A
 hand-written pool doing the same measured the same.
 
+### Where a miss's time goes (2026-10-10)
+
+`lily-ssd-probe` read one expert in 0.51 ms and k at once in about
+0.28 + 0.225 k ms, yet a missed layer cost the server about 0.8 ms at
+64 GB (1.39 misses per missed layer) and 1.7 ms at 40 GB (2.86). Measured
+with `LILY_EXPERT_TRACE=<stem>` (per resolution: request taken, GPU signal
+seen, ids looked up, reads done, `ready` signalled; per region read: start,
+end, thread; written as `<stem>.layers.csv` and `<stem>.reads.csv`), q4-xl,
+8K prompt, 1 024 sampled tokens, plain decode, every run on a fresh APFS
+clone of the checkpoint with `LILY_EXPERT_NOCACHE=1`. Per token at 64 GB
+(15 736 slots, 19.2 misses and 14.0 missed layers per token) against the
+reference with 23 115 slots (0.7 misses):
+
+| ms per token                                   | reference | 64 GB before | 64 GB after |
+|------------------------------------------------|----------:|-------------:|------------:|
+| holds of missed layers (reads, lookups)        | 0.44      | 9.01         | 8.36        |
+| GPU between handshakes, layers 1 to 47         | 12.03     | 13.85        | 12.20       |
+| layer 0 to 1 (the parked pass's host release)  | 1.03      | 1.77         | 0.44        |
+| token boundary and hit holds                   | 1.55      | 1.61         | 1.58        |
+| **total**                                      | **15.05** | **26.24**    | **22.57**   |
+
+The hold itself was close to the probe: 0.64 ms per missed layer against
+0.59 predicted. The rest went to three things, each fixed:
+
+- **The GPU slows down while it waits.** Idle at the handshake for half a
+  millisecond, the GPU drops its clock and the next layers run slower,
+  hits included: 0.08 ms more GPU time after a missed layer at 64 GB, and
+  at 40 GB every layer's GPU time went from 0.23 to 0.68 ms (26 ms per
+  token). Holding every layer 1 ms with nothing to read, at the reference
+  configuration, reproduced it (0.23 to 0.80 ms per layer), so it is the
+  idle time, not the reads; reads through a heap bounce buffer instead of
+  straight into the slab changed nothing. Now the service thread has a
+  warm pass committed on a second Metal context for the length of each
+  resolution with misses: one SIMD group polling a host-written word,
+  capped at 65 536 polls. It ends about 0.25 ms after the release (the GPU
+  sees the host's write late), and that overlap costs 0.02 ms per missed
+  layer against the 0.08 (64 GB) to 0.6 ms (40 GB) per missed layer it
+  saves. A warm pass running all the
+  time instead slowed 64 GB to 41.7 ms per token: two queues with work
+  time-slice in milliseconds. `LILY_EXPERT_WARM=0` turns it off.
+- **The pacer overslept.** A paced wait sleeps until an average of past
+  pass lengths minus 1.5 ms, and under misses a token takes 18 to 32 ms
+  (p10 to p90 at 64 GB): the host woke late for about half of them and the
+  parked next pass waited at its first layer. A pass now carries a
+  milestone, its last cache handshake (`ComputePass::set_milestone`): the
+  paced wait blocks on `ready` reaching it and paces only the rest. Same as
+  no pacing at all, which measured 24.49 against 26.24 at 64 GB and 14.45
+  against 15.05 at the reference.
+- **The reads started late.** The nine reads of a missed expert started
+  one by one, 8 microseconds apart as pool threads woke, after 18
+  microseconds of the service thread spawning eight jobs; the down
+  projection's codes, third in file order, started 61 microseconds in and
+  finished last in 78% of single misses. Now one job spawns the others, so
+  the service thread reads at once, and every expert's three code regions
+  are claimed before any scales or biases (`expert_cache::claimed_read`).
+  The probe, A/B on one clone: one expert 0.57 to 0.44 to 0.48 ms, two
+  0.93 to 0.77, four 1.44 to 1.25, eight 2.32 to 2.19 to 2.27. Splitting
+  the code regions into smaller reads went the other way (pieces of 256,
+  128 and 64 KiB: 32 experts at 8.3, 7.0 and 4.9 GB/s against 11.5).
+- Smaller: finding a miss's victim scanned every slot, about 9
+  microseconds per miss; the LRU region's slots are now kept ordered by the
+  eviction rule (`SlotPolicy`, a `BTreeSet`), 1 to 2 microseconds.
+
+Decode ms per token, fresh clone per run, baseline (`ee40c24`) against
+all four, alternating:
+
+| configuration                         | before          | after           | digest       |
+|---------------------------------------|-----------------|-----------------|--------------|
+| reference, 23 115 slots               | 14.58           | 14.36           | equal        |
+| 64 GB, 15 736 slots                   | 26.24, 26.48    | 22.83, 22.92    | equal        |
+| 64 GB, warm pass off                  |                 | 23.67           | equal        |
+| 40 GB, 6 416 slots                    | 82.85, 82.99    | 53.18, 47.2     | see below    |
+| 64 GB, 2 drafts, 512 tokens (tok/s)   | 43.1            | 58.3            | equal        |
+
+### Timed-out waits in long prefill passes (2026-10-10, not fixed)
+
+At 40 GB a prefill pass of 4 096 tokens waits about 85 ms per layer and
+5.6 s in all, and from about 4 s into the pass the GPU stops waiting for
+`ready`: the service thread finds `routed` one to six layers ahead of the
+request it is serving, so those layers ran with experts that were not
+loaded. Metal documents it: a wait that times out on an `MTL4CommandQueue`
+releases the queue (on an `MTLCommandBuffer` it fails the buffer), and the
+time limit is not documented. `metal::tests::queue_wait_timeout_probe`
+reproduces it without the model (40 waits of 250 ms in one pass: from
+about 4 s every wait released early; waits of 100 ms for 6 s held). At
+40 GB this happened in every prefill pass measured (64 to 76 per run of
+four passes), the prefill's distinct lookups vary run to run (44 537 to
+44 663 against 44 561 everywhere else), and so do the drawn tokens; the
+40 GB rows above are not one token sequence, and the "after" run with the
+same digest as the "before" ones is the 53.18. At 64 GB a prefill pass
+takes 3.8 to 4.0 s with 2.1 s of waits and none was released early. The
+service thread now counts them ("timed-out waits" in the cache's closing
+line, and a warning at the first). The fix has to keep a submission from
+waiting that long, for example by submitting a cached prefill pass in
+parts, each only when the service has nearly reached it; that changes how
+passes are submitted and is left for a decision.
+
 ### Cross-layer prefetch on agent sessions, and what it costs (2026-10-09)
 
 The same seven sessions with predictor B's picks logged at every position
