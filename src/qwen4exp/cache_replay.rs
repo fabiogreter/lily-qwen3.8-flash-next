@@ -26,7 +26,7 @@
 
 use std::ops::Range;
 
-use anyhow::{Result, ensure};
+use anyhow::{Context as _, Result, ensure};
 
 use super::expert_cache::{DECODE_IDS, PROMOTE_EVERY};
 use super::expert_store::{LiveUsage, Lookup, SlotPolicy, UsageRanking};
@@ -547,9 +547,55 @@ pub struct PrefetchReplay {
 }
 
 impl PrefetchReplay {
+    /// Parses `off` (`None`) or `LOOKAHEAD:TOP[:BUDGET][@CUT+CUT..[r]]`,
+    /// the syntax of `lily-cache-replay --prefetch` and of the server's
+    /// `LILY_EXPERT_PREFETCH` (`expert_prefetch`).
+    pub fn parse(spec: &str) -> Result<Option<Self>> {
+        if spec == "off" {
+            return Ok(None);
+        }
+        let (head, cuts, replace) = match spec.split_once('@') {
+            Some((head, cuts)) => {
+                let (cuts, replace) = match cuts.strip_suffix('r') {
+                    Some(c) => (c, true),
+                    None => (cuts, false),
+                };
+                let mut mask = 0u64;
+                for c in cuts.split('+') {
+                    let k: u32 =
+                        c.parse().with_context(|| format!("prefetch {spec}"))?;
+                    ensure!(k < 63, "prefetch {spec}: cut {k} out of range");
+                    mask |= 1 << k;
+                }
+                (head, mask, replace)
+            }
+            None => (spec, 0, false),
+        };
+        let v: Vec<usize> = head
+            .split(':')
+            .map(|x| x.parse().with_context(|| format!("prefetch {spec}")))
+            .collect::<Result<_>>()?;
+        ensure!(
+            (2..=3).contains(&v.len()),
+            "prefetch {spec}: LOOKAHEAD:TOP[:BUDGET][@CUT]"
+        );
+        Ok(Some(Self {
+            lookahead: v[0],
+            top: v[1],
+            budget: v.get(2).copied(),
+            cuts,
+            replace,
+        }))
+    }
+
     /// The plane a cut after layer `k` reads.
-    fn cut_plane(&self, k: usize) -> usize {
+    pub fn cut_plane(&self, k: usize) -> usize {
         1 + (self.cuts & ((1u64 << k) - 1)).count_ones() as usize
+    }
+
+    /// Whether a cut follows layer `layer`.
+    pub fn is_cut(&self, layer: usize) -> bool {
+        layer < 64 && self.cuts >> layer & 1 == 1
     }
 }
 
@@ -1078,8 +1124,7 @@ impl CacheSim {
                         missed += 1;
                     }
                     if let Some((p, pred)) = &prefetch
-                        && layer < 64
-                        && p.cuts >> layer & 1 == 1
+                        && p.is_cut(layer)
                     {
                         // The cut's plane, ready when the cut layer ends,
                         // queued behind what is still queued.

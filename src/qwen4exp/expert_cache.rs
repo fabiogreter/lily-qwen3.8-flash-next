@@ -47,6 +47,9 @@ use std::thread::JoinHandle;
 
 use anyhow::{Result, ensure};
 
+use super::expert_prefetch::{
+    Launch, PrefetchCounts, PrefetchSetup, Prefetcher, Read, Reads,
+};
 use super::expert_store::{ExpertStore, LiveUsage, Lookup, REGIONS, SlotPolicy};
 use crate::config::QuantizationConfig;
 use crate::metal::{MetalContext, SharedEvent};
@@ -64,6 +67,9 @@ struct Request {
     layer: usize,
     ids: usize,
     count: usize,
+    /// The position of the pass's first row, for a decode or verify pass
+    /// ([`ExpertCacheLink::set_position`]); `None` for prefill.
+    pos: Option<usize>,
 }
 
 struct Service {
@@ -85,6 +91,8 @@ struct Service {
     /// Requests skipped because their pass was dropped (`QueuedRequests`),
     /// counted at the thread, so the ones the queue purge did not catch.
     skipped: AtomicU64,
+    /// What the prefetch from a prediction file did, if one is served.
+    prefetch: Mutex<PrefetchCounts>,
 }
 
 impl Service {
@@ -148,6 +156,8 @@ pub struct ExpertCacheStats {
     pub promotions: u64,
     /// Requests of dropped passes the thread skipped (after the queue purge).
     pub skipped: u64,
+    /// The prefetch from a prediction file (`expert_prefetch`), if served.
+    pub prefetch: PrefetchCounts,
 }
 
 impl ExpertCacheStats {
@@ -160,6 +170,7 @@ impl ExpertCacheStats {
             decode_misses: self.decode_misses - earlier.decode_misses,
             promotions: self.promotions - earlier.promotions,
             skipped: self.skipped - earlier.skipped,
+            prefetch: self.prefetch.since(earlier.prefetch),
         }
     }
 
@@ -167,9 +178,10 @@ impl ExpertCacheStats {
         100.0 * misses as f64 / lookups.max(1) as f64
     }
 
-    /// `misses of lookups (x%), decode m of n (y%), p promotions, s skipped`.
+    /// `misses of lookups (x%), decode m of n (y%), p promotions, s skipped`,
+    /// then the prefetch's counts when it read anything.
     pub fn describe(&self) -> String {
-        format!(
+        let mut s = format!(
             "{} misses of {} lookups ({:.1}%), decode {} of {} ({:.1}%), {} promotions, {} skipped",
             self.misses,
             self.lookups,
@@ -179,7 +191,11 @@ impl ExpertCacheStats {
             Self::rate(self.decode_misses, self.decode_lookups),
             self.promotions,
             self.skipped
-        )
+        );
+        if self.prefetch.tokens > 0 {
+            s += &format!("; {}", self.prefetch.describe());
+        }
+        s
     }
 }
 
@@ -204,9 +220,19 @@ pub struct ExpertCacheLink {
     pub ready: SharedEvent,
     next_seq: Cell<u64>,
     service: Arc<Service>,
+    /// What [`Self::set_position`] set.
+    position: Cell<Option<usize>>,
 }
 
 impl ExpertCacheLink {
+    /// The passes encoded from now on are decode or verify passes whose
+    /// first row is at `pos` (`None`: prefill): their requests carry it, so
+    /// a prefetch from a prediction file (`expert_prefetch`) knows which
+    /// row to read. Each pass's encoder sets it before its first layer.
+    pub fn set_position(&self, pos: Option<usize>) {
+        self.position.set(pos);
+    }
+
     /// Registers the routing of `layer` held in `ids` (`count` `U32`s) and
     /// returns the sequence number the pass must signal `routed` and wait
     /// `ready` with. Sequence numbers rise in encode order, which is the
@@ -214,7 +240,13 @@ impl ExpertCacheLink {
     pub fn enqueue(&self, layer: usize, ids: &Tensor, count: usize) -> u64 {
         let seq = self.next_seq.get() + 1;
         self.next_seq.set(seq);
-        let request = Request { seq, layer, ids: ids.contents_ptr() as usize, count };
+        let request = Request {
+            seq,
+            layer,
+            ids: ids.contents_ptr() as usize,
+            count,
+            pos: self.position.get(),
+        };
         self.service
             .requests
             .lock()
@@ -252,6 +284,7 @@ impl ExpertCacheLink {
             decode_misses: s.decode_misses.load(Ordering::Relaxed),
             promotions: s.promotions.load(Ordering::Relaxed),
             skipped: s.skipped.load(Ordering::Relaxed),
+            prefetch: *s.prefetch.lock().unwrap_or_else(|e| e.into_inner()),
         }
     }
 }
@@ -321,6 +354,7 @@ impl ExpertCache {
             routed: ctx.new_shared_event()?,
             ready: ctx.new_watched_event()?,
             next_seq: Cell::new(0),
+            position: Cell::new(None),
             service: Arc::new(Service {
                 requests: Mutex::new(VecDeque::new()),
                 wake: Condvar::new(),
@@ -334,6 +368,7 @@ impl ExpertCache {
                 stale: AtomicU64::new(0),
                 released: AtomicU64::new(0),
                 skipped: AtomicU64::new(0),
+                prefetch: Mutex::new(PrefetchCounts::default()),
             }),
         });
         Ok(Self {
@@ -430,8 +465,9 @@ impl ExpertCache {
     /// Fills the slab per `policy` from `store` (every pinned slice and
     /// the LRU region's prefill), points the tables at the slots, and
     /// starts the service thread that resolves misses, counts `usage`,
-    /// promotes when `adapt` and persists to `usage_out`. Must run before
-    /// any pass reads the slab.
+    /// promotes when `adapt`, persists to `usage_out` and, with `prefetch`,
+    /// prefetches decode passes' experts from its predictions
+    /// (`expert_prefetch`). Must run before any pass reads the slab.
     pub fn fill_and_serve(
         &mut self,
         store: ExpertStore,
@@ -439,6 +475,7 @@ impl ExpertCache {
         mut usage: LiveUsage,
         adapt: bool,
         usage_out: Option<PathBuf>,
+        prefetch: Option<PrefetchSetup>,
     ) -> Result<()> {
         ensure!(self.worker.is_none(), "the expert cache is already being served");
         ensure!(
@@ -466,16 +503,33 @@ impl ExpertCache {
             policy.pinned(),
             started.elapsed().as_secs_f64()
         );
+        let store = Arc::new(store);
+        let experts = self.experts;
+        let prefetcher = match prefetch {
+            Some(setup) => {
+                // Each read in flight reads an expert's regions at once, on
+                // threads of its own so demand reads keep the whole pool.
+                let pool = Arc::new(
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(REGIONS * setup.depth)
+                        .thread_name(|i| format!("expert-prefetch-{i}"))
+                        .build()?,
+                );
+                let launch = prefetch_launch(pool, store.clone(), slab);
+                Some(Prefetcher::new(setup, self.slot_of.len(), experts, launch))
+            }
+            None => None,
+        };
         let service = self.link.service.clone();
         let (routed, ready) = (self.link.routed.clone(), self.link.ready.clone());
-        let experts = self.experts;
         self.usage_out = usage_out.clone();
         self.worker =
             Some(std::thread::Builder::new().name("expert-cache".into()).spawn(
                 move || {
                     serve(
                         pool,
-                        store,
+                        &store,
+                        prefetcher,
                         &mut policy,
                         &mut usage,
                         adapt,
@@ -783,6 +837,27 @@ unsafe fn load_slots(
     entries: &[(u32, usize, usize)],
     trace: Option<(&MissTrace, u64)>,
 ) -> Result<()> {
+    // SAFETY: as documented.
+    unsafe { read_slots(pool, store, slab, entries, trace)? };
+    for &(slot, layer, expert) in entries {
+        // SAFETY: the table is a shared-storage U32 [E] buffer.
+        unsafe { set_entry(tables, experts, layer, expert, slot) };
+    }
+    Ok(())
+}
+
+/// The reads of [`load_slots`], without pointing the tables at the slots.
+///
+/// # Safety
+///
+/// As [`load_slots`].
+unsafe fn read_slots(
+    pool: &rayon::ThreadPool,
+    store: &ExpertStore,
+    slab: &SlabPointers,
+    entries: &[(u32, usize, usize)],
+    trace: Option<(&MissTrace, u64)>,
+) -> Result<()> {
     if entries.is_empty() {
         return Ok(());
     }
@@ -805,12 +880,40 @@ unsafe fn load_slots(
         }
         Ok(())
     };
-    run_claimed(pool, entries.len() * REGIONS, read)?;
-    for &(slot, layer, expert) in entries {
-        // SAFETY: the table is a shared-storage U32 [E] buffer.
-        unsafe { set_entry(tables, experts, layer, expert, slot) };
-    }
-    Ok(())
+    run_claimed(pool, entries.len() * REGIONS, read)
+}
+
+/// How the prefetch reads ([`Prefetcher`]): each one a job on `pool`, which
+/// reads the expert's regions as a demand miss's are read, from that job's
+/// thread and the pool's others ([`run_claimed`]), straight into its slot.
+/// A failed read ends the process, as a failed demand read does.
+fn prefetch_launch(
+    pool: Arc<rayon::ThreadPool>,
+    store: Arc<ExpertStore>,
+    slab: SlabPointers,
+) -> Launch {
+    Box::new(move |reads: &Arc<Reads>, read: Read| {
+        let (inner, store, reads) = (pool.clone(), store.clone(), reads.clone());
+        pool.spawn(move || {
+            let started = std::time::Instant::now();
+            let entry = [(read.slot, read.layer, read.expert as usize)];
+            // SAFETY: the slot was taken for this read from one no pass in
+            // flight reads (`SlotPolicy::reserve`), its table entry stays
+            // `NONE` until the service thread sets it after the read landed,
+            // and no other read writes the slot before this one has landed:
+            // a lookup that takes it waits for it (`Prefetcher::release`).
+            // The service thread waits for every read in flight before it
+            // ends, so the slab outlives the read.
+            if let Err(e) = unsafe { read_slots(&inner, &store, &slab, &entry, None) } {
+                eprintln!(
+                    "expert cache: prefetching layer {} expert {}: {e:#}",
+                    read.layer, read.expert
+                );
+                std::process::abort();
+            }
+            reads.landed(read, started.elapsed());
+        });
+    })
 }
 
 /// Reads each `(layer, expert)` of `experts` into its buffer in `dst`
@@ -964,9 +1067,11 @@ unsafe fn set_entry(
 /// Timing of the service thread's resolutions, a diagnostic
 /// (`LILY_EXPERT_TRACE=<path>`): per resolution when the thread took the
 /// request, saw the GPU's signal, had looked every id up, had read the
-/// misses and had signalled `ready`; per region read its start, end and
-/// reading thread. Written as `<path>.layers.csv` and `<path>.reads.csv`
-/// when the service stops; nanoseconds since the service started. Off, the
+/// misses (and had the routed experts' prefetches, `late`) and had
+/// signalled `ready`; per region read of a miss its start, end and reading
+/// thread (prefetch reads are not traced). Written as `<path>.layers.csv`
+/// and `<path>.reads.csv` when the service stops; nanoseconds since the
+/// service started. Off, the
 /// thread pays one branch per resolution and per read. On, it perturbs what
 /// it measures a little: a clock read per mark, a lock per region read, and
 /// now and then a vector growing. The first [`MissTrace::MAX_LAYERS`]
@@ -987,7 +1092,10 @@ struct LayerTiming {
     layer: usize,
     count: usize,
     ids: usize,
+    /// The policy's misses, and routed experts whose prefetch was still
+    /// queued (read with the misses) or in flight (waited for).
     misses: usize,
+    late: usize,
     popped: u64,
     seen: u64,
     resolved: u64,
@@ -1056,11 +1164,14 @@ impl MissTrace {
         };
         let mut out =
             std::io::BufWriter::new(std::fs::File::create(with(".layers.csv"))?);
-        writeln!(out, "seq,layer,count,ids,misses,popped,seen,resolved,loaded,ready")?;
+        writeln!(
+            out,
+            "seq,layer,count,ids,misses,popped,seen,resolved,loaded,ready,late"
+        )?;
         for t in &self.layers {
             writeln!(
                 out,
-                "{},{},{},{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},{},{},{}",
                 t.seq,
                 t.layer,
                 t.count,
@@ -1070,7 +1181,8 @@ impl MissTrace {
                 t.seen,
                 t.resolved,
                 t.loaded,
-                t.ready
+                t.ready,
+                t.late
             )?;
         }
         out.flush()?;
@@ -1102,7 +1214,8 @@ impl Drop for MissTrace {
 #[allow(clippy::too_many_arguments)]
 fn serve(
     pool: rayon::ThreadPool,
-    store: ExpertStore,
+    store: &ExpertStore,
+    mut prefetcher: Option<Prefetcher>,
     policy: &mut SlotPolicy,
     usage: &mut LiveUsage,
     adapt: bool,
@@ -1116,6 +1229,12 @@ fn serve(
 ) {
     let mut ids: Vec<u32> = Vec::new();
     let mut misses: Vec<(u32, usize, usize)> = Vec::new();
+    // With a prefetch: the slots the lookups took from other experts, and
+    // the prefetches in flight the layer waits for.
+    let mut evicted_by: Vec<(usize, usize)> = Vec::new();
+    let mut awaited: Vec<Read> = Vec::new();
+    // The last request signalled: a pass may still read its slots.
+    let mut last_ready = 0u64;
     let debug = std::env::var_os("LILY_EXPERT_CACHE_DEBUG").is_some();
     let mut trace = MissTrace::from_env();
     // `LILY_EXPERT_WARM=0` leaves the GPU idle while misses are read.
@@ -1151,6 +1270,18 @@ fn serve(
         if service.is_cancelled(request.seq) {
             service.skipped.fetch_add(1, Ordering::Relaxed);
             continue;
+        }
+        let decode = request.count <= DECODE_IDS;
+        if let Some(pf) = prefetcher.as_mut() {
+            // Before the GPU signals: a decode pass's first layer is its
+            // token's start.
+            pf.taken(
+                request.layer,
+                request.pos.filter(|_| decode),
+                policy,
+                request.seq,
+                last_ready,
+            );
         }
         // The GPU is stalled behind this request from the moment it
         // signals, so the wait spins: a blocking wait wakes tens of
@@ -1216,12 +1347,16 @@ fn serve(
         }
         ids.sort_unstable();
         ids.dedup();
-        let decode = request.count <= DECODE_IDS;
         service.lookups.fetch_add(ids.len() as u64, Ordering::Relaxed);
         if decode {
             service.decode_lookups.fetch_add(ids.len() as u64, Ordering::Relaxed);
         }
         misses.clear();
+        evicted_by.clear();
+        awaited.clear();
+        if let Some(pf) = prefetcher.as_mut() {
+            pf.before_lookups(request.layer, &ids, policy);
+        }
         // TODO: hits are stamped in id order, so an earlier miss can evict a
         // resident expert this request routes later, which then misses too;
         // stamping the hits first would avoid it. Measured in replay: 0.2%
@@ -1242,6 +1377,9 @@ fn serve(
                         // SAFETY: the GPU waits at this layer; the evicted
                         // expert's readers have completed.
                         unsafe { set_entry(&tables, experts, l2, e2, NONE) };
+                        if prefetcher.is_some() {
+                            evicted_by.push((l2, e2));
+                        }
                     }
                     misses.push((slot, request.layer, expert));
                 }
@@ -1254,9 +1392,21 @@ fn serve(
                 }
             }
         }
-        if !misses.is_empty()
-            && let Some(w) = warmer.as_mut()
-        {
+        // The policy's misses; a prefetch still queued for a routed expert
+        // is read with them.
+        let missed = misses.len();
+        if let Some(pf) = prefetcher.as_mut() {
+            pf.after_lookups(
+                request.layer,
+                &ids,
+                &mut misses,
+                &evicted_by,
+                policy,
+                &mut awaited,
+            );
+        }
+        let waits = !misses.is_empty() || !awaited.is_empty();
+        if waits && let Some(w) = warmer.as_mut() {
             w.start();
         }
         let resolved = trace.as_ref().map_or(0, MissTrace::now);
@@ -1264,14 +1414,22 @@ fn serve(
         // from experts whose readers have completed, and are distinct.
         let traced = trace.as_ref().map(|t| (t, request.seq));
         if let Err(e) = unsafe {
-            load_slots(&pool, &store, &slab, &tables, experts, &misses, traced)
+            load_slots(&pool, store, &slab, &tables, experts, &misses, traced)
         } {
             eprintln!("expert cache: loading layer {}: {e:#}", request.layer);
             std::process::abort();
         }
-        service.misses.fetch_add(misses.len() as u64, Ordering::Relaxed);
+        service.misses.fetch_add(missed as u64, Ordering::Relaxed);
         if decode {
-            service.decode_misses.fetch_add(misses.len() as u64, Ordering::Relaxed);
+            service.decode_misses.fetch_add(missed as u64, Ordering::Relaxed);
+        }
+        if let Some(pf) = prefetcher.as_mut() {
+            pf.wait(&awaited);
+            // SAFETY: the GPU waits at this layer, and the slots of landed
+            // reads are no longer written.
+            pf.publish(policy, |layer, expert, slot| unsafe {
+                set_entry(&tables, experts, layer, expert, slot)
+            });
         }
         // The GPU waits at this layer for `ready` (or, in a gated pass, has
         // not been handed what follows it), so it cannot have signalled a
@@ -1290,12 +1448,11 @@ fn serve(
             );
         }
         let loaded = trace.as_ref().map_or(0, MissTrace::now);
-        if !misses.is_empty()
-            && let Some(w) = warmer.as_ref()
-        {
+        if waits && let Some(w) = warmer.as_ref() {
             w.release();
         }
         ready.signal(request.seq);
+        last_ready = request.seq;
         if let Some(t) = trace.as_mut() {
             let ready = t.now();
             t.layer(LayerTiming {
@@ -1303,7 +1460,8 @@ fn serve(
                 layer: request.layer,
                 count: request.count,
                 ids: ids.len(),
-                misses: misses.len(),
+                misses: missed,
+                late: misses.len() - missed + awaited.len(),
                 popped,
                 seen,
                 resolved,
@@ -1318,6 +1476,12 @@ fn serve(
             if swaps > 0 {
                 service.promotions.fetch_add(swaps as u64, Ordering::Relaxed);
             }
+        }
+        if let Some(pf) = prefetcher.as_mut() {
+            // After a cut its plane (after the promotion, as in the replay),
+            // stamped as the next request will be.
+            pf.resolved(request.layer, policy, request.seq + 1, request.seq);
+            *service.prefetch.lock().unwrap_or_else(|e| e.into_inner()) = pf.counts();
         }
         if let Some(path) = usage_out
             && persisted.elapsed().as_secs() >= PERSIST_SECS

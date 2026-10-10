@@ -161,43 +161,6 @@ struct Trace {
     requests: Vec<TraceRequest>,
 }
 
-fn parse_prefetch(spec: &str) -> Result<Option<PrefetchReplay>> {
-    if spec == "off" {
-        return Ok(None);
-    }
-    let (head, cuts, replace) = match spec.split_once('@') {
-        Some((head, cuts)) => {
-            let (cuts, replace) = match cuts.strip_suffix('r') {
-                Some(c) => (c, true),
-                None => (cuts, false),
-            };
-            let mut mask = 0u64;
-            for c in cuts.split('+') {
-                let k: u32 = c.parse().with_context(|| format!("prefetch {spec}"))?;
-                ensure!(k < 63, "prefetch {spec}: cut {k} out of range");
-                mask |= 1 << k;
-            }
-            (head, mask, replace)
-        }
-        None => (spec, 0, false),
-    };
-    let v: Vec<usize> = head
-        .split(':')
-        .map(|x| x.parse().with_context(|| format!("prefetch {spec}")))
-        .collect::<Result<_>>()?;
-    ensure!(
-        (2..=3).contains(&v.len()),
-        "prefetch {spec}: LOOKAHEAD:TOP[:BUDGET][@CUT]"
-    );
-    Ok(Some(PrefetchReplay {
-        lookahead: v[0],
-        top: v[1],
-        budget: v.get(2).copied(),
-        cuts,
-        replace,
-    }))
-}
-
 fn label(p: Option<PrefetchReplay>) -> String {
     match p {
         None => "off".into(),
@@ -414,8 +377,11 @@ fn load_trace(stem: &std::path::Path, predicted: bool) -> Result<Trace> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let ranking = UsageRanking::load(&cli.usage)?;
-    let prefetches =
-        cli.prefetch.iter().map(|p| parse_prefetch(p)).collect::<Result<Vec<_>>>()?;
+    let prefetches = cli
+        .prefetch
+        .iter()
+        .map(|p| PrefetchReplay::parse(p))
+        .collect::<Result<Vec<_>>>()?;
     let predicted = prefetches.iter().any(Option::is_some);
     ensure!(
         matches!(cli.predictor.as_str(), "b" | "transitions" | "token" | "oracle"),

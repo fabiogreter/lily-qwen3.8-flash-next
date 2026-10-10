@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 
 use super::expert_cache::ExpertCache;
+use super::expert_prefetch::PrefetchSetup;
 use super::expert_store::{ExpertStore, LiveUsage, SlotPolicy, UsageRanking};
 use crate::weights::{LinearWeights, Loader, MlpWeights, MoeWeights, expect_shape};
 
@@ -912,7 +913,16 @@ pub fn load(
                     "expert cache: expert reads bypass the page cache (LILY_EXPERT_NOCACHE)"
                 );
             }
-            cache.fill_and_serve(store, policy, live, adapt, usage_out)?;
+            // `LILY_EXPERT_PREFETCH_FILE` (measurement): decode passes
+            // prefetch their experts from precomputed predictions.
+            let prefetch = PrefetchSetup::from_env(layers, e)?;
+            if let Some(p) = &prefetch {
+                eprintln!(
+                    "expert cache: prefetch from a prediction file, {}",
+                    p.describe()
+                );
+            }
+            cache.fill_and_serve(store, policy, live, adapt, usage_out, prefetch)?;
             Some(cache)
         }
         None => None,

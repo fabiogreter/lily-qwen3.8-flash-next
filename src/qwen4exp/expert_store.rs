@@ -552,13 +552,44 @@ impl SlotPolicy {
             self.update(s, |p| p.last_used[s] = Some(tick));
             return Lookup::Hit(slot);
         }
-        // Slots used at `tick` rank last among the filled ones, so this
-        // stops within a few keys.
+        self.take_slot(layer, expert, tick, None)
+    }
+
+    /// A prefetch's [`Self::lookup`] of `expert` of `layer`, which must not
+    /// be resident: like a miss, but the victim is never a slot used at
+    /// `busy_from` or later (a pass on the GPU may still be reading those),
+    /// nor at `tick`, which stamps the slot taken. The expert's data is the
+    /// caller's to read in.
+    pub fn reserve(
+        &mut self,
+        layer: usize,
+        expert: usize,
+        tick: u64,
+        busy_from: u64,
+    ) -> Lookup {
+        debug_assert!(self.slot_of(layer, expert).is_none());
+        self.take_slot(layer, expert, tick, Some(busy_from))
+    }
+
+    /// Assigns a victim slot to `expert` of `layer`, stamped `tick`: one not
+    /// used at `tick`, nor at `busy_from` or later when given.
+    fn take_slot(
+        &mut self,
+        layer: usize,
+        expert: usize,
+        tick: u64,
+        busy_from: Option<u64>,
+    ) -> Lookup {
+        // Slots used at `tick` (or `busy_from` and later) rank last among the
+        // filled ones, so this stops within a few keys.
+        let free = |used: Option<u64>| {
+            used != Some(tick) && busy_from.is_none_or(|b| used.is_none_or(|t| t < b))
+        };
         let victim = self
             .victims
             .iter()
             .map(|&key| self.slot_of_key(key))
-            .find(|&s| self.last_used[s] != Some(tick));
+            .find(|&s| free(self.last_used[s]));
         let Some(slot) = victim else {
             return Lookup::Full;
         };

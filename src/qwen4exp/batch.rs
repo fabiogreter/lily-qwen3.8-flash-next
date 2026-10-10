@@ -492,6 +492,12 @@ impl Qwen4ExpModel {
             draws.shape()
         );
 
+        // One row is a decode pass at its position; rows of several
+        // sessions have none a prediction file could follow.
+        self.set_cache_position(match rows {
+            [row] => Some(row.state.pos),
+            _ => None,
+        });
         quant::gather_rows_quant(ctx, pass, &self.weights.embed_tokens, ids, &ps.x)?;
         pass.level_barrier(&[&ps.x])?;
         hc_broadcast_bf16(ctx, pass, &ps.x, &ps.hyper, h, g)?;

@@ -24,13 +24,14 @@ fn service() -> Arc<Service> {
         stale: AtomicU64::new(0),
         released: AtomicU64::new(0),
         skipped: AtomicU64::new(0),
+        prefetch: Mutex::new(Default::default()),
     })
 }
 
 fn enqueue(service: &Service, seqs: impl IntoIterator<Item = u64>) {
     let mut queue = service.requests.lock().unwrap();
     for seq in seqs {
-        queue.push_back(Request { seq, layer: 0, ids: 0, count: 10 });
+        queue.push_back(Request { seq, layer: 0, ids: 0, count: 10, pos: None });
     }
 }
 

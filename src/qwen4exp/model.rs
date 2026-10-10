@@ -2398,6 +2398,15 @@ impl Qwen4ExpModel {
         self.weights.expert_cache.as_ref().map(|c| c.link().stats())
     }
 
+    /// Tells the expert cache, if any, where the pass about to be encoded
+    /// starts (`ExpertCacheLink::set_position`): a decode or verify pass's
+    /// first row, `None` for prefill.
+    pub(super) fn set_cache_position(&self, pos: Option<usize>) {
+        if let Some(cache) = &self.weights.expert_cache {
+            cache.link().set_position(pos);
+        }
+    }
+
     /// Experts and top-k of the routed FFN (for reading the log).
     pub fn moe_shape(&self) -> (usize, usize, usize) {
         (
@@ -2854,6 +2863,7 @@ impl Qwen4ExpModel {
         let conv_slot = state.conv_slot;
         let verify = matches!(mode, BatchMode::Verify { .. });
         pass.set_label(if verify { "verify" } else { "prefill" });
+        self.set_cache_position(verify.then_some(pos));
         if !verify && m > GATED_PREFILL_ROWS {
             // Under the expert cache every MoE layer waits for its misses,
             // and a long prefill's waits add up to seconds (5.6 s for 4 096
@@ -4090,6 +4100,7 @@ impl Qwen4ExpModel {
         let cfg = &self.config;
         let (h, g) = (cfg.hidden_size, cfg.hc_count);
         let conv_slot = state.conv_slot;
+        self.set_cache_position(Some(state.pos));
 
         let ids = s.next_token.view(slot_in, &[1])?;
         quant::gather_rows_quant(ctx, pass, &self.weights.embed_tokens, &ids, &s.x)?;
