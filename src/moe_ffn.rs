@@ -652,6 +652,10 @@ fn resolve_experts(
         let seq = link.enqueue(*layer, indices, count);
         pass.signal_event(&link.routed, seq)?;
         pass.wait_event(&link.ready, seq)?;
+        // The last cached layer's resolution leaves only that layer's
+        // experts and the pass's tail to run: a paced wait for the pass
+        // blocks until then instead of predicting a length the misses vary.
+        pass.set_milestone(&link.ready, seq);
     }
     Ok(())
 }

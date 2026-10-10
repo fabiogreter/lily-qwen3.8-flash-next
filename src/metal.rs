@@ -434,6 +434,7 @@ impl MetalContext {
             open: RefCell::new(None),
             concurrent,
             done: RefCell::new(None),
+            milestone: RefCell::new(None),
             label: Cell::new(profile::UNLABELED),
             names: RefCell::new(Vec::new()),
             segment_kernel: Cell::new(None),
@@ -1137,6 +1138,8 @@ pub struct ComputePass<'a> {
     concurrent: bool,
     /// The event and value [`Self::signal_done`] encoded, if any.
     done: RefCell<Option<(SharedEvent, u64)>>,
+    /// The last host-signalled wait of the pass ([`Self::set_milestone`]).
+    milestone: RefCell<Option<(SharedEvent, u64)>>,
     /// Name for the per-kernel profile ([`Self::set_label`]).
     label: Cell<&'static str>,
     /// Profile mode only: the kernel of each closed command buffer, in
@@ -1439,12 +1442,14 @@ impl<'a> ComputePass<'a> {
         self.close_segment();
         let program = std::mem::take(&mut *self.program.borrow_mut());
         let done = self.done.borrow().clone();
+        let milestone = self.milestone.borrow_mut().take();
         let slot = self.slot.replace(Slot { inner: None, pool: self.ctx.pool.clone() });
         let names = std::mem::take(&mut *self.names.borrow_mut());
         Ok(EncodedPass {
             ctx: self.ctx,
             program,
             done,
+            milestone,
             slot,
             label: self.label.get(),
             names,
@@ -1459,6 +1464,17 @@ impl<'a> ComputePass<'a> {
         self.signal_event(event, value)?;
         *self.done.borrow_mut() = Some((event.clone(), value));
         Ok(())
+    }
+
+    /// Marks `event` reaching `value` as the pass's milestone: a wait the
+    /// pass encoded ([`Self::wait_event`]) that the host satisfies, after
+    /// which little of the pass is left. A paced wait
+    /// ([`PendingPass::wait_paced`]) then blocks until the host has signalled
+    /// it and paces only the rest, which is what makes pacing work for a pass
+    /// whose length varies with host work it waits for (the expert cache's
+    /// misses). Called again, the later milestone replaces the earlier one.
+    pub fn set_milestone(&self, event: &SharedEvent, value: u64) {
+        *self.milestone.borrow_mut() = Some((event.clone(), value));
     }
 
     /// Ends encoding, submits, and blocks until the GPU finishes.
@@ -1481,6 +1497,7 @@ pub struct EncodedPass<'a> {
     ctx: &'a MetalContext,
     program: Vec<Item>,
     done: Option<(SharedEvent, u64)>,
+    milestone: Option<(SharedEvent, u64)>,
     slot: Slot,
     label: &'static str,
     /// Profile mode only: one kernel name per `Item::Cmd`.
@@ -1490,7 +1507,7 @@ pub struct EncodedPass<'a> {
 impl<'a> EncodedPass<'a> {
     /// Submits without blocking.
     pub fn commit(self) -> Result<PendingPass<'a>> {
-        let EncodedPass { ctx, program, done, slot, label, names } = self;
+        let EncodedPass { ctx, program, done, milestone, slot, label, names } = self;
         let cmds = program.iter().filter(|item| matches!(item, Item::Cmd(_))).count();
         let profile = if ctx.profile {
             ensure!(
@@ -1504,7 +1521,15 @@ impl<'a> EncodedPass<'a> {
         };
         let feedback = Feedback::new(cmds, profile);
         let fence_value = ctx.submit(&program, &feedback)?;
-        Ok(PendingPass { ctx, program, fence_value, done, feedback, slot: Some(slot) })
+        Ok(PendingPass {
+            ctx,
+            program,
+            fence_value,
+            done,
+            milestone,
+            feedback,
+            slot: Some(slot),
+        })
     }
 
     /// Drops the context lifetime so the pass can be kept inside long-lived
@@ -1514,6 +1539,7 @@ impl<'a> EncodedPass<'a> {
         DetachedPass {
             program: self.program,
             done: self.done,
+            milestone: self.milestone,
             slot: self.slot,
             label: self.label,
             names: self.names,
@@ -1527,6 +1553,7 @@ impl<'a> EncodedPass<'a> {
 pub struct DetachedPass {
     program: Vec<Item>,
     done: Option<(SharedEvent, u64)>,
+    milestone: Option<(SharedEvent, u64)>,
     slot: Slot,
     label: &'static str,
     names: Vec<&'static str>,
@@ -1538,6 +1565,7 @@ impl DetachedPass {
             ctx,
             program: self.program,
             done: self.done,
+            milestone: self.milestone,
             slot: self.slot,
             label: self.label,
             names: self.names,
@@ -1564,6 +1592,7 @@ pub struct PendingPass<'a> {
     program: Vec<Item>,
     fence_value: u64,
     done: Option<(SharedEvent, u64)>,
+    milestone: Option<(SharedEvent, u64)>,
     feedback: Arc<Feedback>,
     slot: Option<Slot>,
 }
@@ -1663,6 +1692,19 @@ impl PendingPass<'_> {
             Some((event, value)) => (event.clone(), *value),
             None => (self.ctx.fence.clone(), self.fence_value),
         };
+        if let Some((milestone, reached)) = &self.milestone {
+            // Blocks: the host signals the milestone only after work of its
+            // own of unpredictable length. The poll of the pass's end keeps
+            // a milestone that is never signalled (an error path that
+            // released the pass's waits) from holding the thread forever.
+            while !milestone.wait_until(*reached, MILESTONE_POLL_MS) {
+                if event.signaled_value() >= value {
+                    break;
+                }
+                self.ctx.fault.check()?;
+            }
+            pacer.begin(Instant::now());
+        }
         if let Some(wake_at) = pacer.wake_at() {
             let now = Instant::now();
             if wake_at > now {
@@ -1704,12 +1746,18 @@ impl PendingPass<'_> {
     }
 }
 
+/// How often a paced wait blocked on a milestone checks whether the pass
+/// ended without it.
+const MILESTONE_POLL_MS: u64 = 50;
+
 /// Longest a paced wait polls before falling back to a blocking wait.
 const SPIN_CAP: Duration = Duration::from_millis(20);
 
 /// Predicts when a repeating GPU pass completes so the host can sleep until
 /// shortly before and then poll ([`PendingPass::wait_paced`]). Tracks an
-/// exponential average of the interval between `begin` and `end` marks.
+/// exponential average of the interval between `begin` and `end` marks; for
+/// a pass with a milestone ([`ComputePass::set_milestone`]) the paced wait
+/// begins the interval when the milestone is reached.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Pacer {
     began: Option<Instant>,
