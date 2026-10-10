@@ -130,7 +130,10 @@ scratch, caches and pipelines); a 64 GB machine therefore gets about
    reads the routed ids from the shared indices buffer, resolves them
    through the policy and signals. With every expert resident this costs
    7% of decode (96.9 against 104.6 tok/s); a blocking wait in the thread
-   had cost 30%.
+   had cost 30%. A prefill pass is submitted layer by layer instead, each
+   part once its layer's `ready` is signalled, because Metal releases a
+   queue wait still blocked 4 s after its submission ("Timed-out waits in
+   long prefill passes" below).
 3. **Placement by usage.** The ranking from `lily-experts` (`expert-usage.
    json` next to the checkpoint, or `LILY_EXPERT_USAGE`; uniform without
    one) pins the top slices; an LRU region (10% by default, at least a
@@ -609,28 +612,130 @@ all four, alternating:
 | 40 GB, 6 416 slots                    | 82.85, 82.99    | 53.18, 47.2     | see below    |
 | 64 GB, 2 drafts, 512 tokens (tok/s)   | 43.1            | 58.3            | equal        |
 
-### Timed-out waits in long prefill passes (2026-10-10, not fixed)
+### Timed-out waits in long prefill passes (2026-10-10, fixed)
 
 At 40 GB a prefill pass of 4 096 tokens waits about 85 ms per layer and
-5.6 s in all, and from about 4 s into the pass the GPU stops waiting for
-`ready`: the service thread finds `routed` one to six layers ahead of the
-request it is serving, so those layers ran with experts that were not
-loaded. Metal documents it: a wait that times out on an `MTL4CommandQueue`
-releases the queue (on an `MTLCommandBuffer` it fails the buffer), and the
-time limit is not documented. `metal::tests::queue_wait_timeout_probe`
-reproduces it without the model (40 waits of 250 ms in one pass: from
-about 4 s every wait released early; waits of 100 ms for 6 s held). At
-40 GB this happened in every prefill pass measured (64 to 76 per run of
-four passes), the prefill's distinct lookups vary run to run (44 537 to
-44 663 against 44 561 everywhere else), and so do the drawn tokens; the
-40 GB rows above are not one token sequence, and the "after" run with the
-same digest as the "before" ones is the 53.18. At 64 GB a prefill pass
-takes 3.8 to 4.0 s with 2.1 s of waits and none was released early. The
-service thread now counts them ("timed-out waits" in the cache's closing
-line, and a warning at the first). The fix has to keep a submission from
-waiting that long, for example by submitting a cached prefill pass in
-parts, each only when the service has nearly reached it; that changes how
-passes are submitted and is left for a decision.
+5.6 s in all, and from about 4 s into the pass the GPU stopped waiting for
+`ready`: the service thread found `routed` one to six layers ahead of the
+request it was serving, so those layers ran with experts that were not
+loaded. It happened in every prefill pass measured at 40 GB (57 to 76
+timed-out waits per run of four passes), the prefill's distinct lookups
+varied run to run (44 094 to 44 663 against 44 561 everywhere else), and
+so did the drawn tokens; the 40 GB rows of the table above are not one
+token sequence.
+
+**The limit.** Metal's `MTLEvent` page says a wait that times out on an
+`MTL4CommandQueue` "unblocks subsequent work in the queue" (on an
+`MTLCommandBuffer` it fails the buffer with a timeout error). Neither the
+page nor the headers give the limit, and there is no property to read or
+raise it and no status that reports it: the commit feedback has no error.
+`metal::tests::queue_wait_timeout_probe` measures it without the model: a
+pass of (wait `e = k`, work, signal `f = k`) triples, the host raising
+`e` on a schedule and a thread polling `f` for when the queue passed each
+wait.
+
+- A wait nobody signals is released 4.00 s after the submission that
+  encoded it (4.002 to 4.003 s, waits of 1 to 5 s).
+- Waits of 140 ms with 4 to 40 ms of GPU work between them: from 4.03 s
+  after the submission every wait was released, most at once.
+- The clock is per submission, not per wait or per queue. Of two
+  submissions on one queue, committed at 0 and at 3.34 s, the first's
+  waits were released from 4.03 s and the second's from 7.35 s, its own
+  commit plus 4.01 s. The same waits in submissions of one or five, each
+  committed at most 1 s before its first wait, held for 8 s.
+- Some short waits are spared, by a rule the probe did not pin down:
+  waits of 100 ms with 4 ms of work, or 10 ms with 40 ms, held for 7 to
+  8 s in one submission, and waits of up to 210 ms without any work for
+  8 to 9 s (230 ms and more were released at 4.0 s; mixed schedules
+  without work were released 3.4 to 3.75 s after the first long wait).
+  The model's prefill waits of 75 to 130 ms were released, so nothing is
+  built on this.
+- A submission made after released waits waits normally again: the queue
+  is not left broken.
+
+**What waits, and for how long.** Every queue-level wait in lily is on a
+host-signalled event:
+
+| wait                                    | passes                         | blocked for                                                    | past 4 s?                          |
+|-----------------------------------------|--------------------------------|----------------------------------------------------------------|------------------------------------|
+| `ready`, each cached MoE layer           | prefill (more than 4 rows)     | the layer's misses: 85 ms a layer at 40 GB, 5.6 s a pass         | yes at 40 GB; 64 GB at 3.8 to 4 s   |
+| `ready`, each cached MoE layer           | decode, verify (up to 4 rows), short prefills | a few ms a layer; at most 40 experts a layer, about 9 ms when all miss, 0.45 s a pass | only with a drive or host stalled for seconds |
+| `StepSync`, a parked pass's first input  | decode, verify, batched rows   | the pass before it plus the host's per-token callbacks (ms; the token stream's channel is unbounded, so a slow client does not hold them) | only with a stalled host |
+| none                                     | the warm pass, blits, vision, everything resident | (the warm pass polls a host-written word, capped at 65 536 polls) | no |
+
+The draft head's experts are resident, so draft passes have no cache
+waits; without the cache the only wait is the parked one.
+
+**The fix.** A gated pass (`ComputePass::gate_host_waits`) is submitted in
+parts that begin at its waits: the commit submits it up to the first wait,
+and a feeder thread submits each later part only once the host has
+signalled that part's wait (polling for 0.2 ms, then blocking). The queue
+never blocks on a host event, so nothing can time out however long the
+reads take; later submissions on the context wait until the feeder has
+submitted the last part, which keeps the queue's order. `encode_batch`
+gates every prefill pass of more than 4 rows (`GATED_PREFILL_ROWS`, a
+verify pass's size); without the cache a prefill has no waits and is
+submitted as before. A part costs the host's wake-up and commit after
+`ready` instead of the GPU seeing the signal (`event_handoff_latency`:
+0.21 against 0.09 ms), about 5 ms per 48-layer pass. Decode and verify
+passes keep their queue waits, which the table bounds well under the
+limit; gating them would cost those 5 ms per token.
+
+**One that happens anyway fails the request.** Every pass's commit
+feedback now checks its waits (`metal::Watch`): the command buffer behind
+a wait must have started after the host signalled the event (each
+`SharedEvent::signal` logs its value and time, the last 4 096), and the
+event must not be below the value when that command buffer has completed.
+A wait that did not hold records a context fault; the pass's wait reports
+it before anything reads the pass's outputs, because a pass with waits
+takes its waits' feedback first. An empty command buffer behind the last
+wait has that feedback arrive as soon as the wait is passed: waiting for
+the feedback of the command buffer that follows it, which in a decode
+pass runs to the end, cost 0.15 ms per token at the reference. The fault
+fails the request (503) and the server drops the engine without spilling
+its sessions and loads it again, as after any Metal error. That over
+recomputing the pass: the pass read slots the service thread was
+rewriting and wrote attention and recurrent state from the wrong experts,
+lily keeps no copy of the in-place recurrent state to recompute from, and
+a decode-class pass gets there only if the drive or the host stalled for
+seconds, so a reload is proportionate. Waits the host released start 0.1
+to 0.5 ms after its signal (`waits_the_host_releases_are_not_reported_as_timed_out`);
+a real timeout is caught (`a_real_timed_out_wait_faults_the_context`,
+ignored, 4.5 s). A GPU signal after every wait, which the host could
+check before it signals, measured 0.22 ms per 48 waits
+(`witness_signal_cost_probe`) and was not used. The service thread's
+count of timed-out waits stays as a diagnostic.
+
+**Measured**, q4-xl, 8K prompt, 1 024 sampled tokens, a fresh APFS clone
+per run with `LILY_EXPERT_NOCACHE=1`, before (`4740cab`) and after
+alternating; times in s for the prefill and ms per token for the decode:
+
+| configuration                    | prefill before                | prefill after          | decode before                      | decode after               | digest                          | timed-out waits |
+|----------------------------------|-------------------------------|------------------------|------------------------------------|----------------------------|---------------------------------|-----------------|
+| 40 GB, 6 416 slots               | 11.13, 11.24                  | 12.03, 12.06           | 52.98, 58.89                       | 55.37, 59.16               | each run its own; `5f98c38bea6bc0e0` | 57, 68; 0, 0    |
+| 40 GB, one pass of 8 192         | 6.04                          | 7.72                   | 52.95                              | 55.51                      | `fbeeab98f092b3f4`; `5f98c38bea6bc0e0` | 48; 0           |
+| 64 GB, 15 736 slots              | 7.47, 7.39, 7.42, 7.50, 7.55, 7.46 | 7.35, 7.35, 7.34, 7.33 | 22.61, 22.60, 22.60, 22.64, 22.58, 22.65 | 22.69, 22.70, 22.55, 22.64 | `5f98c38bea6bc0e0`              | 0               |
+| reference, 23 115 slots          | 4.38, 4.40, 4.45, 4.42, 4.45  | 4.38, 4.46, 4.43, 4.43, 4.44 | 14.42, 14.40, 14.36, 14.38, 14.47 | 14.39, 14.64, 14.39, 14.43, 14.33 | `5f98c38bea6bc0e0`        | 0               |
+| resident                         | 3.29, 3.25, 3.34              | 3.32, 3.28, 3.04       | 12.73, 12.66, 12.78                | 12.74, 12.66, 12.80        | `5f98c38bea6bc0e0`              |                 |
+
+At 40 GB the prefill's lookups are now 44 561 and the tokens are the
+reference's in every run, also from a single 8 192-token pass of 7.7 s.
+The prefill takes 0.8 to 0.9 s longer there because it now waits for every
+layer's reads, which the released waits had let the GPU skip; at 64 GB,
+where nothing was released, it is 1.5% faster gated (7.34 against 7.46 s),
+and at the reference and resident it is unchanged. The 40 GB decode times
+are not comparable before and after (different tokens). Runs made in
+slow spells of the machine, both binaries alike, are left out: two
+reference pairs (18.6 to 19.7 ms per token) and two resident pairs (17.9
+to 18.0 and 14.6 to 14.8). The 4-layer checkpoint's
+`the_expert_cache_generates_what_the_resident_model_does` checks gated
+prefill and queue-waited decode under the cache token for token against
+the resident model.
+
+The timing-dependent digest that "Prefill chunks of 8 192 tokens" below
+reports for 8 192-token passes under memory pressure is most likely this
+as well: passes that slow wait past 4 s. It was not rerun under that
+balloon.
 
 ### Cross-layer prefetch on agent sessions, and what it costs (2026-10-09)
 
@@ -893,7 +998,9 @@ not (all of those match the resident path exactly); the drift starts at
 token 26 and stays plausible text, so it reads as GPU buffers being
 paged under extreme pressure rather than a data race in the cache (a
 re-read check on the routed ids found no stale reads). A run on a real
-64 GB machine, without the preload, is what settles it.
+64 GB machine, without the preload, is what settles it. (2026-10-10: more
+likely the timed-out waits above, which such slow passes run into; at
+40 GB a single 8 192-token pass now reproduces the reference tokens.)
 
 ### What would move it further
 
