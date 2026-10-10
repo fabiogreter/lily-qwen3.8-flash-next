@@ -242,6 +242,20 @@ impl Clock {
         }
     }
 
+    /// The prefetches queued or in flight now, into `out`.
+    fn unlanded(&self, out: &mut Vec<(usize, u32)>) {
+        out.extend(self.queue.iter().map(|&(l, e, _)| (l, e)));
+        match &self.shared {
+            Some(s) => out.extend(s.reads.iter().filter_map(|r| r.prefetch)),
+            None => out.extend(
+                self.landing
+                    .iter()
+                    .filter(|&(_, &land)| land > self.now)
+                    .map(|(&k, _)| k),
+            ),
+        }
+    }
+
     /// Starts queued prefetches the SSD reaches before `until`.
     fn run_queue(&mut self, until: f64) {
         while let Some(&(layer, expert, issued)) = self.queue.front() {
@@ -712,6 +726,9 @@ pub struct CacheSim {
     keep_free: usize,
     /// The tick the last prefetches were stamped with, and how many.
     stamped: (u64, usize),
+    /// For a request that promotes: the prefetches not landed by the last
+    /// request's end, which promotion leaves alone.
+    unlanded: Vec<(usize, u32)>,
 }
 
 impl CacheSim {
@@ -743,6 +760,7 @@ impl CacheSim {
             session_index: 0,
             keep_free: 0,
             stamped: (0, 0),
+            unlanded: Vec::new(),
         })
     }
 
@@ -834,8 +852,13 @@ impl CacheSim {
         }
         self.served += 1;
         if self.config.adapt && self.served.is_multiple_of(PROMOTE_EVERY) {
-            counts.promotions += self.usage.promote(&mut self.policy, self.tick) as u64;
+            // As in the server, never a prefetch still on its way.
+            let unlanded = &self.unlanded;
+            let pending = |l: usize, e: usize| unlanded.contains(&(l, e as u32));
+            counts.promotions +=
+                self.usage.promote_except(&mut self.policy, self.tick, pending) as u64;
         }
+        self.unlanded.clear();
         misses
     }
 
@@ -1088,6 +1111,12 @@ impl CacheSim {
                         counts.prefetch_useful += useful;
                         self.layer_useful[layer] += useful;
                         read.clear();
+                    }
+                    if self.config.adapt
+                        && (self.served + 1).is_multiple_of(PROMOTE_EVERY)
+                        && let Some(c) = &clock
+                    {
+                        c.unlanded(&mut self.unlanded);
                     }
                     let misses = self.request(layer, &pass, counts);
                     self.layer_misses[layer] += misses;

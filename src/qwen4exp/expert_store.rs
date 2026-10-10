@@ -762,6 +762,19 @@ impl LiveUsage {
     /// each pair whose cold score clears the hysteresis swaps roles in
     /// `policy`. Returns the swaps made.
     pub fn promote(&mut self, policy: &mut SlotPolicy, tick: u64) -> usize {
+        self.promote_except(policy, tick, |_, _| false)
+    }
+
+    /// [`Self::promote`], leaving out the LRU slots whose (layer, expert)
+    /// `pending` names: a prefetch's reservation whose data has not landed,
+    /// which a cancellation may yet empty ([`SlotPolicy::forget`]), and a
+    /// pinned slot emptied would shrink the pinned set for good.
+    pub fn promote_except(
+        &mut self,
+        policy: &mut SlotPolicy,
+        tick: u64,
+        pending: impl Fn(usize, usize) -> bool,
+    ) -> usize {
         let n_slots = policy.n_slots();
         let mut pinned: Vec<(u64, u32)> = Vec::new();
         let mut cold: Vec<(u64, u32)> = Vec::new();
@@ -773,7 +786,7 @@ impl LiveUsage {
                 if since == 0 || tick.saturating_sub(since) >= Self::PROTECT_TICKS {
                     pinned.push((score, slot));
                 }
-            } else {
+            } else if !pending(l, e) {
                 cold.push((score, slot));
             }
         }

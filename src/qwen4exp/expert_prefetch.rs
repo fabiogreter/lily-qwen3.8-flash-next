@@ -25,6 +25,10 @@
 //!   as that pass routes ids ([`Prefetcher::taken`]'s `keep_free`): past
 //!   that a pick is given up (`full`), since the request's own misses could
 //!   then find no slot. The replay caps its prefetches the same way.
+//! - Promotion leaves a reservation alone until its read has landed and
+//!   been published ([`Prefetcher::is_outstanding`]): a cancelled one is
+//!   emptied, and a pinned slot emptied would shrink the pinned set for
+//!   good. The replay leaves its unlanded prefetches alone the same way.
 //! - Once a cut layer's request is resolved (its `ready` signalled), the
 //!   cut's plane does the same for the layers after it; with `replace` it
 //!   first cancels the queued reads for those layers that it does not pick.
@@ -65,6 +69,10 @@ use anyhow::{Context as _, Result, ensure};
 
 use super::cache_replay::{NO_PREDICTION, PrefetchReplay};
 use super::expert_store::{Lookup, SlotPolicy};
+
+/// The most prefetch reads in flight: each has a pool of its own, one
+/// thread per region of an expert.
+pub const MAX_DEPTH: usize = 8;
 
 /// Precomputed predictions ([`cache_replay::Predictions`]' layout), read
 /// whole.
@@ -176,7 +184,11 @@ impl PrefetchSetup {
             plan.cuts.checked_shr(layers as u32 - 1).unwrap_or(0) == 0,
             "every cut needs a layer after it"
         );
-        ensure!(depth >= 1, "a prefetch depth of at least 1");
+        ensure!(
+            (1..=MAX_DEPTH).contains(&depth),
+            "a prefetch depth of 1 to {MAX_DEPTH} (each read in flight has {} threads of its own)",
+            super::expert_store::REGIONS
+        );
         let planes = 1 + plan.cuts.count_ones() as usize;
         ensure!(
             file.planes >= planes && file.layers == layers,
@@ -306,7 +318,7 @@ impl PrefetchCounts {
 
     /// Reads issued and not cancelled: `lily-cache-replay`'s prefetch reads.
     pub fn reads(&self) -> u64 {
-        self.issued - self.cancelled
+        self.issued.saturating_sub(self.cancelled)
     }
 
     /// `prefetch over T tokens: R reads (r/token), U useful (u/token), L
@@ -496,6 +508,12 @@ impl Prefetcher {
             landed: Vec::new(),
             picks: Vec::new(),
         }
+    }
+
+    /// Whether a prefetch of `expert` of `layer` holds a slot whose table
+    /// entry is not set yet: queued, in flight, or landed and not published.
+    pub(crate) fn is_outstanding(&self, layer: usize, expert: usize) -> bool {
+        self.outstanding[layer * self.experts + expert]
     }
 
     pub(crate) fn counts(&self) -> PrefetchCounts {

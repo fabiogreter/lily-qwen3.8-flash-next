@@ -1125,8 +1125,11 @@ queued read with the demand misses, one in flight waited for, the rest
 cancelled at their layer. The reservations for one request leave it as
 many LRU slots as its pass routes ids (past that a pick counts as `full`,
 in the replay too), so its own misses always find a slot; the cap never
-engaged on the anchor (0 full in every replay and run below). A slot table
-entry points at a prefetched slot only once its read landed. Departures
+engaged on the anchor (0 full in every replay and run below). Promotion
+skips a reservation whose read has not landed (a cancellation would empty
+a pinned slot for good), in the replay too; on the anchor that moved only
+the 6 416-slot oracle replay, by 0.005 ms. A slot table entry points at a
+prefetched slot only once its read landed. Departures
 from the replay:
 both kinds of plane come slightly earlier than the replay's layer end, a
 prefetch never evicts a slot the last signalled request used, and a lookup

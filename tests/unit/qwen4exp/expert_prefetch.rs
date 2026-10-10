@@ -139,10 +139,35 @@ fn request(
     last_ready: &mut u64,
     table: &mut Vec<(usize, usize, u32)>,
 ) -> Served {
+    request_sparing(
+        pf,
+        policy,
+        usage,
+        (layer, pos, routed, seq),
+        last_ready,
+        table,
+        true,
+    )
+}
+
+/// [`request`]; with `spare_busy` false the prefetches spare only the slots
+/// the next request stamps, as the replay's do, not the last signalled
+/// request's too.
+#[allow(clippy::too_many_arguments)]
+fn request_sparing(
+    pf: &mut Prefetcher,
+    policy: &mut SlotPolicy,
+    usage: &mut LiveUsage,
+    (layer, pos, routed, seq): (usize, Option<usize>, &[u32], u64),
+    last_ready: &mut u64,
+    table: &mut Vec<(usize, usize, u32)>,
+    spare_busy: bool,
+) -> Served {
     let mut set = |l: usize, e: usize, s: u32| table.push((l, e, s));
     let decode = routed.len() <= crate::qwen4exp::expert_cache::DECODE_IDS;
     let pos = pos.filter(|_| decode);
-    pf.taken(layer, pos, routed.len(), policy, seq, *last_ready, &mut set);
+    let busy = if spare_busy { *last_ready } else { seq };
+    pf.taken(layer, pos, routed.len(), policy, seq, busy, &mut set);
     let mut ids = routed.to_vec();
     ids.sort_unstable();
     ids.dedup();
@@ -162,7 +187,8 @@ fn request(
     pf.wait(&res.awaited);
     pf.publish(policy, &mut set);
     *last_ready = seq;
-    pf.resolved(layer, routed.len(), policy, (seq + 1, seq), &mut set);
+    let busy = if spare_busy { seq } else { seq + 1 };
+    pf.resolved(layer, routed.len(), policy, (seq + 1, busy), &mut set);
     Served {
         missed: missed_ids,
         demand: res.misses.iter().map(|m| m.2 as u32).collect(),
@@ -329,6 +355,43 @@ fn a_cut_replaces_the_queued_reads_it_does_not_pick() {
     finish(pf);
 }
 
+/// Stamps every resident LRU slot but those of `except` at `tick`, so the
+/// slots of `except` (stamped earlier) are the next victims.
+fn age_all_but(policy: &mut SlotPolicy, except: &[(usize, usize)], tick: u64) {
+    let lru: Vec<(usize, usize)> = (0..policy.n_slots() as u32)
+        .filter(|&s| !policy.is_pinned(s))
+        .filter_map(|s| policy.slice_in(s))
+        .collect();
+    for (l, e) in lru {
+        if !except.contains(&(l, e)) {
+            policy.lookup(l, e, tick);
+        }
+    }
+}
+
+/// `layer`'s lookups of `ids` at `seq` through the service thread's own
+/// function, the table writes into `table`.
+fn look_up_layer(
+    pf: &mut Prefetcher,
+    policy: &mut SlotPolicy,
+    (layer, ids, seq): (usize, &[u32], u64),
+    table: &mut Vec<(usize, usize, u32)>,
+) -> Resolution {
+    let mut res = Resolution::default();
+    let mut set = |l: usize, e: usize, s: u32| table.push((l, e, s));
+    look_up(
+        policy,
+        &mut usage(),
+        Some(pf),
+        (layer, seq, true),
+        ids,
+        &mut res,
+        &mut set,
+    )
+    .expect("a slot");
+    res
+}
+
 #[test]
 fn a_lookup_that_takes_a_queued_prefetchs_slot_cancels_it() {
     let f = file(1, 1, &[(0, 3, 0, &[11, 12])]);
@@ -338,12 +401,14 @@ fn a_lookup_that_takes_a_queued_prefetchs_slot_cancels_it() {
     start(&mut pf, &mut policy, Some(0), 10, 9);
     assert_eq!(queued(&pf), vec![(3, 12)]);
     let slot = policy.slot_of(3, 12).unwrap();
-    // A demand miss evicts it (as if it were the LRU's oldest).
-    let (mut misses, mut awaited) = (vec![(slot, 1, 15)], Vec::new());
-    policy.forget(3, 12);
-    pf.after_lookups(1, &[15], &mut misses, &[(3, 12)], &mut policy, &mut awaited);
+    // (3, 12)'s slot is the LRU's oldest when layer 1 misses expert 15.
+    age_all_but(&mut policy, &[(3, 12)], 11);
+    let mut table = Vec::new();
+    let res = look_up_layer(&mut pf, &mut policy, (1, &[15], 12), &mut table);
+    assert_eq!(res.misses, vec![(slot, 1, 15)], "the demand read only");
+    assert_eq!(res.evicted, vec![(3, 12)]);
+    assert_eq!(table, vec![(3, 12, SlotPolicy::NONE)], "the entry cleared");
     assert!(queued(&pf).is_empty());
-    assert_eq!(misses.len(), 1, "the demand read only");
     let c = pf.counts();
     assert_eq!((c.reads(), c.cancelled), (1, 1));
     finish(pf);
@@ -457,12 +522,18 @@ fn synthetic_predictions(routing: &[u32], tokens: usize) -> Vec<u16> {
     ids
 }
 
-#[test]
-fn reads_that_land_at_once_count_as_the_untimed_replay_does() {
-    let (prefill, tokens) = (6, 40);
-    let routing = synthetic_routing(tokens);
-    let ids = synthetic_predictions(&routing, tokens);
-    let spec = "0:3@1";
+/// Replays `spec` over the synthetic session with `ids` (`planes` x width
+/// `width` predictions) untimed, serves the same requests with reads that
+/// land at once (sparing the busy slots or not, [`request_sparing`]), and
+/// with `exact` checks the two count alike: both sides' counts.
+fn against_the_replay(
+    spec: &str,
+    routing: &[u32],
+    ids: &[u16],
+    (planes, width): (usize, usize),
+    (spare_busy, exact): (bool, bool),
+) -> (ReplayCounts, PrefetchCounts) {
+    let (prefill, tokens) = (6, routing.len() / (LAYERS * 2));
     // The replay: reads land at once without a timing.
     let plan = PrefetchReplay::parse(spec).unwrap().unwrap();
     let config = ReplayConfig {
@@ -477,11 +548,11 @@ fn reads_that_land_at_once_count_as_the_untimed_replay_does() {
     };
     let mut sim = CacheSim::new(&ranking(), 2, config).expect("sim");
     let mut want = ReplayCounts::default();
-    let pred = Predictions { ids: &ids, planes: 2, width: 4 };
+    let pred = Predictions { ids, planes, width };
     let req = [TraceRequest { prefill: 0..prefill, decode: prefill..tokens }];
-    sim.session(&routing, Some(&pred), tokens, 2, &req, &mut want).expect("replay");
+    sim.session(routing, Some(&pred), tokens, 2, &req, &mut want).expect("replay");
     // The service thread's schedule over the same requests.
-    let f = PredictionFile::new(ids.clone(), 2, LAYERS, 4).unwrap();
+    let f = PredictionFile::new(ids.to_vec(), planes, LAYERS, width).unwrap();
     let mut pf = Prefetcher::new(setup(spec, 1, f), LAYERS, EXPERTS, instant());
     let mut policy = policy();
     let (mut seq, mut last, mut table, mut usage) = (0u64, 0u64, Vec::new(), usage());
@@ -489,16 +560,15 @@ fn reads_that_land_at_once_count_as_the_untimed_replay_does() {
     for layer in 0..LAYERS {
         seq += 1;
         let pass = &routing[(layer * tokens) * 2..(layer * tokens + prefill) * 2];
-        let s = request(
+        let at = (layer, None, pass, seq);
+        let s = request_sparing(
             &mut pf,
             &mut policy,
             &mut usage,
-            layer,
-            None,
-            pass,
-            seq,
+            at,
             &mut last,
             &mut table,
+            spare_busy,
         );
         prefill_misses += s.missed.len();
     }
@@ -506,16 +576,15 @@ fn reads_that_land_at_once_count_as_the_untimed_replay_does() {
         for layer in 0..LAYERS {
             seq += 1;
             let routed = &routing[(layer * tokens + pos) * 2..][..2];
-            let s = request(
+            let at = (layer, Some(pos), routed, seq);
+            let s = request_sparing(
                 &mut pf,
                 &mut policy,
                 &mut usage,
-                layer,
-                Some(pos),
-                routed,
-                seq,
+                at,
                 &mut last,
                 &mut table,
+                spare_busy,
             );
             assert!(
                 s.awaited.is_empty() && s.demand == s.missed,
@@ -528,7 +597,10 @@ fn reads_that_land_at_once_count_as_the_untimed_replay_does() {
         }
     }
     let c = pf.counts();
-    assert!(c.reads() > 0 && c.useful > 0, "the predictions read something");
+    finish(pf);
+    if !exact {
+        return (want, c);
+    }
     // A prefill pass of 12 ids is decode-class to the replay, as to the
     // service.
     assert_eq!(want.prefill_lookups, 0);
@@ -542,6 +614,35 @@ fn reads_that_land_at_once_count_as_the_untimed_replay_does() {
     // every other entry written cleared an evicted expert.
     let published = table.iter().filter(|&&(_, _, s)| s != SlotPolicy::NONE).count();
     assert_eq!(published as u64, c.reads());
+    (want, c)
+}
+
+#[test]
+fn reads_that_land_at_once_count_as_the_untimed_replay_does() {
+    let routing = synthetic_routing(40);
+    let ids = synthetic_predictions(&routing, 40);
+    let (_, c) = against_the_replay("0:3@1", &routing, &ids, (2, 4), (true, true));
+    assert!(c.reads() > 0 && c.useful > 0, "the predictions read something");
+    assert_eq!(c.full, 0);
+}
+
+#[test]
+fn the_replay_caps_a_plane_where_the_server_does() {
+    // Every position's plane 0 picks every cold expert of every layer: 24
+    // picks against 20 LRU slots less a pass's 2 routed ids.
+    let routing = synthetic_routing(40);
+    let mut ids = Vec::new();
+    for _ in 0..LAYERS * 40 {
+        ids.extend_from_slice(&[10, 11, 12, 13, 14, 15]);
+    }
+    // Sparing what the replay spares, every count agrees.
+    let (_, c) = against_the_replay("0:6", &routing, &ids, (1, 6), (false, true));
+    assert!(c.full > 0 && c.reads() > 0, "{c:?}");
+    // Sparing the busy slots too, the server can take other victims once
+    // the region runs out (a miss more or less here), but caps alike.
+    let (want, c) = against_the_replay("0:6", &routing, &ids, (1, 6), (true, false));
+    assert_eq!(want.prefetch_full, c.full);
+    assert!(c.full > 0);
 }
 
 /// Plane 0 picking every cold expert (10 to 15) of every layer: 24 picks
@@ -568,7 +669,7 @@ fn a_plane_leaves_its_request_a_slot_for_every_routed_id() {
     });
     let c = pf.counts();
     assert_eq!(c.issued, 10);
-    assert_eq!(c.full, 3, "layer 1's seventh pick, then layers 2 and 3");
+    assert_eq!(c.full, 3, "layer 1's fifth pick, then layers 2 and 3");
     // Every reservation evicted an LRU expert, whose entry was cleared.
     assert_eq!(cleared.len(), 10);
     assert!(
@@ -585,26 +686,20 @@ fn a_plane_leaves_its_request_a_slot_for_every_routed_id() {
             "miss {e} found no slot"
         );
     }
-    // The next tick starts a new count.
-    let mut nothing = |_: usize, _: usize, _: u32| {};
-    pf.resolved(0, 10, &mut policy, (11, 10), &mut nothing);
     finish(pf);
 }
 
 #[test]
 fn a_demand_miss_that_takes_a_prefetch_in_flight_waits_for_it() {
-    let f = file(1, 1, &[(0, 3, 0, &[11, 12])]);
-    let (launch, _log) = recording();
+    let f = file(1, 1, &[(0, 3, 0, &[11])]);
+    let (launch, log) = recording();
     let mut pf = Prefetcher::new(setup("0:20", 1, f), LAYERS, EXPERTS, launch);
     let mut policy = policy();
     start(&mut pf, &mut policy, Some(0), 10, 9);
-    assert_eq!(started(&_log), vec![(3, 11)]);
-    // A demand miss of layer 1 took (3, 11)'s slot (as the LRU's oldest).
+    assert_eq!(started(&log), vec![(3, 11)]);
     let slot = policy.slot_of(3, 11).unwrap();
-    policy.forget(3, 11);
-    assert!(
-        matches!(policy.lookup(1, 15, 11), Lookup::Miss { slot: s, .. } if s == slot)
-    );
+    // (3, 11)'s slot is the LRU's oldest when layer 1 misses expert 15.
+    age_all_but(&mut policy, &[(3, 11)], 11);
     let reads = pf.reads.clone();
     let landed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = landed.clone();
@@ -614,19 +709,20 @@ fn a_demand_miss_that_takes_a_prefetch_in_flight_waits_for_it() {
         let (read, _) = reads.lock().in_flight[0];
         reads.landed(read, Duration::ZERO);
     });
-    let (mut misses, mut awaited) = (vec![(slot, 1, 15)], Vec::new());
-    pf.after_lookups(1, &[15], &mut misses, &[(3, 11)], &mut policy, &mut awaited);
+    let mut table = Vec::new();
+    let res = look_up_layer(&mut pf, &mut policy, (1, &[15], 12), &mut table);
     assert!(
         landed.load(std::sync::atomic::Ordering::SeqCst),
         "the demand read waits for the prefetch writing its slot"
     );
     lander.join().unwrap();
-    assert!(awaited.is_empty());
+    assert_eq!(res.misses, vec![(slot, 1, 15)]);
+    assert!(res.awaited.is_empty());
+    assert_eq!(table, vec![(3, 11, SlotPolicy::NONE)], "the entry cleared");
     // The landed read is not published: its slot is the demand miss's now.
-    let mut table = Vec::new();
+    table.clear();
     pf.publish(&policy, |l, e, s| table.push((l, e, s)));
     assert!(table.is_empty());
-    assert_eq!(policy.slot_of(1, 15), Some(slot));
     finish(pf);
 }
 
@@ -695,7 +791,7 @@ fn a_cut_that_takes_plane_zeros_slots_cancels_or_waits_for_them() {
 }
 
 #[test]
-fn a_reserved_slot_pinned_by_a_promotion_and_then_cancelled_is_released() {
+fn promotion_leaves_a_reservation_alone_until_it_lands() {
     let f = file(1, 1, &[(0, 2, 0, &[11, 12])]);
     let (launch, _log) = recording();
     let mut pf = Prefetcher::new(setup("0:20", 1, f), LAYERS, EXPERTS, launch);
@@ -703,17 +799,34 @@ fn a_reserved_slot_pinned_by_a_promotion_and_then_cancelled_is_released() {
     start(&mut pf, &mut policy, Some(0), 10, 9);
     assert_eq!(queued(&pf), vec![(2, 12)]);
     let (pinned, slot) = (policy.pinned(), policy.slot_of(2, 12).unwrap());
-    let demoted = (0..40).find(|&s| policy.is_pinned(s)).unwrap();
-    policy.swap_roles(slot, demoted);
-    assert!(policy.is_pinned(slot));
-    // A prefill request cancels it: the slot is emptied and unpinned.
+    // (2, 12) has out-earned every pinned expert.
+    let mut usage = usage();
+    for _ in 0..100_000 {
+        usage.record(2, 12, true);
+    }
+    // Plain promotion would pin the reservation, and its cancellation would
+    // then empty a pinned slot for good.
+    let mut p = policy.clone();
+    assert_eq!(usage.clone().promote(&mut p, 10), 1);
+    assert!(p.is_pinned(slot));
+    p.forget(2, 12);
+    assert_eq!(p.pinned(), pinned - 1);
+    // The service thread's promotion leaves it in the LRU region.
+    let swaps = usage.promote_except(&mut policy, 10, |l, e| pf.is_outstanding(l, e));
+    assert_eq!(swaps, 0);
+    assert!(!policy.is_pinned(slot));
     start(&mut pf, &mut policy, None, 11, 10);
-    assert!(policy.slot_of(2, 12).is_none() && !policy.is_pinned(slot));
-    assert_eq!(policy.pinned(), pinned - 1);
-    // The emptied slot is the next miss's.
-    assert!(
-        matches!(policy.lookup(1, 15, 12), Lookup::Miss { slot: s, .. } if s == slot)
-    );
+    assert!(policy.slot_of(2, 12).is_none());
+    assert_eq!(policy.pinned(), pinned, "the pinned set kept its size");
+    // Landed and published, it is a candidate like any other.
+    land(&pf, 2, 11);
+    pf.publish(&policy, |_, _, _| {});
+    for _ in 0..100_000 {
+        usage.record(2, 11, true);
+    }
+    let swaps = usage.promote_except(&mut policy, 12, |l, e| pf.is_outstanding(l, e));
+    assert_eq!(swaps, 1);
+    assert!(policy.is_pinned(policy.slot_of(2, 11).unwrap()));
     finish(pf);
 }
 

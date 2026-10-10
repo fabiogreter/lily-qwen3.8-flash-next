@@ -1519,7 +1519,12 @@ fn serve(
         // Off the GPU's critical path: the pass has its slots.
         served += 1;
         if adapt && served.is_multiple_of(PROMOTE_EVERY) {
-            let swaps = usage.promote(policy, request.seq);
+            // Never a reservation still being read: a cancellation would
+            // empty a pinned slot.
+            let pending = |l: usize, e: usize| {
+                prefetcher.as_ref().is_some_and(|pf| pf.is_outstanding(l, e))
+            };
+            let swaps = usage.promote_except(policy, request.seq, pending);
             if swaps > 0 {
                 service.promotions.fetch_add(swaps as u64, Ordering::Relaxed);
             }
