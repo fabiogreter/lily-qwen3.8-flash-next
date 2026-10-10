@@ -140,6 +140,16 @@ struct Cli {
     #[arg(long, value_name = "PATH|off")]
     stats_db: Option<String>,
 
+    /// The dashboard's machine figures: system, CPU, GPU and ANE power, the
+    /// GPU's activity and frequency and the temperatures, sampled by a thread
+    /// of its own (IOReport and the SMC through the `macmon` crate, no root
+    /// needed) every 2 s while the engine is busy or the dashboard is open
+    /// and every 30 s otherwise, and kept in the history. `off` starts no
+    /// sampler and the dashboard shows none of them. A sampler that cannot
+    /// start, or fails later, logs once and stops; serving is unaffected.
+    #[arg(long, default_value = "on", value_name = "on|off")]
+    machine_stats: lily::serve::machine::MachineStats,
+
     /// Where the Qwen3.8-Flash-Next n-gram table lives: `paged` reads rows
     /// from the checkpoint files through the page cache (32 GB less GPU
     /// memory), `resident` uploads it whole.
@@ -416,6 +426,7 @@ fn run() -> Result<()> {
         flags: flag_values(&matches),
         stats_db: lily::serve::recorder::stats_db(cli.stats_db.as_deref())
             .map_err(anyhow::Error::msg)?,
+        machine_stats: cli.machine_stats,
     };
     lily::serve::run(&cli.model, options)
 }

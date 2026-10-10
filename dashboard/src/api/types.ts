@@ -90,15 +90,20 @@ export interface LiveStatus {
   active_sessions: number;
 }
 
-/** Watts by part; the whole object is null while the sampler is not running. */
+/** Watts by part; the whole object is null while there is no fresh reading. */
 export interface Power {
   cpu_w: number;
   gpu_w: number;
   ane_w: number;
-  sys_w: number;
+  /** null when the SMC does not report the system's power (the parts above are still measured). */
+  sys_w: number | null;
 }
 
-/** `ok` sampling, `off` (`--machine-stats off`), `failed` (an error after startup stopped it). */
+/**
+ * `ok`: the sampler thread is running; its figures can still be null until the first fresh reading.
+ * `off`: `--machine-stats off`.
+ * `failed`: it could not start, or stopped after repeated errors.
+ */
 export type SamplerState = 'ok' | 'off' | 'failed';
 
 /** Every field is null when its probe is unavailable. */

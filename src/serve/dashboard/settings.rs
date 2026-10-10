@@ -137,6 +137,8 @@ const DESCRIPTORS: &[Descriptor] = &[
     d("image_min_pixels", ENGINE, Kind::Int),
     d("stats_db", ENGINE, Kind::Text)
         .help("The dashboard's history; off records none."),
+    d("machine_stats", ENGINE, Kind::Enum(&["on", "off"]))
+        .help("Power, GPU and temperature sampling; off starts no sampler."),
 ];
 
 /// A setting's text as the JSON value its kind reads as; a text that does

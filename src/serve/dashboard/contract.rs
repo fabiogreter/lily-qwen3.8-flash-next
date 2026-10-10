@@ -78,7 +78,8 @@ pub struct Power {
     pub cpu_w: f64,
     pub gpu_w: f64,
     pub ane_w: f64,
-    pub sys_w: f64,
+    /// `None` when the SMC does not report the system's power.
+    pub sys_w: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

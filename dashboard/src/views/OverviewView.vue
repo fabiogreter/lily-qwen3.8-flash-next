@@ -112,7 +112,7 @@ const powerSeries: SeriesDef[] = [
         </div>
         <div class="tile">
           <div class="k">Power</div>
-          <div v-if="st.machine.power" class="v">{{ rate(st.machine.power.sys_w) }}<small>W system</small></div>
+          <div v-if="st.machine.power" class="v">{{ st.machine.power.sys_w === null ? '–' : rate(st.machine.power.sys_w) }}<small>W system</small></div>
           <div v-else class="v" :title="`Sampler ${st.machine.sampler}`"><small>unavailable</small></div>
           <div class="m">
             <template v-if="st.machine.power">GPU {{ rate(st.machine.power.gpu_w) }} W</template>

@@ -424,6 +424,7 @@ export function buildSettings(): Setting[] {
     ro('queue', 'Engine', 32, '--queue', 'default'),
     ro('vision', 'Engine', 'auto', '--vision', 'default'),
     ro('stats_db', 'Engine', '~/Library/Application Support/lily/lily.sqlite', '--stats-db', 'default'),
+    ro('machine_stats', 'Engine', 'on', '--machine-stats', 'default'),
     ro('cache_bytes', 'Caches', 'auto', '--cache-bytes', 'default'),
     ro('max_sessions', 'Caches', 16, '--max-sessions', 'default'),
     ro('disk_cache_bytes', 'Caches', '100G', '--disk-cache-bytes', 'default'),

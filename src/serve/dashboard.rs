@@ -13,7 +13,9 @@
 //! token rates come from two counters the engine bumps (a relaxed atomic add
 //! per drawn token, one per prefill chunk), sampled by the HTTP threads.
 //! Machine figures (CPU load, memory, swap, pressure) are read on the HTTP
-//! thread directly. The history and the per-session figures come from the
+//! thread directly; the power, the GPU's activity and frequency and the
+//! temperatures are the sampler's latest reading (`serve::machine`), shown
+//! while it is fresh. The history and the per-session figures come from the
 //! recorder's database (`serve::recorder`), which the board feeds each
 //! finished request's row through a bounded channel (`try_send`; a full
 //! channel drops the row and counts it), read here through a read-only
@@ -47,9 +49,9 @@
 //!
 //! Without the recorder (`--stats-db off`, or a database that could not be
 //! opened) the history routes answer 503 and the per-session figures cover
-//! the requests still in the [`REQUEST_ROWS`] ring. What is not built yet:
-//! the machine's power, GPU and temperatures wait for the sampler
-//! (`machine.sampler` is `off`).
+//! the requests still in the [`REQUEST_ROWS`] ring. With `--machine-stats off`
+//! (or a sampler that failed) `machine.sampler` says so and the power, GPU and
+//! temperatures are `null`.
 
 pub mod contract;
 pub mod history;
@@ -64,14 +66,15 @@ use std::time::{Duration, Instant};
 
 use contract::{
     CancelledBy, DiskTier, ErrorBody, ErrorDetail, ExpertTier, GpuTier, LifecycleState,
-    LiveStatus, MachineStatus, MemoryPressure, NgramTier, QueueStatus, Range,
+    LiveStatus, MachineStatus, MemoryPressure, NgramTier, Power, QueueStatus, Range,
     RequestRow, RequestsResponse, SamplerState, Session, SessionTier, SessionsResponse,
     Setting, SettingResetResponse, SettingsLogResponse, SettingsResponse,
-    SettingsUpdateResponse, Status, Tiers, WeightsTier,
+    SettingsUpdateResponse, Status, Temperatures, Tiers, WeightsTier,
 };
 use serde::Serialize;
 
 use super::http::Request;
+use super::machine::{self, Machine};
 use super::recorder::{
     Recorder, RowSink, SETTINGS_LOG_LIMIT, SETTINGS_WAIT, TierSnapshot,
 };
@@ -256,6 +259,11 @@ pub struct Board {
     lineages: Arc<Lineages>,
     /// The recorder's channel, once it started.
     recorder: OnceLock<RowSink>,
+    /// The machine sampler, once it started (never with
+    /// `--machine-stats off`).
+    machine: OnceLock<Arc<Machine>>,
+    /// The token counters as [`Board::busy`] last saw them.
+    seen_tokens: AtomicU64,
 }
 
 impl Default for Board {
@@ -269,6 +277,8 @@ impl Default for Board {
             pinned: Arc::new(AtomicBool::new(false)),
             lineages: Arc::new(Lineages::default()),
             recorder: OnceLock::new(),
+            machine: OnceLock::new(),
+            seen_tokens: AtomicU64::new(0),
         }
     }
 }
@@ -283,6 +293,28 @@ impl Board {
     /// refused (`false`).
     pub fn attach_recorder(&self, sink: RowSink) -> bool {
         self.recorder.set(sink).is_ok()
+    }
+
+    /// Shows the sampler's readings in the status and hands them to the
+    /// recorder; a second sampler is refused (`false`).
+    pub fn attach_machine(&self, machine: Arc<Machine>) -> bool {
+        self.machine.set(machine).is_ok()
+    }
+
+    /// The machine sampler, if one was attached.
+    pub fn machine(&self) -> Option<&Arc<Machine>> {
+        self.machine.get()
+    }
+
+    /// Whether the engine is working: a request between `opened` and
+    /// `closed`, or tokens drawn or prefilled since the last call (which
+    /// also sees work that no request accounts for). Two relaxed loads and a
+    /// swap; the sampler's choice of window is its only caller.
+    pub fn busy(&self) -> bool {
+        let (decoded, prefilled) = self.token_counts();
+        let total = decoded.wrapping_add(prefilled);
+        let moved = self.seen_tokens.swap(total, Ordering::Relaxed) != total;
+        moved || lock(&self.activity).open > 0
     }
 
     /// The flag the weights' pin mirrors its state into.
@@ -872,6 +904,10 @@ impl Dashboard {
             self.log_refusal(connection.peer, request, path, why);
             return Response::error(403, why, None);
         }
+        // The page counts as open from now (the sampler's 2 s cadence).
+        if let Some(machine) = self.board.machine() {
+            machine.touch();
+        }
         match route {
             Route::Page => match page(path) {
                 Some(asset) => Response {
@@ -1047,19 +1083,38 @@ impl Dashboard {
         };
 
         let memory = crate::stats::memory_use();
+        let (sampler, sample) = match self.board.machine() {
+            Some(m) => (m.state(), m.latest(now)),
+            None => (machine::State::Off, None),
+        };
         let machine = MachineStatus {
-            sampler: SamplerState::Off,
+            sampler: match sampler {
+                machine::State::Off => SamplerState::Off,
+                machine::State::Running => SamplerState::Ok,
+                machine::State::Failed => SamplerState::Failed,
+            },
             cpu_load,
-            gpu_active: None,
-            gpu_freq_mhz: None,
+            gpu_active: sample.map(|s| round(s.reading.gpu_active.min(1.0), 1e3)),
+            gpu_freq_mhz: sample.map(|s| s.reading.gpu_freq_mhz.round()),
             memory_pressure: crate::stats::pressure_level()
                 .and_then(MemoryPressure::of_level),
             ram_total_bytes: memory.map(|m| m.total),
             ram_used_bytes: memory.map(|m| m.used),
             lily_resident_bytes: crate::stats::task_memory().map(|t| t.phys_footprint),
             swap_used_bytes: crate::stats::swap_used(),
-            power: None,
-            temp_c: None,
+            power: sample.map(|s| Power {
+                cpu_w: round(s.reading.cpu_w, 100.0),
+                gpu_w: round(s.reading.gpu_w, 100.0),
+                ane_w: round(s.reading.ane_w, 100.0),
+                sys_w: s.reading.sys_w.map(|w| round(w, 100.0)),
+            }),
+            // Both or none: the contract has no half a pair.
+            temp_c: sample
+                .and_then(|s| s.reading.cpu_temp_c.zip(s.reading.gpu_temp_c))
+                .map(|(cpu, gpu)| Temperatures {
+                    cpu: round(cpu, 10.0),
+                    gpu: round(gpu, 10.0),
+                }),
         };
 
         // Only a loaded model has a table to show.

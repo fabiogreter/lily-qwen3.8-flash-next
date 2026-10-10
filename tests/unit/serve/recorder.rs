@@ -2,7 +2,9 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 
 use super::*;
-use crate::serve::dashboard::contract::{DiskTier, GpuTier};
+use crate::serve::dashboard::contract::{DiskTier, GpuTier, Range};
+use crate::serve::dashboard::history;
+use crate::serve::machine::Machine;
 use crate::serve::session::Lineage;
 
 /// A fresh directory under `$TMPDIR` for one test.
@@ -217,7 +219,12 @@ fn a_database_from_a_newer_lily_is_left_untouched_and_the_history_off() {
     let status = recorder.status();
     assert!(!status.ok);
     let error = status.error.expect("why");
-    assert!(error.contains("has schema 99, this lily knows 1: history off"), "{error}");
+    assert!(
+        error.contains(&format!(
+            "has schema 99, this lily knows {SCHEMA_VERSION}: history off"
+        )),
+        "{error}"
+    );
     assert_eq!(recorder.read(|_| Ok(())), Err(Unavailable::Failed));
     assert_eq!(fs::read(&path).unwrap(), before, "the file is untouched");
     let names: Vec<_> =
@@ -713,7 +720,6 @@ fn a_machine_minute_keeps_least_mean_most_and_the_worst_pressure() {
     assert!((m.cpu_load.mean().unwrap() - 0.4).abs() < 1e-12);
     assert_eq!(m.pressure_level, Some(4));
     assert_eq!(m.swap_bytes.max(), Some(300.0));
-    assert_eq!((m.power_w.mean(), m.gpu_freq_mhz.min()), (None, None));
     let mut w = writer();
     assert!(w.machine(&m));
     let (load, pressure, swap, power): (f64, u32, u64, Option<f64>) = w
@@ -752,6 +758,231 @@ fn after_the_clock_went_back_a_minute_keeps_its_latest_samples() {
     assert!(w.machine(&again));
     assert_eq!(written(&w), (1, 0.8));
     assert_eq!(count(w.connection(), "machine"), 1);
+}
+
+/// The sampler's window `[start_ms, end_ms]` reading `sys_w`, with the other
+/// figures following from it.
+fn window(start_ms: u64, end_ms: u64, sys_w: f64) -> Sample {
+    Sample {
+        start_ms,
+        end_ms,
+        reading: Reading {
+            cpu_w: sys_w / 2.0,
+            gpu_w: sys_w / 4.0,
+            ane_w: 0.0,
+            sys_w: Some(sys_w),
+            gpu_active: sys_w / 100.0,
+            gpu_freq_mhz: sys_w * 10.0,
+            cpu_temp_c: Some(40.0 + sys_w / 10.0),
+            gpu_temp_c: None,
+        },
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct PowerColumns {
+    covered_ms: Option<u64>,
+    sys_covered_ms: Option<u64>,
+    sys_w: (Option<f64>, Option<f64>, Option<f64>),
+    gpu_w: Option<f64>,
+    gpu_active: Option<f64>,
+    freq: (Option<f64>, Option<f64>, Option<f64>),
+    temps: (Option<f64>, Option<f64>),
+    samples: u32,
+}
+
+fn power_columns(w: &Writer, minute: u64) -> Option<PowerColumns> {
+    w.connection()
+        .query_row(
+            "SELECT power_covered_ms, power_w_min, power_w_mean, power_w_max,
+                    gpu_power_w_mean, gpu_active_mean, gpu_freq_mhz_min,
+                    gpu_freq_mhz_mean, gpu_freq_mhz_max, cpu_temp_c_max,
+                    gpu_temp_c_max, samples, sys_covered_ms
+             FROM machine WHERE minute = ?1",
+            [minute],
+            |r| {
+                Ok(PowerColumns {
+                    covered_ms: r.get(0)?,
+                    sys_w: (r.get(1)?, r.get(2)?, r.get(3)?),
+                    gpu_w: r.get(4)?,
+                    gpu_active: r.get(5)?,
+                    freq: (r.get(6)?, r.get(7)?, r.get(8)?),
+                    temps: (r.get(9)?, r.get(10)?),
+                    samples: r.get(11)?,
+                    sys_covered_ms: r.get(12)?,
+                })
+            },
+        )
+        .ok()
+}
+
+fn close(a: Option<f64>, b: f64) -> bool {
+    a.is_some_and(|a| (a - b).abs() < 1e-9)
+}
+
+#[test]
+fn a_window_is_spread_over_the_minutes_it_overlaps_by_the_time_in_each() {
+    // 10 s in the first minute, 60 s in the second, 20 s in the third.
+    let parts = spread(&[window(T0 + 50_000, T0 + 140_000, 10.0)]);
+    let covered: Vec<_> = parts.iter().map(|(m, p)| (*m, p.covered_ms)).collect();
+    assert_eq!(covered, [(M, 10_000), (M + 1, 60_000), (M + 2, 20_000)]);
+    for p in parts.values() {
+        assert_eq!(p.sys_w_mean(), Some(10.0), "the window's reading in each");
+    }
+    // A window with no span covers nothing, and one that ends on a minute's
+    // edge stays in it.
+    assert!(spread(&[window(T0, T0, 5.0), window(T0 + 9, T0 + 3, 5.0)]).is_empty());
+    let edge = spread(&[window(T0 - 5_000, T0, 5.0)]);
+    assert_eq!(edge.keys().copied().collect::<Vec<_>>(), [M - 1]);
+    assert_eq!(edge[&(M - 1)].covered_ms, 5_000);
+}
+
+#[test]
+fn a_minutes_power_is_time_weighted_with_the_least_and_most_of_its_windows() {
+    // 2 s at 10 W, 6 s at 30 W, 2 s at 20 W in one minute.
+    let parts = spread(&[
+        window(T0, T0 + 2_000, 10.0),
+        window(T0 + 2_000, T0 + 8_000, 30.0),
+        window(T0 + 8_000, T0 + 10_000, 20.0),
+    ]);
+    let p = parts[&M];
+    assert_eq!(p.covered_ms, 10_000);
+    assert!(close(p.sys_w_mean(), (20.0 + 180.0 + 40.0) / 10.0), "{p:?}");
+    assert_eq!((p.sys_w_min(), p.sys_w_max()), (Some(10.0), Some(30.0)));
+    assert_eq!(
+        (p.gpu_freq_mhz_min(), p.gpu_freq_mhz_max()),
+        (Some(100.0), Some(300.0))
+    );
+    assert!(close(p.gpu_w_mean(), 24.0 / 4.0), "{p:?}");
+    assert!(close(p.gpu_active_mean(), 0.24), "{p:?}");
+    assert_eq!((p.cpu_temp_max, p.gpu_temp_max), (Some(43.0), None), "the hottest");
+    // 24 W for 10 s: 240 J, 0.0667 Wh.
+    assert!(close(p.energy_wh(), 240.0 / 3600.0), "{:?}", p.energy_wh());
+    assert_eq!(PowerMinute::default().energy_wh(), None);
+}
+
+#[test]
+fn power_is_stored_per_minute_and_parts_of_a_minute_merge_into_the_row() {
+    let mut w = writer();
+    // The first 20 s of the minute at 10 W, written by one tick; the next
+    // 10 s at 40 W by a later one (or a later process).
+    assert!(w.power(M, &spread(&[window(T0, T0 + 20_000, 10.0)])[&M]));
+    let first = power_columns(&w, M).expect("row");
+    assert_eq!(first.covered_ms, Some(20_000));
+    assert_eq!(first.samples, 0, "a row with the sampler's figures only");
+    assert!(close(first.sys_w.1, 10.0));
+    assert!(w.power(M, &spread(&[window(T0 + 20_000, T0 + 30_000, 40.0)])[&M]));
+    let both = power_columns(&w, M).expect("row");
+    assert_eq!(both.covered_ms, Some(30_000));
+    assert!(close(both.sys_w.1, 20.0), "(10 x 20 + 40 x 10) / 30: {both:?}");
+    assert_eq!((both.sys_w.0, both.sys_w.2), (Some(10.0), Some(40.0)));
+    assert_eq!((both.freq.0, both.freq.2), (Some(100.0), Some(400.0)));
+    assert!(close(both.gpu_w, 5.0) && close(both.gpu_active, 0.2), "{both:?}");
+    assert_eq!(both.temps, (Some(44.0), None));
+    assert_eq!(count(w.connection(), "machine"), 1);
+
+    // The machine's own samples arrive for the same minute: their columns
+    // are written, the sampler's are left as they are.
+    let mut m = MachineMinute::new(M);
+    m.add(&MachineSample { cpu_load: Some(0.5), ..MachineSample::default() });
+    assert!(w.machine(&m));
+    let after = power_columns(&w, M).expect("row");
+    assert_eq!(
+        (after.covered_ms, after.sys_w, after.samples),
+        (both.covered_ms, both.sys_w, 1)
+    );
+    // And the other way round: power merged into a row with samples keeps them.
+    assert!(w.power(M, &spread(&[window(T0 + 30_000, T0 + 40_000, 20.0)])[&M]));
+    let last = power_columns(&w, M).expect("row");
+    assert_eq!((last.covered_ms, last.samples), (Some(40_000), 1));
+    assert!(close(last.sys_w.1, (600.0 + 200.0) / 40.0), "{last:?}");
+    let load: f64 = w
+        .connection()
+        .query_row("SELECT cpu_load_mean FROM machine WHERE minute = ?1", [M], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(load, 0.5);
+    // Nothing covered writes nothing.
+    assert!(w.power(M + 5, &PowerMinute::default()));
+    assert_eq!(power_columns(&w, M + 5), None);
+}
+
+#[test]
+fn a_v1_database_gains_the_sampler_columns_and_keeps_its_rows() {
+    let root = temp_root("v1");
+    let path = root.join("lily.sqlite");
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(&format!(
+            "INSERT INTO machine (minute, samples, cpu_load_mean) VALUES ({M}, 6, 0.25);
+             PRAGMA user_version = 1;"
+        ))
+        .unwrap();
+    }
+    let (conn, aside) = open(&path, 5).expect("migrates");
+    assert_eq!(aside, None);
+    assert_eq!(pragma(&conn, "user_version"), 2);
+    let mut w = Writer::new(conn, Some(path.clone()), Arc::default(), 0);
+    let old = power_columns(&w, M).expect("the old row is kept");
+    assert_eq!((old.samples, old.covered_ms, old.sys_w.1), (6, None, None));
+    // Power merges into the old row as into any other.
+    assert!(w.power(M, &spread(&[window(T0, T0 + 60_000, 30.0)])[&M]));
+    let now = power_columns(&w, M).expect("row");
+    assert_eq!((now.samples, now.covered_ms), (6, Some(60_000)));
+    assert!(close(now.sys_w.1, 30.0));
+    drop(w);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_recorder_takes_the_samplers_windows_and_the_history_shows_their_energy() {
+    let root = temp_root("power");
+    let path = root.join("lily.sqlite");
+    let board = Arc::new(Board::default());
+    let machine = Machine::running();
+    board.attach_machine(machine.clone());
+    // The last complete minutes before now: a whole minute at 20 W, a gap,
+    // then the last 30 s of one minute at 40 W.
+    let edge = crate::serve::now_ms() / MINUTE_MS * MINUTE_MS;
+    machine
+        .publish(Duration::from_secs(30), window(edge - 300_000, edge - 270_000, 20.0));
+    machine
+        .publish(Duration::from_secs(30), window(edge - 270_000, edge - 240_000, 20.0));
+    machine
+        .publish(Duration::from_secs(30), window(edge - 150_000, edge - 120_000, 40.0));
+    let recorder = Recorder::start(Some(&path), &board, None);
+    assert!(
+        eventually(|| {
+            recorder
+                .read(|c| history::read(c, Range::QuarterHour, edge + 1, None, false))
+                .is_ok_and(|h| h.is_some_and(|h| h.summary.energy_wh.is_some()))
+        }),
+        "the first tick takes the queue and writes it"
+    );
+    assert!(machine.drain().is_empty(), "the recorder took them");
+    let h = recorder
+        .read(|c| history::read(c, Range::QuarterHour, edge + 1, None, false))
+        .unwrap()
+        .unwrap();
+    // 20 W for 60 s and 40 W for 30 s: 2 400 W s, over the 90 s covered.
+    assert_eq!(h.summary.energy_wh, Some(0.667));
+    assert_eq!(h.summary.power_avg_w, Some(26.67));
+    let powered: Vec<_> = h.points.iter().filter_map(|p| p.power_w).collect();
+    assert_eq!(powered, [20.0, 40.0], "the gap minutes stay null");
+    let nulls = h.points.iter().filter(|p| p.power_w.is_none()).count();
+    assert_eq!(nulls, h.points.len() - 2);
+    // What a stop still holds is written before the thread ends.
+    machine
+        .publish(Duration::from_secs(30), window(edge - 60_000, edge - 30_000, 60.0));
+    recorder.finish(Duration::from_secs(5));
+    let after = Recorder::reading(&path, Arc::default())
+        .read(|c| history::read(c, Range::QuarterHour, edge + 1, None, false))
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.points.iter().filter_map(|p| p.power_w).count(), 3);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1195,4 +1426,92 @@ fn a_reset_deletes_a_stale_row_the_start_ignored() {
     );
     recorder.finish(Duration::from_secs(2));
     let _ = fs::remove_dir_all(&root);
+}
+
+/// [`window`] with no system power: the SMC's key failed.
+fn window_without_system_power(start_ms: u64, end_ms: u64, gpu_w: f64) -> Sample {
+    let mut s = window(start_ms, end_ms, 0.0);
+    s.reading.sys_w = None;
+    s.reading.gpu_w = gpu_w;
+    s
+}
+
+#[test]
+fn a_window_without_system_power_covers_the_gpu_series_but_not_the_energy() {
+    // 40 s at 20 W, then 20 s with no system power (the GPU at 8 W).
+    let parts = spread(&[
+        window(T0, T0 + 40_000, 20.0),
+        window_without_system_power(T0 + 40_000, T0 + 60_000, 8.0),
+    ]);
+    let p = parts[&M];
+    assert_eq!((p.covered_ms, p.sys_ms), (60_000, 40_000));
+    assert_eq!(p.sys_w_mean(), Some(20.0), "over the time that had it");
+    assert!(close(p.energy_wh(), 20.0 * 40.0 / 3600.0), "{:?}", p.energy_wh());
+    // The GPU's figures cover the whole minute: (5 x 40 + 8 x 20) / 60.
+    assert!(close(p.gpu_w_mean(), 6.0), "{p:?}");
+    // A minute with no system power at all has none, and energy is None.
+    let none = spread(&[window_without_system_power(T0, T0 + 30_000, 8.0)])[&M];
+    assert_eq!((none.covered_ms, none.sys_ms), (30_000, 0));
+    assert_eq!(
+        (none.sys_w_mean(), none.sys_w_min(), none.energy_wh()),
+        (None, None, None)
+    );
+    assert!(close(none.gpu_w_mean(), 8.0));
+
+    let mut w = writer();
+    assert!(w.power(M, &parts[&M]));
+    assert!(w.power(M + 1, &none));
+    let row = power_columns(&w, M).expect("row");
+    assert_eq!((row.covered_ms, row.sys_covered_ms), (Some(60_000), Some(40_000)));
+    assert!(close(row.sys_w.1, 20.0));
+    let row = power_columns(&w, M + 1).expect("row");
+    assert_eq!((row.covered_ms, row.sys_covered_ms), (Some(30_000), Some(0)));
+    assert_eq!(row.sys_w, (None, None, None), "unknown, not 0 W");
+    assert!(close(row.gpu_w, 8.0));
+    // Another part with system power joins a minute that had none.
+    assert!(w.power(
+        M + 1,
+        &spread(&[window(T0 + 60_000 + 30_000, T0 + 60_000 + 40_000, 50.0)])[&(M + 1)]
+    ));
+    let row = power_columns(&w, M + 1).expect("row");
+    assert_eq!((row.covered_ms, row.sys_covered_ms), (Some(40_000), Some(10_000)));
+    assert!(close(row.sys_w.1, 50.0), "{row:?}");
+    assert!(close(row.gpu_w, (8.0 * 30.0 + 12.5 * 10.0) / 40.0), "{row:?}");
+}
+
+#[test]
+fn a_minute_never_holds_more_than_sixty_seconds_of_coverage() {
+    // Windows that overlap (a clock that jumped back): 50 s, then 30 s of
+    // the same minute again.
+    let p = spread(&[
+        window(T0, T0 + 50_000, 10.0),
+        window(T0 + 20_000, T0 + 50_000, 30.0),
+    ])[&M];
+    // They claim 80 s of a minute; it holds 60.
+    assert_eq!((p.covered_ms, p.sys_ms), (60_000, 60_000));
+    assert!(close(p.sys_w_mean(), (10.0 * 50.0 + 30.0 * 10.0) / 60.0), "{p:?}");
+    let full =
+        spread(&[window(T0, T0 + 60_000, 10.0), window(T0, T0 + 60_000, 30.0)])[&M];
+    assert_eq!((full.covered_ms, full.sys_ms), (60_000, 60_000));
+    assert!(close(full.sys_w_mean(), 10.0), "the first claimed it: {full:?}");
+    assert!(close(full.energy_wh(), 10.0 * 60.0 / 3600.0));
+    // The same across ticks: the stored row is full, a late overlap adds nothing.
+    let mut w = writer();
+    assert!(w.power(M, &spread(&[window(T0, T0 + 60_000, 10.0)])[&M]));
+    assert!(w.power(M, &spread(&[window(T0 + 10_000, T0 + 40_000, 90.0)])[&M]));
+    let row = power_columns(&w, M).expect("row");
+    assert_eq!((row.covered_ms, row.sys_covered_ms), (Some(60_000), Some(60_000)));
+    assert!(close(row.sys_w.1, 10.0), "{row:?}");
+    // A part that half fits is taken in proportion: 40 s stored, 40 s offered,
+    // 20 s of room.
+    assert!(
+        w.power(M + 1, &spread(&[window(T0 + 60_000, T0 + 100_000, 10.0)])[&(M + 1)])
+    );
+    assert!(
+        w.power(M + 1, &spread(&[window(T0 + 60_000, T0 + 100_000, 40.0)])[&(M + 1)])
+    );
+    let row = power_columns(&w, M + 1).expect("row");
+    assert_eq!(row.covered_ms, Some(60_000));
+    assert!(close(row.sys_w.1, (10.0 * 40.0 + 40.0 * 20.0) / 60.0), "{row:?}");
+    assert_eq!((row.sys_w.0, row.sys_w.2), (Some(10.0), Some(40.0)));
 }

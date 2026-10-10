@@ -174,6 +174,8 @@ fn machine_series_are_minute_means_the_worst_pressure_and_the_energy() {
             pressure_level: Some(1),
             swap_bytes: Some(10),
             power_w: Some(30.0),
+            power_covered_ms: Some(60_000),
+            sys_covered_ms: Some(60_000),
             ..MachineRow::default()
         },
         MachineRow {
@@ -182,6 +184,8 @@ fn machine_series_are_minute_means_the_worst_pressure_and_the_energy() {
             pressure_level: Some(2),
             swap_bytes: Some(30),
             power_w: Some(90.0),
+            power_covered_ms: Some(60_000),
+            sys_covered_ms: Some(60_000),
             ..MachineRow::default()
         },
     ];
@@ -197,6 +201,52 @@ fn machine_series_are_minute_means_the_worst_pressure_and_the_energy() {
     assert_eq!((h.summary.power_avg_w, h.summary.energy_wh), (Some(60.0), Some(2.0)));
     // Buckets with no machine minute: null machine values.
     assert_eq!(h.points[0].cpu_load, None);
+}
+
+#[test]
+fn power_is_weighted_by_the_time_the_sampler_covered_and_gaps_add_no_energy() {
+    let first = (EDGE - 900_000) / MIN;
+    let powered = |minute, w, covered| MachineRow {
+        minute,
+        power_w: Some(w),
+        gpu_power_w: Some(w / 2.0),
+        gpu_active: Some(if w > 50.0 { 0.8 } else { 0.2 }),
+        gpu_freq_mhz: Some(w * 10.0),
+        power_covered_ms: Some(covered),
+        sys_covered_ms: Some(covered),
+        ..MachineRow::default()
+    };
+    let machine = [
+        // A whole minute at 30 W, a quarter minute at 90 W (the sampler
+        // started 15 s before the minute ended), a minute with machine
+        // samples but no power, and a minute the server was off.
+        powered(first, 30.0, 60_000),
+        powered(first + 1, 90.0, 15_000),
+        MachineRow { minute: first + 2, cpu_load: Some(0.5), ..MachineRow::default() },
+    ];
+    let h = build(Range::Day, EDGE, &[], Some(&machine), &[]);
+    let p = h.points.last().unwrap();
+    // (30 W x 60 s + 90 W x 15 s) / 75 s = 42 W, not (30 + 90) / 2.
+    assert_eq!(p.power_w, Some(42.0));
+    assert_eq!(p.gpu_power_w, Some(21.0));
+    assert_eq!(p.gpu_freq_mhz, Some(420.0));
+    assert_eq!(p.gpu_active, Some(0.32));
+    assert_eq!(p.cpu_load, Some(0.5));
+    // 30 W for a minute and 90 W for 15 s: 0.5 Wh + 0.375 Wh, over the 75 s
+    // covered and not over the quarter hour the grid spans.
+    assert_eq!(h.summary.energy_wh, Some(0.875));
+    assert_eq!(h.summary.power_avg_w, Some(42.0));
+    // Power in no minute at all: null, not 0.
+    let none =
+        [MachineRow { minute: first, cpu_load: Some(0.5), ..MachineRow::default() }];
+    let h = build(Range::Day, EDGE, &[], Some(&none), &[]);
+    assert_eq!((h.summary.power_avg_w, h.summary.energy_wh), (None, None));
+    assert_eq!(h.points.last().unwrap().power_w, None);
+    // A figure without covered time has no weight.
+    let unweighted =
+        [MachineRow { minute: first, power_w: Some(70.0), ..MachineRow::default() }];
+    let h = build(Range::Day, EDGE, &[], Some(&unweighted), &[]);
+    assert_eq!((h.summary.power_avg_w, h.summary.energy_wh), (None, None));
 }
 
 #[test]
@@ -325,4 +375,34 @@ fn pruning_keeps_the_oldest_bucket_of_the_week_whole() {
         .query_row("SELECT count(*) FROM requests", [], |r| r.get(0))
         .unwrap();
     assert_eq!(kept, 2, "pruning cuts an hour further back than the grid");
+}
+
+#[test]
+fn a_minute_without_system_power_counts_for_the_gpu_series_but_not_for_energy() {
+    let first = (EDGE - 900_000) / MIN;
+    let machine = [
+        MachineRow {
+            minute: first,
+            power_w: Some(30.0),
+            power_covered_ms: Some(60_000),
+            sys_covered_ms: Some(60_000),
+            gpu_power_w: Some(10.0),
+            ..MachineRow::default()
+        },
+        // The SMC's key failed all minute: the GPU was measured, the system not.
+        MachineRow {
+            minute: first + 1,
+            power_w: None,
+            gpu_power_w: Some(40.0),
+            power_covered_ms: Some(60_000),
+            sys_covered_ms: None,
+            ..MachineRow::default()
+        },
+    ];
+    let h = build(Range::Day, EDGE, &[], Some(&machine), &[]);
+    let p = h.points.last().unwrap();
+    assert_eq!(p.power_w, Some(30.0), "only the minute that had it");
+    assert_eq!(p.gpu_power_w, Some(25.0), "both minutes");
+    assert_eq!(h.summary.energy_wh, Some(0.5), "30 W for the minute that had it");
+    assert_eq!(h.summary.power_avg_w, Some(30.0));
 }

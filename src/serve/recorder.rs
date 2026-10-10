@@ -8,8 +8,9 @@
 //! ([`RecorderStatus::dropped_rows`], § 2.3). Every [`SAMPLE_EVERY`] the
 //! recorder thread samples the machine itself (CPU load, memory pressure,
 //! swap, RAM in use, lily's resident memory, the same calls the status route
-//! makes) and, once a minute, takes the session cache's tiers from the view
-//! the engine last published. It never sends the engine anything, never
+//! makes), takes the readings the machine sampler (`serve::machine`) queued
+//! since the last tick and, once a minute, takes the session cache's tiers
+//! from the view the engine last published. It never sends the engine anything, never
 //! takes a lock the engine holds across work (a board lock only for a clone,
 //! never across a SQLite call) and never runs on the engine's thread.
 //!
@@ -54,6 +55,16 @@
 //! **Requests, cache hits, acceptance and queue times** belong to the
 //! minute a request finished in; a failed request has no queue time.
 //!
+//! **The sampler's windows** (§ 6). A reading says which window it covers, so
+//! the recorder spreads it over the minutes it overlaps ([`spread`]) and
+//! merges each part into that minute's row ([`Writer::power`]): means weighted
+//! by the milliseconds covered, the least and most of the windows, the hottest
+//! temperatures and `power_covered_ms`. Parts of a minute arriving on
+//! different ticks, or in a later process, add up; the machine's own samples
+//! ([`Writer::machine`]) write their columns of the same row and leave these
+//! alone. History turns them into series and an energy that counts the
+//! covered time only (`dashboard::history`).
+//!
 //! **A broken probe never breaks serving** (§ 2.4). A file that is not a
 //! database or fails `quick_check` is renamed aside (`<path>.corrupt-<unix
 //! seconds>`, its `-wal` and `-shm` with it), logged, and a fresh database
@@ -87,7 +98,7 @@
 //! The directory lily creates for the database is `0700`, the database and
 //! its WAL files `0600`.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -96,19 +107,22 @@ use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use rusqlite::{Connection, ErrorCode, OpenFlags, Transaction, params};
+use rusqlite::{
+    Connection, ErrorCode, OpenFlags, OptionalExtension as _, Transaction, params,
+};
 
 use super::dashboard::contract::{
     CancelledBy, RecorderState, RecorderStatus, RequestRow, SettingValue,
     SettingsLogEntry, SettingsLogSource,
 };
 use super::dashboard::{Board, StoreView};
+use super::machine::{Reading, Sample};
 use super::runtime::{Change, Entry, Plan, RuntimeSettings, same_value};
 use crate::stats::CpuTicks;
 
 /// The schema this lily writes (`PRAGMA user_version`). Migrations only go
 /// forward; a database with a larger version is left alone.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 /// How long everything is kept.
 pub const RETENTION_MS: u64 = 7 * 86_400_000;
 /// Kept on top of [`RETENTION_MS`], pruned at the hour: the 7d range's
@@ -149,7 +163,7 @@ pub const SETTINGS_WAIT: Duration = Duration::from_secs(3);
 pub const SETTINGS_LOG_LIMIT: usize = 500;
 
 /// The forward-only migrations: `MIGRATIONS[v]` takes version `v` to `v + 1`.
-const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [SCHEMA_V1];
+const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [SCHEMA_V1, SCHEMA_V2];
 
 /// Times are unix milliseconds (`t`, `*_t`) or unix minutes (`minute`, unix
 /// milliseconds / 60 000); tokens in the rollups are fractional, a request's
@@ -259,6 +273,19 @@ CREATE TABLE settings_log (
     source TEXT NOT NULL
 );
 CREATE INDEX settings_log_t ON settings_log (t);
+";
+
+/// The machine sampler's figures (§ 6): the milliseconds of the minute its
+/// windows covered (`power_covered_ms`, which the GPU series are weighted by)
+/// and those of them that had a system power (`sys_covered_ms`, which the
+/// system power is weighted by and the energy integrated over), and the
+/// hottest temperatures. A v1 row has none of them, and its power columns are
+/// `NULL`.
+const SCHEMA_V2: &str = "
+ALTER TABLE machine ADD COLUMN power_covered_ms INTEGER;
+ALTER TABLE machine ADD COLUMN sys_covered_ms INTEGER;
+ALTER TABLE machine ADD COLUMN cpu_temp_c_max REAL;
+ALTER TABLE machine ADD COLUMN gpu_temp_c_max REAL;
 ";
 
 /// The tables pruning trims and the column that dates their rows (`true`:
@@ -1096,8 +1123,9 @@ impl Stat {
     }
 }
 
-/// One reading of the machine; `None` where its probe has nothing. Power,
-/// GPU activity and frequency wait for the sampler (§ 6) and are `None`.
+/// One reading of the machine's own counters, taken every [`SAMPLE_EVERY`];
+/// `None` where its probe has nothing. The power, GPU and temperature
+/// figures come from the sampler's windows instead ([`PowerMinute`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct MachineSample {
     pub cpu_load: Option<f64>,
@@ -1106,10 +1134,6 @@ pub struct MachineSample {
     pub swap_bytes: Option<u64>,
     pub ram_used_bytes: Option<u64>,
     pub lily_resident_bytes: Option<u64>,
-    pub gpu_active: Option<f64>,
-    pub gpu_freq_mhz: Option<f64>,
-    pub power_w: Option<f64>,
-    pub gpu_power_w: Option<f64>,
 }
 
 impl MachineSample {
@@ -1126,7 +1150,6 @@ impl MachineSample {
             swap_bytes: crate::stats::swap_used(),
             ram_used_bytes: crate::stats::memory_use().map(|m| m.used),
             lily_resident_bytes: crate::stats::task_memory().map(|t| t.phys_footprint),
-            ..Self::default()
         }
     }
 }
@@ -1142,10 +1165,6 @@ pub struct MachineMinute {
     pub swap_bytes: Stat,
     pub ram_used_bytes: Stat,
     pub lily_resident_bytes: Stat,
-    pub gpu_active: Stat,
-    pub gpu_freq_mhz: Stat,
-    pub power_w: Stat,
-    pub gpu_power_w: Stat,
 }
 
 impl MachineMinute {
@@ -1161,11 +1180,260 @@ impl MachineMinute {
         self.swap_bytes.add(s.swap_bytes.map(|b| b as f64));
         self.ram_used_bytes.add(s.ram_used_bytes.map(|b| b as f64));
         self.lily_resident_bytes.add(s.lily_resident_bytes.map(|b| b as f64));
-        self.gpu_active.add(s.gpu_active);
-        self.gpu_freq_mhz.add(s.gpu_freq_mhz);
-        self.power_w.add(s.power_w);
-        self.gpu_power_w.add(s.gpu_power_w);
     }
+}
+
+/// The value of one series over a minute's covered time: its time-weighted
+/// sum (value times milliseconds) and the least and most of the windows'
+/// values.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Weighted {
+    sum: f64,
+    min: f64,
+    max: f64,
+}
+
+impl Weighted {
+    fn add(&mut self, value: f64, ms: u64, first: bool) {
+        self.sum += value * ms as f64;
+        if first {
+            (self.min, self.max) = (value, value);
+        } else {
+            (self.min, self.max) = (self.min.min(value), self.max.max(value));
+        }
+    }
+
+    /// Takes in `other` with its sum scaled by `scale`; `first` when this
+    /// has nothing yet.
+    fn merge(&mut self, other: &Weighted, scale: f64, first: bool) {
+        if first {
+            *self = Weighted { sum: other.sum * scale, ..*other };
+            return;
+        }
+        self.sum += other.sum * scale;
+        (self.min, self.max) = (self.min.min(other.min), self.max.max(other.max));
+    }
+}
+
+/// The larger of two optional values, the one there is when only one is.
+fn larger(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// What `part` more milliseconds of a series with `have` may add to a minute
+/// without going past its 60 000: all of them, or what room is left, as the
+/// fraction of `part` that fits.
+fn room(have: u64, part: u64) -> f64 {
+    if part == 0 {
+        return 0.0;
+    }
+    (MINUTE_MS.saturating_sub(have) as f64 / part as f64).min(1.0)
+}
+
+/// What the sampler's windows (`serve::machine`) say of one minute: system
+/// and GPU power, the GPU's activity and frequency and the hottest
+/// temperatures, over the milliseconds of the minute the windows **covered**.
+/// A window is spread over the minutes it overlaps ([`spread`]), each getting
+/// the milliseconds it overlapped, so a minute the sampler only half
+/// covered (it started, failed or the process ended in it) is half covered,
+/// not a whole minute; the means are time-weighted by those milliseconds. A
+/// minute never holds more than 60 000 of them, however windows overlap (a
+/// clock that jumped back), so the same time is not counted twice.
+///
+/// **System power has a coverage of its own** ([`PowerMinute::sys_ms`], never
+/// more than `covered_ms`): a window whose system power is unknown (the SMC
+/// key failed) counts for the GPU's series and the temperatures but not for
+/// system power, and the energy is the mean system power over the milliseconds
+/// that had it ([`PowerMinute::energy_wh`]). The least and most are over the
+/// windows' own means (a 2 s window's reading is the finest there is). Pieces
+/// of one minute arriving at different times, or in different processes,
+/// merge ([`PowerMinute::merge`]), which is how the stored row grows.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PowerMinute {
+    /// Milliseconds of the minute the windows covered.
+    pub covered_ms: u64,
+    /// Of those, the milliseconds that had a system power.
+    pub sys_ms: u64,
+    sys_w: Weighted,
+    gpu_w: Weighted,
+    gpu_active: Weighted,
+    gpu_freq_mhz: Weighted,
+    pub cpu_temp_max: Option<f64>,
+    pub gpu_temp_max: Option<f64>,
+}
+
+impl PowerMinute {
+    /// Adds a window's reading covering `ms` milliseconds of this minute (at
+    /// most what is left of its 60 000).
+    fn add(&mut self, r: &Reading, ms: u64) {
+        let ms = ms.min(MINUTE_MS.saturating_sub(self.covered_ms));
+        if ms == 0 {
+            return;
+        }
+        let first = self.covered_ms == 0;
+        self.covered_ms += ms;
+        self.gpu_w.add(r.gpu_w, ms, first);
+        self.gpu_active.add(r.gpu_active, ms, first);
+        self.gpu_freq_mhz.add(r.gpu_freq_mhz, ms, first);
+        self.cpu_temp_max = larger(self.cpu_temp_max, r.cpu_temp_c);
+        self.gpu_temp_max = larger(self.gpu_temp_max, r.gpu_temp_c);
+        if let Some(w) = r.sys_w {
+            let sys = ms.min(MINUTE_MS.saturating_sub(self.sys_ms));
+            let first = self.sys_ms == 0;
+            self.sys_ms += sys;
+            self.sys_w.add(w, sys, first);
+        }
+    }
+
+    /// Takes in `other`, another part of the same minute; what does not fit
+    /// in the minute's 60 000 milliseconds is left out, in proportion.
+    pub fn merge(&mut self, other: &PowerMinute) {
+        if other.covered_ms == 0 {
+            return;
+        }
+        let fit = room(self.covered_ms, other.covered_ms);
+        let first = self.covered_ms == 0;
+        self.covered_ms += (other.covered_ms as f64 * fit) as u64;
+        self.gpu_w.merge(&other.gpu_w, fit, first);
+        self.gpu_active.merge(&other.gpu_active, fit, first);
+        self.gpu_freq_mhz.merge(&other.gpu_freq_mhz, fit, first);
+        self.cpu_temp_max = larger(self.cpu_temp_max, other.cpu_temp_max);
+        self.gpu_temp_max = larger(self.gpu_temp_max, other.gpu_temp_max);
+        if other.sys_ms > 0 {
+            let fit = room(self.sys_ms, other.sys_ms);
+            let first = self.sys_ms == 0;
+            self.sys_ms += (other.sys_ms as f64 * fit) as u64;
+            self.sys_w.merge(&other.sys_w, fit, first);
+        }
+    }
+
+    fn mean(&self, series: &Weighted) -> Option<f64> {
+        (self.covered_ms > 0).then(|| series.sum / self.covered_ms as f64)
+    }
+
+    /// The mean system power over the time that had one.
+    pub fn sys_w_mean(&self) -> Option<f64> {
+        (self.sys_ms > 0).then(|| self.sys_w.sum / self.sys_ms as f64)
+    }
+
+    pub fn sys_w_min(&self) -> Option<f64> {
+        (self.sys_ms > 0).then_some(self.sys_w.min)
+    }
+
+    pub fn sys_w_max(&self) -> Option<f64> {
+        (self.sys_ms > 0).then_some(self.sys_w.max)
+    }
+
+    pub fn gpu_w_mean(&self) -> Option<f64> {
+        self.mean(&self.gpu_w)
+    }
+
+    pub fn gpu_active_mean(&self) -> Option<f64> {
+        self.mean(&self.gpu_active)
+    }
+
+    pub fn gpu_freq_mhz_mean(&self) -> Option<f64> {
+        self.mean(&self.gpu_freq_mhz)
+    }
+
+    pub fn gpu_freq_mhz_min(&self) -> Option<f64> {
+        (self.covered_ms > 0).then_some(self.gpu_freq_mhz.min)
+    }
+
+    pub fn gpu_freq_mhz_max(&self) -> Option<f64> {
+        (self.covered_ms > 0).then_some(self.gpu_freq_mhz.max)
+    }
+
+    /// The energy the system used over the time that had a system power, in
+    /// watt-hours.
+    pub fn energy_wh(&self) -> Option<f64> {
+        self.sys_w_mean().map(|w| w * self.sys_ms as f64 / 3_600_000.0)
+    }
+
+    /// The minute as its stored row says it (`None` for a row without
+    /// sampler figures: a v1 row, or a minute with only the machine's own
+    /// samples). The gpu power's and activity's least and most are not stored
+    /// and are set to their mean: nothing reads them.
+    fn stored(row: &StoredPower) -> Option<Self> {
+        let covered_ms = row.covered_ms.filter(|&ms| ms > 0)?;
+        let series = |mean: Option<f64>,
+                      min: Option<f64>,
+                      max: Option<f64>,
+                      ms: u64|
+         -> Option<Weighted> {
+            let mean = mean?;
+            Some(Weighted {
+                sum: mean * ms as f64,
+                min: min.unwrap_or(mean),
+                max: max.unwrap_or(mean),
+            })
+        };
+        let sys_ms = row.sys_covered_ms.unwrap_or(0).min(covered_ms);
+        let sys_w = if sys_ms > 0 {
+            series(row.sys_w_mean, row.sys_w_min, row.sys_w_max, sys_ms)
+        } else {
+            None
+        };
+        Some(Self {
+            covered_ms,
+            sys_ms: if sys_w.is_some() { sys_ms } else { 0 },
+            sys_w: sys_w.unwrap_or_default(),
+            gpu_w: series(row.gpu_w_mean, None, None, covered_ms)?,
+            gpu_active: series(row.gpu_active_mean, None, None, covered_ms)?,
+            gpu_freq_mhz: series(
+                row.gpu_freq_mhz_mean,
+                row.gpu_freq_mhz_min,
+                row.gpu_freq_mhz_max,
+                covered_ms,
+            )?,
+            cpu_temp_max: row.cpu_temp_max,
+            gpu_temp_max: row.gpu_temp_max,
+        })
+    }
+}
+
+/// The columns of a `machine` row that [`PowerMinute`] keeps.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct StoredPower {
+    covered_ms: Option<u64>,
+    sys_covered_ms: Option<u64>,
+    sys_w_min: Option<f64>,
+    sys_w_mean: Option<f64>,
+    sys_w_max: Option<f64>,
+    gpu_w_mean: Option<f64>,
+    gpu_active_mean: Option<f64>,
+    gpu_freq_mhz_min: Option<f64>,
+    gpu_freq_mhz_mean: Option<f64>,
+    gpu_freq_mhz_max: Option<f64>,
+    cpu_temp_max: Option<f64>,
+    gpu_temp_max: Option<f64>,
+}
+
+/// The longest window [`spread`] takes at its word: the sampler's own are
+/// at most a minute (`machine::window_of`).
+const MAX_WINDOW_MS: u64 = 10 * MINUTE_MS;
+
+/// The sampler's `samples` spread over the minutes their windows overlap,
+/// each minute getting the milliseconds of overlap (a window with no span
+/// covers nothing and is left out), and never more than the 60 000 a minute
+/// has.
+pub fn spread(samples: &[Sample]) -> BTreeMap<u64, PowerMinute> {
+    let mut minutes: BTreeMap<u64, PowerMinute> = BTreeMap::new();
+    for s in samples {
+        let start = s.start_ms.max(s.end_ms.saturating_sub(MAX_WINDOW_MS));
+        if s.end_ms <= start {
+            continue;
+        }
+        for minute in start / MINUTE_MS..=(s.end_ms - 1) / MINUTE_MS {
+            let from = start.max(minute * MINUTE_MS);
+            let to = s.end_ms.min((minute + 1) * MINUTE_MS);
+            minutes.entry(minute).or_default().add(&s.reading, to - from);
+        }
+    }
+    minutes
 }
 
 /// The session cache's tiers at one moment, as the engine last published
@@ -1318,20 +1586,28 @@ impl Writer {
         Ok(skipped)
     }
 
-    /// Stores a finished minute of machine samples. A minute already stored
-    /// is replaced: after the clock went back, the latest samples of a
-    /// minute are the ones kept.
+    /// Stores a finished minute of the machine's own samples. A minute
+    /// already stored has those columns replaced: after the clock went back,
+    /// the latest samples of a minute are the ones kept. The sampler's
+    /// columns ([`Writer::power`]) are left as they are.
     pub fn machine(&mut self, m: &MachineMinute) -> bool {
         let result = self
             .conn
             .prepare_cached(
-                "INSERT OR REPLACE INTO machine (minute, samples, cpu_load_min, cpu_load_mean,
+                "INSERT INTO machine (minute, samples, cpu_load_min, cpu_load_mean,
                      cpu_load_max, memory_pressure, swap_bytes_mean, swap_bytes_max,
-                     ram_used_bytes_mean, lily_resident_bytes_max, gpu_active_mean,
-                     gpu_freq_mhz_min, gpu_freq_mhz_mean, gpu_freq_mhz_max, power_w_min,
-                     power_w_mean, power_w_max, gpu_power_w_mean)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                     ?16, ?17, ?18)",
+                     ram_used_bytes_mean, lily_resident_bytes_max)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT (minute) DO UPDATE SET
+                     samples = excluded.samples,
+                     cpu_load_min = excluded.cpu_load_min,
+                     cpu_load_mean = excluded.cpu_load_mean,
+                     cpu_load_max = excluded.cpu_load_max,
+                     memory_pressure = excluded.memory_pressure,
+                     swap_bytes_mean = excluded.swap_bytes_mean,
+                     swap_bytes_max = excluded.swap_bytes_max,
+                     ram_used_bytes_mean = excluded.ram_used_bytes_mean,
+                     lily_resident_bytes_max = excluded.lily_resident_bytes_max",
             )
             .and_then(|mut insert| {
                 insert.execute(params![
@@ -1345,17 +1621,97 @@ impl Writer {
                     m.swap_bytes.max().map(|b| b as u64),
                     m.ram_used_bytes.mean(),
                     m.lily_resident_bytes.max().map(|b| b as u64),
-                    m.gpu_active.mean(),
-                    m.gpu_freq_mhz.min(),
-                    m.gpu_freq_mhz.mean(),
-                    m.gpu_freq_mhz.max(),
-                    m.power_w.min(),
-                    m.power_w.mean(),
-                    m.power_w.max(),
-                    m.gpu_power_w.mean(),
                 ])
             });
         let ok = self.outcome("writing machine samples", result).is_some();
+        if ok && self.health.oldest.load(Ordering::Relaxed) == 0 {
+            self.publish_extent();
+        }
+        ok
+    }
+
+    /// Adds `delta`, what the sampler's windows said of one more part of
+    /// `minute`, to the sampler's columns of that minute's row: merged with
+    /// what the row holds (the earlier parts, even of an earlier process), so
+    /// the row always says the whole of the covered time. The row is created
+    /// (with no machine samples of its own) if the minute has none yet;
+    /// [`Writer::machine`] leaves these columns alone. Returns whether it was
+    /// stored.
+    pub fn power(&mut self, minute: u64, delta: &PowerMinute) -> bool {
+        if delta.covered_ms == 0 {
+            return true;
+        }
+        let stored = self.conn.query_row(
+            "SELECT power_covered_ms, power_w_min, power_w_mean, power_w_max,
+                    gpu_power_w_mean, gpu_active_mean, gpu_freq_mhz_min,
+                    gpu_freq_mhz_mean, gpu_freq_mhz_max, cpu_temp_c_max, gpu_temp_c_max,
+                    sys_covered_ms
+             FROM machine WHERE minute = ?1",
+            [minute],
+            |r| {
+                Ok(StoredPower {
+                    covered_ms: r.get(0)?,
+                    sys_w_min: r.get(1)?,
+                    sys_w_mean: r.get(2)?,
+                    sys_w_max: r.get(3)?,
+                    gpu_w_mean: r.get(4)?,
+                    gpu_active_mean: r.get(5)?,
+                    gpu_freq_mhz_min: r.get(6)?,
+                    gpu_freq_mhz_mean: r.get(7)?,
+                    gpu_freq_mhz_max: r.get(8)?,
+                    cpu_temp_max: r.get(9)?,
+                    gpu_temp_max: r.get(10)?,
+                    sys_covered_ms: r.get(11)?,
+                })
+            },
+        );
+        // Without the stored part, writing would replace it.
+        let Some(stored) = self.read("reading power samples", stored.optional()) else {
+            return false;
+        };
+        let mut merged =
+            stored.as_ref().and_then(PowerMinute::stored).unwrap_or_default();
+        merged.merge(delta);
+        let result = self
+            .conn
+            .prepare_cached(
+                "INSERT INTO machine (minute, samples, power_covered_ms, power_w_min,
+                     power_w_mean, power_w_max, gpu_power_w_mean, gpu_active_mean,
+                     gpu_freq_mhz_min, gpu_freq_mhz_mean, gpu_freq_mhz_max,
+                     cpu_temp_c_max, gpu_temp_c_max, sys_covered_ms)
+                 VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 ON CONFLICT (minute) DO UPDATE SET
+                     power_covered_ms = excluded.power_covered_ms,
+                     sys_covered_ms = excluded.sys_covered_ms,
+                     power_w_min = excluded.power_w_min,
+                     power_w_mean = excluded.power_w_mean,
+                     power_w_max = excluded.power_w_max,
+                     gpu_power_w_mean = excluded.gpu_power_w_mean,
+                     gpu_active_mean = excluded.gpu_active_mean,
+                     gpu_freq_mhz_min = excluded.gpu_freq_mhz_min,
+                     gpu_freq_mhz_mean = excluded.gpu_freq_mhz_mean,
+                     gpu_freq_mhz_max = excluded.gpu_freq_mhz_max,
+                     cpu_temp_c_max = excluded.cpu_temp_c_max,
+                     gpu_temp_c_max = excluded.gpu_temp_c_max",
+            )
+            .and_then(|mut insert| {
+                insert.execute(params![
+                    minute,
+                    merged.covered_ms,
+                    merged.sys_w_min(),
+                    merged.sys_w_mean(),
+                    merged.sys_w_max(),
+                    merged.gpu_w_mean(),
+                    merged.gpu_active_mean(),
+                    merged.gpu_freq_mhz_min(),
+                    merged.gpu_freq_mhz_mean(),
+                    merged.gpu_freq_mhz_max(),
+                    merged.cpu_temp_max,
+                    merged.gpu_temp_max,
+                    merged.sys_ms,
+                ])
+            });
+        let ok = self.outcome("writing power samples", result).is_some();
         if ok && self.health.oldest.load(Ordering::Relaxed) == 0 {
             self.publish_extent();
         }
@@ -1596,6 +1952,9 @@ impl Recording {
         }
         if let Some(m) = self.machine.take() {
             writer.machine(&m);
+        }
+        if let Some(board) = self.board.upgrade() {
+            self.write_power(&mut writer, &board);
         }
         writer.close();
     }
@@ -1843,11 +2202,21 @@ impl Recording {
         }
     }
 
-    /// Samples the machine at `now_ms`; when a minute ended since the last
-    /// sample (or the clock went back to another), stores it and the tiers.
-    /// `false` once the board is gone.
+    /// Writes what the sampler measured since the last tick: its windows
+    /// spread over the minutes they overlap, each merged into its row.
+    fn write_power(&self, writer: &mut Writer, board: &Board) {
+        let Some(machine) = board.machine() else { return };
+        for (minute, delta) in spread(&machine.drain()) {
+            writer.power(minute, &delta);
+        }
+    }
+
+    /// Samples the machine at `now_ms` and stores what the sampler measured;
+    /// when a minute ended since the last sample (or the clock went back to
+    /// another), stores it and the tiers. `false` once the board is gone.
     fn sample(&mut self, writer: &mut Writer, now_ms: u64) -> bool {
         let Some(board) = self.board.upgrade() else { return false };
+        self.write_power(writer, &board);
         let minute = now_ms / MINUTE_MS;
         if let Some(m) = self.machine.take_if(|m| m.minute != minute) {
             writer.machine(&m);

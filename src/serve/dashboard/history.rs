@@ -17,12 +17,18 @@
 //! busy time (the recorder's union of running intervals, decode and prefill
 //! each over their own), its maximum the best minute in it. The machine
 //! series are the minute means (memory pressure the worst level, swap the
-//! most); a session's history has them all `null`. Queue times are the
+//! most); a session's history has them all `null`. The sampler's series are
+//! weighted by the milliseconds of each minute its windows covered
+//! (`PowerMinute`), so a minute it only half covered counts for half: the
+//! GPU's power, activity and frequency by the time it measured, the system
+//! power by the part of it that had a system power. Queue times are the
 //! requests that finished in the bucket: the median by nearest rank and the
 //! longest. The summary is the same arithmetic over the whole grid: tokens
 //! over busy time, the best minute, busy time over the wall time the grid
 //! covers, and the mean
-//! system power and its energy over the minutes that have a power sample
+//! system power over the time the sampler covered, and its energy: the sum
+//! over the minutes of mean power times covered time, so a gap (the sampler
+//! off, failed or lily not running) adds nothing and is not filled in
 //! (`null` while nothing measures power).
 
 use rusqlite::{Connection, params};
@@ -104,12 +110,43 @@ pub struct MachineRow {
     pub power_w: Option<f64>,
     pub gpu_power_w: Option<f64>,
     pub gpu_freq_mhz: Option<f64>,
+    /// Milliseconds of the minute the sampler's windows covered: the weight
+    /// of its GPU figures above (`None`: it measured nothing).
+    pub power_covered_ms: Option<u64>,
+    /// Of those, the milliseconds that had a system power: the weight of
+    /// `power_w` and the time the energy is integrated over.
+    pub sys_covered_ms: Option<u64>,
 }
 
 /// The mean of the values present.
 fn mean(values: impl Iterator<Item = Option<f64>>) -> Option<f64> {
     let (n, sum) = values.flatten().fold((0u32, 0.0), |(n, s), v| (n + 1, s + v));
     (n > 0).then(|| sum / n as f64)
+}
+
+fn gpu_weight(m: &MachineRow) -> Option<u64> {
+    m.power_covered_ms
+}
+
+fn sys_weight(m: &MachineRow) -> Option<u64> {
+    m.sys_covered_ms
+}
+
+/// The mean of a sampler series over the time its windows covered: each
+/// minute's figure weighted by its covered milliseconds, minutes without
+/// either left out.
+fn weighted_mean(
+    minutes: &[&MachineRow],
+    series: impl Fn(&MachineRow) -> Option<f64>,
+    weight: impl Fn(&MachineRow) -> Option<u64>,
+) -> Option<f64> {
+    let (ms, sum) = minutes.iter().fold((0.0, 0.0), |(ms, sum), m| {
+        match (series(m), weight(m).filter(|&c| c > 0)) {
+            (Some(v), Some(c)) => (ms + c as f64, sum + v * c as f64),
+            _ => (ms, sum),
+        }
+    });
+    (ms > 0.0).then(|| sum / ms)
 }
 
 /// Sums of a run of minutes.
@@ -224,7 +261,7 @@ pub fn build(
                 queue_ms_max,
                 sessions_max: t.sessions_max,
                 cpu_load: mean(ms.iter().map(|m| m.cpu_load)).map(|v| round(v, 1e3)),
-                gpu_active: mean(ms.iter().map(|m| m.gpu_active))
+                gpu_active: weighted_mean(ms, |m| m.gpu_active, gpu_weight)
                     .map(|v| round(v, 1e3)),
                 memory_pressure: ms
                     .iter()
@@ -232,19 +269,24 @@ pub fn build(
                     .max()
                     .and_then(MemoryPressure::of_level),
                 swap_bytes: ms.iter().filter_map(|m| m.swap_bytes).max(),
-                power_w: mean(ms.iter().map(|m| m.power_w)).map(|v| round(v, 100.0)),
-                gpu_power_w: mean(ms.iter().map(|m| m.gpu_power_w))
+                power_w: weighted_mean(ms, |m| m.power_w, sys_weight)
                     .map(|v| round(v, 100.0)),
-                gpu_freq_mhz: mean(ms.iter().map(|m| m.gpu_freq_mhz))
+                gpu_power_w: weighted_mean(ms, |m| m.gpu_power_w, gpu_weight)
+                    .map(|v| round(v, 100.0)),
+                gpu_freq_mhz: weighted_mean(ms, |m| m.gpu_freq_mhz, gpu_weight)
                     .map(|v| round(v, 10.0)),
             }
         })
         .collect();
 
-    // A minute's power sample stands for that minute's energy.
-    let powered: Vec<f64> =
-        machines.iter().flatten().filter_map(|m| m.power_w).collect();
-    let power_sum: f64 = powered.iter().sum();
+    // The energy is each minute's mean power over the time the sampler
+    // covered in it (watt-milliseconds), and the average power is the same
+    // sum over the covered time: minutes it did not cover count for nothing.
+    let (covered_ms, watt_ms) = machines
+        .iter()
+        .flatten()
+        .filter_map(|m| m.power_w.zip(m.sys_covered_ms.filter(|&c| c > 0)))
+        .fold((0.0, 0.0), |(ms, sum), (w, c)| (ms + c as f64, sum + w * c as f64));
     let wall_ms = grid.data_end.saturating_sub(grid.start).max(1) as f64;
     let summary = HistorySummary {
         decode: Rate {
@@ -261,10 +303,8 @@ pub fn build(
         busy_share: round((all.busy_ms / wall_ms).min(1.0), 1e4),
         cache_hit: ratio(all.cached_tokens, all.prompt_tokens),
         acceptance: ratio(all.accepted_tokens, all.drafted_tokens),
-        power_avg_w: (!powered.is_empty())
-            .then(|| round(power_sum / powered.len() as f64, 100.0)),
-        energy_wh: (!powered.is_empty())
-            .then(|| round(power_sum * (MINUTE_MS as f64 / 3_600_000.0), 1e3)),
+        power_avg_w: (covered_ms > 0.0).then(|| round(watt_ms / covered_ms, 100.0)),
+        energy_wh: (covered_ms > 0.0).then(|| round(watt_ms / 3_600_000.0, 1e3)),
     };
     History { range, step_s: grid.step / 1000, points, summary }
 }
@@ -333,7 +373,8 @@ pub fn machine(
 ) -> rusqlite::Result<Vec<MachineRow>> {
     let mut select = conn.prepare_cached(
         "SELECT minute, cpu_load_mean, memory_pressure, swap_bytes_max, gpu_active_mean,
-                power_w_mean, gpu_power_w_mean, gpu_freq_mhz_mean
+                power_w_mean, gpu_power_w_mean, gpu_freq_mhz_mean, power_covered_ms,
+                sys_covered_ms
          FROM machine WHERE minute >= ?1 AND minute < ?2",
     )?;
     select
@@ -347,6 +388,8 @@ pub fn machine(
                 power_w: r.get(5)?,
                 gpu_power_w: r.get(6)?,
                 gpu_freq_mhz: r.get(7)?,
+                power_covered_ms: r.get(8)?,
+                sys_covered_ms: r.get(9)?,
             })
         })?
         .collect()

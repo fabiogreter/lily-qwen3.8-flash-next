@@ -55,6 +55,61 @@ it holds and checkpoint the WAL. `--stats-db off` records nothing: the
 history routes answer 503 and the per-session figures cover the last 1 024
 requests. The design is [dashboard.md](dashboard.md).
 
+### Machine power, GPU and temperatures
+
+`--machine-stats on|off` (default `on`, restart-only, listed read-only in the
+Settings view) runs a sampler thread of its own, at the utility quality of
+service, over the `macmon` crate (IOReport and the SMC, no root): system, CPU,
+GPU and ANE power, the GPU's activity and frequency and the CPU and GPU
+temperatures. The thread creates the sampler (about 0.7 s), never while the
+server starts, and takes a reading 2 s after the previous one while a request
+is running or a dashboard request came in within the last 10 s, 30 s after it
+otherwise, so the history has idle samples too. lily does the waiting itself
+(`macmon` is asked for no window after the first, so it measures exactly the
+time since its last call): the wait is cut short when the page opens (a
+dashboard request after the page was closed), polls the engine's activity
+every 2 s and ends at once at shutdown, so a page opened in the middle of an
+idle wait gets a fresh reading immediately.
+
+`/v1/lily/status` shows the latest reading as `machine.power`, `gpu_active`,
+`gpu_freq_mhz` and `temp_c` while it is younger than three waits (6 s, or 90 s
+after an idle one) and `null` otherwise. `machine.power.sys_w` is `null` when
+the SMC does not report the system's power (macmon then gives 0, or less than
+the parts); the parts are still shown. `machine.sampler` is `ok` (the thread
+runs; the figures can be `null` until the first fresh reading), `off`
+(`--machine-stats off`: no thread) or `failed` (it could not start, or stopped
+after repeated errors).
+
+A reading that fails, is not finite, or is out of range (a power or the system
+power above 1 000 W, a frequency above 10 000 MHz, a temperature outside
+-20 to 150 °C) is skipped and counted, and one good reading resets the count;
+the first skip and every 100th are logged. Five failures in a row, a panic, or
+a sampler that cannot be created (IOReport refuses where a sandbox blocks it)
+log `machine: <what> failed: <cause>; the dashboard shows no power, ...` once;
+the sampler is then `failed`, its thread ends and the figures stay `null`;
+nothing else is affected, and a restart tries again. A Rust panic in the
+sampler is caught; a crash inside `macmon`'s FFI (a NULL CoreFoundation object
+dereferenced) would end the whole process, which a subprocess probe would
+prevent (a `TODO(dashboard)` in `src/serve/machine.rs`; the owner's decision).
+CPU load, memory, swap and pressure are lily's own probes and do not depend on
+the sampler.
+
+The recorder keeps each window in the `machine` table, spread over the
+minutes it overlaps: per minute the system power's least, time-weighted mean
+and most, the GPU's power, activity and frequency, the hottest temperatures,
+`power_covered_ms` (the milliseconds of the minute the windows covered, never
+more than 60 000) and `sys_covered_ms` (of those, the ones that had a system
+power). The history's power series are those means weighted by the covered
+time, and the summary's **energy is the sum over minutes of mean system power
+times the time that had a system power**: a minute the sampler did not cover (it
+was off or failed, lily was not running, a stall) or that had no system power
+adds nothing and is never filled in, so `summary.energy_wh` is what the machine
+used while it was being measured, not an extrapolation over the range, and
+`power_avg_w` is the mean over the same time. Both are `null` while no minute
+has a system power. The database is at schema 2 (`power_covered_ms`,
+`sys_covered_ms` and the temperature columns are added to a v1 database when it
+is opened).
+
 ### Runtime settings
 
 Seventeen settings change without a restart, from the dashboard's Settings

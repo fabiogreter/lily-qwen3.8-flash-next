@@ -198,7 +198,7 @@ export const statusSmallMachine: Status = {
       "cpu_w": 7.5,
       "gpu_w": 48.25,
       "ane_w": 0.0,
-      "sys_w": 71.5
+      "sys_w": null
     },
     "temp_c": {
       "cpu": 66.0,
@@ -1082,6 +1082,27 @@ export const settings: SettingsResponse = {
       "step": null,
       "options": null,
       "help": "The dashboard's history; off records none.",
+      "applies": null
+    },
+    {
+      "name": "machine_stats",
+      "group": "Engine",
+      "type": "enum",
+      "editable": false,
+      "flag": "--machine-stats",
+      "default": null,
+      "flag_value": null,
+      "value": null,
+      "value_s": null,
+      "source": "default",
+      "min": null,
+      "max": null,
+      "step": null,
+      "options": [
+        "on",
+        "off"
+      ],
+      "help": "Power, GPU and temperature sampling; off starts no sampler.",
       "applies": null
     }
   ]

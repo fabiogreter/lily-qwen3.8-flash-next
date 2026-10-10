@@ -5,6 +5,7 @@ use super::contract::*;
 use super::settings::{self, FlagValue};
 use super::*;
 use crate::serve::State;
+use crate::serve::machine;
 use crate::serve::timings::{BatchTimings, Speculation};
 
 // --- the app's files ---------------------------------------------------------
@@ -1164,6 +1165,168 @@ fn the_status_maps_the_lifecycle_and_holds_the_pin_only_while_idle() {
     assert_eq!((status.tiers.weights.bytes, status.queue.max_batch), (42, 1));
 }
 
+// --- the machine sampler -------------------------------------------------------
+
+fn sampled(sys_w: f64) -> machine::Sample {
+    machine::Sample {
+        start_ms: 1_000,
+        end_ms: 3_000,
+        reading: machine::Reading {
+            cpu_w: 8.123,
+            gpu_w: 41.987,
+            ane_w: 0.0,
+            sys_w: Some(sys_w),
+            gpu_active: 0.9137,
+            gpu_freq_mhz: 1577.6,
+            cpu_temp_c: Some(61.26),
+            gpu_temp_c: Some(55.0),
+        },
+    }
+}
+
+/// A dashboard whose board has a sampler that `play` publishes to.
+fn with_sampler() -> (Arc<Machine>, Dashboard) {
+    let (board, d) = dashboard();
+    let machine = Machine::running();
+    assert!(board.attach_machine(machine.clone()));
+    assert!(!board.attach_machine(Machine::off()), "a second sampler is refused");
+    (machine, d)
+}
+
+#[test]
+fn the_status_shows_the_samplers_fresh_reading_and_nothing_stale() {
+    let (machine, d) = with_sampler();
+    // Running, nothing measured yet: the sampler is ok and the figures null.
+    let m = d.status(READY).machine;
+    assert_eq!(m.sampler, SamplerState::Ok);
+    assert_eq!(
+        (m.power, m.gpu_active, m.gpu_freq_mhz, m.temp_c),
+        (None, None, None, None)
+    );
+
+    machine.publish(machine::BUSY_INTERVAL, sampled(61.456));
+    let m = d.status(READY).machine;
+    assert_eq!(m.sampler, SamplerState::Ok);
+    assert_eq!(
+        m.power,
+        Some(Power { cpu_w: 8.12, gpu_w: 41.99, ane_w: 0.0, sys_w: Some(61.46) })
+    );
+    assert_eq!((m.gpu_active, m.gpu_freq_mhz), (Some(0.914), Some(1578.0)));
+    assert_eq!(m.temp_c, Some(Temperatures { cpu: 61.3, gpu: 55.0 }));
+    // CPU load and memory stay lily's own probes.
+    assert!(m.ram_total_bytes.is_some_and(|t| t > 0));
+
+    // The contract has no half a pair of temperatures.
+    let mut half = sampled(10.0);
+    half.reading.gpu_temp_c = None;
+    machine.publish(machine::BUSY_INTERVAL, half);
+    let m = d.status(READY).machine;
+    assert_eq!(m.temp_c, None);
+    assert!(m.power.is_some(), "the rest of the reading stays");
+    // A ratio past 1 (a rounding in the source) is shown as 1.
+    let mut over = sampled(10.0);
+    over.reading.gpu_active = 1.0004;
+    machine.publish(machine::BUSY_INTERVAL, over);
+    assert_eq!(d.status(READY).machine.gpu_active, Some(1.0));
+}
+
+#[test]
+fn a_failed_or_off_sampler_leaves_the_machine_figures_null_and_serving_on() {
+    // Off: no sampler on the board at all, and one that is `Off`.
+    let (_, d) = dashboard();
+    assert_eq!(d.status(READY).machine.sampler, SamplerState::Off);
+    let board = Arc::new(Board::default());
+    board.attach_machine(Machine::off());
+    let off = Dashboard::new(board, config());
+    assert_eq!(off.status(READY).machine.sampler, SamplerState::Off);
+    assert_eq!(answer(&off, "GET", "/v1/lily/status", &[]).status, 200);
+
+    // Failed at the start: the real thread, a source that cannot be made.
+    let board = Arc::new(Board::default());
+    let failing = Machine::spawn(
+        || -> Result<NoSource, String> { Err("Failed to create subscription".into()) },
+        || false,
+        machine::Intervals::default(),
+    );
+    board.attach_machine(failing.clone());
+    let d = Dashboard::new(board, config());
+    let until = Instant::now() + Duration::from_secs(10);
+    while !failing.finished() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let r = answer(&d, "GET", "/v1/lily/status", &[]);
+    assert_eq!(r.status, 200, "serving is unaffected");
+    let m = &body(&r)["machine"];
+    assert_eq!(m["sampler"], "failed");
+    for field in ["power", "gpu_active", "gpu_freq_mhz", "temp_c"] {
+        assert!(m[field].is_null(), "{field}");
+    }
+    assert!(m["ram_total_bytes"].as_u64().is_some_and(|t| t > 0));
+
+    // Failed mid-run: what was shown is gone.
+    let (machine, d) = with_sampler();
+    machine.publish(machine::BUSY_INTERVAL, sampled(50.0));
+    assert!(d.status(READY).machine.power.is_some());
+    machine.fail("sampling failed: boom".into());
+    let m = d.status(READY).machine;
+    assert_eq!((m.sampler, m.power, m.temp_c), (SamplerState::Failed, None, None));
+}
+
+struct NoSource;
+
+impl machine::Source for NoSource {
+    fn read(&mut self, _: Duration) -> Result<machine::Reading, String> {
+        Err("never created".into())
+    }
+}
+
+#[test]
+fn a_dashboard_request_opens_the_page_and_a_refused_one_does_not() {
+    let (board, d) = dashboard();
+    let machine = Machine::off();
+    board.attach_machine(machine.clone());
+    assert_eq!(machine.since_touch(), None);
+    let remote =
+        Connection { peer: at(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20))), port: 8000 };
+    let target = "/v1/lily/status";
+    let refused = d.respond(
+        Route::Api,
+        &request("GET", target, &[]),
+        (target, ""),
+        remote,
+        READY,
+    );
+    assert_eq!(refused.status, 403);
+    assert_eq!(machine.since_touch(), None, "a refused peer does not keep it open");
+    assert_eq!(answer(&d, "GET", target, &[]).status, 200);
+    assert!(machine.since_touch().is_some_and(|age| age < Duration::from_secs(1)));
+    // The page's own files count too.
+    let machine = Machine::off();
+    let board = Arc::new(Board::default());
+    board.attach_machine(machine.clone());
+    let d = Dashboard::new(board, config());
+    assert_eq!(answer(&d, "GET", "/", &[]).status, 200);
+    assert!(machine.since_touch().is_some());
+}
+
+#[test]
+fn the_board_is_busy_with_a_request_open_or_tokens_moving() {
+    let board = Board::default();
+    assert!(!board.busy(), "nothing has happened");
+    assert!(!board.busy());
+    board.opened();
+    assert!(board.busy(), "a request is running");
+    board.closed(None, Instant::now());
+    assert!(!board.busy());
+    // Tokens drawn since the last look count even with no request open, once.
+    board.drew();
+    assert!(board.busy());
+    assert!(!board.busy(), "the same tokens are not news twice");
+    board.prefilled(512);
+    assert!(board.busy());
+    assert!(!board.busy());
+}
+
 #[test]
 fn live_rates_are_measured_against_a_sample_one_to_six_seconds_old() {
     let t0 = Instant::now();
@@ -1401,7 +1564,12 @@ fn busy_status() -> Status {
             ram_used_bytes: Some(104_857_600_000),
             lily_resident_bytes: Some(76_450_000_000),
             swap_used_bytes: Some(1_181_116_006),
-            power: Some(Power { cpu_w: 7.5, gpu_w: 48.25, ane_w: 0.0, sys_w: 71.5 }),
+            power: Some(Power {
+                cpu_w: 7.5,
+                gpu_w: 48.25,
+                ane_w: 0.0,
+                sys_w: Some(71.5),
+            }),
             temp_c: Some(Temperatures { cpu: 66.0, gpu: 72.5 }),
         },
         tiers: Tiers {
@@ -1497,6 +1665,10 @@ fn unloaded_status() -> Status {
 fn small_machine_status() -> Status {
     let mut status = busy_status();
     status.tiers.experts = Some(ExpertTier { slots: 1536, used: 1536, hit_rate: None });
+    // The SMC's system power failed: the parts are still measured.
+    if let Some(power) = &mut status.machine.power {
+        power.sys_w = None;
+    }
     status.recorder = RecorderStatus {
         state: RecorderState::Opening,
         ok: false,
@@ -1716,6 +1888,8 @@ fn history_fixture() -> History {
             power_w: (i < 2).then_some(71.5),
             gpu_power_w: (i < 2).then_some(48.25),
             gpu_freq_mhz: (i < 2).then_some(1578.0),
+            power_covered_ms: (i < 2).then_some(60_000),
+            sys_covered_ms: (i < 2).then_some(60_000),
         })
         .collect();
     let queue = [(FIXTURE_NOW - 30_000, 12.0), (FIXTURE_NOW - 31_000, 40.0)];
@@ -1874,6 +2048,7 @@ fn every_nullable_field_is_null_in_some_fixture() {
         "status.machine.lily_resident_bytes",
         "status.machine.swap_used_bytes",
         "status.machine.power",
+        "status.machine.power.sys_w",
         "status.machine.temp_c",
         "status.tiers.gpu.budget_bytes",
         "status.tiers.disk",

@@ -3,10 +3,11 @@
 Status: **spec, agreed with the owner 2026-10-10; being built.** Prototypes are
 done (§ 9). Build order: the Vue app on mock data (§ 8), then lily serving it
 and the read routes (§ 3), the recorder (§ 4), runtime settings (§ 7) and
-machine sampling (§ 6). The first four are in (`src/serve/dashboard.rs`
-says what each route serves, `src/serve/recorder.rs` what the recorder
-stores and how); with `--stats-db off` the per-session figures cover the
-server's last 1 024 requests and the history routes answer 503.
+machine sampling (§ 6). All five are in (`src/serve/dashboard.rs` says what
+each route serves, `src/serve/recorder.rs` what the recorder stores and
+how, `src/serve/machine.rs` how the machine is sampled); with `--stats-db
+off` the per-session figures cover the server's last 1 024 requests and the
+history routes answer 503.
 
 A small web dashboard served by lily itself at `/`: what the server is doing
 now, what it did over the last 7 days, what the machine pays for it, and the
@@ -204,7 +205,7 @@ As built (phase 3):
 | `requests` | one per finished request: time, lineage id, prompt/cached/prefill/generated tokens, prefill/decode ms and rates, drafted/accepted, queue ms, batch size, cancelled, pinned, forced thinking close | 7 d |
 | `minute` | one per minute: per-series sum, count, max, busy ms (§ 5) | 7 d |
 | `minute_session` | one per minute and lineage id active in it: tokens, busy ms, max rate | 7 d |
-| `machine` | one per minute: load, memory pressure, swap, later watts and GPU frequency (min/mean/max) | 7 d |
+| `machine` | one per minute: load, memory pressure, swap (min/mean/max); from the sampler: system power (min/mean/max), GPU power, activity and frequency, hottest temperatures, covered milliseconds (§ 6) | 7 d |
 | `tiers` | one per minute: bytes and entries per cache tier | 7 d |
 | `settings` | one per overridden setting: name, JSON value, changed at | until reset |
 | `settings_log` | every change: time, name, old, new, source (`dashboard`, `startup`) | 7 d (open item, § 10) |
@@ -259,9 +260,11 @@ Cache tiers (bytes used / budget, entries):
 - n-gram table residency (page-cache share, from the gather stats)
 - pinned weights (pin state, held until)
 
-Machine (first version): CPU load, memory pressure level
-(`stats::pressure_level`), swap used, lily's own resident memory
-(`stats::task_memory`).
+Machine: CPU load, memory pressure level (`stats::pressure_level`), swap
+used, lily's own resident memory (`stats::task_memory`), and from the
+sampler (§ 6) system, CPU, GPU and ANE power, the GPU's activity and
+frequency and the temperatures. Energy and mean power cover only the time
+the sampler measured (§ 6).
 
 Ranges in the UI: 15 min, 1 h, 24 h, 7 d, in the buckets of § 3.4. Live
 values: polled every 2 s, only while the page is visible; history, sessions
@@ -288,6 +291,82 @@ Plan:
    thread; serving is unaffected.
 4. Wrapped in one module (`src/serve/machine.rs`) so a replacement (own
    IOReport bindings modelled on macmon) touches nothing else.
+
+As built (phase 5, `src/serve/machine.rs`; the probe's measurements were
+taken outside the sandbox by the owner: `Sampler::new()` about 0.7 s,
+`get_metrics(1000)` blocks the 1 000 ms, idle system 12 to 15 W, GPU 0.2 W at
+338 MHz, temperatures about 48 °C):
+
+- The thread (utility QoS) **creates the sampler itself**; `Source` is the
+  whole of what the rest of lily asks of `macmon`. **lily does the waiting**:
+  the first call asks `macmon` for a 1 s window (a baseline has to exist), every
+  later one for none after lily waited on a condition variable until the next
+  reading is due, so a window is exactly the time since the previous call. The
+  wait is woken by the page opening (`Machine::touch`, only when the page was
+  closed) and by the shutdown (`Machine::finish`, a 1 s cap), and looks at the
+  engine's activity every 2 s.
+- **Failures**: a call that errors, a value that is not finite or is out of
+  range (power or system power above 1 000 W, frequency above 10 000 MHz,
+  temperature outside -20 to 150 °C), or a first call back in under half its
+  window is skipped and counted (logged on the first and every 100th, never in
+  the contract); a good reading resets the count. **Five in a row**, a panic,
+  or a sampler that cannot be created (IOReport is blocked inside a sandbox:
+  "Failed to create subscription") logs once with the cause, marks
+  `machine.sampler` `failed`, clears the reading and ends the thread.
+  `--machine-stats off` starts none (`sampler: off`); `ok` means the thread
+  runs, the figures can be `null` until the first fresh reading. GPU activity is
+  clamped to 0..1 before it is stored.
+- **What `catch_unwind` covers**: a Rust panic on the sampler thread, in lily's
+  code or `macmon`'s Rust code, is caught and ends the sampler. It does not
+  cover a fault that is not a panic: `macmon` calls IOReport and CoreFoundation
+  through `unsafe` FFI without checking every pointer, and a NULL CoreFoundation
+  object dereferenced there is a `SIGSEGV` that ends the whole lily process (an
+  abort does too); a call that hangs leaves the thread stuck (the figures go
+  `null` when stale, the shutdown does not wait past its cap). `macmon` is
+  pinned (`=0.9.0`). Removing the risk takes a subprocess probe (a child
+  process writing one JSON line per reading): `TODO(dashboard)` in
+  `src/serve/machine.rs`, **owner decision pending**.
+- **Busy** is `Board::busy`: a request between `opened` and `closed`, or
+  tokens drawn or prefilled since the last look, or the engine loading,
+  reloading or recovering. **The page is open** while the last request that
+  passed the dashboard's loopback and `Host` guards (a page file or any
+  `/v1/lily/*` route) is at most 10 s old; the status poll every 2 s keeps it
+  so, and a hidden tab lets it lapse.
+- **Freshness**: the status shows the latest reading while it is younger than
+  three of the waits before it (6 s, 90 s after an idle wait, never less than
+  3 s), and `null` otherwise or after a failure.
+- **System power can be unknown**: `macmon` reads it from the SMC's `PSTR` and
+  reports 0 when that fails, and never less than CPU + GPU + ANE; a reading whose
+  system power is 0 or below that sum has none. `machine.power.sys_w` is then
+  `null` (the parts are still shown; the UI shows "–"), and the recorder counts
+  the window for the GPU series but not for system power or energy.
+- **Sources of the rest**: CPU load stays lily's tick-based figure
+  (`stats::cpu_ticks`: it works without the sampler, measures the same span as
+  the other live rates, and the history's 10 s samples use it); memory,
+  swap and pressure stay lily's Mach and sysctl probes (they work with the
+  sampler off, and are read at the status poll's cadence rather than the
+  sampler's). From `macmon`: `cpu_power`, `gpu_power`, `ane_power`, `sys_power`,
+  `gpu_active_ratio`, `gpu_freq_mhz` and the two average temperatures (`temp_c`
+  needs both).
+- **Recorder** (schema 2): every reading goes to a bounded queue the recorder
+  drains on its 10 s tick. A reading carries its window, the monotonic time
+  since the previous call placed by the wall clock at its end, so a clock that
+  jumps moves a window and never stretches it. The recorder spreads it over the
+  minutes it overlaps and merges each part into the minute's row (time-weighted
+  means, least and most of the windows, hottest temperatures, `power_covered_ms`
+  and `sys_covered_ms`), so parts arriving later, or from an earlier process, add
+  up; a minute never holds more than 60 000 ms of coverage. **Energy integrates
+  over covered time only**: the history's power series are weighted by the
+  covered time (system power by `sys_covered_ms`, the GPU series by
+  `power_covered_ms`), a bucket's `energy_wh` is the sum of mean system power
+  times `sys_covered_ms`, `power_avg_w` the mean over the same time, and a minute
+  without coverage adds nothing and is not filled in.
+- **Resources**: a sampler thread at the utility QoS, a call every 2 s at most
+  and every 30 s idle. `macmon` 0.9.0 holds IOHID and SMC handles for the
+  sampler's life and takes a `mach_host_self` send right per call (a possible
+  slow leak); the ignored real-hardware test measures lily's footprint over 300
+  calls. Not vendored. Whether the sampler costs the engine anything is not
+  measured yet: § 10.
 
 ## 7. Settings
 
@@ -409,12 +488,19 @@ tok/s) and **machine cost** (load, memory pressure, watts).
 
 ## 10. Open items
 
+- Sampler cost on decode throughput: an A/B bench (decode tok/s with
+  `--machine-stats on` against `off`, the page open) needs the GPU and was
+  deferred; until it runs, the sampler's cost to the engine is unmeasured.
+- Owner decision: run `macmon` in a subprocess probe so a crash in its FFI
+  cannot end the server (§ 6, `TODO(dashboard)` in `src/serve/machine.rs`).
 - `settings_log` retention: 7 days like the rest, or kept forever (it is
   tiny)? Default 7 days.
 - Whether the background service may be stopped for testing against the
   real server (phase 2 on).
 - `--stats-db` default location (§ 4).
-- macmon probe result on this machine (§ 6.1).
+- ~~macmon probe result on this machine (§ 6.1).~~ Phase 5: it works outside
+  the sandbox; the real-hardware test is `serve::machine::tests::real_macmon_reads_plausible_figures`
+  (`#[ignore]`, run with `-- --ignored`).
 - ~~Whether `--queue`, `--durable-min-tokens`, `--decode-checkpoint-tokens`
   can change at runtime (§ 7.1).~~ Phase 4: `--durable-min-tokens` yes, the
   other two stay restart-only (§ 7.1).

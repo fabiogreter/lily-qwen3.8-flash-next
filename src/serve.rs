@@ -37,6 +37,7 @@ pub mod dashboard;
 pub mod data_uri;
 pub mod disk;
 pub mod http;
+pub mod machine;
 pub mod pin;
 pub mod recorder;
 pub mod request;
@@ -325,6 +326,9 @@ pub struct ServeOptions {
     pub flags: Vec<dashboard::settings::FlagValue>,
     /// The dashboard's history database (`--stats-db`; `None`: off).
     pub stats_db: Option<std::path::PathBuf>,
+    /// Whether to sample the machine's power, GPU and temperatures
+    /// (`--machine-stats`).
+    pub machine_stats: machine::MachineStats,
 }
 
 // --- lifecycle ---------------------------------------------------------------
@@ -2355,6 +2359,25 @@ fn run_with<M: LanguageModel + 'static>(
         let (queue, jobs) = (queue.clone(), jobs.clone());
         settings.on_timers_changed(move || nudge_engine(&queue, &jobs));
     }
+    // Before the recorder, which takes the sampler's readings from the board.
+    // Returns at once: the sampler's thread creates the sampler.
+    let machine = match options.machine_stats {
+        machine::MachineStats::On => {
+            let (board, lifecycle) = (Arc::downgrade(&board), lifecycle.clone());
+            machine::Machine::start(move || {
+                // A load is work too, with no request counted yet.
+                !matches!(lifecycle.get(), State::Ready | State::Idle | State::Stopping)
+                    || board.upgrade().is_some_and(|board| board.busy())
+            })
+        }
+        machine::MachineStats::Off => {
+            eprintln!(
+                "machine: off (--machine-stats off); the dashboard shows no power, GPU or temperatures"
+            );
+            machine::Machine::off()
+        }
+    };
+    board.attach_machine(machine.clone());
     let recorder = recorder::Recorder::start(
         options.stats_db.as_deref(),
         &board,
@@ -2460,6 +2483,7 @@ fn run_with<M: LanguageModel + 'static>(
     let _ = engine_thread.join();
     // The engine's last rows are in the channel: written, then the WAL
     // checkpointed, within a bounded wait.
+    machine.finish(Duration::from_secs(1));
     recorder_stop.finish(RECORDER_FINISH);
     let deadline = Instant::now() + SHUTDOWN_DRAIN;
     while connections.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
