@@ -64,3 +64,18 @@ The Gated DeltaNet recurrence that tests/support/cpu_ref.rs and
 src/kernels/gdn.rs implement, and the online-softmax formulation the
 flash-attention prefill kernel uses, are published algorithms; the
 implementations here are lily's.
+
+--------------------------------------------------------------------------------
+
+The web dashboard (dashboard/, embedded in the server binary from
+dashboard/dist/) bundles:
+
+Vue (https://github.com/vuejs/core), MIT License,
+  Copyright (c) 2018-present, Yuxi (Evan) You.
+
+Shippori Mincho (https://github.com/fontdasu/ShipporiMincho) and
+IBM Plex Sans (https://github.com/IBM/plex), via @fontsource,
+  licensed under the SIL Open Font License, Version 1.1.
+
+The full license texts are in dashboard/licenses/ and are served with the
+dashboard at /assets/licenses.txt.

@@ -1,0 +1,92 @@
+/* Ink on paper. Light by default; night paper (warm charcoal, pale ink) when
+   the system is dark, unless the toggle forces light, or when it forces dark. */
+:root {
+  color-scheme: light;
+  --paper: #f4efe4;
+  --paper-lamp: #f7f3ea;
+  --paper-deep: #ebe4d5;
+  --ink: #1d1b18;
+  --ink-2: #4d4840;
+  --ink-3: #6f685c; /* muted labels, >= 4.5:1 on paper */
+  --hair: #dcd4c3; /* grid hairline */
+  --base: #c8bfac; /* axis / baseline */
+  --ai: #264a7a; /* indigo accent (seal, selection) */
+  --ai-seal: #2a4f82;
+  --ai-wash: rgba(38, 74, 122, 0.08);
+  --s1: #2a2723; /* series 1: sumi ink */
+  --s2: #4f74ad; /* series 2: indigo, lighter step for lines */
+  --s1-wash: rgba(42, 39, 35, 0.08);
+  --good: #4f7a47;
+  --warn: #9a7424;
+  --crit: #9e3f35;
+  --grain-ink: #3a2f1f; /* paper texture specks and mottle */
+  --grain-opacity: 0.1;
+  --mottle-ink: #6b5a3e;
+  --mottle-opacity: 0.06;
+  --node: rgba(255, 252, 244, 0.55);
+  --shadow: rgba(0, 0, 0, 0.08);
+
+  --f-head: 'Shippori Mincho', 'Hiragino Mincho ProN', serif;
+  --f-label: 'IBM Plex Sans', system-ui, sans-serif;
+  --f-num: 'IBM Plex Sans', system-ui, sans-serif;
+  --w-head: 600;
+  --w-body: 400;
+  --w-num: 400;
+  --label-size: 13px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    color-scheme: dark;
+    --paper: #24211d;
+    --paper-lamp: #2f2b25;
+    --paper-deep: #1c1a17;
+    --ink: #ece4d4;
+    --ink-2: #c5bca9;
+    --ink-3: #9a917f;
+    --hair: #38342d;
+    --base: #4a453c;
+    --ai: #8eaadb;
+    --ai-seal: #2e568f;
+    --ai-wash: rgba(142, 170, 219, 0.1);
+    --s1: #e8e0d0;
+    --s2: #86a6db;
+    --s1-wash: rgba(232, 224, 208, 0.08);
+    --good: #8fb585;
+    --warn: #d4b062;
+    --crit: #d98a7f;
+    --grain-ink: #f3e9d6;
+    --grain-opacity: 0.045;
+    --mottle-ink: #0e0d0b;
+    --mottle-opacity: 0.3;
+    --node: rgba(255, 245, 225, 0.035);
+    --shadow: rgba(0, 0, 0, 0.35);
+  }
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --paper: #24211d;
+  --paper-lamp: #2f2b25;
+  --paper-deep: #1c1a17;
+  --ink: #ece4d4;
+  --ink-2: #c5bca9;
+  --ink-3: #9a917f;
+  --hair: #38342d;
+  --base: #4a453c;
+  --ai: #8eaadb;
+  --ai-seal: #2e568f;
+  --ai-wash: rgba(142, 170, 219, 0.1);
+  --s1: #e8e0d0;
+  --s2: #86a6db;
+  --s1-wash: rgba(232, 224, 208, 0.08);
+  --good: #8fb585;
+  --warn: #d4b062;
+  --crit: #d98a7f;
+  --grain-ink: #f3e9d6;
+  --grain-opacity: 0.045;
+  --mottle-ink: #0e0d0b;
+  --mottle-opacity: 0.3;
+  --node: rgba(255, 245, 225, 0.035);
+  --shadow: rgba(0, 0, 0, 0.35);
+}

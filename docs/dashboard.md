@@ -1,7 +1,9 @@
 # Dashboard
 
-Status: **spec, agreed with the owner 2026-10-10; not built.** Prototypes come
-first (§ 9), then the server side (§ 3 to § 7), then the Vue app (§ 8).
+Status: **spec, agreed with the owner 2026-10-10; being built.** Prototypes are
+done (§ 9). Build order: the Vue app on mock data (§ 8), then lily serving it
+and the read routes (§ 3), the recorder (§ 4), runtime settings (§ 7) and
+machine sampling (§ 6).
 
 A small web dashboard served by lily itself at `/`: what the server is doing
 now, what it did over the last 7 days, what the machine pays for it, and the
@@ -61,7 +63,7 @@ All on lily's existing listener (`--bind`, default `127.0.0.1:8000`).
 | GET | `/` | The Vue app's `index.html` |
 | GET | `/assets/*` | The app's hashed JS, CSS, fonts (immutable cache headers) |
 | GET | `/v1/lily/status` | Now: lifecycle state, queue, batch occupancy, sessions per tier, machine sample, recorder health |
-| GET | `/v1/lily/history?range=15m\|1h\|24h\|7d&series=...` | Rolled-up time series (§ 5) |
+| GET | `/v1/lily/history?range=15m\|1h\|24h\|7d` | Rolled-up time series (§ 5) |
 | GET | `/v1/lily/sessions` | Cache entries: tier, tokens, last used, durable, lineage id, throughput summary |
 | GET | `/v1/lily/sessions/{lineage}/history?range=...` | One entry's throughput series |
 | GET | `/v1/lily/requests?limit=` | Recent request rows (numbers only) |
@@ -69,6 +71,9 @@ All on lily's existing listener (`--bind`, default `127.0.0.1:8000`).
 | PATCH | `/v1/lily/settings` | Change runtime settings (§ 7) |
 | DELETE | `/v1/lily/settings/{name}` | Reset one setting to its flag or default value |
 | GET | `/v1/lily/settings/log` | Change history |
+
+The response shapes are defined once, in `dashboard/src/api/types.ts`: that
+file is the contract the server implements (§ 3.4).
 
 Existing routes (`/health`, `/v1/models`, `/v1/timings`, the completions)
 stay as they are. Unknown paths under `/` that are not `/v1/*` or
@@ -92,6 +97,30 @@ through a generated manifest (path, content type, bytes), so `cargo build`
 never needs node. The HTTP layer (`src/serve/http.rs`) gains a static
 response with `Content-Type` and `Cache-Control`; `index.html` is
 `no-cache`, hashed assets `immutable`.
+
+### 3.4 Contract rules
+
+`dashboard/src/api/types.ts` holds every shape; these rules hold across it:
+
+- snake_case fields; timestamps unix ms; bytes, ms, tok/s, ratios 0..1.
+- A value lily does not have is `null`, never 0 or an absent field: a rate
+  of zero tokens, a missing machine sample, a tier that is off (disk budget
+  0, the expert cache outside small-machine mode).
+- Lists come wrapped (`{sessions: [...]}`), leaving room for totals later.
+- History is the complete grid from `now - range` to `now` at `step_s`,
+  oldest first; buckets with no data are all `null` (counts 0). Steps:
+  15m and 1h at 60 s, 24h at 900 s, 7d at 3 600 s.
+- Memory pressure is lily's own names everywhere: `normal`, `warning`,
+  `critical` or `null`; a history bucket carries the worst in it.
+- Machine power is `{cpu_w, gpu_w, ane_w, sys_w}` or `null`, with
+  `machine.sampler` saying why (`ok`, `off`, `failed`).
+- Durations in settings are the flag text, parsed exactly as
+  `parse_duration_secs` parses the flag, plus `value_s`.
+- `PATCH /v1/lily/settings` takes several names, applied all or none, and
+  returns `{updated: [...]}`; `DELETE` returns `{setting}`. Errors are
+  `{"error": {"message", "setting"?}}` with 404 (unknown setting), 409
+  (restart-only setting), 400 (invalid value) or 403 (write guard). The guard
+  matches the media type `application/json`, so a `charset` parameter passes.
 
 ## 4. Recorder and database
 
@@ -166,8 +195,9 @@ Machine (first version): CPU load, memory pressure level
 (`stats::pressure_level`), swap used, lily's own resident memory
 (`stats::task_memory`).
 
-Ranges in the UI: 15 min, 1 h, 24 h, 7 d. Live values: polled every 2 s,
-only while the page is visible.
+Ranges in the UI: 15 min, 1 h, 24 h, 7 d, in the buckets of § 3.4. Live
+values: polled every 2 s, only while the page is visible; history, sessions
+and requests every 60 s and on a range change.
 
 ## 6. Machine sampling (IOReport)
 
@@ -246,11 +276,25 @@ be added. Decide after living with the runtime ones.
   2026-10-10).
 - `dist/` committed; a check script (`npm run build` and `git diff --exit-code
   dashboard/dist`) catches a stale build.
-- Charting library: chosen during the prototypes, vendored by the build.
-- Light and dark, following the system, with a manual toggle.
-- Views: Overview (the first look), History, Sessions, Requests, Settings.
+- No charting library: hand-written SVG charts.
+- Fonts vendored from `@fontsource` (Shippori Mincho, IBM Plex Sans; OFL),
+  so the page works offline. `dist/assets/licenses.txt` carries the Vue
+  (MIT) and font (OFL) notices into the binary.
+- Light and dark, following the system, with a manual toggle; the paper
+  texture (smooth, grain, charcoal; default charcoal) is a per-browser
+  preference in the Settings view, stored in `localStorage`.
+- Views: Overview (the first look), Sessions, Requests, Engine (the flow
+  diagram), Settings.
+- `npm run dev:mock` runs it on the deterministic mock in `src/mock/`, which
+  the tests use too.
 
-## 9. Design prototypes
+## 9. Design prototypes (done)
+
+Outcome (owner, 2026-10-10): the calm structure in the sumi-e skin, with the
+engine schematic as its own view; Shippori Mincho headings with IBM Plex Sans
+for data; charcoal paper; no explanatory captions (definitions live in
+tooltips). The prototype files were throwaway and are not in the repo. The
+four directions explored:
 
 Four standalone HTML files with mock data in `dashboard/prototypes/`, not
 wired to lily. Each shows the Overview and Settings at least, in light and
@@ -279,6 +323,8 @@ tok/s) and **machine cost** (load, memory pressure, watts).
 
 - `settings_log` retention: 7 days like the rest, or kept forever (it is
   tiny)? Default 7 days.
+- Whether the background service may be stopped for testing against the
+  real server (phase 2 on).
 - `--stats-db` default location (§ 4).
 - macmon probe result on this machine (§ 6.1).
 - Whether `--queue`, `--durable-min-tokens`, `--decode-checkpoint-tokens` can
