@@ -58,7 +58,9 @@ pub struct Holder {
 }
 
 impl Holder {
-    fn parse(text: &str) -> Option<Self> {
+    /// The record as the holder wrote it into the lock file; `None` before
+    /// it has written one.
+    pub fn parse(text: &str) -> Option<Self> {
         let mut lines = text.lines();
         let pid = lines.next()?.strip_prefix("pid ")?.trim().parse().ok()?;
         let binary = lines.next().unwrap_or("").trim().to_owned();

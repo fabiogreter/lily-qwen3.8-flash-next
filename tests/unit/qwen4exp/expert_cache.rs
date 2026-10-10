@@ -140,3 +140,44 @@ fn run_claimed_runs_every_task_once_and_reports_failures() {
     .expect("the pool still runs batches");
     assert_eq!(after.load(Ordering::Relaxed), 10);
 }
+
+/// `read_experts` lays each expert's nine regions out back to back, the
+/// bytes `ExpertStore::read_into` reads, with and without `F_NOCACHE`, on the
+/// four-layer checkpoint (`LILY_MODEL_DIR_FLASH`).
+#[test]
+fn read_experts_match_the_store() {
+    use crate::qwen4exp::config::Qwen4ExpConfig;
+    use crate::qwen4exp::expert_store::ExpertStore;
+    use crate::safetensors::Checkpoint;
+
+    let Ok(dir) = std::env::var("LILY_MODEL_DIR_FLASH") else {
+        eprintln!("LILY_MODEL_DIR_FLASH unset; skipping read_experts_match_the_store");
+        return;
+    };
+    let ckpt = Checkpoint::open(&dir).expect("checkpoint");
+    let config = Qwen4ExpConfig::from_model_dir(&dir).expect("config");
+    let store = ExpertStore::open(&ckpt, &config).expect("store");
+    let pool = super::read_pool().expect("pool");
+    let experts = [(1usize, 7usize), (0, config.num_experts - 1), (2, 300)];
+    let bytes = store.slice_bytes();
+    for nocache in [true, false] {
+        store.set_nocache(nocache).expect("F_NOCACHE");
+        let mut dst = vec![vec![0u8; bytes]; experts.len() + 1];
+        super::read_experts(&pool, &store, &experts, &mut dst).expect("read_experts");
+        for (&(layer, expert), got) in experts.iter().zip(&dst) {
+            let mut regions: Vec<Vec<u8>> =
+                store.region_lens().iter().map(|&n| vec![0u8; n]).collect();
+            let want: [&mut [u8]; super::REGIONS] = regions
+                .iter_mut()
+                .map(Vec::as_mut_slice)
+                .collect::<Vec<_>>()
+                .try_into()
+                .expect("nine buffers");
+            store.read_into(layer, expert, want).expect("read_into");
+            assert!(*got == regions.concat(), "layer {layer} expert {expert}");
+        }
+        assert!(dst[experts.len()].iter().all(|&b| b == 0), "spare buffer written");
+    }
+    let mut short = vec![vec![0u8; bytes - 1]];
+    assert!(super::read_experts(&pool, &store, &experts[..1], &mut short).is_err());
+}

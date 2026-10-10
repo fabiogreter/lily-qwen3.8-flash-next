@@ -184,6 +184,33 @@ impl ExpertStore {
         &self.shards[shard].0
     }
 
+    /// Turns the unified buffer cache off (`F_NOCACHE`, `on`) or back on for
+    /// every shard the store opened: reads of pages that are not resident go
+    /// to the drive and leave no pages behind (pages already resident may
+    /// still be served from memory, which `lily-ssd-probe` checks with
+    /// `mincore`). Set by `lily-ssd-probe` and by the diagnostic
+    /// `LILY_EXPERT_NOCACHE=1`; the server reads through the cache.
+    pub fn set_nocache(&self, on: bool) -> Result<()> {
+        use std::os::fd::AsRawFd as _;
+        for (path, file) in &self.shards {
+            // SAFETY: fcntl on a descriptor the store owns.
+            let rc = unsafe {
+                libc::fcntl(
+                    file.as_raw_fd(),
+                    libc::F_NOCACHE,
+                    std::ffi::c_int::from(on),
+                )
+            };
+            ensure!(
+                rc != -1,
+                "F_NOCACHE on {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(())
+    }
+
     /// Where the nine regions of `expert` in `layer` live.
     pub fn slice(&self, layer: usize, expert: usize) -> ExpertSlice {
         debug_assert!(layer < self.layers() && expert < self.experts);

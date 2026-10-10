@@ -442,10 +442,7 @@ impl ExpertCache {
         let started = std::time::Instant::now();
         let fill: Vec<(u32, usize, usize)> = policy.initial_fill().collect();
         let filled = fill.len();
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(LOAD_THREADS)
-            .thread_name(|i| format!("expert-read-{i}"))
-            .build()?;
+        let pool = read_pool()?;
         // SAFETY: nothing reads the slab before this function returns, and
         // every entry names a distinct slot and expert.
         unsafe { load_slots(&pool, &store, &slab, &tables, self.experts, &fill)? };
@@ -560,8 +557,62 @@ unsafe fn load_slots(
     Ok(())
 }
 
+/// Reads each `(layer, expert)` of `experts` into its buffer in `dst`
+/// ([`ExpertStore::slice_bytes`] long, the nine regions back to back in
+/// `REGION_NAMES` order) the way [`load_slots`] reads a resolution's misses:
+/// one task per region over `pool` and the calling thread
+/// ([`run_claimed`]). The server reads into the slab; this serves
+/// `lily-ssd-probe`, which times that path without a model.
+// TODO: this mirrors `load_slots`' region split; share one helper with it
+// when the server's read path is next touched.
+pub fn read_experts(
+    pool: &rayon::ThreadPool,
+    store: &ExpertStore,
+    experts: &[(usize, usize)],
+    dst: &mut [Vec<u8>],
+) -> Result<()> {
+    let bytes = store.slice_bytes();
+    ensure!(
+        dst.len() >= experts.len()
+            && dst[..experts.len()].iter().all(|b| b.len() == bytes),
+        "{} destinations of {bytes} bytes needed",
+        experts.len()
+    );
+    let lens = store.region_lens();
+    let mut starts = [0usize; REGIONS];
+    for r in 1..REGIONS {
+        starts[r] = starts[r - 1] + lens[r - 1];
+    }
+    let bases: Vec<usize> =
+        dst.iter_mut().take(experts.len()).map(|b| b.as_mut_ptr() as usize).collect();
+    // Task `k` reads region `k % REGIONS` of expert `k / REGIONS`.
+    let read = |k: usize| -> Result<()> {
+        let (i, r) = (k / REGIONS, k % REGIONS);
+        let (layer, expert) = experts[i];
+        // SAFETY: `dst[i]` is `bytes` long and borrowed mutably for the
+        // call; each (expert, region) range is written by one task only.
+        let dst = unsafe {
+            core::slice::from_raw_parts_mut(
+                (bases[i] as *mut u8).add(starts[r]),
+                lens[r],
+            )
+        };
+        store.read_region(layer, expert, r, dst)
+    };
+    run_claimed(pool, experts.len() * REGIONS, read)
+}
+
 /// Threads in the read pool; the service thread reads alongside them.
-const LOAD_THREADS: usize = 16;
+pub const LOAD_THREADS: usize = 16;
+
+/// The read pool the cache's service thread loads slots with:
+/// [`LOAD_THREADS`] threads, started once.
+pub fn read_pool() -> Result<rayon::ThreadPool> {
+    Ok(rayon::ThreadPoolBuilder::new()
+        .num_threads(LOAD_THREADS)
+        .thread_name(|i| format!("expert-read-{i}"))
+        .build()?)
+}
 
 /// Runs `task(0)` to `task(tasks - 1)`, each once, on the calling thread and
 /// up to `pool`'s thread count of pool jobs, every one claiming the next task
@@ -571,7 +622,7 @@ const LOAD_THREADS: usize = 16;
 /// wake; a parallel iterator's work stealing, or a broadcast that blocks the
 /// caller, measured no faster on a few blocking reads than the threads this
 /// pool replaced ("The read threads" in `docs/low-ram-experts.md`).
-pub(crate) fn run_claimed(
+pub fn run_claimed(
     pool: &rayon::ThreadPool,
     tasks: usize,
     task: impl Fn(usize) -> Result<()> + Sync,
