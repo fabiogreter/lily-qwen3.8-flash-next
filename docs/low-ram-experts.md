@@ -963,7 +963,8 @@ parameters, 290 MB of weights per token in bf16, 85% of them in the
 24 576-wide output layers, on the order of a millisecond per token on a
 small machine's memory bandwidth; as large as what it saves at 64 GB.
 A low-rank output layer, fewer cuts and 4-bit weights are the obvious
-cuts, each to be checked against the overlap it costs.
+cuts, each to be checked against the overlap it costs. (Measured since: see
+"What the predictors cost inside the server" below.)
 
 **The drive.** `lily-ssd-probe --model <checkpoint>` reads random experts
 through the server's read pool (`expert_cache::read_experts`, the
@@ -1060,6 +1061,54 @@ Two cache policies replayed against these predictions, neither kept
   whose LRU region floats between layers (no prefetch 4.65 against
   4.92 ms at 64 GB, 13.04 against 13.68 at 40 GB); uniform capacities
   lose 18%.
+
+### What the predictors cost inside the server (2026-10-10)
+
+The predictors built into the decode and verify passes with their trained
+shapes and random weights (branch `predictor-cost-probe`, not merged;
+`LILY_PRED_PROBE=bf16|lowrank|q4|q4-lowrank|q8|q8-lowrank`). Each cut
+model runs right after its layer, the token-start model after the final
+hidden state over every row of a pass. The top-20 ids reach the host on
+the next expert-cache request, so no new synchronisation point. Lily had
+no bf16 GEMV; the probe adds one for up to four rows (about 517 GB/s
+here), the rest reuses lily's kernels. Token digests were identical with
+the probe on and off in every run.
+
+| variant | weights | slots lost | resident, per token | 64 GB, per token | 2 drafts, 64 GB, per accepted token |
+|---|---:|---:|---:|---:|---:|
+| bf16 as trained (token start + 4 cuts) | 411 MB | 149 | +0.79 ms | +0.96 ms | +0.60 ms |
+| low-rank output (units, 256, layers x 512) | 216 MB | 78 | +0.38 ms | +0.95 ms | +0.18 ms |
+| 4-bit | 116 MB | 42 | +0.32 ms | +0.23 ms | +0.14 ms |
+| 4-bit, low-rank | 61 MB | 22 | +0.07 ms | +0.13 ms | +0.09 ms |
+| bf16, token start + cut 7 only | 275 MB | 99 | +0.16 to 0.24 ms | +0.49 to 0.54 ms | +0.79 to 0.85 ms |
+
+Paired against probe-off runs in the same repetition, four repetitions
+at 64 GB (fresh clone each, `LILY_EXPERT_NOCACHE=1`). Noise: 0.2 to 0.3
+ms standard deviation, a few outliers of 1 to 2 ms. A slot is 2.76 MB.
+In bf16 the cost is streaming the wide output layers (79% of the 312 MB
+read per token); the lost slots add 0.7 misses per token at 64 GB. At 4
+bits with the low-rank layer what is left is fixed per-dispatch work
+(about 0.26 ms of GPU time per decode pass, mostly the per-layer routing
+copies for the token-start model's routing input), largely hidden in
+wall time.
+
+Net, replayed saving with each variant's slots removed minus the
+resident cost, per decoded token: bf16 +0.3 ms at 64 GB and +1.6 ms at
+40 GB; 4-bit low-rank +1.2 and +2.6 ms if it predicts as well as bf16
+(not yet measured). With 2 drafts the replayed saving per accepted token
+is smaller (64 GB 4.27 to 3.61 ms, 40 GB 11.05 to 10.24; the cuts see
+only a verify pass's first row), which bf16 nearly cancels and 4-bit
+low-rank keeps most of (+0.6 and +0.8 ms). These replace the earlier
+speculative figures, which were on the serial drive model and the first
+predictors.
+
+Caveats: measured on this machine's memory bandwidth; a 64 or 40 GB
+machine has less (for example 273 GB/s), so the weight-streaming part
+roughly doubles there, which matters for bf16 and little for 4-bit
+low-rank. No probe runs at 40 GB (resident cost plus replayed slot loss
+instead). For a verify pass's draft rows a cut model's previous-position
+hidden state does not exist yet; the probe reads a stale row, a real
+build has to choose an input.
 
 ### Prefill chunks of 8 192 tokens
 
