@@ -22,8 +22,9 @@ use std::path::PathBuf;
 use anyhow::{Context as _, Result, ensure};
 use clap::Parser;
 use lily::qwen4exp::cache_replay::{
-    CacheSim, Predictions, PrefetchReplay, ReplayConfig, ReplayCounts, SsdTiming,
-    TokenRouting, TraceRequest, Transitions,
+    CacheSim, Predictions, PrefetchReplay, RejectedRows, ReplayConfig, ReplayCounts,
+    SharedSsd, SpecReplay, SsdModel, SsdTiming, TokenRouting, TraceRequest,
+    Transitions,
 };
 use lily::qwen4exp::expert_store::UsageRanking;
 
@@ -51,15 +52,40 @@ struct Cli {
     /// Prefetches to sweep: `off`, or `LOOKAHEAD:TOP[:BUDGET]` (the
     /// predictor's `TOP` best for the layer `LOOKAHEAD` ahead, at most
     /// `BUDGET` reads per layer; lookahead 0 reads every layer at the
-    /// token's start).
+    /// token's start, and with `@CUT+CUT..` again after each layer `CUT`
+    /// for the layers after it, from the cut's own plane; a trailing `r`
+    /// lets each cut cancel queued reads for its layers that it does not
+    /// pick).
     #[arg(long, value_delimiter = ',', default_value = "off")]
     prefetch: Vec<String>,
-    /// What the prefetch predicts from: `b` (the logged predictor B),
-    /// `transitions` (each session's decode predicted from the transition
-    /// counts of all the other sessions' positions) or `token` (from the
-    /// other sessions' routing per input token id).
+    /// What the prefetch predicts from: `b` (the logged predictor B, or any
+    /// `STEM.pred.u16`), `transitions` (each session's decode predicted from
+    /// the transition counts of all the other sessions' positions), `token`
+    /// (from the other sessions' routing per input token id) or `oracle`
+    /// (the routing itself, every plane: the timing's ceiling).
     #[arg(long, default_value = "b")]
     predictor: String,
+    /// Replay decoding as speculative verify passes, `DRAFTS:ACCEPT`
+    /// (`cache_replay::SpecReplay`, e.g. `2:0.79`); stall and rates are then
+    /// per accepted token, and `layers missed/tok` counts a pass's missed
+    /// layers once for all the tokens it accepts.
+    #[arg(long)]
+    speculate: Option<String>,
+    /// Under `--speculate`: what rows of drafts that were not accepted route
+    /// to, `next` (the kept token's routing, optimistic; the default) or
+    /// `random`.
+    #[arg(long)]
+    rejected: Option<String>,
+    /// Planes in each `STEM.pred.u16` (`cache_replay::Predictions`).
+    #[arg(long, default_value_t = 2)]
+    planes: usize,
+    /// `--predictor b`: picks per row of each `STEM.pred.u16`. Default:
+    /// twice `--top-k`, what `lily-trace-routing --predict` writes, and for
+    /// its two planes only; other files (`tools/bench/expert_predictor.py`
+    /// writes 40) and any other `--planes` need it given, so a wrong layout
+    /// is refused rather than read.
+    #[arg(long)]
+    pred_width: Option<usize>,
     /// Picks kept per row by the learned predictors.
     #[arg(long, default_value_t = 20)]
     learned_width: usize,
@@ -84,11 +110,35 @@ struct Cli {
     /// Where in a layer its request comes (after the mixer).
     #[arg(long, default_value_t = 0.5)]
     mixer_share: f64,
-    /// One expert read, ms (2.76 MB at about 6.5 GB/s).
-    #[arg(long, default_value_t = 0.42)]
-    read_ms: f64,
+    /// `--timed`: the SSD model (`cache_replay::SsdModel`), `serial` (the
+    /// default: one read at a time in `--read-ms`, demand first) or
+    /// `shared` (each read a latency, then a transfer sharing the bandwidth
+    /// with every read in flight; fitted to `lily-ssd-probe`).
+    #[arg(long)]
+    ssd: Option<String>,
+    /// `--timed --ssd serial`: one expert read, ms (default 0.42: 2.76 MB
+    /// at about 6.5 GB/s).
+    #[arg(long)]
+    read_ms: Option<f64>,
+    /// `--timed --ssd shared`: a read's latency before its transfer, ms
+    /// (default `SharedSsd::PROBED`'s).
+    #[arg(long)]
+    latency_ms: Option<f64>,
+    /// `--timed --ssd shared`: one expert's transfer at full bandwidth, ms
+    /// (default `SharedSsd::PROBED`'s).
+    #[arg(long)]
+    transfer_ms: Option<f64>,
+    /// `--timed --ssd shared`: prefetches in flight at most (more wait
+    /// queued; default `SharedSsd::PROBED`'s 4, which all but saturated the
+    /// probed drive's bandwidth).
+    #[arg(long)]
+    prefetch_depth: Option<usize>,
     #[arg(long)]
     json_out: Option<PathBuf>,
+    /// Write each session's decode misses to `DIR/<name>.miss.u8`
+    /// (`CacheSim::take_miss_log`); one configuration only.
+    #[arg(long)]
+    miss_log: Option<PathBuf>,
 }
 
 /// One configuration's replay: the pinned slots, each session's counts, and
@@ -113,21 +163,59 @@ fn parse_prefetch(spec: &str) -> Result<Option<PrefetchReplay>> {
     if spec == "off" {
         return Ok(None);
     }
-    let v: Vec<usize> = spec
+    let (head, cuts, replace) = match spec.split_once('@') {
+        Some((head, cuts)) => {
+            let (cuts, replace) = match cuts.strip_suffix('r') {
+                Some(c) => (c, true),
+                None => (cuts, false),
+            };
+            let mut mask = 0u64;
+            for c in cuts.split('+') {
+                let k: u32 = c.parse().with_context(|| format!("prefetch {spec}"))?;
+                ensure!(k < 63, "prefetch {spec}: cut {k} out of range");
+                mask |= 1 << k;
+            }
+            (head, mask, replace)
+        }
+        None => (spec, 0, false),
+    };
+    let v: Vec<usize> = head
         .split(':')
         .map(|x| x.parse().with_context(|| format!("prefetch {spec}")))
         .collect::<Result<_>>()?;
-    ensure!((2..=3).contains(&v.len()), "prefetch {spec}: LOOKAHEAD:TOP[:BUDGET]");
-    Ok(Some(PrefetchReplay { lookahead: v[0], top: v[1], budget: v.get(2).copied() }))
+    ensure!(
+        (2..=3).contains(&v.len()),
+        "prefetch {spec}: LOOKAHEAD:TOP[:BUDGET][@CUT]"
+    );
+    Ok(Some(PrefetchReplay {
+        lookahead: v[0],
+        top: v[1],
+        budget: v.get(2).copied(),
+        cuts,
+        replace,
+    }))
 }
 
 fn label(p: Option<PrefetchReplay>) -> String {
     match p {
         None => "off".into(),
-        Some(p) => match p.budget {
-            Some(b) => format!("{}:{}:{b}", p.lookahead, p.top),
-            None => format!("{}:{}", p.lookahead, p.top),
-        },
+        Some(p) => {
+            let mut s = format!("{}:{}", p.lookahead, p.top);
+            if let Some(b) = p.budget {
+                s += &format!(":{b}");
+            }
+            if p.cuts != 0 {
+                let cuts: Vec<String> = (0..64)
+                    .filter(|k| p.cuts >> k & 1 == 1)
+                    .map(|k| k.to_string())
+                    .collect();
+                s += &format!("@{}", cuts.join("+"));
+                if p.replace {
+                    s += "r";
+                }
+            }
+            s
+        }
     }
 }
 
@@ -223,6 +311,63 @@ fn learn_token_predictions(
     Ok(())
 }
 
+/// The routing itself as predictions, in every plane, `top_k` wide: what a
+/// perfect predictor would read, under the same timing.
+/// The routing's layout, `[layers][tokens][top_k]`, is one such plane.
+fn oracle_predictions(routing: &[u32], planes: usize) -> Vec<u16> {
+    let plane = routing.iter().map(|&e| e as u16);
+    plane.cycle().take(planes * routing.len()).collect()
+}
+
+/// `--ssd serial`'s default read, ms: 2.76 MB at about 6.5 GB/s.
+const SERIAL_READ_MS: f64 = 0.42;
+
+/// The row width of `--predictor b`'s `STEM.pred.u16`: `--pred-width`, or
+/// by default `lily-trace-routing --predict`'s, twice the top-k over its
+/// two planes. With another plane count the default would be a guess, and
+/// a guess that divides the file would misread it: refused.
+fn logged_width(
+    given: Option<usize>,
+    planes: usize,
+    top_k: usize,
+    experts: usize,
+) -> Result<usize> {
+    let width = match given {
+        Some(w) => w,
+        None => {
+            ensure!(
+                planes == 2,
+                "--planes {planes} needs --pred-width (the default, {}, is \
+                 lily-trace-routing --predict's, over two planes)",
+                2 * top_k
+            );
+            2 * top_k
+        }
+    };
+    ensure!((1..=experts).contains(&width), "--pred-width {width}: 1 to {experts}");
+    Ok(width)
+}
+
+/// Refuses a logged `STEM.pred.u16` that does not hold exactly `planes` x
+/// layers x tokens x `width` ids, the layout it is read as.
+fn check_predictions(
+    t: &Trace,
+    planes: usize,
+    layers: usize,
+    width: usize,
+) -> Result<()> {
+    let expected = planes * layers * t.tokens * width;
+    ensure!(
+        t.predicted.len() == expected,
+        "{}.pred.u16 holds {} ids, not {planes} planes x {layers} layers x {} tokens x \
+         {width} (--planes, --pred-width)",
+        t.name,
+        t.predicted.len(),
+        t.tokens
+    );
+    Ok(())
+}
+
 fn load_trace(stem: &std::path::Path, predicted: bool) -> Result<Trace> {
     let with = |ext: &str| PathBuf::from(format!("{}.{ext}", stem.display()));
     let meta: serde_json::Value = serde_json::from_slice(
@@ -271,17 +416,56 @@ fn main() -> Result<()> {
         cli.prefetch.iter().map(|p| parse_prefetch(p)).collect::<Result<Vec<_>>>()?;
     let predicted = prefetches.iter().any(Option::is_some);
     ensure!(
-        matches!(cli.predictor.as_str(), "b" | "transitions" | "token"),
-        "--predictor b, transitions or token"
+        matches!(cli.predictor.as_str(), "b" | "transitions" | "token" | "oracle"),
+        "--predictor b, transitions, token or oracle"
     );
     let learned = cli.predictor != "b";
+    // The learned predictors build two planes (token start, lookahead 1 and
+    // 2) and fill rows they cannot predict with expert 0, so a cut would
+    // read those as picks; the logged and oracle predictions take `--planes`.
+    let learned_tables = matches!(cli.predictor.as_str(), "transitions" | "token");
+    ensure!(cli.planes >= 1, "--planes 1 or more");
+    ensure!(
+        !learned_tables || prefetches.iter().flatten().all(|p| p.cuts == 0),
+        "cuts need logged or oracle predictions, not --predictor {}",
+        cli.predictor
+    );
+    let planes = if learned_tables { 2 } else { cli.planes };
+    ensure!(
+        cli.pred_width.is_none() || (predicted && !learned),
+        "--pred-width is the layout of --predictor b's STEM.pred.u16, read for a prefetch"
+    );
+    // Picks per prediction row: the logged file's, the oracle's top-k, or
+    // what the learned predictors keep.
+    let width = match cli.predictor.as_str() {
+        _ if !predicted => 0,
+        "b" => logged_width(cli.pred_width, planes, cli.top_k, ranking.experts)?,
+        "oracle" => cli.top_k,
+        _ => cli.learned_width,
+    };
+    let names: std::collections::HashSet<_> =
+        cli.trace.iter().filter_map(|t| t.file_name()).collect();
+    ensure!(
+        cli.miss_log.is_none() || names.len() == cli.trace.len(),
+        "--miss-log needs distinct trace file names"
+    );
     let mut traces = cli
         .trace
         .iter()
         .map(|t| load_trace(t, predicted && !learned))
         .collect::<Result<Vec<_>>>()?;
+    if predicted && !learned {
+        for t in &traces {
+            check_predictions(t, planes, ranking.layers, width)?;
+        }
+    }
     if predicted && cli.predictor == "transitions" {
         learn_predictions(&mut traces, &ranking, cli.top_k, cli.learned_width)?;
+    }
+    if predicted && cli.predictor == "oracle" {
+        for t in &mut traces {
+            t.predicted = oracle_predictions(&t.routing, cli.planes);
+        }
     }
     if predicted && cli.predictor == "token" {
         learn_token_predictions(
@@ -302,11 +486,73 @@ fn main() -> Result<()> {
             Ok(Some(h.parse().with_context(|| format!("half-life {h}"))?))
         })
         .collect::<Result<Vec<_>>>()?;
+    // Flags that would change nothing are refused rather than ignored.
+    let shared_flags = cli.latency_ms.is_some()
+        || cli.transfer_ms.is_some()
+        || cli.prefetch_depth.is_some();
+    ensure!(
+        cli.timed || (cli.ssd.is_none() && cli.read_ms.is_none() && !shared_flags),
+        "--ssd, --read-ms, --latency-ms, --transfer-ms and --prefetch-depth model the \
+         SSD of a timed replay: they need --timed"
+    );
+    let ssd = match cli.ssd.as_deref().unwrap_or("serial") {
+        "serial" => {
+            ensure!(
+                !shared_flags,
+                "--latency-ms, --transfer-ms and --prefetch-depth are --ssd shared's"
+            );
+            SsdModel::Serial
+        }
+        "shared" => {
+            ensure!(cli.read_ms.is_none(), "--read-ms is --ssd serial's");
+            let p = SharedSsd::PROBED;
+            let m = SharedSsd {
+                latency_ms: cli.latency_ms.unwrap_or(p.latency_ms),
+                transfer_ms: cli.transfer_ms.unwrap_or(p.transfer_ms),
+                prefetch_depth: cli.prefetch_depth.unwrap_or(p.prefetch_depth),
+            };
+            ensure!(
+                m.latency_ms >= 0.0 && m.transfer_ms > 0.0 && m.prefetch_depth >= 1,
+                "--ssd shared: --latency-ms 0 or more, --transfer-ms above 0, \
+                 --prefetch-depth 1 or more"
+            );
+            SsdModel::Shared(m)
+        }
+        other => anyhow::bail!("--ssd {other}: serial or shared"),
+    };
     let timing = cli.timed.then_some(SsdTiming {
         layer_ms: cli.layer_ms,
         mixer_share: cli.mixer_share,
-        read_ms: cli.read_ms,
+        read_ms: cli.read_ms.unwrap_or(SERIAL_READ_MS),
     });
+    ensure!(
+        cli.rejected.is_none() || cli.speculate.is_some(),
+        "--rejected needs --speculate"
+    );
+    let speculation = match &cli.speculate {
+        None => None,
+        Some(spec) => {
+            let (d, a) = spec
+                .split_once(':')
+                .with_context(|| format!("--speculate {spec}: DRAFTS:ACCEPT"))?;
+            let accept: f64 =
+                a.parse().with_context(|| format!("--speculate {spec}"))?;
+            ensure!(
+                (0.0..=1.0).contains(&accept),
+                "--speculate {spec}: ACCEPT in 0..=1"
+            );
+            Some(SpecReplay {
+                drafts: d.parse().with_context(|| format!("--speculate {spec}"))?,
+                accept,
+                rejected: match cli.rejected.as_deref().unwrap_or("next") {
+                    "next" => RejectedRows::Next,
+                    "random" => RejectedRows::Random,
+                    other => anyhow::bail!("--rejected {other}: next or random"),
+                },
+                seed: 1,
+            })
+        }
+    };
     let mut configs = Vec::new();
     for &lru_share in &cli.lru_shares {
         for &prefetch in &prefetches {
@@ -319,17 +565,35 @@ fn main() -> Result<()> {
                     prefetch,
                     half_life,
                     timing,
+                    speculation,
                 });
             }
         }
     }
+    ensure!(
+        cli.miss_log.is_none() || configs.len() == 1,
+        "--miss-log takes one configuration, not {}",
+        configs.len()
+    );
+    if let Some(dir) = &cli.miss_log {
+        std::fs::create_dir_all(dir).with_context(|| format!("{}", dir.display()))?;
+    }
+    let miss_dir = cli.miss_log.as_deref();
     let results: Vec<Result<Replayed>> = std::thread::scope(|scope| {
         let handles: Vec<_> = configs
             .iter()
             .map(|&config| {
                 let (ranking, traces) = (&ranking, &traces);
                 scope.spawn(move || -> Result<Replayed> {
-                    let mut sim = CacheSim::new(ranking, cli.top_k, config)?;
+                    // A fresh cache for session `i` numbers it `i`, so it
+                    // draws what one cache across sessions would.
+                    let new_sim = |r: &UsageRanking, i: usize| -> Result<CacheSim> {
+                        let sim = CacheSim::new(r, cli.top_k, config)?
+                            .with_ssd(ssd)
+                            .starting_at_session(i as u64);
+                        Ok(if miss_dir.is_some() { sim.log_misses() } else { sim })
+                    };
+                    let mut sim = new_sim(ranking, 0)?;
                     let pinned = sim.pinned();
                     let mut per = Vec::with_capacity(traces.len());
                     let layers = ranking.layers;
@@ -339,7 +603,7 @@ fn main() -> Result<()> {
                         misses.iter_mut().zip(m).for_each(|(a, b)| *a += b);
                         useful.iter_mut().zip(u).for_each(|(a, b)| *a += b);
                     };
-                    for t in traces {
+                    for (i, t) in traces.iter().enumerate() {
                         if cli.fresh {
                             take(&sim);
                             let next = if cli.persist {
@@ -347,12 +611,13 @@ fn main() -> Result<()> {
                             } else {
                                 ranking.clone()
                             };
-                            sim = CacheSim::new(&next, cli.top_k, config)?;
+                            sim = new_sim(&next, i)?;
                         }
                         let mut c = ReplayCounts::default();
                         let pred = (!t.predicted.is_empty()).then(|| Predictions {
                             ids: &t.predicted,
-                            width: t.predicted.len() / (2 * layers * t.tokens.max(1)),
+                            planes,
+                            width,
                         });
                         sim.session(
                             &t.routing,
@@ -362,6 +627,12 @@ fn main() -> Result<()> {
                             &t.requests,
                             &mut c,
                         )?;
+                        if let (Some(dir), Some(log)) = (miss_dir, sim.take_miss_log())
+                        {
+                            let dst = dir.join(format!("{}.miss.u8", t.name));
+                            std::fs::write(&dst, log)
+                                .with_context(|| format!("{}", dst.display()))?;
+                        }
                         per.push(c);
                     }
                     take(&sim);
@@ -387,8 +658,24 @@ fn main() -> Result<()> {
             (true, true) => "fresh per session from the previous session's usage",
         }
     );
+    if let Some(t) = timing {
+        match ssd {
+            SsdModel::Serial => println!(
+                "timed: layer {} ms, mixer share {}, serial SSD, read {} ms",
+                t.layer_ms, t.mixer_share, t.read_ms
+            ),
+            SsdModel::Shared(s) => println!(
+                "timed: layer {} ms, mixer share {}, shared SSD, latency {} ms, transfer {} ms, prefetch depth {}",
+                t.layer_ms,
+                t.mixer_share,
+                s.latency_ms,
+                s.transfer_ms,
+                s.prefetch_depth
+            ),
+        }
+    }
     println!(
-        "lru share | pinned | prefetch | half-life | decode miss/tok | layers missed/tok | prefetch reads/tok | useful/tok | stall ms/tok | late/tok | recent 64/1024 | prefill miss/tok | promotions | full"
+        "lru share | pinned | prefetch | half-life | decode miss/tok | layers missed/tok | prefetch reads/tok | useful/tok | stall ms/tok | late/tok | recent 64/1024 | prefill miss/tok | promotions | full | passes/tok"
     );
     let mut json = Vec::new();
     for (config, result) in configs.iter().zip(results) {
@@ -398,7 +685,7 @@ fn main() -> Result<()> {
             all.plus(c);
         }
         println!(
-            "{:9.2} | {:6} | {:8} | {:9} | {:15.2} | {:17.2} | {:18.2} | {:10.2} | {:12.3} | {:8.2} | {:6.2} {:6.2} | {:16.3} | {:10} | {}",
+            "{:9.2} | {:6} | {:8} | {:9} | {:15.2} | {:17.2} | {:18.2} | {:10.2} | {:12.3} | {:8.2} | {:6.2} {:6.2} | {:16.3} | {:10} | {:4} | {:.3}",
             config.lru_share,
             pinned,
             label(config.prefetch),
@@ -413,12 +700,14 @@ fn main() -> Result<()> {
             rate(all.decode_misses_recent_1024, all.decode_tokens),
             rate(all.prefill_misses, all.prefill_tokens),
             all.promotions,
-            all.full
+            all.full,
+            rate(all.decode_passes, all.decode_tokens)
         );
         let counts = |c: &ReplayCounts| {
             serde_json::json!({
                 "prefill_tokens": c.prefill_tokens, "prefill_lookups": c.prefill_lookups,
                 "prefill_misses": c.prefill_misses, "decode_tokens": c.decode_tokens,
+                "decode_passes": c.decode_passes,
                 "decode_lookups": c.decode_lookups, "decode_misses": c.decode_misses,
                 "decode_layers_missed": c.decode_layers_missed, "full": c.full,
                 "promotions": c.promotions, "prefetch_reads": c.prefetch_reads,
@@ -448,13 +737,69 @@ fn main() -> Result<()> {
             "slots": cli.slots,
             "fresh": cli.fresh,
             "persist": cli.persist,
-            "timing": timing.map(|t| serde_json::json!({
-                "layer_ms": t.layer_ms, "mixer_share": t.mixer_share, "read_ms": t.read_ms,
-            })),
+            "timing": timing.map(|t| {
+                let mut j = serde_json::json!({
+                    "layer_ms": t.layer_ms, "mixer_share": t.mixer_share,
+                });
+                match ssd {
+                    SsdModel::Serial => {
+                        j["ssd"] = "serial".into();
+                        j["read_ms"] = t.read_ms.into();
+                    }
+                    SsdModel::Shared(s) => {
+                        j["ssd"] = "shared".into();
+                        j["latency_ms"] = s.latency_ms.into();
+                        j["transfer_ms"] = s.transfer_ms.into();
+                        j["prefetch_depth"] = s.prefetch_depth.into();
+                    }
+                }
+                j
+            }),
             "predictor": cli.predictor,
             "results": json,
         });
         std::fs::write(path, serde_json::to_vec_pretty(&record)?)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A session of `tokens` positions over `layers` layers whose
+    /// `STEM.pred.u16` holds `ids` ids.
+    fn trace(layers: usize, tokens: usize, ids: usize) -> Trace {
+        Trace {
+            name: "s".into(),
+            routing: vec![0; layers * tokens * 10],
+            predicted: vec![0; ids],
+            tokens,
+            requests: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_logged_layout_is_explicit() {
+        // lily-trace-routing --predict's output: two planes of twice top-10.
+        let width = logged_width(None, 2, 10, 512).expect("default");
+        assert_eq!(width, 20);
+        let t = trace(48, 7, 2 * 48 * 7 * 20);
+        check_predictions(&t, 2, 48, width).expect("its own layout");
+        // Read as four planes, the file divides into rows of 10: inferring
+        // the width would have misread it. The default width is only for
+        // two planes, and four planes of 20 do not match the file.
+        assert!(logged_width(None, 4, 10, 512).is_err());
+        let w = logged_width(Some(20), 4, 10, 512).expect("given");
+        assert!(check_predictions(&t, 4, 48, w).is_err());
+        assert!(check_predictions(&t, 3, 48, w).is_err());
+        // Another producer's width is given, and checked against the file.
+        let t = trace(48, 7, 5 * 48 * 7 * 24);
+        check_predictions(&t, 5, 48, 24).expect("five planes of 24");
+        assert!(check_predictions(&t, 6, 48, 24).is_err());
+        assert!(check_predictions(&t, 5, 48, 20).is_err());
+        // Wider than the experts there are, or empty: refused.
+        assert!(logged_width(Some(513), 2, 10, 512).is_err());
+        assert!(logged_width(Some(0), 2, 10, 512).is_err());
+    }
 }

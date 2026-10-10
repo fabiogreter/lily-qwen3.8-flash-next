@@ -9,7 +9,8 @@ with --ids, token p+1's id) predicts position p+1's routing at every layer
 (multi-hot over layers x experts). It then writes, for every decoded
 position q of the held-out session, the top WIDTH experts per layer
 predicted from position q-1, as STEM.pred.u16 in the layout
-lily-cache-replay reads for a token-start prefetch (--prefetch 0:TOP).
+lily-cache-replay reads for a token-start prefetch (--prefetch 0:TOP
+--pred-width 40).
 
 Usage: .venv/bin/python tools/bench/expert_predictor.py <traces> <hidden> <out>
            --usage <ranking> --sessions STEM,STEM,... [--ids] [--cold W]

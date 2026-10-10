@@ -250,7 +250,7 @@ Trains and evaluates a whole-token expert predictor for the expert cache,
 leave one session out: position p's final hidden state predicts position
 p+1's routing at every layer. It reads recorded sessions as
 `lily-trace-routing --hidden` writes them and writes predictions that
-`lily-cache-replay --prefetch 0:TOP` replays; method and results in
+`lily-cache-replay --prefetch 0:TOP --pred-width 40` replays; method and results in
 `docs/low-ram-experts.md`, "A whole-token predictor from the hidden state".
 Runs on the GPU through PyTorch's MPS backend, about 2.5 minutes per held-out
 session of about 450 000 training positions. The hidden states are as
