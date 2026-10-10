@@ -1025,7 +1025,10 @@ replay's default; the replay's warm layer time (0.315 ms, 15.1 ms over
 
 The predictors retrained (same shapes and sample; sessions held out
 untouched for a final check), replayed on the shared drive model, per
-decoded token, held-out sessions only. The three recorded sessions as
+decoded token, held-out sessions only. (The plans here, 16 246 and
+11 587 slots, are the q4 model's; the server sizes q4-xl at 15 736 and
+6 416. See "Smaller predictors, at the server's own plans" for the
+figures at those; the 40 GB column below is much too kind.) The three recorded sessions as
 served (one cache), the others each from the loaded ranking (`--fresh`):
 
 | prefetch (cuts after 3, 7, 15, 23, replacing) | recorded, 64 GB | recorded, 40 GB | others, 64 GB | others, 40 GB |
@@ -1093,7 +1096,8 @@ copies for the token-start model's routing input), largely hidden in
 wall time.
 
 Net, replayed saving with each variant's slots removed minus the
-resident cost, per decoded token: bf16 +0.3 ms at 64 GB and +1.6 ms at
+resident cost, per decoded token (at the q4 model's plans; the server's
+own follow in "Smaller predictors, at the server's own plans"): bf16 +0.3 ms at 64 GB and +1.6 ms at
 40 GB; 4-bit low-rank +1.2 and +2.6 ms if it predicts as well as bf16
 (not yet measured). With 2 drafts the replayed saving per accepted token
 is smaller (64 GB 4.27 to 3.61 ms, 40 GB 11.05 to 10.24; the cuts see
@@ -1160,8 +1164,10 @@ against 28.9 at 64 GB). At 64 GB the predictions keep about 80% of the
 replayed saving; at the 6 416-slot plan top 20 saturates the drive, as
 replayed, and top 10 saves about what the replay says. The oracle leaves 3
 misses per token at 64 GB (13 at 40 GB) where the replay leaves none: the
-trace's routing comes from prefill, which near ties route differently from
-decode (not checked further). A prefetch in flight slows the demand reads:
+trace's routing comes from prefill, whose router logits are bf16 where
+decode's are f32 (`lily-trace-routing`), so near ties can pick another
+expert: about 3 of the 480 a token routes, a little label noise in the
+predictors' training data too. A prefetch in flight slows the demand reads:
 the median hold of a layer with one miss and nothing late, 0.50 to 0.51
 ms without prefetch, was 0.52 to 0.54 ms with top 20 at 64 GB and 0.57 to
 0.58 ms at 40 GB (two misses: 0.74 to 0.75, then 0.78 to 0.80 and 0.88).
@@ -1171,6 +1177,61 @@ read in flight. Noise: 0.3 ms at 64 GB and 2 ms at 40
 GB between runs of one arm; the outliers (one run in each arm of the second
 repetition) coincide with slower prefetch reads (0.60 to 0.79 against 0.52
 to 0.66 ms), so the drive, not the arm. Not measured with drafts.
+
+### Smaller predictors, at the server's own plans (2026-10-10)
+
+The plans above (16 246 and 11 587 slots) were the q4 model's. For q4-xl
+the server picks 15 736 slots at `LILY_MEMORY_GB=64` and 6 416 at 40,
+LRU 10%; at 40 GB that is a much tighter cache, where the drive is busy
+with demand reads already. Replayed at the server's plans, tuning split,
+shared drive, depth 1, each variant with the slots its weights take
+(previous section) removed, stall per decoded token:
+
+| | 64 GB recorded | 64 GB others | 40 GB recorded | 40 GB others |
+|---|---:|---:|---:|---:|
+| none | 5.31 ms | 4.73 ms | 34.04 ms | 29.95 ms |
+| bf16 as trained, top 20 (40 GB: top 10) | 4.09 ms | 4.26 ms | 30.16 ms | 28.11 ms |
+| 4-bit | 3.98 ms | 4.15 ms | 29.64 ms | 27.63 ms |
+| 4-bit, rank 256 output | 4.16 ms | 4.30 ms | 30.17 ms | 28.16 ms |
+| bf16, token start and cut 7 only | 4.31 ms | 4.40 ms | 30.66 ms | 28.58 ms |
+| the routing itself (ceiling) | 0.41 ms | 0.36 ms | 16.07 ms | 13.17 ms |
+
+At 40 GB top 20 is worse than top 10 (32.7 against 30.2 ms recorded):
+about 110 reads per token saturate the drive. Rounding to 8 bits changes
+no prediction measurably, to 4 bits costs 0.2 to 0.3 points of top-10
+overlap, a rank-256 output layer 1.2 (token start) to 2.4 points (cuts);
+the rank curve on cut 7: 64, 128, 256, 512, full rank give 0.512, 0.542,
+0.559, 0.568, 0.582.
+
+Net of the cost measured in the server (resident, per decoded token):
+
+| | cost | 64 GB recorded | 64 GB others | 40 GB recorded | 40 GB others |
+|---|---:|---:|---:|---:|---:|
+| bf16 | 0.79 ms | +0.43 ms | -0.32 ms | +3.09 ms | +1.05 ms |
+| 4-bit | 0.32 ms | +1.01 ms | +0.26 ms | +4.08 ms | +2.00 ms |
+| 4-bit, rank 256 | 0.07 ms | +1.08 ms | +0.36 ms | +3.80 ms | +1.72 ms |
+| 4-bit, rank 256, token start and cut 7 | about 0.05 ms | +0.88 ms | +0.25 ms | +3.19 ms | +1.21 ms |
+
+4-bit with the rank-256 output layer and all four cuts is the one to
+carry on: best at 64 GB, level with plain 4-bit at 40 GB, and the only
+variant whose cost stays small on a machine with half this memory
+bandwidth. As a share of decode time it is about 4.5% (64 GB) and 6.5%
+(40 GB) on the recorded sessions, 1.5% and 3% on the others; the
+ceiling is far above it, so what limits it is how well routing can be
+predicted.
+
+**Draft rows.** In a verify pass a cut model has the row's own cut read
+but not the previous position's final hidden state, which the same pass
+computes later. Cut models trained without it lose 3.0, 1.9, 2.6 and 0.8
+points of overlap (cuts 3, 7, 15, 23); that is all that draft-head states
+could win back for the cuts.
+
+**Data.** Overlap on the recorded sessions at 1.5M, 3M and 6M training
+positions: cut 7 0.560, 0.582, 0.594; token start 0.530, 0.539, 0.546.
+About 12.3M positions exist outside the test and held-out sessions; on
+this curve all of them would add about a point, worth 0.1 to 0.2 ms. (A
+61 GB input tensor on MPS trained to garbage without an error; the
+trainer now keeps inputs over 24 GB in host memory.)
 
 ### Prefill chunks of 8 192 tokens
 
