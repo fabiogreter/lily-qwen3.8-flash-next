@@ -110,10 +110,12 @@ struct Cli {
     /// Where in a layer its request comes (after the mixer).
     #[arg(long, default_value_t = 0.5)]
     mixer_share: f64,
-    /// `--timed`: the SSD model (`cache_replay::SsdModel`), `serial` (the
-    /// default: one read at a time in `--read-ms`, demand first) or
-    /// `shared` (each read a latency, then a transfer sharing the bandwidth
-    /// with every read in flight; fitted to `lily-ssd-probe`).
+    /// `--timed`: the SSD model (`cache_replay::SsdModel`), `shared` (the
+    /// default: each read a latency, then a transfer sharing the bandwidth
+    /// with every read in flight; fitted to `lily-ssd-probe`, within 3.5%
+    /// and 6.4% of the server's measured stall at 64 and 40 GB) or `serial`
+    /// (one read at a time in `--read-ms`, demand first; the default with
+    /// `--read-ms`).
     #[arg(long)]
     ssd: Option<String>,
     /// `--timed --ssd serial`: one expert read, ms (default 0.42: 2.76 MB
@@ -495,7 +497,8 @@ fn main() -> Result<()> {
         "--ssd, --read-ms, --latency-ms, --transfer-ms and --prefetch-depth model the \
          SSD of a timed replay: they need --timed"
     );
-    let ssd = match cli.ssd.as_deref().unwrap_or("serial") {
+    let default_ssd = if cli.read_ms.is_some() { "serial" } else { "shared" };
+    let ssd = match cli.ssd.as_deref().unwrap_or(default_ssd) {
         "serial" => {
             ensure!(
                 !shared_flags,

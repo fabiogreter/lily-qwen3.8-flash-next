@@ -978,8 +978,9 @@ reads cost the same. `--ssd shared` models that (a 0.33 ms latency, then
 `--prefetch-depth` prefetches in flight; `SharedSsd`); it matches the
 probe within 15% except for large demand batches against a deep
 prefetch queue, where the drive shares by request, not by expert, and the
-model is optimistic. The serial model (one read at a time, 0.42 ms,
-demand first) stays the default.
+model is optimistic. It is the default since the server was brought up
+to the drive (below); the serial model (one read at a time, `--read-ms`,
+0.42 ms by default, demand first) is `--ssd serial`.
 
 **The server against both.** `lily-bench --tokens-out STEM` writes the
 measured run's tokens as a trace; `LILY_EXPERT_NOCACHE=1` turns the page
@@ -1002,8 +1003,21 @@ the server's stall is about 11 and 67 ms per token: about 0.6 ms per
 miss at both plans, where the probe reads a layer's misses (1.4 and 2.9
 on average) in less. The serial model underestimates the server by about
 27%, the shared model more; relative comparisons between predictors hold,
-absolute savings scale up with it. Where the server loses the
-difference is being measured.
+absolute savings scale up with it. The difference was the server's, not
+the drive's ("Where an expert-cache miss's time goes" below): with the
+GPU kept clocked, milestone pacing and reads started at once, the same
+runs (40 GB now with the reference's tokens, its earlier tokens having
+been changed by the timed-out waits fixed there):
+
+| plan | decode | stall over the reference | shared model | serial model |
+|------|-------:|-------------------------:|-------------:|-------------:|
+| `--memory-limit-gb 71` | 15.0 ms | | | |
+| `LILY_MEMORY_GB=64` | 23.7 ms | 8.7 ms | 8.4 ms (-3.5%) | 7.8 ms (-10%) |
+| `LILY_MEMORY_GB=40` | 57.8 ms | 42.8 ms | 40.0 ms (-6.4%) | 52.0 ms (+22%) |
+
+The shared model now tracks the server at both plans and is the
+replay's default; the replay's warm layer time (0.315 ms, 15.1 ms over
+48 layers) matches the reference's 15.0 ms.
 
 ### Prefill chunks of 8 192 tokens
 
