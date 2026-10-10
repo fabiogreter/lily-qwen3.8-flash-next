@@ -349,3 +349,69 @@ fn forget_empties_the_slot_for_the_next_miss() {
     }
     assert!(p.slot_of(1, 2).is_some());
 }
+
+/// The victim a miss would take by the documented rule, over every slot:
+/// the reference the policy's LRU-region list must reproduce.
+fn victim_by_full_scan(p: &SlotPolicy, tick: u64) -> Option<u32> {
+    let n = p.n_slots();
+    (0..n)
+        .filter(|&s| !p.is_pinned(s as u32) && p.last_used[s] != Some(tick))
+        .min_by_key(|&s| match (p.slice_in[s], p.last_used[s]) {
+            (None, _) => (0u8, 0u64, s),
+            (Some(_), None) => (1, 0, n - s),
+            (Some(_), Some(t)) => (2, t, s),
+        })
+        .map(|s| s as u32)
+}
+
+#[test]
+fn misses_pick_the_full_scan_victim_through_swaps_and_forgets() {
+    // Six layers of 16 experts, 40 slots of which a quarter are LRU; a
+    // seeded walk of lookups, role swaps and forgets, every miss checked
+    // against the scan over all slots.
+    let counts: Vec<Vec<u64>> = (0..6)
+        .map(|l| (0..16).map(|e| ((l * 16 + e) * 7919 % 101) as u64).collect())
+        .collect();
+    let r = UsageRanking { layers: 6, experts: 16, counts };
+    let mut p = SlotPolicy::new(40, 6, 16, &r, 0.25).expect("policy");
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    let mut next = |n: u64| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x % n
+    };
+    let mut misses = 0;
+    for tick in 1..400u64 {
+        for _ in 0..4 {
+            let (layer, expert) = (next(6) as usize, next(16) as usize);
+            let resident = p.slot_of(layer, expert).is_some();
+            let expected = (!resident).then(|| victim_by_full_scan(&p, tick));
+            match p.lookup(layer, expert, tick) {
+                Lookup::Hit(_) => assert!(resident),
+                Lookup::Miss { slot, .. } => {
+                    assert_eq!(Some(Some(slot)), expected, "tick {tick}");
+                    misses += 1;
+                }
+                Lookup::Full => assert_eq!(expected, Some(None), "tick {tick}"),
+            }
+        }
+        match next(10) {
+            0 => {
+                // Swap a random LRU slot's role with a random pinned one.
+                let lru: Vec<u32> = (0..40).filter(|&s| !p.is_pinned(s)).collect();
+                let pinned: Vec<u32> = (0..40).filter(|&s| p.is_pinned(s)).collect();
+                if !lru.is_empty() && !pinned.is_empty() {
+                    let a = lru[next(lru.len() as u64) as usize];
+                    let b = pinned[next(pinned.len() as u64) as usize];
+                    p.swap_roles(a, b);
+                }
+            }
+            1 => {
+                let _ = p.forget(next(6) as usize, next(16) as usize);
+            }
+            _ => {}
+        }
+    }
+    assert!(misses > 100, "the walk should miss often ({misses})");
+}

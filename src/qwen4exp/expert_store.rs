@@ -5,7 +5,7 @@
 //! number of GPU slots. Nothing here touches Metal; the model wires the
 //! slots, the slot tables and the round trip per MoE layer.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
@@ -400,6 +400,10 @@ pub struct SlotPolicy {
     /// `[slot]` -> tick of the last lookup that touched it; `None` since the
     /// initial fill.
     last_used: Vec<Option<u64>>,
+    /// Every unpinned slot's [`Self::victim_key`], so a miss finds its
+    /// victim in the order the eviction rule ranks them without scanning
+    /// the slots.
+    victims: BTreeSet<(u8, u64, u32)>,
 }
 
 impl SlotPolicy {
@@ -451,10 +455,13 @@ impl SlotPolicy {
             slot_of: vec![Self::NONE; layers * experts],
             slice_in: vec![None; n_slots],
             last_used: vec![None; n_slots],
+            victims: BTreeSet::new(),
         };
         for (slot, &(layer, expert)) in ranked.iter().take(n_slots).enumerate() {
             policy.assign(slot, layer, expert);
         }
+        policy.victims =
+            (pinned..n_slots).map(|slot| policy.victim_key(slot)).collect();
         Ok(policy)
     }
 
@@ -482,8 +489,10 @@ impl SlotPolicy {
     pub fn swap_roles(&mut self, promote: u32, demote: u32) {
         let (p, d) = (promote as usize, demote as usize);
         debug_assert!(!self.is_pinned[p] && self.is_pinned[d]);
+        self.victims.remove(&self.victim_key(p));
         self.is_pinned[p] = true;
         self.is_pinned[d] = false;
+        self.victims.insert(self.victim_key(d));
     }
 
     /// Unmaps `expert` of `layer`, whose data never arrived (a cancelled
@@ -493,11 +502,13 @@ impl SlotPolicy {
         let slot = self.slot_of(layer, expert)?;
         let s = slot as usize;
         self.slot_of[layer * self.experts + expert] = Self::NONE;
-        self.slice_in[s] = None;
-        if self.is_pinned[s] {
-            self.is_pinned[s] = false;
-            self.pinned -= 1;
-        }
+        self.update(s, |p| {
+            p.slice_in[s] = None;
+            if p.is_pinned[s] {
+                p.is_pinned[s] = false;
+                p.pinned -= 1;
+            }
+        });
         Some(slot)
     }
 
@@ -537,17 +548,17 @@ impl SlotPolicy {
     /// decrease between calls.
     pub fn lookup(&mut self, layer: usize, expert: usize, tick: u64) -> Lookup {
         if let Some(slot) = self.slot_of(layer, expert) {
-            self.last_used[slot as usize] = Some(tick);
+            let s = slot as usize;
+            self.update(s, |p| p.last_used[s] = Some(tick));
             return Lookup::Hit(slot);
         }
-        let n_slots = self.n_slots();
-        let victim = (0..n_slots)
-            .filter(|&s| !self.is_pinned[s] && self.last_used[s] != Some(tick))
-            .min_by_key(|&s| match (self.slice_in[s], self.last_used[s]) {
-                (None, _) => (0u8, 0u64, s),
-                (Some(_), None) => (1, 0, n_slots - s),
-                (Some(_), Some(t)) => (2, t, s),
-            });
+        // Slots used at `tick` rank last among the filled ones, so this
+        // stops within a few keys.
+        let victim = self
+            .victims
+            .iter()
+            .map(|&key| self.slot_of_key(key))
+            .find(|&s| self.last_used[s] != Some(tick));
         let Some(slot) = victim else {
             return Lookup::Full;
         };
@@ -555,9 +566,39 @@ impl SlotPolicy {
         if let Some((l, e)) = evicted {
             self.slot_of[l * self.experts + e] = Self::NONE;
         }
-        self.assign(slot, layer, expert);
-        self.last_used[slot] = Some(tick);
+        self.update(slot, |p| {
+            p.assign(slot, layer, expert);
+            p.last_used[slot] = Some(tick);
+        });
         Lookup::Miss { slot: slot as u32, evicted }
+    }
+
+    /// Where `slot` ranks as a victim, lowest first: an empty slot (lowest
+    /// slot first), then one untouched since the initial fill (highest slot,
+    /// the worst ranked, first), then by the tick of its last use (lowest
+    /// slot on ties). Keys are distinct per slot.
+    fn victim_key(&self, slot: usize) -> (u8, u64, u32) {
+        let n = self.n_slots();
+        match (self.slice_in[slot], self.last_used[slot]) {
+            (None, _) => (0, 0, slot as u32),
+            (Some(_), None) => (1, 0, (n - slot) as u32),
+            (Some(_), Some(t)) => (2, t, slot as u32),
+        }
+    }
+
+    fn slot_of_key(&self, (class, _, x): (u8, u64, u32)) -> usize {
+        if class == 1 { self.n_slots() - x as usize } else { x as usize }
+    }
+
+    /// Applies `change` to `slot`'s state, keeping [`Self::victims`] in step.
+    fn update(&mut self, slot: usize, change: impl FnOnce(&mut Self)) {
+        if !self.is_pinned[slot] {
+            self.victims.remove(&self.victim_key(slot));
+        }
+        change(self);
+        if !self.is_pinned[slot] {
+            self.victims.insert(self.victim_key(slot));
+        }
     }
 
     fn assign(&mut self, slot: usize, layer: usize, expert: usize) {
