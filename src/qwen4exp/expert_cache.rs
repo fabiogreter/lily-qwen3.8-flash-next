@@ -775,16 +775,27 @@ pub fn read_experts(
     run_claimed(pool, experts.len() * REGIONS, read)
 }
 
-/// The order a resolution's reads are claimed in: task `k` of `per_expert *
-/// n` reads region `REGIONS_BY_SIZE[k / n]` of expert `k % n`, so every
-/// expert's large code regions go first. Claims start a few microseconds
+/// The order a resolution's reads are claimed in, as (expert, region) for
+/// task `k` of `REGIONS * n`. Up to [`BIG_FIRST_MAX`] experts, every
+/// expert's large code regions go first: claims start a few microseconds
 /// apart as pool threads wake, and the read that starts last ends the
-/// resolution: with regions in file order, an expert's third code region
-/// (the down projection's) started some 60 microseconds after the first
-/// and finished last in four resolutions of five.
+/// resolution; with regions in file order, an expert's third code region
+/// (the down projection's) started some 60 microseconds after the first and
+/// finished last in four single misses of five. Larger batches keep each
+/// expert's regions together, which `lily-ssd-probe` measured faster from
+/// 16 experts on (and the initial fill 10% faster), as a queue of small
+/// reads at the end draws less from the drive.
 fn claimed_read(k: usize, n: usize) -> (usize, usize) {
-    (k % n, REGIONS_BY_SIZE[k / n])
+    if n <= BIG_FIRST_MAX {
+        (k % n, REGIONS_BY_SIZE[k / n])
+    } else {
+        (k / REGIONS, k % REGIONS)
+    }
 }
+
+/// The most experts a resolution reads code regions first for
+/// ([`claimed_read`]).
+const BIG_FIRST_MAX: usize = 8;
 
 /// The regions largest first: the three code tensors, then the scales and
 /// biases.

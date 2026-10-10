@@ -183,11 +183,19 @@ fn read_experts_match_the_store() {
     assert!(super::read_experts(&pool, &store, &experts[..1], &mut short).is_err());
 }
 
-/// Every (expert, region) pair of a resolution is claimed exactly once, the
-/// code regions of all experts before any scales or biases.
+/// Every (expert, region) pair of a resolution is claimed exactly once; up
+/// to `BIG_FIRST_MAX` experts, the code regions of all of them before any
+/// scales or biases, and beyond it each expert's regions together.
 #[test]
 fn claim_order_covers_every_read_once_large_regions_first() {
-    for n in [1usize, 2, 5] {
+    for n in [9usize, 20] {
+        let order: Vec<(usize, usize)> =
+            (0..n * REGIONS).map(|k| super::claimed_read(k, n)).collect();
+        let expected: Vec<(usize, usize)> =
+            (0..n).flat_map(|i| (0..REGIONS).map(move |r| (i, r))).collect();
+        assert_eq!(order, expected, "n {n}");
+    }
+    for n in [1usize, 2, 5, 8] {
         let order: Vec<(usize, usize)> =
             (0..n * REGIONS).map(|k| super::claimed_read(k, n)).collect();
         let mut seen = order.clone();

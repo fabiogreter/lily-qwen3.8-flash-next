@@ -581,9 +581,17 @@ The hold itself was close to the probe: 0.64 ms per missed layer against
   projection's codes, third in file order, started 61 microseconds in and
   finished last in 78% of single misses. Now one job spawns the others, so
   the service thread reads at once, and every expert's three code regions
-  are claimed before any scales or biases (`expert_cache::claimed_read`).
-  The probe, A/B on one clone: one expert 0.57 to 0.44 to 0.48 ms, two
-  0.93 to 0.77, four 1.44 to 1.25, eight 2.32 to 2.19 to 2.27. Splitting
+  are claimed before any scales or biases (`expert_cache::claimed_read`),
+  up to eight experts; from 16 on, and for the initial fill (3.4 against
+  3.8 s), each expert's regions together measured faster, so larger
+  batches keep that order. In the server the hold per missed layer went
+  from 545 to 496 microseconds for one miss, 794 to 729 for two, 1 031 to
+  958 for three, 1 265 to 1 203 for four (medians, 64 GB, with the victim
+  change below). The probe, A/B pairs on one clone: one expert 0.57 to
+  0.44 to 0.48 ms, two 0.93 to 0.77, four 1.44 to 1.25 in the first two
+  pairs; later that day, with the drive slower (one expert 0.66 to 0.68 ms
+  before), one expert 0.59 to 0.64, two 0.95, four and eight no better.
+  Splitting
   the code regions into smaller reads went the other way (pieces of 256,
   128 and 64 KiB: 32 experts at 8.3, 7.0 and 4.9 GB/s against 11.5).
 - Smaller: finding a miss's victim scanned every slot, about 9
