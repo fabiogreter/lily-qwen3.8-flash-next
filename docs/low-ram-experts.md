@@ -1110,6 +1110,54 @@ instead). For a verify pass's draft rows a cut model's previous-position
 hidden state does not exist yet; the probe reads a stale row, a real
 build has to choose an input.
 
+### Prefetch from a prediction file (2026-10-10)
+
+Whether the replayed saving shows up in the server, before any predictor
+runs on the GPU: `LILY_EXPERT_PREFETCH_FILE=<stem>.pred.u16` with
+`LILY_EXPERT_PREFETCH=0:20@3+7+15+23r` (the replay's `--prefetch` syntax;
+`LILY_EXPERT_PREFETCH_DEPTH`, default 1; `_PLANES`, default one per plane
+read; `_WIDTH`, default 24) has the service thread issue precomputed planes
+as the replay does (`expert_prefetch`): plane 0 when a decode pass's
+layer-0 request is taken, a cut's plane once its layer is signalled, reads
+in queue order at most `depth` in flight on a pool of their own, a routed
+expert still queued read with the demand misses, one in flight waited for,
+the rest cancelled at their layer. A slot table entry points at a
+prefetched slot only once its read landed. Departures from the replay:
+both kinds of plane come slightly earlier than the replay's layer end, a
+prefetch never evicts a slot the last signalled request used, and a lookup
+that takes a queued prefetch's slot cancels it (one in flight it waits for).
+
+The anchor (8 192-token prompt, 1 024 sampled tokens, plain decode, fresh
+clone per run, `LILY_EXPERT_NOCACHE=1`, `LILY_EXPERT_TRACE` on in every
+arm), the step-4 bf16 predictors evaluated on it, the oracle as the trace's
+own routing in every plane. Decode ms per token, digest identical in every
+run; replayed stall at the same slot counts beside it:
+
+| plan, prefetch | runs | measured | saving | replayed stall | replayed saving |
+|---|---|---:|---:|---:|---:|
+| 64 GB, off | 22.61, 23.25, 22.70, 22.82 | 22.85 | | 8.80 | |
+| 64 GB, top 20 | 21.65, 23.58, 21.83, 21.82 | 21.83 (median) | 0.9 | 7.64 | 1.15 |
+| 64 GB, oracle | 17.65, 17.95 | 17.80 | 5.0 | 1.23 | 7.57 |
+| 40 GB, off | 56.02, 58.34, 59.94 | 58.10 | | 40.41 | |
+| 40 GB, top 20 | 58.63, 59.41, 63.28 | 60.44 | -2.3 | 41.00 | -0.59 |
+| 40 GB, top 10 | 54.95, 65.29, 53.90 | 54.95 (median) | 3.2 | 37.66 | 2.75 |
+| 40 GB, oracle | 43.25, 49.68, 42.80 | 43.25 (median) | 14.9 | 27.96 | 12.45 |
+
+Misses per token match the replay (64 GB top 20: 12.13 against 12.12; 40
+GB: 55.2 against 55.1, top 10 75.2 against 75.3), reads within 9% (31.4
+against 28.9 at 64 GB). At 64 GB the predictions keep about 80% of the
+replayed saving; at the 6 416-slot plan top 20 saturates the drive, as
+replayed, and top 10 saves about what the replay says. The oracle leaves 3
+misses per token at 64 GB (13 at 40 GB) where the replay leaves none: the
+trace's routing comes from prefill, which near ties route differently from
+decode (not checked further). A prefetch in flight slows the demand reads:
+the median hold of a layer with one miss and nothing late went from 0.50
+to 0.52 to 0.54 ms at 64 GB and to 0.57 to 0.58 ms at 40 GB with top 20
+(two misses 0.74 to 0.78 and 0.88). Noise: 0.3 ms at 64 GB and 2 ms at 40
+GB between runs of one arm; the outliers (one run in each arm of the second
+repetition) coincide with slower prefetch reads (0.60 to 0.79 against 0.52
+to 0.66 ms), so the drive, not the arm. Not measured with drafts.
+
 ### Prefill chunks of 8 192 tokens
 
 `LILY_PREFILL_CHUNK=8192` (a per-model value now, `Qwen4ExpModel::
