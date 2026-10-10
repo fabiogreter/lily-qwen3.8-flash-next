@@ -829,6 +829,14 @@ pub fn load(
         Some(n_slots) => {
             let (layers, e) = (config.num_hidden_layers, config.num_experts);
             let store = ExpertStore::open(loader.checkpoint(), config)?;
+            // LILY_EXPERT_NOCACHE=1 (diagnostic): expert reads bypass the
+            // page cache, as on a machine whose page cache cannot hold the
+            // experts it has read; on a large machine a re-read miss is
+            // otherwise a memory copy, not an SSD read.
+            let nocache = std::env::var("LILY_EXPERT_NOCACHE").is_ok_and(|v| v == "1");
+            if nocache {
+                store.set_nocache(true)?;
+            }
             // The usage the cache persists between runs (`LoadOptions::
             // expert_usage_out`, `LILY_EXPERT_USAGE_OUT`); when the file
             // exists it is the ranking, unless one was named explicitly;
@@ -899,6 +907,11 @@ pub fn load(
                     .as_ref()
                     .map_or("nowhere".to_string(), |p| p.display().to_string())
             );
+            if nocache {
+                eprintln!(
+                    "expert cache: expert reads bypass the page cache (LILY_EXPERT_NOCACHE)"
+                );
+            }
             cache.fill_and_serve(store, policy, live, adapt, usage_out)?;
             Some(cache)
         }

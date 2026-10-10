@@ -1,10 +1,10 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use anyhow::{Result, ensure};
+use anyhow::{Context as _, Result, ensure};
 use clap::Parser;
 use lily::engine::{
     BatchRow, DecodeStateApi, Draw, LanguageModel, LoadOptions, RowsStepPhases,
@@ -70,9 +70,9 @@ struct Cli {
     /// The most memory the load should take, in GB (default: the machine's
     /// less the plan's reserve): below what the checkpoint needs, however
     /// little, the load switches to small-machine mode, caching part of the
-    /// experts and reading the rest from the checkpoint, with speculative
-    /// decoding off (docs/low-ram-experts.md). LILY_MEMORY_GB plans as if
-    /// the machine had that much memory instead.
+    /// experts and reading the rest from the checkpoint
+    /// (docs/low-ram-experts.md). LILY_MEMORY_GB plans as if the machine
+    /// had that much memory instead.
     #[arg(long)]
     memory_limit_gb: Option<f64>,
     /// Retired: refuses to start and says what replaced it.
@@ -99,8 +99,32 @@ struct Cli {
     /// of parking on one binary.
     #[arg(long, default_value_t = false)]
     no_park: bool,
+    /// Writes the measured run's tokens as a trace for `lily-trace-routing`
+    /// and `lily-cache-replay`: `STEM.u32` (the prompt, then every drawn
+    /// token) and `STEM.json` (one request, decoded from the prompt's end).
+    #[arg(long, value_name = "STEM")]
+    tokens_out: Option<PathBuf>,
     #[arg(long)]
     json_out: PathBuf,
+}
+
+/// [`Cli::tokens_out`]: `prompt` then `drawn` (the prefill's draw first).
+fn write_tokens(stem: &Path, prompt: &[u32], drawn: &[u32]) -> Result<()> {
+    let tokens: Vec<u8> =
+        prompt.iter().chain(drawn).flat_map(|id| id.to_le_bytes()).collect();
+    let n = prompt.len() + drawn.len();
+    let with = |ext: &str| {
+        let mut path = stem.as_os_str().to_owned();
+        path.push(ext);
+        PathBuf::from(path)
+    };
+    let (ids, json) = (with(".u32"), with(".json"));
+    std::fs::write(&ids, tokens)
+        .with_context(|| format!("writing {}", ids.display()))?;
+    let meta = serde_json::json!({"tokens": n, "requests": [[0, prompt.len(), n]]});
+    std::fs::write(&json, serde_json::to_vec(&meta)?)
+        .with_context(|| format!("writing {}", json.display()))?;
+    Ok(())
 }
 
 /// The prompt: the synthetic sequence (token `i` is `i * 2654435761 mod
@@ -390,6 +414,19 @@ fn deliver<'a, M: LanguageModel>(
 fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
     ensure!(cli.prompt_len > 0, "--prompt-len must be positive");
     ensure!(cli.decode_steps > 0, "--decode-steps must be positive");
+    ensure!(
+        cli.tokens_out.is_none() || cli.batch_rows.is_none(),
+        "--tokens-out writes one session's tokens: not with --batch-rows"
+    );
+    if let Some(stem) = &cli.tokens_out {
+        // Checked before the load, so a typo does not cost a run.
+        let dir = stem.parent().filter(|d| !d.as_os_str().is_empty());
+        ensure!(
+            dir.is_none_or(Path::is_dir),
+            "--tokens-out {}: no such directory",
+            stem.display()
+        );
+    }
     let max_seq = cli
         .prompt_len
         .checked_add(cli.decode_steps)
@@ -653,12 +690,18 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
                     "wall_secs": gpu.gpu_end_secs - gpu.gpu_start_secs,
                 })),
                 "token_digest": format!("{token_digest:016x}"),
-                "token_ids": token_ids,
+                "token_ids": &token_ids,
                 "kernel_profile": kernel_profile,
             },
         },
     });
     std::fs::write(&cli.json_out, serde_json::to_vec_pretty(&report)?)?;
+    // After the report, so a bad `--tokens-out` cannot lose a finished run.
+    if let Some(stem) = &cli.tokens_out {
+        let drawn: Vec<u32> =
+            std::iter::once(first_token_id).chain(token_ids.iter().copied()).collect();
+        write_tokens(stem, &prompt, &drawn)?;
+    }
     if let (Some(s0), Some(s1), Some(s2)) =
         (cache_before, cache_after_prefill, model.expert_cache_stats())
     {
@@ -768,6 +811,9 @@ fn bench_speculative<M: LanguageModel>(
         },
     });
     std::fs::write(&cli.json_out, serde_json::to_vec_pretty(&report)?)?;
+    if let Some(stem) = &cli.tokens_out {
+        write_tokens(stem, &prompt, &tokens)?;
+    }
     eprintln!(
         "prefill: {} tok in {:.3}s ({:.1} tok/s) | speculative decode ({} drafts): {} tokens in {:.3}s ({:.1} tok/s), {}/{} drafts accepted ({:.1}%) | digest={digest:016x}",
         cli.prompt_len,
