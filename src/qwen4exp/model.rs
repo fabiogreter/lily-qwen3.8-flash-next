@@ -38,6 +38,7 @@ use crate::kernels::hc::{
     hc_mix_bf16, hc_read_down_q8, hc_read_down_q8_rows, hc_read_up_mix_q8,
     hc_read_up_mix_q8_rows, rmsnorm_grouped_bf16, silu_scaled_bf16,
 };
+use crate::kernels::moe::ROUTER_MAX_K;
 use crate::kernels::norm::rmsnorm_bf16;
 use crate::kernels::ple;
 use crate::kernels::qsa::{self, INDEXER_D, SparseAttnRoute, SparseSplitScratch};
@@ -1151,6 +1152,9 @@ pub struct Scratch {
     /// Final hidden-state log for measurement, `BF16 [capacity, hidden]`
     /// (`Qwen4ExpModel::enable_hidden_log`).
     pub(super) hidden_log: Option<Tensor>,
+    /// Mid-trunk read and router log for measurement
+    /// (`Qwen4ExpModel::enable_trunk_log`).
+    pub(super) trunk_log: Option<TrunkLog>,
     /// Batched decode across sessions (`batch`): per-slot samplers and
     /// per-row attention scratch, allocated by the first batched step.
     pub(super) batch: Option<batch::BatchScratch>,
@@ -1216,6 +1220,31 @@ pub(super) struct ExpertPredLog {
     indices: Tensor,
     picked_scores: Tensor,
     hc: HcScratch,
+}
+
+/// The mid-trunk log ([`Qwen4ExpModel::enable_trunk_log`]) and the
+/// scratch it runs in, kept apart from the layer's own.
+pub(super) struct TrunkLog {
+    /// Layers after which the read is logged, ascending.
+    cuts: Vec<usize>,
+    /// Positions the log holds.
+    capacity: usize,
+    /// `BF16 [cuts, capacity, hidden]`: entry `(c, p)` is layer `cuts[c] +
+    /// 1`'s MoE read-in (its norm included) over the streams of position
+    /// `p` right after layer `cuts[c]`'s MoE inject. `None` without cuts.
+    reads: Option<Tensor>,
+    /// `U32 [layers, capacity, w]` and `F32` of the same shape: each
+    /// layer's own router over its gate input, its top `w` picks in the
+    /// router kernel's order and their scores (as the top-k kernel writes
+    /// them: renormalised over the `w` picks when the model renormalises
+    /// its top-k). `None` for `w = 0`.
+    router: Option<(Tensor, Tensor)>,
+    /// Prefill rows: a read's intermediates, and the router's bf16 `[rows,
+    /// E]` logits, U32 `[rows, w]` picks and F32 `[rows, w]` scores.
+    rows_hc: HcScratch,
+    rows_logits: Tensor,
+    rows_indices: Tensor,
+    rows_scores: Tensor,
 }
 
 /// What a verify pass records so a draft pass can roll the recurrent state
@@ -1986,6 +2015,152 @@ impl Qwen4ExpModel {
         pass.level_barrier(&[log])
     }
 
+    /// Records, for measurement (the input and soft targets of an expert
+    /// predictor trained offline), every position's read after each layer
+    /// in `cuts` and, for `router_width > 0`, every layer's top
+    /// `router_width` router picks with their scores ([`TrunkLog`]).
+    /// Batched passes only (a prefill, or a verify pass, as the routing log
+    /// records them), of at most the prefill chunk set at this call. Off by default; disabled, no pass encodes anything for
+    /// it.
+    pub fn enable_trunk_log(
+        &self,
+        ctx: &MetalContext,
+        scratch: &mut Scratch,
+        capacity: usize,
+        cuts: &[usize],
+        router_width: usize,
+    ) -> Result<()> {
+        let cfg = &self.config;
+        let (layers, e, h) =
+            (self.weights.layers.len(), cfg.num_experts, cfg.hidden_size);
+        ensure!(
+            cuts.windows(2).all(|w| w[0] < w[1])
+                && cuts.iter().all(|&c| c + 1 < layers),
+            "cuts {cuts:?}: ascending, each before the last of {layers} layers"
+        );
+        ensure!(
+            router_width <= e.min(ROUTER_MAX_K),
+            "a router log of {router_width} picks: at most {} (of {e} experts)",
+            ROUTER_MAX_K
+        );
+        let rows = self.prefill_chunk;
+        let w = router_width.max(1);
+        let router = if router_width > 0 {
+            let shape = [layers, capacity, router_width];
+            Some((
+                Tensor::zeros(ctx, &shape, DType::U32)?,
+                Tensor::zeros(ctx, &shape, DType::F32)?,
+            ))
+        } else {
+            None
+        };
+        scratch.trunk_log = Some(TrunkLog {
+            cuts: cuts.to_vec(),
+            capacity,
+            reads: if cuts.is_empty() {
+                None
+            } else {
+                Some(Tensor::zeros(ctx, &[cuts.len(), capacity, h], DType::BF16)?)
+            },
+            router,
+            rows_hc: HcScratch::new(ctx, cfg, rows)?,
+            rows_logits: Tensor::zeros(ctx, &[rows, e], DType::BF16)?,
+            rows_indices: Tensor::zeros(ctx, &[rows, w], DType::U32)?,
+            rows_scores: Tensor::zeros(ctx, &[rows, w], DType::F32)?,
+        });
+        Ok(())
+    }
+
+    /// The reads of [`Self::enable_trunk_log`], `BF16 [cuts, capacity,
+    /// hidden]`.
+    pub fn trunk_reads<'s>(&self, scratch: &'s Scratch) -> Option<&'s Tensor> {
+        scratch.trunk_log.as_ref().and_then(|t| t.reads.as_ref())
+    }
+
+    /// The router picks and scores of [`Self::enable_trunk_log`], `U32` and
+    /// `F32 [layers, capacity, w]`.
+    pub fn trunk_router<'s>(
+        &self,
+        scratch: &'s Scratch,
+    ) -> Option<(&'s Tensor, &'s Tensor)> {
+        scratch.trunk_log.as_ref()?.router.as_ref().map(|(i, s)| (i, s))
+    }
+
+    /// Measurement only (no-op unless [`Self::enable_trunk_log`]), after
+    /// layer `layer`'s MoE inject in a batched pass of `ps.m` rows at
+    /// positions `pos..`: the layer's router over its gate input
+    /// (`ps.hc.mixed`, as the routing log reads it) and, at a cut, the next
+    /// layer's MoE read-in over the streams, each into the log's own
+    /// scratch and copied out. Must come before the next layer overwrites
+    /// the gate input; ends ordered.
+    fn encode_trunk_log(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        s: &Scratch,
+        ps: &PrefillScratch,
+        layer: usize,
+        pos: usize,
+    ) -> Result<()> {
+        let Some(t) = &s.trunk_log else { return Ok(()) };
+        let m = ps.m;
+        let rows = t.rows_logits.shape()[0];
+        ensure!(
+            m <= rows,
+            "trunk log scratch holds {rows} rows (enable after set_prefill_chunk)"
+        );
+        let capacity = t.capacity;
+        ensure!(pos + m <= capacity, "trunk log holds {capacity} positions");
+        if let Some((ids, scores)) = &t.router {
+            let dims = moe_dims(&self.config);
+            let (e, w) = (dims.num_experts, ids.shape()[2]);
+            let picked = t.rows_indices.view(0, &[m, w])?;
+            let picked_scores = t.rows_scores.view(0, &[m, w])?;
+            route_rows(
+                ctx,
+                pass,
+                &dims,
+                &self.weights.layers[layer].ffn.gate,
+                &ps.hc.mixed,
+                &t.rows_logits.view(0, &[m, e])?,
+                &picked,
+                &picked_scores,
+                &s.dequant,
+            )?;
+            pass.level_barrier(&[&picked, &picked_scores])?;
+            let at = (layer * capacity + pos) * w;
+            copy_words(
+                ctx,
+                pass,
+                &picked.view(0, &[m * w])?,
+                &ids.view(at, &[m * w])?,
+            )?;
+            copy_words(
+                ctx,
+                pass,
+                &picked_scores.view(0, &[m * w])?,
+                &scores.view(at, &[m * w])?,
+            )?;
+            pass.level_barrier(&[ids, scores])?;
+        }
+        if let (Some(c), Some(reads)) =
+            (t.cuts.iter().position(|&k| k == layer), &t.reads)
+        {
+            let h = self.config.hidden_size;
+            let out = t.rows_hc.rows(m)?;
+            let hc = &self.weights.layers[layer + 1].mlp_hc;
+            self.hc_read_rows(ctx, pass, hc, &ps.hyper, &out, m, &s.dequant)?;
+            copy_words(
+                ctx,
+                pass,
+                &out.mixed.view(0, &[m * h])?,
+                &reads.view((c * capacity + pos) * h, &[m * h])?,
+            )?;
+            pass.level_barrier(&[reads])?;
+        }
+        Ok(())
+    }
+
     /// The prediction log enabled by [`Self::enable_expert_prediction`]:
     /// the predicted ids, `U32 [EXPERT_PRED_VARIANTS,
     /// EXPERT_PRED_LOOKAHEADS, layers, capacity, EXPERT_PRED_WIDTH *
@@ -2319,6 +2494,7 @@ impl Qwen4ExpModel {
             expert_log: None,
             expert_pred: None,
             hidden_log: None,
+            trunk_log: None,
             batch: None,
             spec: self
                 .weights
@@ -2796,6 +2972,7 @@ impl Qwen4ExpModel {
                 m,
                 false,
             )?;
+            self.encode_trunk_log(ctx, &pass, s, ps, layer_index, pos)?;
         }
 
         match mode {
@@ -5182,3 +5359,7 @@ mod expert_pred_log_tests;
 #[cfg(test)]
 #[path = "../../tests/unit/qwen4exp/hidden_log.rs"]
 mod hidden_log_tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/qwen4exp/trunk_log.rs"]
+mod trunk_log_tests;

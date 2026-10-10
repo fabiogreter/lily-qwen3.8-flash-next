@@ -22,6 +22,16 @@
 //! input, `Qwen4ExpModel::enable_hidden_log`) goes to `<stem>.hidden.bf16`:
 //! `[tokens][hidden]` little-endian bf16, the input of a whole-token expert
 //! predictor trained offline.
+//!
+//! With `--cuts`, every position's read after each listed layer `k` (layer
+//! `k + 1`'s MoE read-in over the streams right after layer `k`,
+//! `Qwen4ExpModel::enable_trunk_log`) goes to `<stem>.trunk.bf16`:
+//! `[cuts][tokens][hidden]` little-endian bf16, cuts ascending. With
+//! `--router-top W`, every layer's own top `W` router picks go to
+//! `<stem>.router.u16` (`[layers][tokens][W]` little-endian `u16` ids, best
+//! first) and their scores to `<stem>.router-p.bf16` (same layout, bf16,
+//! renormalised over the `W` picks when the model renormalises its top-k):
+//! soft targets for that predictor.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -57,6 +67,13 @@ struct Cli {
     /// Also write every position's final hidden state, `<stem>.hidden.bf16`.
     #[arg(long, default_value_t = false)]
     hidden: bool,
+    /// Also write the read after each of these layers, `<stem>.trunk.bf16`.
+    #[arg(long, value_delimiter = ',')]
+    cuts: Vec<usize>,
+    /// Also write each layer's top W router picks and scores,
+    /// `<stem>.router.u16` and `<stem>.router-p.bf16`.
+    #[arg(long, default_value_t = 0)]
+    router_top: usize,
 }
 
 /// Exits 75 when another lily instance holds the lock (`lily::instance`).
@@ -105,6 +122,15 @@ fn run() -> Result<()> {
         if cli.hidden {
             model.enable_hidden_log(&ctx, &mut scratch, capacity)?;
         }
+        if !cli.cuts.is_empty() || cli.router_top > 0 {
+            model.enable_trunk_log(
+                &ctx,
+                &mut scratch,
+                capacity,
+                &cli.cuts,
+                cli.router_top,
+            )?;
+        }
         let mut state = model.new_state(&ctx, capacity)?;
         let started = Instant::now();
         LanguageModel::prefill(&model, &ctx, &mut state, &mut scratch, &ids, None)?;
@@ -130,6 +156,45 @@ fn run() -> Result<()> {
             let dst = cli.out_dir.join(format!("{stem}.hidden.bf16"));
             std::fs::write(&dst, &log.contents()[..n * row])
                 .with_context(|| format!("writing {}", dst.display()))?;
+        }
+        if !cli.cuts.is_empty() {
+            let reads = model.trunk_reads(&scratch).expect("enabled");
+            let row = reads.shape()[2] * reads.dtype().size();
+            let mut out = Vec::with_capacity(cli.cuts.len() * n * row);
+            for c in 0..cli.cuts.len() {
+                let at = c * capacity * row;
+                out.extend_from_slice(&reads.contents()[at..at + n * row]);
+            }
+            let dst = cli.out_dir.join(format!("{stem}.trunk.bf16"));
+            std::fs::write(&dst, &out)
+                .with_context(|| format!("writing {}", dst.display()))?;
+        }
+        if cli.router_top > 0 {
+            let (ids, scores) = model.trunk_router(&scratch).expect("enabled");
+            let (ids, scores) = (ids.to_u32()?, scores.to_f32()?);
+            let w = cli.router_top;
+            let mut out_ids = Vec::with_capacity(layers * n * w * 2);
+            let mut out_p = Vec::with_capacity(layers * n * w * 2);
+            let mut order: Vec<usize> = Vec::with_capacity(w);
+            for layer in 0..layers {
+                for pos in 0..n {
+                    let at = (layer * capacity + pos) * w;
+                    let (i, sc) = (&ids[at..at + w], &scores[at..at + w]);
+                    // By score, best first; stable, as `top_by_score`.
+                    order.clear();
+                    order.extend(0..w);
+                    order.sort_by(|&a, &b| sc[b].total_cmp(&sc[a]));
+                    for &k in &order {
+                        out_ids.extend_from_slice(&u16::try_from(i[k])?.to_le_bytes());
+                        out_p.extend_from_slice(&bf16_bits(sc[k]).to_le_bytes());
+                    }
+                }
+            }
+            for (ext, out) in [("router.u16", &out_ids), ("router-p.bf16", &out_p)] {
+                let dst = cli.out_dir.join(format!("{stem}.{ext}"));
+                std::fs::write(&dst, out)
+                    .with_context(|| format!("writing {}", dst.display()))?;
+            }
         }
         if cli.predict {
             let pred = model.expert_pred_log(&scratch).expect("enabled");
@@ -183,4 +248,10 @@ fn run() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// `x` as bf16 bits, rounded to nearest even (finite inputs).
+fn bf16_bits(x: f32) -> u16 {
+    let b = x.to_bits();
+    ((b + 0x7fff + ((b >> 16) & 1)) >> 16) as u16
 }

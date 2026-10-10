@@ -14,7 +14,7 @@ const MAX_E: usize = 1024;
 const MAX_K: usize = 16;
 /// Experts the router top-k kernels select at most (`MOE_ROUTER_MAX_K`):
 /// above `MAX_K` only for the prediction log's wider selection.
-const ROUTER_MAX_K: usize = 32;
+pub const ROUTER_MAX_K: usize = 32;
 
 /// Softmax top-k routing from F32 logits; ties choose the lowest expert id.
 pub fn moe_router_topk(
