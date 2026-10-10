@@ -21,6 +21,7 @@ fn store_fake(
             tokens,
             &[],
             key,
+            None,
             &[n],
             &mut |w| Ok(w.write_all(&vec![7u8; prefix_bytes])?),
             &mut |pos, w| Ok(w.write_all(&(pos as u64).to_le_bytes())?),
@@ -38,6 +39,7 @@ fn store_fake_durable(
         .store_durable(
             tokens,
             &[],
+            None,
             None,
             &[n],
             &mut |w| Ok(w.write_all(&vec![9u8; prefix_bytes])?),
@@ -162,6 +164,7 @@ fn image_spans_round_trip_through_meta_and_old_meta_files_load_as_text() {
             &tokens,
             &images,
             None,
+            None,
             &[tokens.len()],
             &mut |w| Ok(w.write_all(&[1u8; 10])?),
             &mut |pos, w| Ok(w.write_all(&(pos as u64).to_le_bytes())?),
@@ -174,6 +177,7 @@ fn image_spans_round_trip_through_meta_and_old_meta_files_load_as_text() {
         .store(
             &tokens,
             &[CachedImage { start: 8, len: 4, grid_h: 2, grid_w: 8, digest: [0; 32] }],
+            None,
             None,
             &[tokens.len()],
             &mut |w| Ok(w.write_all(&[1u8; 10])?),
@@ -372,6 +376,7 @@ fn a_reserved_entry_is_invisible_until_committed_and_a_crash_leaves_nothing_read
         cache_key: None,
         checkpoints: &[3],
         durable: false,
+        lineage: None,
     };
     assert_eq!(store.commit(reserved, &new, bytes).expect("commit"), Some(id.clone()));
     assert!(store.contains(&id));
@@ -396,6 +401,7 @@ fn an_eviction_names_the_entry_its_size_and_whether_it_was_durable() {
         cache_key: None,
         durable,
         images: vec![],
+        lineage: None,
     };
     assert_eq!(
         eviction_line(&entry(true), "to make room"),
@@ -405,4 +411,51 @@ fn an_eviction_names_the_entry_its_size_and_whether_it_was_durable() {
         eviction_line(&entry(false), "to make room"),
         "session cache: evicted s84 (15689 tokens, 0.5 GB) from disk to make room"
     );
+}
+
+#[test]
+fn lineage_ids_round_trip_through_meta_and_old_meta_files_load_without_one() {
+    let root = temp_root("lineage-meta");
+    let mut store = DiskStore::open(&root, "fmt", 1 << 20, 0).expect("open");
+    let lineage = Lineage { id: 41, created_ms: 1_760_000_000_000 };
+    let id = store
+        .store(
+            &[1, 2, 3],
+            &[],
+            None,
+            Some(lineage),
+            &[3],
+            &mut |w| Ok(w.write_all(&[7u8; 10])?),
+            &mut |pos, w| Ok(w.write_all(&(pos as u64).to_le_bytes())?),
+        )
+        .expect("store")
+        .expect("kept");
+    let lineage_of = |store: &DiskStore| {
+        store.entries().iter().find(|e| e.id == id).and_then(|e| e.lineage)
+    };
+    assert_eq!(lineage_of(&store), Some(lineage));
+    assert_eq!(store.max_lineage(), Some(41));
+
+    // In meta.json, kept by a touch (which rewrites it) and by a reopen.
+    let meta_path = root.join("fmt").join(&id).join(META);
+    let read_meta = || -> serde_json::Value {
+        serde_json::from_slice(&fs::read(&meta_path).expect("meta")).expect("json")
+    };
+    assert_eq!(read_meta()["lineage"]["id"], 41);
+    store.touch(&id);
+    assert_eq!(read_meta()["lineage"]["created_ms"], 1_760_000_000_000u64);
+    let reopened = DiskStore::open(&root, "fmt", 1 << 20, 0).expect("reopen");
+    assert_eq!(lineage_of(&reopened), Some(lineage));
+    drop(reopened);
+
+    // A meta file from before the field existed loads as an entry without
+    // a lineage, and contributes nothing to the counter's floor.
+    let mut old = read_meta();
+    old.as_object_mut().expect("object").remove("lineage");
+    fs::write(&meta_path, serde_json::to_vec(&old).expect("json")).expect("write");
+    let legacy = DiskStore::open(&root, "fmt", 1 << 20, 0).expect("reopen legacy");
+    assert_eq!(legacy.len(), 1);
+    assert_eq!(lineage_of(&legacy), None);
+    assert_eq!(legacy.max_lineage(), None);
+    let _ = fs::remove_dir_all(&root);
 }

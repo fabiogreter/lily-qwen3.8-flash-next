@@ -63,3 +63,28 @@ fn system_memory_can_be_sampled() {
         assert_ne!(pressure_name(level), "unknown");
     }
 }
+
+#[test]
+fn cpu_load_is_the_busy_share_of_the_ticks_between_two_samples() {
+    let at = |user, system, idle, nice| CpuTicks { user, system, idle, nice };
+    let earlier = at(100, 50, 850, 0);
+    assert_eq!(at(130, 60, 900, 10).load_since(earlier), Some(0.5));
+    assert_eq!(at(100, 50, 950, 0).load_since(earlier), Some(0.0));
+    // No tick passed, or a counter wrapped: no load to report.
+    assert_eq!(earlier.load_since(earlier), None);
+    assert_eq!(at(10, 50, 900, 0).load_since(earlier), None);
+}
+
+#[test]
+fn machine_figures_can_be_sampled() {
+    let a = cpu_ticks().expect("host_statistics");
+    let b = cpu_ticks().expect("host_statistics");
+    assert!(b.idle >= a.idle && b.user >= a.user);
+    let memory = memory_use().expect("memory");
+    assert!(memory.total > 0 && memory.used > 0 && memory.used <= memory.total);
+    // `vm.swapusage` is refused inside some sandboxes; when it answers, the
+    // swap in use is no more than the machine could page out.
+    if let Some(swap) = swap_used() {
+        assert!(swap < 64 * memory.total, "swap {swap}");
+    }
+}

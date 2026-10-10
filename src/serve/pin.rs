@@ -50,6 +50,7 @@
 //! [`LanguageModel::weight_buffers`]: crate::engine::LanguageModel::weight_buffers
 
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -303,7 +304,12 @@ struct Shared {
 
 struct State {
     ranges: Vec<(usize, usize)>,
+    /// Changed only through [`State::set_pinned`], which keeps `mirror` equal.
     pinned: bool,
+    /// `pinned`, readable without this lock: the dashboard reads it from
+    /// its HTTP threads ([`WeightPin::with_mirror`]), and this lock is held
+    /// across the seconds an `mlock` takes.
+    mirror: Arc<AtomicBool>,
     stop: bool,
     /// Requests between [`WeightPin::before_request`] and their
     /// [`InFlight`]'s drop.
@@ -345,12 +351,17 @@ fn pressure_line(level: u32) -> String {
 }
 
 impl State {
+    fn set_pinned(&mut self, pinned: bool) {
+        self.pinned = pinned;
+        self.mirror.store(pinned, Ordering::Release);
+    }
+
     /// Unlocks when pinned and logs `line` then.
     fn release(&mut self, line: &str) {
         self.deferred = None;
         if self.pinned {
             unlock_all(&self.ranges);
-            self.pinned = false;
+            self.set_pinned(false);
             eprintln!("{line}");
         }
     }
@@ -476,6 +487,7 @@ impl WeightPin {
             state: Mutex::new(State {
                 ranges,
                 pinned: false,
+                mirror: Arc::new(AtomicBool::new(false)),
                 stop: false,
                 in_flight: 0,
                 deferred: None,
@@ -505,6 +517,18 @@ impl WeightPin {
             pressure_logged: false,
             _buffers: buffers,
         })
+    }
+
+    /// Mirrors whether the weights are pinned into `flag` from now on, for
+    /// readers that must not wait on this pin's lock (an `mlock` holds it
+    /// for seconds).
+    pub fn with_mirror(self, flag: Arc<AtomicBool>) -> Self {
+        {
+            let mut state = self.shared.lock();
+            flag.store(state.pinned, Ordering::Release);
+            state.mirror = flag;
+        }
+        self
     }
 
     pub fn pinned(&self) -> bool {
@@ -563,7 +587,7 @@ impl WeightPin {
         let started = Instant::now();
         match lock_all(&state.ranges) {
             Ok(()) => {
-                state.pinned = true;
+                state.set_pinned(true);
                 self.pressure_logged = false;
                 self.shared.wake.notify_all();
                 eprintln!(

@@ -101,8 +101,10 @@ fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
         411 => "Length Required",
         413 => "Payload Too Large",
         500 => "Internal Server Error",
@@ -128,16 +130,26 @@ fn head(status: u16, content_type: &str, extra: &[(&str, &str)]) -> String {
 
 /// Writes a complete response and closes the connection.
 pub fn respond(
-    mut stream: TcpStream,
+    stream: TcpStream,
     status: u16,
     content_type: &str,
     body: &[u8],
 ) -> Result<()> {
     let length = body.len().to_string();
+    respond_raw(stream, status, content_type, &[("Content-Length", &length)], body)
+}
+
+/// Writes `headers` as given (`Content-Length` among them: a HEAD answer
+/// states its GET's length over an empty `body`) and closes the connection.
+pub fn respond_raw(
+    mut stream: TcpStream,
+    status: u16,
+    content_type: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Result<()> {
     stream
-        .write_all(
-            head(status, content_type, &[("Content-Length", &length)]).as_bytes(),
-        )
+        .write_all(head(status, content_type, headers).as_bytes())
         .context("writing response head")?;
     stream.write_all(body).context("writing response body")?;
     stream.flush().ok();

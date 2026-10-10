@@ -29,7 +29,7 @@ const gpu = computed(() => props.st.tiers.gpu);
 const disk = computed(() => props.st.tiers.disk);
 const m = computed(() => props.st.machine);
 const share = (part: number, whole: number): number => (whole > 0 ? part / whole : 0);
-const gpuShare = computed(() => share(gpu.value.used_bytes, gpu.value.budget_bytes));
+const gpuShare = computed(() => share(gpu.value.used_bytes, gpu.value.budget_bytes ?? 0));
 const diskShare = computed(() => (disk.value ? share(disk.value.used_bytes - disk.value.durable_bytes, disk.value.budget_bytes) : 0));
 const durShare = computed(() => (disk.value ? share(disk.value.durable_bytes, disk.value.budget_bytes) : 0));
 const queueShare = computed(() => share(props.st.queue.waiting, props.st.queue.capacity));
@@ -195,10 +195,10 @@ const temps = computed(() => (m.value.temp_c ? `CPU ${Math.round(m.value.temp_c.
     <!-- ngram -->
     <rect class="node" x="700" y="300" width="210" height="84" rx="3" />
     <text class="n-title" x="714" y="322">{{ ngram ? 'n-gram table, ' + ngram : 'n-gram table' }}</text>
-    <text class="n-val" x="714" y="349">{{ pct(st.tiers.ngram.resident_share) }}<tspan class="n-sub" dx="5">resident</tspan></text>
+    <text class="n-val" x="714" y="349">{{ pct(st.tiers.ngram?.resident_share) }}<tspan class="n-sub" dx="5">resident</tspan></text>
     <rect class="track" x="714" y="359" width="182" height="3" />
-    <rect class="fill" x="714" y="358" :width="182 * st.tiers.ngram.resident_share" height="5" filter="url(#ink-line)" />
-    <text class="n-sub" x="714" y="378">{{ bytes(st.tiers.ngram.bytes) }} in page cache</text>
+    <rect class="fill" x="714" y="358" :width="182 * (st.tiers.ngram?.resident_share ?? 0)" height="5" filter="url(#ink-line)" />
+    <text class="n-sub" x="714" y="378">{{ bytes(st.tiers.ngram?.bytes) }} in page cache</text>
 
     <!-- expert cache (small-machine mode only) -->
     <rect :class="['node', st.tiers.experts ? '' : 'off']" x="950" y="320" width="210" height="64" rx="3" />

@@ -22,6 +22,11 @@
 //! client ever sent is a candidate and only the ones still being hit matter.
 //! Otherwise it ages and trims like any entry, which is what retires a
 //! preamble once the client's prompt has changed.
+//!
+//! Every entry's meta file carries the session's lineage id
+//! ([`Lineage`], docs/dashboard.md § 4.2), so a session written out and read
+//! back is the same lineage to the dashboard. Meta files written before the
+//! id existed load without one.
 
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -31,7 +36,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 
-use super::session::CachedImage;
+use super::session::{CachedImage, Lineage};
 
 /// Free space to leave on the volume after a write.
 const FREE_SPACE_MARGIN: u64 = 8 << 30;
@@ -64,6 +69,11 @@ struct Meta {
     /// they are; the cache bytes are the same, so the format tag stays.
     #[serde(default)]
     images: Vec<CachedImage>,
+    /// The session's lineage. Meta files written before the field existed
+    /// load without one: the dashboard shows such an entry with no id and
+    /// no history.
+    #[serde(default)]
+    lineage: Option<Lineage>,
 }
 
 /// One persisted session (its token list stays in memory for prefix matching).
@@ -78,6 +88,8 @@ pub struct DiskEntry {
     pub durable: bool,
     /// The images among `tokens`, matched alongside them on lookup.
     pub images: Vec<CachedImage>,
+    /// The session's lineage; `None` for an entry written before lineage ids.
+    pub lineage: Option<Lineage>,
 }
 
 /// What a store describes about the entry it writes.
@@ -89,6 +101,7 @@ pub struct NewEntry<'a> {
     /// Positions with a checkpoint file; must include `tokens.len()`.
     pub checkpoints: &'a [usize],
     pub durable: bool,
+    pub lineage: Option<Lineage>,
 }
 
 impl NewEntry<'_> {
@@ -214,6 +227,7 @@ impl DiskStore {
                         cache_key: meta.cache_key,
                         durable: meta.durable,
                         images: meta.images,
+                        lineage: meta.lineage,
                     });
                 }
                 Err(error) => {
@@ -294,6 +308,12 @@ impl DiskStore {
         &self.entries
     }
 
+    /// The largest lineage id of any entry, for a counter that must never
+    /// hand out one of them again.
+    pub fn max_lineage(&self) -> Option<u64> {
+        self.entries.iter().filter_map(|e| e.lineage.map(|l| l.id)).max()
+    }
+
     /// Durable prefix entries currently held (at most [`DURABLE_MAX_ENTRIES`]).
     pub fn durable_len(&self) -> usize {
         self.entries.iter().filter(|e| e.durable).count()
@@ -302,70 +322,61 @@ impl DiskStore {
     /// Writes a session: `prefix` streams the per-token caches for all of
     /// `tokens`, `checkpoint(pos, w)` streams the snapshot at each position in
     /// `checkpoints` (which must include `tokens.len()`), `images` are the
-    /// spans among `tokens`. Returns the new id, or `None` when the entry
-    /// does not fit the budget or the volume.
+    /// spans among `tokens`, `lineage` the session's. Returns the new id, or
+    /// `None` when the entry does not fit the budget or the volume.
     #[allow(clippy::too_many_arguments)]
     pub fn store(
         &mut self,
         tokens: &[u32],
         images: &[CachedImage],
         cache_key: Option<&str>,
+        lineage: Option<Lineage>,
         checkpoints: &[usize],
         prefix: &mut dyn FnMut(&mut dyn Write) -> Result<()>,
         checkpoint: &mut dyn FnMut(usize, &mut dyn Write) -> Result<()>,
     ) -> Result<Option<String>> {
-        self.store_with(
-            false,
+        let new = NewEntry {
             tokens,
             images,
             cache_key,
             checkpoints,
-            prefix,
-            checkpoint,
-        )
+            durable: false,
+            lineage,
+        };
+        self.store_with(&new, prefix, checkpoint)
     }
 
     /// [`Self::store`] for a durable prefix entry: `tokens` is the shared
     /// prefix and its length the one checkpoint. Storing the entry that takes
     /// the count past [`DURABLE_MAX_ENTRIES`] deletes the least recently used
-    /// durable entry; evicted sessions are never touched for it.
+    /// durable entry; evicted sessions are never touched for it. A durable
+    /// entry is a lineage of its own (`lineage`), whatever it was cut from.
     #[allow(clippy::too_many_arguments)]
     pub fn store_durable(
         &mut self,
         tokens: &[u32],
         images: &[CachedImage],
         cache_key: Option<&str>,
+        lineage: Option<Lineage>,
         checkpoints: &[usize],
         prefix: &mut dyn FnMut(&mut dyn Write) -> Result<()>,
         checkpoint: &mut dyn FnMut(usize, &mut dyn Write) -> Result<()>,
     ) -> Result<Option<String>> {
-        self.store_with(
-            true,
-            tokens,
-            images,
-            cache_key,
-            checkpoints,
-            prefix,
-            checkpoint,
-        )
+        let new =
+            NewEntry { tokens, images, cache_key, checkpoints, durable: true, lineage };
+        self.store_with(&new, prefix, checkpoint)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn store_with(
         &mut self,
-        durable: bool,
-        tokens: &[u32],
-        images: &[CachedImage],
-        cache_key: Option<&str>,
-        checkpoints: &[usize],
+        new: &NewEntry<'_>,
         prefix: &mut dyn FnMut(&mut dyn Write) -> Result<()>,
         checkpoint: &mut dyn FnMut(usize, &mut dyn Write) -> Result<()>,
     ) -> Result<Option<String>> {
-        let new = NewEntry { tokens, images, cache_key, checkpoints, durable };
         new.check()?;
         let reserved = self.reserve();
-        match write_files(&reserved.path, checkpoints, prefix, checkpoint) {
-            Ok(bytes) => self.commit(reserved, &new, bytes),
+        match write_files(&reserved.path, new.checkpoints, prefix, checkpoint) {
+            Ok(bytes) => self.commit(reserved, new, bytes),
             Err(error) => {
                 self.abandon(reserved);
                 Err(error)
@@ -431,7 +442,8 @@ impl DiskStore {
         bytes: u64,
     ) -> Result<Option<DiskEntry>> {
         new.check()?;
-        let NewEntry { tokens, images, cache_key, checkpoints, durable } = *new;
+        let NewEntry { tokens, images, cache_key, checkpoints, durable, lineage } =
+            *new;
         if bytes > self.budget {
             return Ok(None);
         }
@@ -458,6 +470,7 @@ impl DiskStore {
             cache_key: cache_key.map(str::to_owned),
             durable,
             images: images.to_vec(),
+            lineage,
         };
         fs::write(reserved.path.join(META), serde_json::to_vec(&meta)?)?;
         Ok(Some(DiskEntry {
@@ -469,6 +482,7 @@ impl DiskStore {
             cache_key: meta.cache_key,
             durable,
             images: meta.images,
+            lineage,
         }))
     }
 
@@ -512,6 +526,7 @@ impl DiskStore {
                 cache_key: entry.cache_key.clone(),
                 durable: entry.durable,
                 images: entry.images.clone(),
+                lineage: entry.lineage,
             };
             if let Ok(json) = serde_json::to_vec(&meta) {
                 let _ = fs::write(dir.join(id).join(META), json);

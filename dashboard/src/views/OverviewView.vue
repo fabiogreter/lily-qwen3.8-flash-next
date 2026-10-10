@@ -174,7 +174,7 @@ const powerSeries: SeriesDef[] = [
           <div class="tier">
             <div class="name">GPU sessions</div>
             <div class="val">{{ bytes(st.tiers.gpu.used_bytes) }} of {{ bytes(st.tiers.gpu.budget_bytes) }} · {{ st.tiers.gpu.entries }}/{{ st.tiers.gpu.max_entries }}</div>
-            <div class="meter"><InkMeter :parts="[{ v: st.tiers.gpu.used_bytes, color: 'var(--s1)' }]" :total="st.tiers.gpu.budget_bytes" /></div>
+            <div class="meter"><InkMeter :parts="[{ v: st.tiers.gpu.used_bytes, color: 'var(--s1)' }]" :total="st.tiers.gpu.budget_bytes ?? 0" /></div>
           </div>
           <div class="tier">
             <div class="name">
@@ -198,8 +198,9 @@ const powerSeries: SeriesDef[] = [
           </div>
           <div class="tier">
             <div class="name">n-gram table</div>
-            <div class="val">{{ pct(st.tiers.ngram.resident_share) }} of {{ bytes(st.tiers.ngram.bytes) }} resident</div>
-            <div class="meter"><InkMeter :parts="[{ v: st.tiers.ngram.resident_share, color: 'var(--s1)' }]" :total="1" /></div>
+            <div v-if="st.tiers.ngram" class="val">{{ pct(st.tiers.ngram.resident_share) }} of {{ bytes(st.tiers.ngram.bytes) }} resident</div>
+            <div v-else class="val na">none</div>
+            <div v-if="st.tiers.ngram" class="meter"><InkMeter :parts="[{ v: st.tiers.ngram.resident_share, color: 'var(--s1)' }]" :total="1" /></div>
           </div>
           <div class="tier">
             <div class="name">Weights</div>

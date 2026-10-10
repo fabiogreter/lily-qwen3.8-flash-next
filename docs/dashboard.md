@@ -3,7 +3,9 @@
 Status: **spec, agreed with the owner 2026-10-10; being built.** Prototypes are
 done (§ 9). Build order: the Vue app on mock data (§ 8), then lily serving it
 and the read routes (§ 3), the recorder (§ 4), runtime settings (§ 7) and
-machine sampling (§ 6).
+machine sampling (§ 6). The first two are in; until the recorder exists the
+per-session figures cover the server's last 1 024 requests and the history
+routes answer 503 (`src/serve/dashboard.rs` says what each route serves).
 
 A small web dashboard served by lily itself at `/`: what the server is doing
 now, what it did over the last 7 days, what the machine pays for it, and the

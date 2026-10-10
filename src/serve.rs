@@ -23,9 +23,15 @@
 //! trustworthy) and loads it again; `/health` says `recovering` meanwhile.
 //! More than [`MAX_RECOVERIES`] faults within [`RECOVERY_WINDOW`] exit the
 //! process with status 1 for the supervisor to restart it.
+//!
+//! The same listener serves the dashboard ([`dashboard`]): the app at `/`
+//! and the read-only `/v1/lily/*` routes, to loopback peers only, answered
+//! on the connection's thread from what the engine publishes, so a page
+//! that polls never wakes the engine.
 
 pub mod api;
 pub mod batch;
+pub mod dashboard;
 pub mod data_uri;
 pub mod disk;
 pub mod http;
@@ -290,6 +296,9 @@ pub struct ServeOptions {
     /// serves (1-based, counted across reloads) to exercise the recovery
     /// path; `None` in normal operation.
     pub inject_metal_fault: Option<u64>,
+    /// The command line as given, for the dashboard's settings view (empty:
+    /// every setting shows as its default or unset).
+    pub flags: Vec<dashboard::settings::FlagValue>,
 }
 
 // --- lifecycle ---------------------------------------------------------------
@@ -616,6 +625,9 @@ struct Sink {
     tx: Sender<Out>,
     cancelled: Arc<AtomicBool>,
     started: bool,
+    /// The lineage id of the request's session once admission acquired it,
+    /// for the dashboard ([`Engine::close`] ends its activity there).
+    lineage: Option<u64>,
 }
 
 impl Sink {
@@ -815,6 +827,8 @@ struct Engine<M: LanguageModel> {
     /// The thinking controls' markers and texts; `None` when the vocabulary
     /// lacks them (the controls are then ignored).
     thinking_tokens: Option<Arc<ThinkingTokens>>,
+    /// Where the engine publishes what the dashboard shows.
+    board: Arc<dashboard::Board>,
 }
 
 /// Where a request's text ends up when not streaming.
@@ -832,7 +846,7 @@ impl<M: LanguageModel> Engine<M> {
         shared: &Shared,
         next_id: u64,
     ) -> Result<Self> {
-        let Shared { generator, shutdown, timings, queue: _, thinking_tokens } =
+        let Shared { generator, shutdown, timings, queue: _, thinking_tokens, board } =
             shared.clone();
         // `LILY_KERNEL_PROFILE=1`: per-kernel GPU times per pass, printed
         // after every answered request (diagnostic; the profile transport
@@ -968,7 +982,8 @@ impl<M: LanguageModel> Engine<M> {
             decision,
             options.pin_hold_secs,
             crate::stats::pressure_level,
-        )?;
+        )?
+        .with_mirror(board.pin_mirror());
         let max_seq =
             effective_max_seq(options.max_seq, model.max_position_embeddings());
         ensure!(max_seq > 1, "max_seq must be at least 2");
@@ -1049,7 +1064,8 @@ impl<M: LanguageModel> Engine<M> {
             );
         }
         let mut sessions =
-            SessionStore::new(budget, options.max_sessions, CHECKPOINTS_PER_SESSION);
+            SessionStore::new(budget, options.max_sessions, CHECKPOINTS_PER_SESSION)
+                .with_lineages(board.lineages());
         // The expert cache's plan reserved one session with exactly
         // `CHECKPOINTS_PER_SESSION` snapshots; more would outgrow it.
         if model.session_reserve().is_some() {
@@ -1170,7 +1186,15 @@ impl<M: LanguageModel> Engine<M> {
             }
             _ => None,
         };
-        Ok(Self {
+        board.loaded(dashboard::Loaded {
+            max_batch,
+            weights_bytes: pin_bytes,
+            ngram: model.ngram_table_bytes().map(|bytes| dashboard::NgramFacts {
+                bytes,
+                paged: model.paged_table().map(|table| Arc::downgrade(&table)),
+            }),
+        });
+        let engine = Self {
             ctx,
             model,
             generator,
@@ -1185,7 +1209,15 @@ impl<M: LanguageModel> Engine<M> {
             preload,
             pin,
             thinking_tokens,
-        })
+            board,
+        };
+        engine.publish();
+        Ok(engine)
+    }
+
+    /// Publishes the session cache as it is now to the dashboard.
+    fn publish(&self) {
+        self.board.publish(dashboard::StoreView::of(&self.sessions, Some(&self.model)));
     }
 
     /// Takes the engine down: every resident session goes to the disk tier
@@ -1204,6 +1236,7 @@ impl<M: LanguageModel> Engine<M> {
             next_id,
             preload,
             pin,
+            board,
             ..
         } = self;
         // Unlocked before any buffer is released: the pin holds handles on
@@ -1223,6 +1256,7 @@ impl<M: LanguageModel> Engine<M> {
         let (spilled, dropped) =
             if faulted { (0, sessions.drop_all()) } else { sessions.spill_all(&ctx) };
         let spill_secs = started.elapsed().as_secs_f64();
+        board.unloaded(dashboard::StoreView::of::<M>(&sessions, None));
         drop(scratch);
         drop(sessions);
         drop(model);
@@ -1249,10 +1283,20 @@ impl<M: LanguageModel> Engine<M> {
     }
 
     /// Between requests: lets the session cache write the next evictions
-    /// ahead (see [`SessionStore::write_ahead`]). Returns whether a write is
-    /// in flight, which the engine loop then polls for.
+    /// ahead (see [`SessionStore::write_ahead`]), and publishes the cache
+    /// when a write started or finished. Returns whether a write is in
+    /// flight, which the engine loop then polls for (every 50 ms: unchanged
+    /// polls publish nothing).
     fn write_ahead(&mut self) -> bool {
-        self.sessions.write_ahead(&self.ctx)
+        let shape = |s: &SessionStore<M>| {
+            (s.writing(), s.len(), s.disk().map(|d| (d.len(), d.used_bytes())))
+        };
+        let before = shape(&self.sessions);
+        let writing = self.sessions.write_ahead(&self.ctx);
+        if shape(&self.sessions) != before {
+            self.publish();
+        }
+        writing
     }
 
     /// Testing only: makes the context fail its next submission the way a
@@ -1323,6 +1367,7 @@ impl<M: LanguageModel> Engine<M> {
             &options,
             Some(checkpointer),
             &mut |token| {
+                out.drew();
                 let events = parser.push(token)?;
                 out.deliver(events, sink);
                 Ok(!sink.cancelled() && !parser.stopped && !shutdown.cancel())
@@ -1622,8 +1667,18 @@ fn image_policy(model_dir: &Path, options: &ServeOptions) -> Result<ImagePolicy>
 }
 
 /// Sampling defaults: `generation_config.json` over OpenAI's defaults, then
-/// the command-line overrides.
+/// the command-line overrides, validated.
 fn sampling_defaults(
+    model_dir: &Path,
+    overrides: &SamplingOverrides,
+) -> Result<SamplingParams> {
+    let params = sampling_unvalidated(model_dir, overrides)?;
+    params.validate()?;
+    Ok(params)
+}
+
+/// [`sampling_defaults`] as read, without the validation.
+fn sampling_unvalidated(
     model_dir: &Path,
     overrides: &SamplingOverrides,
 ) -> Result<SamplingParams> {
@@ -1685,8 +1740,44 @@ fn sampling_defaults(
     if let Some(v) = overrides.repetition_penalty {
         params.repetition_penalty = v;
     }
-    params.validate()?;
     Ok(params)
+}
+
+/// The dashboard's defaults for the settings whose default is not a flag's
+/// text: the K/V format and the batch size the server falls back to, and the
+/// checkpoint's sampling defaults (`generation_config.json` over OpenAI's,
+/// as read: a value the validation refuses is the defaults' problem, not
+/// the settings view's). It never fails the start: a checkpoint whose
+/// sampling defaults cannot be read is logged and leaves them out.
+fn computed_defaults(
+    model_dir: &Path,
+) -> Vec<(&'static str, dashboard::contract::SettingValue)> {
+    use dashboard::contract::SettingValue;
+    // The shortest text of an f32 read back as f64: 0.6, not 0.60000002.
+    let number = |v: f32| {
+        v.to_string()
+            .parse()
+            .map_or(SettingValue::Number(f64::from(v)), SettingValue::Number)
+    };
+    let mut computed = vec![
+        ("kv_cache", SettingValue::Text(KvFormat::default().name().to_owned())),
+        ("max_batch", SettingValue::Int(DEFAULT_MAX_BATCH as u64)),
+    ];
+    match sampling_unvalidated(model_dir, &SamplingOverrides::default()) {
+        Ok(p) => computed.extend([
+            ("temperature", number(p.temperature)),
+            ("top_k", SettingValue::Int(p.top_k as u64)),
+            ("top_p", number(p.top_p)),
+            ("min_p", number(p.min_p)),
+            ("presence_penalty", number(p.presence_penalty)),
+            ("frequency_penalty", number(p.frequency_penalty)),
+            ("repetition_penalty", number(p.repetition_penalty)),
+        ]),
+        Err(error) => eprintln!(
+            "dashboard: the settings view shows no checkpoint sampling defaults: {error:#}"
+        ),
+    }
+    computed
 }
 
 /// Serves the checkpoint at `model_dir` with the engine its `model_type` names.
@@ -1718,6 +1809,8 @@ struct Shared {
     queue: Arc<EngineQueue>,
     /// See [`Engine::thinking_tokens`].
     thinking_tokens: Option<Arc<ThinkingTokens>>,
+    /// See [`Engine::board`].
+    board: Arc<dashboard::Board>,
 }
 
 /// Everything the HTTP thread needs without the engine.
@@ -1734,6 +1827,8 @@ struct Front {
     connections: Arc<AtomicUsize>,
     model_id: &'static str,
     idle_unload_secs: u64,
+    /// The dashboard's routes, answered from what the engine publishes.
+    dashboard: dashboard::Dashboard,
 }
 
 /// The engine thread's body: the first load, then requests until a stop is
@@ -2137,12 +2232,30 @@ fn run_with<M: LanguageModel + 'static>(
     let (jobs, job_rx) = mpsc::sync_channel::<Cmd>(queue.capacity());
     let lifecycle = Arc::new(Lifecycle::new(State::Loading));
     let shutdown = Arc::new(Shutdown::default());
+    let board = Arc::new(dashboard::Board::default());
+    let dashboard = dashboard::Dashboard::new(
+        board.clone(),
+        dashboard::Config {
+            model: M::MODEL_ID,
+            idle_unload_secs: options.idle_unload_secs,
+            pin_hold_secs: options.pin_hold_secs,
+            max_batch: options.max_batch.unwrap_or(DEFAULT_MAX_BATCH),
+            queue: options.queue,
+            max_sessions: options.max_sessions,
+            cache_bytes: options.cache_bytes.map(|b| b as u64),
+            settings: dashboard::settings::build(
+                &options.flags,
+                &computed_defaults(model_dir),
+            ),
+        },
+    );
     let shared = Shared {
         generator,
         shutdown: shutdown.clone(),
         timings: Arc::new(TimingsLog::new(TIMINGS_LOG_CAPACITY)),
         queue,
         thinking_tokens,
+        board,
     };
     let engine_thread = {
         let model_dir = model_dir.to_path_buf();
@@ -2193,6 +2306,7 @@ fn run_with<M: LanguageModel + 'static>(
         connections: connections.clone(),
         model_id: M::MODEL_ID,
         idle_unload_secs: options.idle_unload_secs,
+        dashboard,
     });
     for stream in listener.incoming() {
         if shutdown.requested() {
@@ -2242,13 +2356,48 @@ fn handle(front: &Front, mut stream: TcpStream) {
             return;
         }
     };
-    let path = request.path.split('?').next().unwrap_or("").to_string();
+    let (path, query) = request.path.split_once('?').unwrap_or((&request.path, ""));
+    let (path, query) = (path.to_owned(), query.to_owned());
     let what = format!("{} {path}", request.method);
     let state = if front.shared.shutdown.requested() {
         State::Stopping
     } else {
         front.lifecycle.get()
     };
+    // Before anything that could reach the engine: the dashboard's routes
+    // only read what it published.
+    if let Some(route) = dashboard::route(&request.method, &path) {
+        let connection = dashboard::Connection {
+            peer: stream.peer_addr().ok(),
+            port: stream.local_addr().map_or(0, |a| a.port()),
+        };
+        let engine = dashboard::EngineNow {
+            state,
+            waiting: front.shared.queue.waiting.load(Ordering::Acquire),
+        };
+        let response = front.dashboard.respond(
+            route,
+            &request,
+            (&path, &query),
+            connection,
+            engine,
+        );
+        // A HEAD gets its GET's head, the body's length included.
+        let body: &[u8] = if request.method == "HEAD" { &[] } else { &response.body };
+        let length = response.body.len().to_string();
+        let mut headers = response.headers();
+        headers.push(("Content-Length", &length));
+        if let Err(error) = http::respond_raw(
+            stream,
+            response.status,
+            response.content_type,
+            &headers,
+            body,
+        ) {
+            eprintln!("response error: {error:#}");
+        }
+        return;
+    }
     match (request.method.as_str(), path.as_str()) {
         ("GET", "/health") => {
             let (code, status) = state.health();
@@ -2367,7 +2516,12 @@ fn handle(front: &Front, mut stream: TcpStream) {
             let cancelled = Arc::new(AtomicBool::new(false));
             let job = Job {
                 prepared,
-                sink: Sink { tx, cancelled: cancelled.clone(), started: false },
+                sink: Sink {
+                    tx,
+                    cancelled: cancelled.clone(),
+                    started: false,
+                    lineage: None,
+                },
                 queued_at: Instant::now(),
             };
             if !queue.admit() {
@@ -2414,6 +2568,11 @@ fn handle(front: &Front, mut stream: TcpStream) {
 
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+/// Unix time in milliseconds, the dashboard's clock.
+pub(crate) fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
 /// Stop signals, taken synchronously on one thread. SIGTERM and SIGINT are

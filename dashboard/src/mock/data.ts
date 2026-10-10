@@ -291,6 +291,8 @@ export function buildRequests(sessions: Session[], now: number): RequestRow[] {
       cancelled_by: cancelled,
       thinking_forced: r() < 0.08,
       pinned: true,
+      // One failed request in the list, without drawing from the stream.
+      failed: i === 17,
     });
     t -= Math.round(4e3 + r() * 90e3);
   }

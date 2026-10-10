@@ -55,7 +55,8 @@ const res = useResource((signal) => backend.requests(LIMIT, signal), { intervalM
               <td :class="{ muted: r.queue_ms < 10 }">{{ r.queue_ms }}</td>
               <td>{{ r.batch }}</td>
               <td class="l">
-                <span v-if="r.cancelled_by" class="tag">cancelled by {{ r.cancelled_by }}</span
+                <span v-if="r.failed" class="tag">failed</span
+                ><span v-if="r.cancelled_by" class="tag">cancelled by {{ r.cancelled_by }}</span
                 ><span v-if="r.thinking_forced" class="tag ai">thinking closed</span>
               </td>
             </tr>

@@ -601,6 +601,22 @@ pub trait LanguageModel: Sized {
         None
     }
 
+    /// The expert cache's slots, when the model serves its experts from one.
+    fn expert_cache_slots(&self) -> Option<usize> {
+        None
+    }
+
+    /// Prompt tokens per prefill chunk (every chunk of a `prefill_until`
+    /// call but its last has this many), when the model chunks its prefill.
+    fn prefill_chunk_tokens(&self) -> Option<usize> {
+        None
+    }
+
+    /// Bytes of the n-gram table, paged or resident; `None` without one.
+    fn ngram_table_bytes(&self) -> Option<u64> {
+        None
+    }
+
     type State: DecodeStateApi;
     type Scratch: ScratchApi;
 

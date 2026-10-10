@@ -25,6 +25,19 @@ other OpenAI-compatible servers:
   rates, cached tokens and draft acceptance. `GET /v1/timings` keeps the
   last 32; `tools/opencode-plugin-timings/` shows them in opencode.
 
+## The dashboard
+
+`http://127.0.0.1:8000/` (the `--bind` address) serves a dashboard built into
+the binary: what the server is doing, its cache tiers, recent requests and
+every setting. It reads `/v1/lily/status`, `/sessions`, `/requests` and
+`/settings`, which answer from what the engine already publishes, so an open
+page never wakes an idle or unloaded engine. Every dashboard route answers
+loopback peers only, under `127.0.0.1`, `localhost` or `[::1]` with lily's
+port as `Host` (403 otherwise, whatever `--bind` says), and forbids framing.
+History and
+runtime settings are not built yet (503 and 409). The design is
+[dashboard.md](dashboard.md).
+
 ## Batching
 
 Up to four requests decode together (`--max-batch`, continuous batching): a

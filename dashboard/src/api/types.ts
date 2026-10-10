@@ -63,13 +63,17 @@ export interface QueueStatus {
   capacity: number;
 }
 
-/** What the engine is doing right now. All zero/null while idle. */
+/**
+ * What the engine is doing right now. All zero/null while idle. The rates are
+ * measured over about the last 6 s (the first poll after a pause reads 0);
+ * prefill tokens are counted per chunk as each finishes.
+ */
 export interface LiveStatus {
   /** Decode throughput now, tokens per second, summed over the running requests. */
   decode_tps: number;
   /** Prefill throughput now, per computed token; 0 when no prefill is running. */
   prefill_tps: number;
-  /** MTP acceptance ratio now; null when nothing is decoding. */
+  /** MTP acceptance ratio over the requests finished in the last minute; null when nothing is decoding. */
   acceptance: number | null;
   requests_per_min: number;
   active_sessions: number;
@@ -106,8 +110,8 @@ export interface MachineStatus {
 
 export interface GpuTier {
   used_bytes: number;
-  /** `--cache-bytes`. */
-  budget_bytes: number;
+  /** `--cache-bytes`, or derived at the load; null until loaded unless `--cache-bytes` set it. */
+  budget_bytes: number | null;
   entries: number;
   /** `--max-sessions`. */
   max_entries: number;
@@ -125,15 +129,16 @@ export interface DiskTier {
 
 export interface ExpertTier {
   slots: number;
+  /** Slots holding an expert; the load fills every slot, so this equals `slots`. */
   used: number;
-  /** 0..1 */
-  hit_rate: number;
+  /** 0..1, cumulative since the load; null before the first lookup. */
+  hit_rate: number | null;
 }
 
 export interface NgramTier {
   /** Size of the n-gram table. */
   bytes: number;
-  /** Share of the table currently in the page cache, 0..1. */
+  /** Share of the table currently in the page cache, 0..1; 1 for a table resident in GPU memory. */
   resident_share: number;
 }
 
@@ -149,7 +154,8 @@ export interface Tiers {
   disk: DiskTier | null;
   /** Present only in small-machine mode. */
   experts: ExpertTier | null;
-  ngram: NgramTier;
+  /** null while no model is loaded, or the model has no n-gram table. */
+  ngram: NgramTier | null;
   weights: WeightsTier;
 }
 
@@ -265,7 +271,11 @@ export interface History {
 
 export type SessionTier = 'gpu' | 'disk';
 
-/** One cache entry, identified by its lineage id (docs/dashboard.md § 4.2). */
+/**
+ * One cache entry, identified by its lineage id (docs/dashboard.md § 4.2).
+ * Until the recorder exists (phase 3) the per-session figures (`requests`,
+ * the rates, `cache_hit`, `acceptance`) cover the server's last 1024 requests.
+ */
 export interface Session {
   /** null for an entry written before lineage ids existed; it has no history. */
   lineage: number | null;
@@ -283,8 +293,8 @@ export interface Session {
   prefill_tps_avg: number | null;
   cache_hit: number | null;
   acceptance: number | null;
-  /** Creation time, unix ms. */
-  created_t: number;
+  /** Creation time, unix ms; null for an entry written before lineage ids existed. */
+  created_t: number | null;
 }
 
 export interface SessionsResponse {
@@ -324,6 +334,8 @@ export interface RequestRow {
   /** The thinking budget closed the reasoning block. */
   thinking_forced: boolean;
   pinned: boolean;
+  /** The request failed (an error, a GPU fault); its counts are 0 and its rates null. */
+  failed: boolean;
 }
 
 export interface RequestsResponse {

@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 
 use super::api::{self, Kind, Prepared};
 use super::batch::BatchStats;
+use super::dashboard::{self, Board};
 use super::pin::InFlight;
 use super::session::{
     CachedImage, DecodeCheckpoints, Evictions, Session, SessionStore,
@@ -474,6 +475,35 @@ pub(super) trait PrefillChunks<M: LanguageModel> {
 /// chunk, and no other session is in flight.
 pub(super) struct Alone;
 
+/// Runs `prefill`, one `prefill_until` call over `tokens` that asks its stop
+/// before every chunk of `chunk` tokens, and counts the prefilled tokens to
+/// the dashboard's live rate as they go: a chunk once the next one is asked
+/// for (every chunk but the last is whole), the rest when the call returns.
+/// Without a chunk size, everything is counted at the return.
+pub(super) fn counted_prefill(
+    board: &Board,
+    chunk: Option<usize>,
+    tokens: usize,
+    stop: &dyn Fn() -> bool,
+    prefill: impl FnOnce(&dyn Fn() -> bool) -> Result<usize>,
+) -> Result<usize> {
+    let counted = std::cell::Cell::new(0usize);
+    let asked = std::cell::Cell::new(false);
+    let counting = || {
+        if let Some(chunk) = chunk
+            && asked.replace(true)
+        {
+            let done = chunk.min(tokens - counted.get());
+            counted.set(counted.get() + done);
+            board.prefilled(done);
+        }
+        stop()
+    };
+    let fed = prefill(&counting)?;
+    board.prefilled(fed.saturating_sub(counted.get()));
+    Ok(fed)
+}
+
 impl<M: LanguageModel> PrefillChunks<M> for Alone {
     fn prefill(
         &mut self,
@@ -483,14 +513,18 @@ impl<M: LanguageModel> PrefillChunks<M> for Alone {
         vision: Option<&VisionInput<'_>>,
         stop: &dyn Fn() -> bool,
     ) -> Result<usize> {
-        engine.model.prefill_until(
-            &engine.ctx,
-            &mut session.state,
-            &mut engine.scratch,
-            tokens,
-            vision,
-            stop,
-        )
+        let (board, chunk) =
+            (engine.board.clone(), engine.model.prefill_chunk_tokens());
+        counted_prefill(&board, chunk, tokens.len(), stop, |stop| {
+            engine.model.prefill_until(
+                &engine.ctx,
+                &mut session.state,
+                &mut engine.scratch,
+                tokens,
+                vision,
+                stop,
+            )
+        })
     }
 
     fn in_flight_bytes(&self) -> usize {
@@ -553,6 +587,9 @@ impl<M: LanguageModel> Engine<M> {
         )?;
         let session_secs = started.elapsed().as_secs_f64();
         let mut session = acquired.session;
+        sink.lineage = Some(session.lineage.id);
+        self.board.admitted(session.lineage, n, session.bytes() as u64);
+        self.publish();
         let reused = acquired.reused;
         let agreement = acquired.agreement;
         ensure!(reused < n, "session cache returned the whole prompt");
@@ -715,6 +752,7 @@ impl<M: LanguageModel> Engine<M> {
                 &images,
                 p.cache_key.as_deref(),
             );
+            self.publish();
             let counters_end = crate::stats::counters();
             let vm_end = crate::stats::vm_counters();
             let created = now();
@@ -772,6 +810,12 @@ impl<M: LanguageModel> Engine<M> {
                     &measured.log_details()
                 )
             );
+            self.board.record(dashboard::request_row(
+                super::now_ms(),
+                sink.lineage,
+                &measured,
+                None,
+            ));
             self.timings.record(TimingsEntry {
                 id,
                 model: M::MODEL_ID,
@@ -876,6 +920,7 @@ impl<M: LanguageModel> Engine<M> {
             stream: p.stream,
             collected: Collected::default(),
             tool_index: 0,
+            board: self.board.clone(),
         };
         if p.stream {
             sink.start(200, "text/event-stream");
@@ -944,9 +989,16 @@ pub(super) struct Output {
     pub(super) stream: bool,
     pub(super) collected: Collected,
     pub(super) tool_index: usize,
+    /// Counts the drawn tokens for the dashboard's live rate.
+    pub(super) board: Arc<Board>,
 }
 
 impl Output {
+    /// One token drawn for the request (a relaxed atomic add).
+    pub(super) fn drew(&self) {
+        self.board.drew();
+    }
+
     /// Sends `events` to the client as SSE chunks, or collects them for the
     /// body when the request is not streamed.
     pub(super) fn deliver(&mut self, events: Vec<Event>, sink: &Sink) {
@@ -1140,6 +1192,7 @@ impl<M: LanguageModel> Engine<M> {
     /// decode.
     pub(super) fn open(&mut self, job: Job) -> Opened {
         let Job { prepared, sink, queued_at } = job;
+        self.board.opened();
         let in_flight = self.pin.before_request(Instant::now());
         let queued = queued_at.elapsed();
         Opened { p: prepared, sink, in_flight, queued }
@@ -1157,7 +1210,14 @@ impl<M: LanguageModel> Engine<M> {
         stream: bool,
         ending: Ending<'_>,
     ) -> Option<String> {
-        self.pin.after_request(Instant::now());
+        let now = Instant::now();
+        self.pin.after_request(now);
+        // A failed request counts in the dashboard's rows too (an answered
+        // or stopped one recorded its own row).
+        if !matches!(ending, Ending::Answered) {
+            self.board.record(dashboard::failed_row(super::now_ms(), sink.lineage));
+        }
+        self.board.closed(sink.lineage, now);
         let fault = self.ctx.fault();
         match ending {
             Ending::Answered => sink.end(),
@@ -1231,6 +1291,7 @@ impl<M: LanguageModel> Engine<M> {
         self.sessions.set_in_flight_bytes(in_flight_others);
         let released =
             self.sessions.release(&self.ctx, session, &images, p.cache_key.as_deref());
+        self.publish();
 
         // Every pass recorded since the last answer: under batching, other
         // requests' steps and prefills included.
@@ -1293,6 +1354,12 @@ impl<M: LanguageModel> Engine<M> {
                 &measured.log_details()
             )
         );
+        self.board.record(dashboard::request_row(
+            super::now_ms(),
+            sink.lineage,
+            &measured,
+            outcome.thinking.and_then(|t| t.closed_by.filter(|_| !t.close_cut)),
+        ));
         self.timings.record(TimingsEntry {
             id: out.id.clone(),
             model: M::MODEL_ID,

@@ -677,3 +677,32 @@ fn the_log_line_says_whether_a_session_was_cut_back_or_forked() {
     assert_eq!(describe_reuse(None, true), ", forked");
     assert_eq!(describe_reuse(None, false), "");
 }
+
+#[test]
+fn the_settings_views_computed_defaults_never_fail_the_start() {
+    use dashboard::contract::SettingValue;
+    let dir =
+        std::env::temp_dir().join(format!("lily-computed-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let named = |computed: &[(&str, SettingValue)], name: &str| {
+        computed.iter().find(|(n, _)| *n == name).map(|(_, v)| v.clone())
+    };
+    // No generation_config.json: OpenAI's defaults.
+    let computed = computed_defaults(&dir);
+    assert_eq!(named(&computed, "temperature"), Some(SettingValue::Number(1.0)));
+    // A value the validation refuses is shown as it is, not an error.
+    std::fs::write(
+        dir.join("generation_config.json"),
+        r#"{"top_p": 0, "temperature": 0.6}"#,
+    )
+    .expect("write");
+    let computed = computed_defaults(&dir);
+    assert_eq!(named(&computed, "top_p"), Some(SettingValue::Number(0.0)));
+    assert_eq!(named(&computed, "temperature"), Some(SettingValue::Number(0.6)));
+    // Unreadable: logged, the sampling defaults left out, the rest kept.
+    std::fs::write(dir.join("generation_config.json"), "{not json").expect("write");
+    let computed = computed_defaults(&dir);
+    assert_eq!(named(&computed, "temperature"), None);
+    assert_eq!(named(&computed, "kv_cache"), Some(SettingValue::Text("q8".into())));
+    let _ = std::fs::remove_dir_all(&dir);
+}

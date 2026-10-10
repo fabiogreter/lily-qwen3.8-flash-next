@@ -374,6 +374,7 @@ impl<M: LanguageModel> Row<'_, M> {
             let Row { req: Admitted { parser, out, p, .. }, sink, generated, .. } =
                 self;
             let mut deliver = |t: u32| -> Result<bool> {
+                out.drew();
                 let events = parser.push(t)?;
                 out.deliver(events, sink);
                 Ok(!(sink.cancelled() || parser.stopped || shutdown_cancel))
@@ -384,6 +385,7 @@ impl<M: LanguageModel> Row<'_, M> {
             return Ok(());
         }
         self.generated.push(token);
+        self.req.out.drew();
         if stop {
             self.finish = Some(FinishReason::StopToken);
             return Ok(());
@@ -518,13 +520,23 @@ impl<M: LanguageModel> PrefillChunks<M> for Interleaved<'_, '_, M> {
         let mut fed = 0;
         while fed < tokens.len() {
             if self.rows.is_empty() {
-                fed += engine.model.prefill_until(
-                    &engine.ctx,
-                    &mut session.state,
-                    &mut engine.scratch,
-                    &tokens[fed..],
-                    vision,
+                let (board, chunk) =
+                    (engine.board.clone(), engine.model.prefill_chunk_tokens());
+                fed += request::counted_prefill(
+                    &board,
+                    chunk,
+                    tokens.len() - fed,
                     stop,
+                    |stop| {
+                        engine.model.prefill_until(
+                            &engine.ctx,
+                            &mut session.state,
+                            &mut engine.scratch,
+                            &tokens[fed..],
+                            vision,
+                            stop,
+                        )
+                    },
                 )?;
                 break;
             }
@@ -540,6 +552,7 @@ impl<M: LanguageModel> PrefillChunks<M> for Interleaved<'_, '_, M> {
                 vision,
                 &one_chunk,
             )?;
+            engine.board.prefilled(chunk);
             fed += chunk;
             if chunk == 0 || stop() {
                 break;
@@ -769,6 +782,7 @@ impl<M: LanguageModel> Engine<M> {
                 thinking: thinking.as_ref(),
             };
             let mut on_token = |token: u32| -> Result<bool> {
+                out.drew();
                 let events = parser.push(token)?;
                 out.deliver(events, sink);
                 let terminal = sink.cancelled() || parser.stopped || shutdown.cancel();

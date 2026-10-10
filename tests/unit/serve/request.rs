@@ -683,7 +683,7 @@ fn the_store_summary_names_the_disk_tier_only_when_there_is_one() {
 fn sink() -> (Sink, std::sync::mpsc::Receiver<crate::serve::Out>) {
     let (tx, rx) = std::sync::mpsc::channel();
     let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    (Sink { tx, cancelled, started: false }, rx)
+    (Sink { tx, cancelled, started: false, lineage: None }, rx)
 }
 
 /// What the responder thread would get, one line per message.
@@ -785,4 +785,43 @@ fn the_thinking_group_is_truthful_about_the_close() {
         outcome(Some(ClosedBy::Budget), true, 0).describe(),
         ", thinking 120 tokens, its close by the budget cut short by max_tokens"
     );
+}
+
+#[test]
+fn a_prefill_is_counted_chunk_by_chunk_as_the_next_chunk_is_asked_for() {
+    let board = Board::default();
+    // A prefill of 10 tokens in chunks of 4 asks before each chunk; after
+    // the second ask the first chunk is counted, and so on.
+    let seen = std::cell::RefCell::new(Vec::new());
+    let fed = counted_prefill(&board, Some(4), 10, &|| false, |stop| {
+        for _ in 0..3 {
+            assert!(!stop());
+            seen.borrow_mut().push(board.token_counts().1);
+        }
+        Ok(10)
+    })
+    .expect("prefill");
+    assert_eq!(fed, 10);
+    assert_eq!(*seen.borrow(), [0, 4, 8]);
+    assert_eq!(board.token_counts().1, 10, "the last chunk at the return");
+    // Stopped before its third chunk: what was fed, exactly.
+    let board = Board::default();
+    let fed = counted_prefill(&board, Some(4), 10, &|| false, |stop| {
+        stop();
+        stop();
+        stop();
+        Ok(8)
+    })
+    .expect("prefill");
+    assert_eq!((fed, board.token_counts().1), (8, 8));
+    // Without a chunk size, all of it at the return.
+    let board = Board::default();
+    counted_prefill(&board, None, 10, &|| false, |stop| {
+        stop();
+        stop();
+        assert_eq!(board.token_counts().1, 0);
+        Ok(10)
+    })
+    .expect("prefill");
+    assert_eq!(board.token_counts().1, 10);
 }

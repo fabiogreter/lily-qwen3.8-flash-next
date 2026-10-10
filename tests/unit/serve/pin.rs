@@ -240,14 +240,19 @@ fn pins_at_the_first_request_holds_then_releases_after_the_hold() {
     let _serial = serial();
     let ctx = MetalContext::new().expect("metal");
     let bufs = buffers(&ctx);
+    // The mirror the dashboard reads follows every change, lock-free.
+    let mirror = Arc::new(AtomicBool::new(true));
     let mut pin = WeightPin::new(bufs.clone(), PinDecision::Pin, 60, normal_pressure)
-        .expect("pin");
+        .expect("pin")
+        .with_mirror(mirror.clone());
     assert!(!pin.pinned());
+    assert!(!mirror.load(Ordering::Acquire), "taken over from the pin");
     assert_eq!(wired(&bufs), vec![false; bufs.len()]);
     assert_eq!(pin.keep_warm_remaining(Instant::now()), None, "no request yet");
 
     let t0 = Instant::now();
     assert!(pin.before_request(t0).pinned(), "pins at the first request");
+    assert!(mirror.load(Ordering::Acquire));
     assert_eq!(wired(&bufs), vec![true; bufs.len()]);
     pin.after_request(t0);
     assert_eq!(pin.hold_remaining(t0), Some(Duration::from_secs(60)));
@@ -268,6 +273,7 @@ fn pins_at_the_first_request_holds_then_releases_after_the_hold() {
     assert_eq!(pin.keep_warm_remaining(t2), Some(Duration::ZERO), "window over");
     pin.release_if_held_out(t2);
     assert!(!pin.pinned());
+    assert!(!mirror.load(Ordering::Acquire));
     assert_eq!(wired(&bufs), vec![false; bufs.len()]);
     assert_eq!(pin.hold_remaining(t2), None, "nothing to hold");
     assert_eq!(pin.keep_warm_remaining(t2), None, "released: no keep-alive");
@@ -438,7 +444,14 @@ fn warning_waits_for_the_requests_in_flight_and_anything_above_it_does_not() {
 /// A pinned state over no memory (unlocking nothing): the policy's state
 /// machine without Metal or `mlock`.
 fn pinned_state(in_flight: usize) -> State {
-    State { ranges: Vec::new(), pinned: true, stop: false, in_flight, deferred: None }
+    State {
+        ranges: Vec::new(),
+        pinned: true,
+        mirror: Arc::new(AtomicBool::new(true)),
+        stop: false,
+        in_flight,
+        deferred: None,
+    }
 }
 
 #[test]

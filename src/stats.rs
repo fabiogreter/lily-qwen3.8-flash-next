@@ -11,8 +11,10 @@
 //!
 //! The system side ([`vm_counters`], [`pressure_level`], [`task_memory`]) is
 //! a handful of Mach and sysctl calls, a few microseconds each, sampled at
-//! phase boundaries only. They are declared here rather than taken from the
-//! `libc` crate, whose Mach bindings are deprecated.
+//! phase boundaries only. The dashboard's machine figures ([`cpu_ticks`],
+//! [`memory_use`], [`swap_used`]) are more of the same, read on the HTTP
+//! thread that answers `/v1/lily/status`. They are declared here rather than
+//! taken from the `libc` crate, whose Mach bindings are deprecated.
 
 use std::cell::Cell;
 
@@ -251,6 +253,116 @@ fn sysctl_u64(name: &std::ffi::CStr) -> Option<u64> {
     }
 }
 
+/// The host's CPU time so far, in scheduler ticks summed over every core
+/// (`host_statistics`, `HOST_CPU_LOAD_INFO`). Cumulative since boot; two
+/// samples give the load between them ([`CpuTicks::load_since`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CpuTicks {
+    pub user: u64,
+    pub system: u64,
+    pub idle: u64,
+    pub nice: u64,
+}
+
+impl CpuTicks {
+    /// The share of the ticks since `earlier` that were not idle, in
+    /// `0.0..=1.0`; `None` when no tick passed (the counters are 32-bit in
+    /// the kernel and wrap, which reads as no time passing as well).
+    pub fn load_since(self, earlier: CpuTicks) -> Option<f64> {
+        let busy = (self.user + self.system + self.nice)
+            .checked_sub(earlier.user + earlier.system + earlier.nice)?;
+        let idle = self.idle.checked_sub(earlier.idle)?;
+        let total = busy + idle;
+        (total > 0).then(|| busy as f64 / total as f64)
+    }
+}
+
+/// The host's CPU ticks now, `None` when the call fails.
+pub fn cpu_ticks() -> Option<CpuTicks> {
+    let mut ticks = [0u32; 4];
+    let mut count = 4u32;
+    // SAFETY: `ticks` is `host_cpu_load_info` (four `natural_t`), `count`
+    // words long; the kernel writes at most that many.
+    let rc = unsafe {
+        sys::host_statistics(
+            sys::host(),
+            sys::HOST_CPU_LOAD_INFO,
+            ticks.as_mut_ptr().cast(),
+            &mut count,
+        )
+    };
+    // `CPU_STATE_USER`, `_SYSTEM`, `_IDLE`, `_NICE`.
+    (rc == 0 && count == 4).then(|| CpuTicks {
+        user: ticks[0].into(),
+        system: ticks[1].into(),
+        idle: ticks[2].into(),
+        nice: ticks[3].into(),
+    })
+}
+
+/// The machine's physical memory and how much of it is used, in bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryUse {
+    /// `hw.memsize`.
+    pub total: u64,
+    /// What Activity Monitor calls "Memory Used": app memory (anonymous
+    /// pages that are not purgeable), wired memory and the compressor's
+    /// pages. The page cache is not in it.
+    pub used: u64,
+}
+
+/// The machine's memory use now, `None` when a call fails.
+pub fn memory_use() -> Option<MemoryUse> {
+    let total = sysctl_u64(c"hw.memsize")?;
+    let page = sysctl_u64(c"hw.pagesize")?;
+    let mut info = sys::VmStatistics64::default();
+    let mut count = sys::VmStatistics64::COUNT;
+    // SAFETY: as in `vm_counters`.
+    let rc = unsafe {
+        sys::host_statistics64(
+            sys::host(),
+            sys::HOST_VM_INFO64,
+            (&raw mut info).cast(),
+            &mut count,
+        )
+    };
+    (rc == 0).then(|| {
+        let app = u64::from(info.internal_page_count)
+            .saturating_sub(info.purgeable_count.into());
+        let pages =
+            app + u64::from(info.wire_count) + u64::from(info.compressor_page_count);
+        MemoryUse { total, used: (pages * page).min(total) }
+    })
+}
+
+/// Bytes of swap in use (`vm.swapusage`), `None` when the sysctl fails.
+pub fn swap_used() -> Option<u64> {
+    /// `struct xsw_usage`.
+    #[repr(C)]
+    #[derive(Default)]
+    struct XswUsage {
+        total: u64,
+        avail: u64,
+        used: u64,
+        pagesize: u32,
+        encrypted: u32,
+    }
+    let mut usage = XswUsage::default();
+    let mut len = std::mem::size_of::<XswUsage>();
+    // SAFETY: a NUL-terminated name and an output buffer of `len` bytes laid
+    // out as the kernel's `xsw_usage`.
+    let rc = unsafe {
+        sys::sysctlbyname(
+            c"vm.swapusage".as_ptr(),
+            (&raw mut usage).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && len == std::mem::size_of::<XswUsage>()).then_some(usage.used)
+}
+
 /// The name of a [`pressure_level`].
 pub fn pressure_name(level: u32) -> &'static str {
     match level {
@@ -301,6 +413,7 @@ mod sys {
     use std::ffi::{c_char, c_int, c_void};
     use std::sync::OnceLock;
 
+    pub const HOST_CPU_LOAD_INFO: c_int = 3;
     pub const HOST_VM_INFO64: c_int = 4;
     pub const TASK_VM_INFO: c_int = 22;
 
@@ -372,6 +485,12 @@ mod sys {
         pub static mach_task_self_: u32;
         fn mach_host_self() -> u32;
         pub fn host_statistics64(
+            host: u32,
+            flavor: c_int,
+            info: *mut c_int,
+            count: *mut u32,
+        ) -> c_int;
+        pub fn host_statistics(
             host: u32,
             flavor: c_int,
             info: *mut c_int,

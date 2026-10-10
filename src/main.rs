@@ -3,10 +3,12 @@
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
-use clap::Parser;
+use clap::parser::ValueSource;
+use clap::{ArgMatches, CommandFactory as _, FromArgMatches as _, Parser};
 use lily::engine::VisionMode;
 use lily::qwen4exp::NgramStorage;
 use lily::serve::api::{ThinkingBudgets, ThinkingDefaults};
+use lily::serve::dashboard::settings::FlagValue;
 use lily::serve::{SamplingOverrides, ServeOptions, parse_duration_secs};
 
 /// The thinking budget by reasoning effort unless `--thinking-budget` says
@@ -304,6 +306,38 @@ fn default_disk_cache_dir() -> PathBuf {
     home.join("Library").join("Caches").join("lily").join("sessions")
 }
 
+/// Every argument of the command line as the dashboard's settings view
+/// shows it: the text given (a switch given without a value reads `true`)
+/// and clap's default, `--disk-cache-dir`'s computed one included.
+fn flag_values(matches: &ArgMatches) -> Vec<FlagValue> {
+    Cli::command()
+        .get_arguments()
+        .map(|arg| {
+            let name = arg.get_id().as_str();
+            let given = (matches.value_source(name) == Some(ValueSource::CommandLine))
+                .then(|| {
+                    matches
+                        .get_raw(name)
+                        .and_then(|mut values| values.next())
+                        .map_or_else(
+                            || "true".to_owned(),
+                            |v| v.to_string_lossy().into_owned(),
+                        )
+                });
+            let default = match name {
+                "disk_cache_dir" => {
+                    Some(default_disk_cache_dir().display().to_string())
+                }
+                _ => arg
+                    .get_default_values()
+                    .first()
+                    .map(|v| v.to_string_lossy().into_owned()),
+            };
+            FlagValue { name: name.to_owned(), given, default }
+        })
+        .collect()
+}
+
 /// Exits 75 when another lily instance holds the lock (`lily::instance`), 1
 /// on any other error.
 fn main() -> std::process::ExitCode {
@@ -311,7 +345,8 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     let options = ServeOptions {
         bind: cli.bind,
         max_seq: cli.max_seq,
@@ -366,6 +401,7 @@ fn run() -> Result<()> {
         pin_weights: cli.pin_weights,
         pin_hold_secs: parse_duration_secs(&cli.pin_hold)?,
         inject_metal_fault: cli.debug_inject_metal_fault,
+        flags: flag_values(&matches),
     };
     lily::serve::run(&cli.model, options)
 }
@@ -394,6 +430,51 @@ mod tests {
         assert_eq!((cli.kv_cache, cli.max_batch), (Some(KvFormat::Bf16), Some(1)));
         assert!(
             Cli::try_parse_from(["lily", "--model", "m", "--kv-cache", "q4"]).is_err()
+        );
+    }
+
+    /// The dashboard's settings view names flags by the `Cli` field: a
+    /// renamed flag must not leave a setting that is never found.
+    #[test]
+    fn every_dashboard_setting_is_a_flag() {
+        let command = Cli::command();
+        for name in lily::serve::dashboard::settings::names() {
+            assert!(
+                command.get_arguments().any(|a| a.get_id() == name),
+                "the dashboard lists {name}, which is not a flag"
+            );
+        }
+    }
+
+    #[test]
+    fn flag_values_say_what_was_given_and_what_the_default_is() {
+        let matches = Cli::command()
+            .try_get_matches_from([
+                "lily",
+                "--model",
+                "m",
+                "--idle-unload",
+                "30m",
+                "--ngram-lock",
+                "--thinking-nudges",
+                "false",
+            ])
+            .expect("parse");
+        let flags = flag_values(&matches);
+        let flag =
+            |name: &str| flags.iter().find(|f| f.name == name).expect(name).clone();
+        let given = |name: &str| flag(name).given;
+        let default = |name: &str| flag(name).default;
+        assert_eq!(
+            (given("idle_unload"), default("idle_unload")),
+            (Some("30m".into()), Some("0".into()))
+        );
+        assert_eq!(given("ngram_lock").as_deref(), Some("true"));
+        assert_eq!(given("thinking_nudges").as_deref(), Some("false"));
+        assert_eq!((given("pin_hold"), default("pin_hold")), (None, Some("1m".into())));
+        assert_eq!((given("temperature"), default("temperature")), (None, None));
+        assert!(
+            default("disk_cache_dir").is_some_and(|d| d.ends_with("lily/sessions"))
         );
     }
 }

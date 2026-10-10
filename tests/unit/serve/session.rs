@@ -343,7 +343,8 @@ mod store {
     use anyhow::{Result, bail};
 
     use super::super::{
-        Acquired, DecodeCheckpoints, DiskCopy, Evictions, SessionStore,
+        Acquired, DecodeCheckpoints, DiskCopy, Evictions, Lineage, Lineages,
+        SessionStore,
     };
     use crate::engine::{
         DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, Segment,
@@ -587,11 +588,10 @@ mod store {
         let reused = acquired.reused;
         let mut session = std::mem::replace(
             &mut acquired.session,
-            super::super::Session::new(State {
-                data: vec![],
-                recurrent: 0,
-                capacity: 0,
-            }),
+            super::super::Session::new(
+                State { data: vec![], recurrent: 0, capacity: 0 },
+                Lineage { id: 0, created_ms: 0 },
+            ),
         );
         assert_eq!(session.state.pos(), reused);
         session.state.feed(&prompt[reused..n - 1]);
@@ -882,11 +882,10 @@ mod store {
         let reused = acquired.reused;
         let mut session = std::mem::replace(
             &mut acquired.session,
-            super::super::Session::new(State {
-                data: vec![],
-                recurrent: 0,
-                capacity: 0,
-            }),
+            super::super::Session::new(
+                State { data: vec![], recurrent: 0, capacity: 0 },
+                Lineage { id: 0, created_ms: 0 },
+            ),
         );
         session.state.feed(&prompt[reused..at]);
         // The position must be the state's: anything else is refused.
@@ -1070,11 +1069,10 @@ mod store {
         let reused = acquired.reused;
         let mut session = std::mem::replace(
             &mut acquired.session,
-            super::super::Session::new(State {
-                data: vec![],
-                recurrent: 0,
-                capacity: 0,
-            }),
+            super::super::Session::new(
+                State { data: vec![], recurrent: 0, capacity: 0 },
+                Lineage { id: 0, created_ms: 0 },
+            ),
         );
         session.state.feed(&prompt[reused..n - 1]);
         let snapshot = session.state.snapshot(&f.ctx).expect("snapshot");
@@ -1286,5 +1284,135 @@ mod store {
         let cut = f.store.entries.iter().find(|s| s.tokens == next);
         assert_holds(&cut.expect("cut back").state, &next);
         gate.store(false, Ordering::Release);
+    }
+
+    /// The lineage id of the resident session whose prompt starts at `seed`.
+    fn resident_lineage(f: &Fixture, seed: u32) -> Option<u64> {
+        f.store
+            .entries
+            .iter()
+            .find(|s| s.tokens.first() == Some(&(seed * 1000)))
+            .map(|s| s.lineage.id)
+    }
+
+    #[test]
+    fn a_lineage_is_kept_by_an_extension_and_new_for_a_new_session_or_a_fork() {
+        let mut f = fixture("lineage-resident", 2_000_000, None);
+        let a = prompt(1, 300);
+        serve(&mut f, &a);
+        let id_a = resident_lineage(&f, 1).expect("a");
+        serve(&mut f, &prompt(2, 300));
+        let id_b = resident_lineage(&f, 2).expect("b");
+        assert!(id_b > id_a, "a new session takes the next id");
+
+        // Extending the live end keeps the lineage.
+        let mut longer = a.clone();
+        longer.extend(prompt(9, 20));
+        let (acquired, _) = serve(&mut f, &longer);
+        assert_eq!((acquired.reused, acquired.forked), (300, false));
+        assert_eq!(resident_lineage(&f, 1), Some(id_a));
+
+        // A prompt that leaves the lineage at its first checkpoint (299,
+        // before the latest request's answer) forks: a lineage of its own,
+        // and the original keeps its id.
+        let mut fork = a[..299].to_vec();
+        fork.extend(prompt(7, 30));
+        let (acquired, _) = serve(&mut f, &fork);
+        assert_eq!((acquired.reused, acquired.forked), (299, true));
+        let ids: Vec<u64> = f.store.entries.iter().map(|s| s.lineage.id).collect();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains(&id_a) && ids.contains(&id_b));
+        assert!(ids.iter().all(|&id| id == id_a || id == id_b || id > id_b));
+        // The view lists each once, with its tier.
+        let view = f.store.entries_view();
+        assert_eq!(view.len(), 3);
+        assert!(view.iter().all(|e| !e.on_disk && e.lineage.is_some()));
+    }
+
+    #[test]
+    fn a_lineage_survives_the_disk_tier_and_the_counter_starts_above_it() {
+        // One 300-token session fits: the second evicts the first to disk.
+        let mut f = fixture("lineage-disk", 400_000, None);
+        let a = prompt(1, 300);
+        serve(&mut f, &a);
+        let id_a = resident_lineage(&f, 1).expect("a");
+        serve(&mut f, &prompt(2, 300));
+        let disk = f.store.disk().expect("disk");
+        assert_eq!(disk.len(), 1);
+        assert_eq!(disk.entries()[0].lineage.map(|l| l.id), Some(id_a));
+        assert_eq!(disk.max_lineage(), Some(id_a));
+        let view = f.store.entries_view();
+        assert!(
+            view.iter().any(|e| e.on_disk && e.lineage.map(|l| l.id) == Some(id_a))
+        );
+
+        // A store opened over the same tier (a restart) hands out ids above
+        // every id on disk, through its own counter or the process's.
+        let reopened = DiskStore::open(&f.root, "fake", 1 << 30, 0).expect("reopen");
+        assert_eq!(reopened.max_lineage(), Some(id_a));
+        let counter = Arc::new(Lineages::default());
+        let restarted = SessionStore::<Model>::new(1 << 30, 16, 3)
+            .with_disk(reopened)
+            .with_lineages(counter.clone());
+        assert!(counter.next().id > id_a);
+        drop(restarted);
+
+        // Resumed at its live end, the entry is consumed and the session is
+        // the same lineage again.
+        let mut longer = a.clone();
+        longer.extend(prompt(9, 20));
+        let acquired = f.store.acquire(&f.ctx, &Model, &longer, &[], None).expect("a");
+        assert!(acquired.from_disk.is_some());
+        assert!(!acquired.forked);
+        assert_eq!(acquired.session.lineage.id, id_a);
+    }
+
+    #[test]
+    fn a_copy_written_ahead_of_a_checked_out_session_restores_as_a_new_lineage() {
+        // Batching: a request holds A checked out while its copy written
+        // ahead is still on disk, and a second request resumes that copy at
+        // its live end. Two living sessions must not share A's id.
+        let mut f = fixture("lineage-shared", 700_000, Some(300_000));
+        let a = prompt(1, 300);
+        serve(&mut f, &a);
+        serve(&mut f, &prompt(2, 300));
+        assert_eq!(settle(&mut f), 1, "A is written ahead");
+        let id_a = resident_lineage(&f, 1).expect("a");
+
+        let mut first = a.clone();
+        first.extend(prompt(8, 20));
+        let held = f.store.acquire(&f.ctx, &Model, &first, &[], None).expect("first");
+        assert_eq!((held.reused, held.from_disk.is_some()), (300, false), "A itself");
+        assert_eq!(held.session.lineage.id, id_a);
+        assert!(f.store.lineage_held(id_a), "checked out");
+
+        let mut second = a.clone();
+        second.extend(prompt(9, 20));
+        let copy = f.store.acquire(&f.ctx, &Model, &second, &[], None).expect("second");
+        assert!(copy.from_disk.is_some() && !copy.forked, "the copy, at its live end");
+        assert_ne!(copy.session.lineage.id, id_a, "a lineage of its own");
+
+        // A request that fails drops its session: no longer held.
+        drop(held);
+        assert!(!f.store.lineage_held(id_a));
+        drop(copy);
+    }
+
+    #[test]
+    fn the_lineage_counter_starts_from_the_clock_and_above_the_disk() {
+        let counter = Lineages::starting_at(1_760_000_000_000);
+        assert_eq!(counter.next().id, 1_760_000_000_000_000);
+        assert_eq!(counter.next().id, 1_760_000_000_000_001);
+        // Below the seed, the disk does not move it; above it, it does.
+        counter.raise_above(5);
+        assert_eq!(counter.next().id, 1_760_000_000_000_002);
+        counter.raise_above(1_760_000_000_000_900);
+        assert_eq!(counter.next().id, 1_760_000_000_000_901);
+        // A later start begins above everything an earlier one could have
+        // handed out at under 1000 ids per millisecond; JSON keeps it exact.
+        let later = Lineages::starting_at(1_760_000_000_001);
+        assert!(later.next().id > 1_760_000_000_000_901);
+        let now = Lineages::default().next().id;
+        assert!((1_760_000_000_000_000..1 << 53).contains(&now));
     }
 }

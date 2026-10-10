@@ -75,10 +75,21 @@
 //! ([`shared_prefix`]), the token prefix they share is cut back to the start
 //! of the first span one has that the other does not match exactly. A
 //! text-only lineage has no spans and matches exactly as before.
+//!
+//! **Lineage ids** (docs/dashboard.md § 4.2). Every session carries a
+//! [`Lineage`]: an id from the process's [`Lineages`] counter, given when the
+//! session is created and kept while it is extended or cut back in place,
+//! written to the disk tier with it and taken back when a prompt resumes the
+//! entry at its live end, unless a session that still lives holds the same
+//! id (resident, parked, or checked out by a request: the entry is then a
+//! copy written ahead of it, and the restored session is a lineage of its
+//! own). A fork (resident, from a disk entry's earlier checkpoint, or from a
+//! durable entry) is a new lineage, and so is every durable prefix entry. The
+//! id is for the dashboard only; nothing in the cache's decisions reads it.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -106,6 +117,99 @@ const DIVERGENT_TAIL_TOKENS: usize = 16;
 /// them): enough to follow what the client does now, few enough that one
 /// odd request stops mattering soon.
 const RECENT_NEW_SESSIONS: usize = 8;
+
+/// A session's identity for the dashboard (see the module docs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lineage {
+    pub id: u64,
+    /// When the lineage was created, unix milliseconds.
+    pub created_ms: u64,
+}
+
+/// Hands out lineage ids: one counter for the process, shared by every
+/// session store the engine builds across reloads and raised above every id
+/// in the disk tier when one is attached ([`SessionStore::with_disk`]).
+///
+/// It starts at the start time in unix milliseconds times 1000, so ids grow
+/// across restarts even when the disk tier forgot the old ones (it was off,
+/// emptied, or the process crashed before spilling), as long as a process
+/// hands out fewer than 1000 ids per millisecond it ran, and the clock does
+/// not go back. The ids stay below 2^53, exact as JSON numbers, until about
+/// the year 2255.
+#[derive(Debug)]
+pub struct Lineages {
+    next: AtomicU64,
+}
+
+impl Default for Lineages {
+    fn default() -> Self {
+        Self::starting_at(super::now_ms())
+    }
+}
+
+impl Lineages {
+    /// A counter seeded for a process started at `now_ms`.
+    pub fn starting_at(now_ms: u64) -> Self {
+        Self { next: AtomicU64::new(now_ms.saturating_mul(1000).max(1)) }
+    }
+
+    /// A new lineage, created now.
+    pub fn next(&self) -> Lineage {
+        Lineage {
+            id: self.next.fetch_add(1, Ordering::Relaxed),
+            created_ms: super::now_ms(),
+        }
+    }
+
+    /// Makes every later id larger than `id`.
+    pub fn raise_above(&self, id: u64) {
+        self.next.fetch_max(id.saturating_add(1), Ordering::Relaxed);
+    }
+}
+
+/// The lineage ids of the sessions requests hold checked out.
+type CheckedOut = Arc<Mutex<Vec<u64>>>;
+
+/// A checked-out session's place in [`CheckedOut`]: from its acquire until
+/// its release, or until it is dropped (a request that failed), which is
+/// what removes the id.
+#[derive(Debug)]
+struct Checkout {
+    ids: CheckedOut,
+    id: u64,
+}
+
+impl Checkout {
+    fn new(ids: &CheckedOut, id: u64) -> Self {
+        ids.lock().unwrap_or_else(|p| p.into_inner()).push(id);
+        Self { ids: ids.clone(), id }
+    }
+}
+
+impl Drop for Checkout {
+    fn drop(&mut self) {
+        let mut ids = self.ids.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(i) = ids.iter().position(|&id| id == self.id) {
+            ids.swap_remove(i);
+        }
+    }
+}
+
+/// One cache entry as the dashboard lists it ([`SessionStore::entries_view`]):
+/// numbers only, never the tokens.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EntryView {
+    /// `None` for a disk entry written before lineage ids existed.
+    pub lineage: Option<Lineage>,
+    /// In the disk tier rather than resident.
+    pub on_disk: bool,
+    pub durable: bool,
+    pub tokens: usize,
+    pub bytes: u64,
+    /// Unix milliseconds of the last use: the release of the request that
+    /// last held a resident session, the last store or hit of a disk entry.
+    pub last_used_ms: u64,
+}
 
 /// One image of a lineage, as the caches identify it: where its
 /// placeholders sit, what the tower was given (the grid) and what the pixel
@@ -475,6 +579,11 @@ pub struct Session<M: LanguageModel> {
     /// Created by the request that holds it (not an extension of a resident
     /// session), so its size at release counts toward the headroom.
     born: bool,
+    pub lineage: Lineage,
+    /// Unix milliseconds of the last release (the creation until then).
+    last_used_ms: u64,
+    /// Set while a request holds the session (see [`Checkout`]).
+    checkout: Option<Checkout>,
 }
 
 /// Whether a resident session's current contents are on disk already.
@@ -491,7 +600,7 @@ enum DiskCopy {
 }
 
 impl<M: LanguageModel> Session<M> {
-    fn new(state: M::State) -> Self {
+    fn new(state: M::State, lineage: Lineage) -> Self {
         Self {
             tokens: Vec::new(),
             images: Vec::new(),
@@ -503,6 +612,9 @@ impl<M: LanguageModel> Session<M> {
             last_used: 0,
             disk: DiskCopy::None,
             born: true,
+            lineage,
+            last_used_ms: lineage.created_ms,
+            checkout: None,
         }
     }
 
@@ -829,6 +941,10 @@ pub struct SessionStore<M: LanguageModel> {
     /// being acquired or released (the batch scheduler's rows, see
     /// [`Self::set_in_flight_bytes`]); 0 when one request runs at a time.
     in_flight_bytes: usize,
+    /// Where new sessions' lineage ids come from.
+    lineages: Arc<Lineages>,
+    /// The lineages of the sessions requests hold checked out.
+    checked_out: CheckedOut,
     /// Tests: while set, a writer thread waits before writing (cancellable).
     #[cfg(test)]
     write_gate: Option<Arc<AtomicBool>>,
@@ -855,14 +971,29 @@ impl<M: LanguageModel> SessionStore<M> {
             recent_new: VecDeque::with_capacity(RECENT_NEW_SESSIONS),
             evictions: Evictions::default(),
             in_flight_bytes: 0,
+            lineages: Arc::new(Lineages::default()),
+            checked_out: CheckedOut::default(),
             #[cfg(test)]
             write_gate: None,
         }
     }
 
-    /// Attaches the disk tier.
+    /// Attaches the disk tier; later lineage ids are larger than any in it.
     pub fn with_disk(mut self, disk: DiskStore) -> Self {
+        if let Some(max) = disk.max_lineage() {
+            self.lineages.raise_above(max);
+        }
         self.disk = Some(disk);
+        self
+    }
+
+    /// Takes new sessions' lineage ids from `lineages` (the process's
+    /// counter, which outlives this store), raised above the disk tier's.
+    pub fn with_lineages(mut self, lineages: Arc<Lineages>) -> Self {
+        if let Some(max) = self.disk.as_ref().and_then(DiskStore::max_lineage) {
+            lineages.raise_above(max);
+        }
+        self.lineages = lineages;
         self
     }
 
@@ -940,6 +1071,50 @@ impl<M: LanguageModel> SessionStore<M> {
         self.budget_bytes
     }
 
+    pub fn max_sessions(&self) -> usize {
+        self.max_sessions
+    }
+
+    /// Every entry, resident (the one being written ahead included) and on
+    /// disk, for the dashboard. A disk entry that is the written-ahead copy
+    /// of a resident session is the same lineage at the same state and is
+    /// left out (its bytes are still the disk tier's).
+    pub fn entries_view(&self) -> Vec<EntryView> {
+        let resident = self.entries.iter().chain(self.parked());
+        let copies: Vec<&str> = resident
+            .clone()
+            .filter_map(|s| match &s.disk {
+                DiskCopy::Written(id) => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let mut views: Vec<EntryView> = resident
+            .map(|s| EntryView {
+                lineage: Some(s.lineage),
+                on_disk: false,
+                durable: false,
+                tokens: s.tokens.len(),
+                bytes: s.bytes() as u64,
+                last_used_ms: s.last_used_ms,
+            })
+            .collect();
+        if let Some(disk) = &self.disk {
+            views.extend(
+                disk.entries().iter().filter(|e| !copies.contains(&e.id.as_str())).map(
+                    |e| EntryView {
+                        lineage: e.lineage,
+                        on_disk: true,
+                        durable: e.durable,
+                        tokens: e.tokens.len(),
+                        bytes: e.bytes,
+                        last_used_ms: e.last_used.saturating_mul(1000),
+                    },
+                ),
+            );
+        }
+        views
+    }
+
     /// GPU bytes of every session held, the one being written ahead included.
     pub fn used_bytes(&self) -> usize {
         self.entries.iter().chain(self.parked()).map(Session::bytes).sum()
@@ -1003,7 +1178,16 @@ impl<M: LanguageModel> SessionStore<M> {
         acquired.agreement = agreement;
         acquired.divergent_tail = divergent_tail;
         acquired.evictions = std::mem::take(&mut self.evictions);
+        acquired.session.checkout =
+            Some(Checkout::new(&self.checked_out, acquired.session.lineage.id));
         Ok(acquired)
+    }
+
+    /// Whether a session that lives holds lineage `id`: resident, parked
+    /// for a write ahead, or checked out by a request.
+    fn lineage_held(&self, id: u64) -> bool {
+        self.entries.iter().chain(self.parked()).any(|s| s.lineage.id == id)
+            || self.checked_out.lock().unwrap_or_else(|p| p.into_inner()).contains(&id)
     }
 
     /// [`Self::acquire`] without the agreement: picks the lineage and builds
@@ -1061,7 +1245,7 @@ impl<M: LanguageModel> SessionStore<M> {
 
         let Some((index, resume_at)) = best else {
             let state = model.new_state(ctx, prompt.len())?;
-            let session = Session::new(state);
+            let session = Session::new(state, self.lineages.next());
             self.trim(ctx, session.bytes());
             return Ok(Acquired::fresh(session));
         };
@@ -1106,7 +1290,7 @@ impl<M: LanguageModel> SessionStore<M> {
             .clone();
         state.copy_prefix_from(ctx, &source.state, resume_at)?;
         state.restore(ctx, &checkpoint.snapshot)?;
-        let mut session = Session::new(state);
+        let mut session = Session::new(state, self.lineages.next());
         session.tokens = source.tokens[..resume_at].to_vec();
         session.images = images_within(&source.images, resume_at);
         session.checkpoints.push(checkpoint);
@@ -1116,9 +1300,11 @@ impl<M: LanguageModel> SessionStore<M> {
 
     /// Builds a session from disk entry `id` resumed at `pos`: the per-token
     /// caches up to `pos` and the checkpoint there. A live-end hit consumes
-    /// the entry; a checkpoint hit forks from it and leaves it on disk. A
-    /// durable prefix entry is forked from even at its live end: it exists to
-    /// be hit again, and every hit is a lineage of its own.
+    /// the entry and takes its lineage back (a new one for an entry written
+    /// before lineage ids: it is live again from here); a checkpoint hit
+    /// forks from it and leaves it on disk. A durable prefix entry is forked
+    /// from even at its live end: it exists to be hit again, and every hit
+    /// is a lineage of its own.
     fn acquire_from_disk(
         &mut self,
         ctx: &MetalContext,
@@ -1129,6 +1315,15 @@ impl<M: LanguageModel> SessionStore<M> {
         len: usize,
     ) -> Result<Acquired<M>> {
         let started = Instant::now();
+        // An entry whose lineage a living session holds is a copy written
+        // ahead of that session (a request has it checked out, or it is
+        // resident): restored, it is a lineage of its own.
+        let lineage = self
+            .disk
+            .as_ref()
+            .and_then(|d| d.entries().iter().find(|e| e.id == id))
+            .and_then(|e| e.lineage)
+            .filter(|l| !self.lineage_held(l.id));
         let disk = self.disk.as_mut().expect("disk tier");
         let entry = disk
             .entries()
@@ -1160,7 +1355,7 @@ impl<M: LanguageModel> SessionStore<M> {
                 );
                 disk.remove(id);
                 let state = model.new_state(ctx, prompt.len())?;
-                let session = Session::new(state);
+                let session = Session::new(state, self.lineages.next());
                 self.trim(ctx, session.bytes());
                 return Ok(Acquired::fresh(session));
             }
@@ -1171,7 +1366,11 @@ impl<M: LanguageModel> SessionStore<M> {
         } else {
             disk.remove(id);
         }
-        let mut session = Session::new(state);
+        let lineage = match lineage {
+            Some(lineage) if !forked => lineage,
+            _ => self.lineages.next(),
+        };
+        let mut session = Session::new(state, lineage);
         session.tokens = tokens;
         session.images = images;
         session
@@ -1218,6 +1417,7 @@ impl<M: LanguageModel> SessionStore<M> {
             tokens,
             &images_within(images, n),
             cache_key,
+            Some(self.lineages.next()),
             &[n],
             &mut |w| state.write_prefix(n, w),
             &mut |_, w| snapshot.write_to(w),
@@ -1454,6 +1654,7 @@ impl<M: LanguageModel> SessionStore<M> {
                     cache_key: session.cache_key.as_deref(),
                     checkpoints: &writing.positions,
                     durable: false,
+                    lineage: Some(session.lineage),
                 };
                 match disk.commit(reserved, &new, bytes) {
                     Ok(Some(id)) => {
@@ -1585,6 +1786,7 @@ impl<M: LanguageModel> SessionStore<M> {
                         cache_key: session.cache_key.as_deref(),
                         checkpoints: &plan.positions,
                         durable: false,
+                        lineage: Some(session.lineage),
                     },
                     bytes,
                 ),
@@ -1636,6 +1838,8 @@ impl<M: LanguageModel> SessionStore<M> {
         cache_key: Option<&str>,
     ) -> Evictions {
         self.evictions = Evictions::default();
+        // No longer checked out, whatever happens to it below.
+        session.checkout = None;
         self.collect_finished();
         if session.state.pos() != session.tokens.len() || session.tokens.is_empty() {
             return std::mem::take(&mut self.evictions);
@@ -1664,6 +1868,7 @@ impl<M: LanguageModel> SessionStore<M> {
         }
         self.clock = self.clock.wrapping_add(1);
         session.last_used = self.clock;
+        session.last_used_ms = super::now_ms();
         session.cache_key = cache_key.map(str::to_owned);
         self.entries.push(session);
         while self.len() > self.max_sessions

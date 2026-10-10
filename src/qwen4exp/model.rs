@@ -4915,6 +4915,23 @@ impl LanguageModel for Qwen4ExpModel {
         Qwen4ExpModel::expert_cache_stats(self)
     }
 
+    fn expert_cache_slots(&self) -> Option<usize> {
+        self.weights.expert_cache.as_ref().map(|c| c.n_slots())
+    }
+
+    fn prefill_chunk_tokens(&self) -> Option<usize> {
+        Some(self.prefill_chunk)
+    }
+
+    fn ngram_table_bytes(&self) -> Option<u64> {
+        Some(match self.ple_table()? {
+            NgramTable::Paged(table) => table.bytes(),
+            NgramTable::Resident(t) => {
+                (t.codes.byte_len() + t.scales.byte_len() + t.biases.byte_len()) as u64
+            }
+        })
+    }
+
     fn load(ctx: &MetalContext, dir: &Path, options: &LoadOptions) -> Result<Self> {
         // `LILY_EXPERT_SLOTS` overrides the option (measurement on machines
         // that fit the checkpoint).
