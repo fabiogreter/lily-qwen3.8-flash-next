@@ -212,6 +212,12 @@ pub struct MetalContext {
     /// Set while a gated pass still has parts to submit: later submissions
     /// wait so the queue keeps program order ([`ComputePass::gate_host_waits`]).
     feeding: Arc<Feeding>,
+    /// How long a gated pass's feeder waits at one gate before it faults
+    /// the context ([`GATE_PATIENCE`]; tests shorten it).
+    gate_patience: Duration,
+    /// Tests: the next gated passes find no feeder thread.
+    #[cfg(test)]
+    fail_feeder_spawn: Cell<bool>,
     /// First GPU error the commit feedback reported, surfaced by the next
     /// wait or commit.
     fault: Arc<Fault>,
@@ -246,7 +252,7 @@ impl MetalContext {
             .ok_or_else(|| anyhow!("failed to create a Metal 4 command queue (macOS 26 or later is required)"))?;
         let residency = Rc::new(Residency::new(&device)?);
         queue.addResidencySet(&residency.set);
-        let fence = SharedEvent::new(&device)?;
+        let fence = SharedEvent::new(&device, false)?;
         let pool = Rc::new(Pool {
             device: device.clone(),
             residency: residency.clone(),
@@ -261,6 +267,9 @@ impl MetalContext {
             fence_value: AtomicU64::new(0),
             submit: Arc::new(Mutex::new(())),
             feeding: Arc::default(),
+            gate_patience: GATE_PATIENCE,
+            #[cfg(test)]
+            fail_feeder_spawn: Cell::new(false),
             fault: Arc::new(Fault::default()),
             pipelines: Mutex::new(HashMap::new()),
             built: AtomicU64::new(0),
@@ -399,6 +408,25 @@ impl MetalContext {
         self.residency.new_buffer_mapped(&self.device, path, offset, len)
     }
 
+    /// A shared buffer over `len` bytes of host memory at `ptr`, not copied
+    /// and not freed by Metal: the caller keeps the memory, so it can
+    /// outlive the buffer and this context (and be written by threads that
+    /// never see either). Not recorded ([`Self::record_buffers`]).
+    ///
+    /// # Safety
+    ///
+    /// `ptr` is page-aligned, `len` a nonzero multiple of the page size, and
+    /// the memory stays allocated until the buffer is dropped and every pass
+    /// that used it has completed.
+    pub unsafe fn new_buffer_no_copy(
+        &self,
+        ptr: NonNull<c_void>,
+        len: usize,
+    ) -> Result<Buffer> {
+        // SAFETY: as documented.
+        unsafe { self.residency.new_buffer_no_copy(&self.device, ptr, len) }
+    }
+
     pub fn new_buffer_with_bytes(&self, bytes: &[u8]) -> Result<Buffer> {
         let buf = self.new_buffer(bytes.len())?;
         // SAFETY: the buffer was just allocated with exactly `bytes.len()` bytes.
@@ -453,7 +481,16 @@ impl MetalContext {
     /// least the awaited value. Lets a pass be committed before all of its
     /// inputs exist.
     pub fn new_shared_event(&self) -> Result<SharedEvent> {
-        SharedEvent::new(&self.device)
+        SharedEvent::new(&self.device, false)
+    }
+
+    /// Like [`Self::new_shared_event`], for an event whose waits can block
+    /// long enough to time out (the expert cache's `ready`): its host
+    /// signals are logged, and every pass's commit feedback checks that the
+    /// work behind each wait on it held until the host's signal ([`Watch`]).
+    /// Waits on other events are submitted and checked as before.
+    pub fn new_watched_event(&self) -> Result<SharedEvent> {
+        SharedEvent::new(&self.device, true)
     }
 
     /// Highest supported Apple GPU family number (10 for M5-class with
@@ -555,12 +592,16 @@ impl MetalContext {
     /// 130 ms were released, so nothing relies on that. No wait may block
     /// for seconds after its submission: a pass whose waits can add up to
     /// that is gated ([`ComputePass::gate_host_waits`]), and every pass's
-    /// commit feedback checks that the work behind each wait started only
-    /// after the host signalled it ([`Watch`]); a wait that did not is
-    /// recorded as a fault.
+    /// commit feedback checks that the work behind each wait on a watched
+    /// event ([`Self::new_watched_event`]) started only after the host
+    /// signalled it ([`Watch`]); a wait that did not is recorded as a fault.
+    /// The other waits (a parked pass's [`ComputePass::wait_event`] on its
+    /// first input) block for a pass and the host's per-token work, and are
+    /// left unwatched as before.
     fn submit(&self, program: &[Item], feedback: &Arc<Feedback>) -> Result<u64> {
-        self.fault.check()?;
+        // A feeder that stopped at a fault ends its feeding: check after.
         self.feeding.wait_idle(&self.fault)?;
+        self.fault.check()?;
         let _guard =
             self.submit.lock().map_err(|e| anyhow!("submit lock poisoned: {e}"))?;
         self.residency.flush();
@@ -574,14 +615,17 @@ impl MetalContext {
     /// to its first wait now, the rest from a feeder thread, each part that
     /// begins at a wait only once the host has signalled that wait's event
     /// to its value. Returns the fence value the last part signals, the
-    /// items submitted now, and the feeder (which returns the others).
+    /// items submitted so far, and the feeder (which returns the others).
+    /// When no feeder thread can be started this thread feeds the pass
+    /// before returning (the waits' events are signalled by another thread,
+    /// [`ComputePass::gate_host_waits`]), and there is no feeder.
     fn submit_gated(
         &self,
         mut program: Vec<Item>,
         feedback: &Arc<Feedback>,
-    ) -> Result<(u64, Vec<Item>, FeederHandle)> {
-        self.fault.check()?;
+    ) -> Result<(u64, Vec<Item>, Option<FeederHandle>)> {
         self.feeding.wait_idle(&self.fault)?;
+        self.fault.check()?;
         let first = program
             .iter()
             .position(|item| matches!(item, Item::Wait(..)))
@@ -603,38 +647,50 @@ impl MetalContext {
         let feeder = Feeder {
             queue: SendQueue(self.queue.clone()),
             submit: self.submit.clone(),
+            feeding: self.feeding.clone(),
             fault: self.fault.clone(),
             fence: self.fence.clone(),
             fence_value: value,
             feedback: feedback.clone(),
             next_cmd,
             items: SendItems(rest),
+            patience: self.gate_patience,
         };
-        let feeding = self.feeding.clone();
-        let spawned = std::thread::Builder::new().name("lily-gated-pass".into()).spawn(
-            move || {
-                let fault = feeder.fault.clone();
-                let (items, result) = feeder.run();
-                if let Err(e) = &result {
-                    // The rest of the pass was not submitted: its fence is
-                    // never signalled and whoever waits on the host events
-                    // it would have reached never sees them. A fault makes
-                    // every wait on the context end with an error instead.
-                    fault.record(format!("a gated pass stopped feeding: {e:#}"));
-                }
-                feeding.end();
-                (items, result)
+        // The feeder reaches its thread through a channel, not the closure,
+        // so it is still here when the thread cannot be started.
+        let (tx, rx) = std::sync::mpsc::channel::<Feeder>();
+        let feeder = match self.spawn_feeder(rx) {
+            Ok(handle) => match tx.send(feeder) {
+                Ok(()) => return Ok((value, program, Some(FeederHandle(handle)))),
+                Err(std::sync::mpsc::SendError(feeder)) => feeder,
             },
-        );
-        match spawned {
-            Ok(handle) => Ok((value, program, FeederHandle(handle))),
             Err(e) => {
-                self.feeding.end();
-                self.fault
-                    .record(format!("could not start a gated pass's feeder: {e}"));
-                bail!("could not start a gated pass's feeder: {e}")
+                eprintln!(
+                    "metal: could not start a gated pass's feeder ({e}); feeding it from the committing thread"
+                );
+                feeder
             }
+        };
+        // Errors are the context's fault now, which the pass's wait reports;
+        // the items submitted must be kept until then either way.
+        let (items, _) = feeder.run();
+        program.extend(items.0);
+        Ok((value, program, None))
+    }
+
+    /// Starts a gated pass's feeder thread, which takes its [`Feeder`] from
+    /// `rx`.
+    fn spawn_feeder(
+        &self,
+        rx: std::sync::mpsc::Receiver<Feeder>,
+    ) -> std::io::Result<std::thread::JoinHandle<FeederResult>> {
+        #[cfg(test)]
+        if self.fail_feeder_spawn.get() {
+            return Err(std::io::Error::other("injected for the test"));
         }
+        std::thread::Builder::new()
+            .name("lily-gated-pass".into())
+            .spawn(move || rx.recv().ok().map(Feeder::run))
     }
 
     /// Blocks until the fence reaches `value`, bailing early on a reported
@@ -767,6 +823,31 @@ impl Residency {
         self.set.addAllocation(ProtocolObject::<dyn MTLAllocation>::from_ref(&*raw));
         self.dirty.set(true);
         Ok((Rc::new(GpuBuffer { raw, address, residency: self.clone() }), inner))
+    }
+
+    /// # Safety
+    ///
+    /// As [`MetalContext::new_buffer_no_copy`].
+    unsafe fn new_buffer_no_copy(
+        self: &Rc<Self>,
+        device: &ProtocolObject<dyn MTLDevice>,
+        ptr: NonNull<c_void>,
+        len: usize,
+    ) -> Result<Buffer> {
+        // SAFETY: as documented; no deallocator, the memory is the caller's.
+        let raw = unsafe {
+            device.newBufferWithBytesNoCopy_length_options_deallocator(
+                ptr,
+                len,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            )
+        }
+        .ok_or_else(|| anyhow!("Metal refused a {len}-byte no-copy buffer"))?;
+        let address = raw.gpuAddress();
+        self.set.addAllocation(ProtocolObject::<dyn MTLAllocation>::from_ref(&*raw));
+        self.dirty.set(true);
+        Ok(Rc::new(GpuBuffer { raw, address, residency: self.clone() }))
     }
 
     fn remove(&self, raw: &ProtocolObject<dyn MTLBuffer>) {
@@ -928,17 +1009,26 @@ impl Arena {
 /// asked for it; the host raises the value once the awaited inputs are in
 /// place. Waits are released in order, so callers use increasing values.
 ///
-/// The host's signals are logged with their time, so the commit feedback
-/// can tell a queue wait the host released from one that timed out
-/// ([`MetalContext::submit`] explains the timeout).
+/// A watched event's host signals ([`MetalContext::new_watched_event`]) are
+/// logged with their time, so the commit feedback can tell a queue wait the
+/// host released from one that timed out ([`MetalContext::submit`] explains
+/// the timeout).
 #[derive(Clone)]
 pub struct SharedEvent {
     event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
-    log: Arc<Mutex<SignalLog>>,
+    /// The host's signals, for a watched event.
+    log: Option<Arc<Mutex<SignalLog>>>,
 }
 
-/// The last [`SignalLog::CAPACITY`] host signals of an event: (value, host
-/// seconds on the [`host_secs`] clock, taken just before the signal).
+/// The last [`SignalLog::CAPACITY`] host signals that raised an event:
+/// (value, host seconds on the [`host_secs`] clock, taken just before the
+/// signal), values rising. A signal at or below the last one logged is not
+/// logged: Metal ignores a lower value, and the event reached an equal one
+/// at the earlier time. The log's lock is held across the signal itself, so
+/// with several signalling threads the log's order is still the event's and
+/// every logged time precedes its signal (lily has one host signaller per
+/// event: the expert cache's service thread for `ready`, and error paths'
+/// [`SharedEvent::release_all`] once it has stopped).
 #[derive(Default)]
 struct SignalLog {
     entries: std::collections::VecDeque<(u64, f64)>,
@@ -950,6 +1040,9 @@ impl SignalLog {
     const CAPACITY: usize = 4096;
 
     fn push(&mut self, value: u64, at: f64) {
+        if self.entries.back().is_some_and(|&(last, _)| value <= last) {
+            return;
+        }
         if self.entries.len() == Self::CAPACITY {
             self.entries.pop_front();
         }
@@ -976,32 +1069,37 @@ unsafe impl Send for SharedEvent {}
 unsafe impl Sync for SharedEvent {}
 
 impl SharedEvent {
-    fn new(device: &ProtocolObject<dyn MTLDevice>) -> Result<Self> {
+    fn new(device: &ProtocolObject<dyn MTLDevice>, watched: bool) -> Result<Self> {
         let event = device
             .newSharedEvent()
             .ok_or_else(|| anyhow!("failed to create shared event"))?;
-        Ok(Self { event, log: Arc::default() })
+        Ok(Self { event, log: watched.then(Arc::default) })
     }
 
     /// Raises the counter to `value` (never lower it: a pass may be waiting
     /// for the current value).
     pub fn signal(&self, value: u64) {
-        self.log_signal(value);
-        self.event.setSignaledValue(value);
-    }
-
-    /// Records a host signal of `value` about to happen.
-    fn log_signal(&self, value: u64) {
-        let at = host_secs();
-        if let Ok(mut log) = self.log.lock() {
-            log.push(value, at);
+        match &self.log {
+            Some(log) => {
+                let mut log = log.lock().unwrap_or_else(|e| e.into_inner());
+                log.push(value, host_secs());
+                self.event.setSignaledValue(value);
+            }
+            None => self.event.setSignaledValue(value),
         }
     }
 
+    /// Whether the event's waits are checked ([`MetalContext::new_watched_event`]).
+    fn watched(&self) -> bool {
+        self.log.is_some()
+    }
+
     /// When the host first signalled `value` or above, while the log holds
-    /// it; `None` for a value only the GPU signalled or one too long ago.
+    /// it; `None` for a value only the GPU signalled, one too long ago, or
+    /// an event that is not watched.
     fn signalled_at(&self, value: u64) -> Option<f64> {
-        self.log.lock().ok().and_then(|log| log.signalled_at(value))
+        let log = self.log.as_ref()?.lock().unwrap_or_else(|e| e.into_inner());
+        log.signalled_at(value)
     }
 
     /// Tests: raises the counter without logging it, the way a queue wait
@@ -1024,8 +1122,7 @@ impl SharedEvent {
     /// Releases every pending and future wait, for error paths that would
     /// otherwise leave a committed pass blocked on the GPU forever.
     pub fn release_all(&self) {
-        self.log_signal(u64::MAX);
-        self.event.setSignaledValue(u64::MAX);
+        self.signal(u64::MAX);
     }
 
     fn as_event(&self) -> &ProtocolObject<dyn MTLEvent> {
@@ -1076,6 +1173,10 @@ fn submit_items(
 struct Feeding {
     busy: Mutex<bool>,
     idle: std::sync::Condvar,
+    /// Tests: per part a feeder submitted, the value of the wait it begins
+    /// at and the host time just before its submission.
+    #[cfg(test)]
+    parts: Mutex<Vec<(u64, f64)>>,
 }
 
 impl Feeding {
@@ -1117,17 +1218,27 @@ unsafe impl Send for SendQueue {}
 struct SendItems(Vec<Item>);
 unsafe impl Send for SendItems {}
 
+/// What a feeder thread returns: the items to keep until completion and how
+/// feeding went (`None` if the thread never got its [`Feeder`]).
+type FeederResult = Option<(SendItems, Result<()>)>;
+
 /// The thread that submits a gated pass's parts; joined by the pass's wait
 /// (or drop), which takes the items back to keep them until completion.
-struct FeederHandle(std::thread::JoinHandle<(SendItems, Result<()>)>);
+struct FeederHandle(std::thread::JoinHandle<FeederResult>);
 
 /// How long a feeder polls a host event before it blocks on it: a hit-only
 /// resolution of the expert cache signals within tens of microseconds, and
 /// a blocked thread wakes some 10 to 20 microseconds late.
 const GATE_SPIN: Duration = Duration::from_micros(200);
 
-/// After this long at one gate a feeder says so once (a host that never
-/// signals would otherwise hang the pass without a word).
+/// After this long at one gate a feeder gives up and faults the context: the
+/// request fails and the engine is reloaded instead of hanging. Ungated, a
+/// queue wait this long would have been released by Metal after 4 s
+/// ([`MetalContext::submit`]). The longest legitimate wait is one layer's
+/// misses in a prefill pass: on average 85 ms a layer for 4 096 rows at
+/// 40 GB, 160 ms for 8 192 rows (7.7 s a pass); allowing the slowest layer
+/// twice the average (not measured), 0.3 s, and 3 s with a drive ten times
+/// slower. 30 s leaves ten times that.
 const GATE_PATIENCE: Duration = Duration::from_secs(30);
 
 /// A gated pass's feeder: the rest of the program, every part of which
@@ -1135,17 +1246,46 @@ const GATE_PATIENCE: Duration = Duration::from_secs(30);
 struct Feeder {
     queue: SendQueue,
     submit: Arc<Mutex<()>>,
+    feeding: Arc<Feeding>,
     fault: Arc<Fault>,
     fence: SharedEvent,
     fence_value: u64,
     feedback: Arc<Feedback>,
     next_cmd: usize,
     items: SendItems,
+    patience: Duration,
+}
+
+/// Ends a feeder's [`Feeding`] however it stops. One that panics faults
+/// the context first, as one that fails does: the rest of its pass was not
+/// submitted, so the pass's fence and the host events it would have reached
+/// never come, and a fault makes every wait on the context end with an
+/// error instead.
+struct EndFeeding {
+    feeding: Arc<Feeding>,
+    fault: Arc<Fault>,
+}
+
+impl Drop for EndFeeding {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.fault.record("a gated pass's feeder panicked".to_owned());
+        }
+        self.feeding.end();
+    }
 }
 
 impl Feeder {
+    /// Submits the rest of the pass; returns its items, to be kept until
+    /// the pass completes, and how it went (a failure is the context's
+    /// fault too).
     fn run(self) -> (SendItems, Result<()>) {
+        let _end =
+            EndFeeding { feeding: self.feeding.clone(), fault: self.fault.clone() };
         let result = self.feed();
+        if let Err(e) = &result {
+            self.fault.record(format!("a gated pass stopped feeding: {e:#}"));
+        }
         (self.items, result)
     }
 
@@ -1164,6 +1304,14 @@ impl Feeder {
             self.fault.check()?;
             let _guard =
                 self.submit.lock().map_err(|e| anyhow!("submit lock poisoned: {e}"))?;
+            #[cfg(test)]
+            if let Item::Wait(_, value) = &items[start] {
+                self.feeding
+                    .parts
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((*value, host_secs()));
+            }
             index = submit_items(
                 &self.queue.0,
                 &items[start..end],
@@ -1179,7 +1327,8 @@ impl Feeder {
         Ok(())
     }
 
-    /// Blocks until the host has raised `event` to `value`.
+    /// Blocks until the host has raised `event` to `value`; fails (with the
+    /// context faulted) after the feeder's patience ([`GATE_PATIENCE`]).
     fn gate(&self, event: &SharedEvent, value: u64) -> Result<()> {
         let began = Instant::now();
         while event.signaled_value() < value {
@@ -1187,15 +1336,16 @@ impl Feeder {
                 std::hint::spin_loop();
                 continue;
             }
-            let mut warned = false;
             while !event.wait_until(value, 50) {
                 self.fault.check()?;
-                if !warned && began.elapsed() > GATE_PATIENCE {
-                    warned = true;
-                    eprintln!(
-                        "metal: a gated pass has waited {:.0} s for a host event to reach {value}",
+                if began.elapsed() > self.patience {
+                    let message = format!(
+                        "a gated pass gave up after {:.1} s waiting for a host event to reach {value}",
                         began.elapsed().as_secs_f64()
                     );
+                    eprintln!("metal: {message}");
+                    self.fault.record(message.clone());
+                    bail!(message);
                 }
             }
             break;
@@ -1321,14 +1471,19 @@ struct Watch {
     value: u64,
 }
 
-/// The waits of `program` that a command buffer follows, in order.
+/// The waits of `program` on watched events
+/// ([`MetalContext::new_watched_event`]) that a command buffer follows, in
+/// order.
 fn watches_of(program: &[Item]) -> Vec<Watch> {
     let mut watches = Vec::new();
     let mut waits: Vec<(SharedEvent, u64)> = Vec::new();
     let mut cmd = 0usize;
     for item in program {
         match item {
-            Item::Wait(event, value) => waits.push((event.clone(), *value)),
+            Item::Wait(event, value) if event.watched() => {
+                waits.push((event.clone(), *value))
+            }
+            Item::Wait(..) => {}
             Item::Cmd(_) => {
                 watches.extend(waits.drain(..).map(|(event, value)| Watch {
                     cmd,
@@ -1346,9 +1501,10 @@ fn watches_of(program: &[Item]) -> Vec<Watch> {
 /// Why the work behind a wait for `value` cannot have waited for the host:
 /// the event was still below `value` when that work had completed
 /// (`now`, read after completion), or the GPU started it at `gpu_start`
-/// before the host's signal (`signalled_at`, taken just before the host
-/// raised the event, so a held wait always starts after it). `None` when
-/// the wait held, or when the host's signal time is no longer known.
+/// more than [`EARLY_START_MARGIN_SECS`] before the host's signal
+/// (`signalled_at`, taken just before the host raised the event, so a held
+/// wait always starts after it). `None` when the wait held, or when the
+/// host's signal time is no longer known.
 fn wait_released_early(
     now: u64,
     value: u64,
@@ -1361,13 +1517,27 @@ fn wait_released_early(
         ));
     }
     match signalled_at {
-        Some(at) if gpu_start > 0.0 && gpu_start < at => Some(format!(
-            "the work behind a wait for {value} started {:.3} ms before the host signalled it",
-            (at - gpu_start) * 1e3
-        )),
+        Some(at) if gpu_start > 0.0 && gpu_start < at - EARLY_START_MARGIN_SECS => {
+            Some(format!(
+                "the work behind a wait for {value} started {:.3} ms before the host signalled it",
+                (at - gpu_start) * 1e3
+            ))
+        }
         _ => None,
     }
 }
+
+/// How much earlier than the host's signal the work behind a wait must have
+/// started to count as released early. Both times are `mach_absolute_time`,
+/// but the GPU's is converted from the GPU's own clock, and a false
+/// positive costs a failed request and an engine reload. Work behind a held
+/// wait started 5 microseconds to 3 ms after the signal, 0.1 ms in the
+/// median (`waits_the_host_releases_are_not_reported_as_timed_out` prints
+/// it): never before it, so the margin is only for disagreement between the
+/// clocks. A timed-out wait is released seconds after its submission, so
+/// this only spares a release that landed within 0.1 ms of the host's own
+/// signal, which the service thread's check of `routed` still counts.
+const EARLY_START_MARGIN_SECS: f64 = 100e-6;
 
 /// What the profile needs besides the timestamps: the pass's label and the
 /// kernel of each command buffer, by submission index.
@@ -1640,7 +1810,9 @@ impl<'a> ComputePass<'a> {
         f(&seg.encoder, inner, &self.ctx.pool)
     }
 
-    /// Puts an empty command buffer right behind the pass's last wait: its
+    /// Puts an empty command buffer right behind the pass's last wait on a
+    /// watched event ([`MetalContext::new_watched_event`]; a pass without
+    /// one, as every pass without the expert cache, is left as it was): its
     /// commit feedback, whose GPU start time shows whether the wait held
     /// ([`Watch`]), then arrives as soon as the wait is passed instead of
     /// after the command buffer that would follow it, which in a decode pass
@@ -1653,8 +1825,9 @@ impl<'a> ComputePass<'a> {
             return Ok(());
         }
         let mut program = self.program.borrow_mut();
-        let Some(last) =
-            program.iter().rposition(|item| matches!(item, Item::Wait(..)))
+        let Some(last) = program
+            .iter()
+            .rposition(|item| matches!(item, Item::Wait(event, _) if event.watched()))
         else {
             return Ok(());
         };
@@ -1991,8 +2164,7 @@ impl<'a> EncodedPass<'a> {
         let feedback = Feedback::new(cmds, profile, watches_of(&program));
         let gated = gated && program.iter().any(|item| matches!(item, Item::Wait(..)));
         let (fence_value, program, feeder) = if gated {
-            let (value, submitted, feeder) = ctx.submit_gated(program, &feedback)?;
-            (value, submitted, Some(feeder))
+            ctx.submit_gated(program, &feedback)?
         } else {
             (ctx.submit(&program, &feedback)?, program, None)
         };
@@ -2183,14 +2355,21 @@ impl PendingPass<'_> {
             // Blocks: the host signals the milestone only after work of its
             // own of unpredictable length. The poll of the pass's end keeps
             // a milestone that is never signalled (an error path that
-            // released the pass's waits) from holding the thread forever.
+            // released the pass's waits) from holding the thread forever;
+            // such a pass is not paced, nor does its length teach the pacer.
+            let mut ended = false;
             while !milestone.wait_until(*reached, MILESTONE_POLL_MS) {
                 if event.signaled_value() >= value {
+                    ended = true;
                     break;
                 }
                 self.ctx.fault.check()?;
             }
-            pacer.begin(Instant::now());
+            if ended {
+                pacer.skip();
+            } else {
+                pacer.begin(Instant::now());
+            }
         }
         if let Some(wake_at) = pacer.wake_at() {
             let now = Instant::now();
@@ -2223,10 +2402,11 @@ impl PendingPass<'_> {
     fn join_feeder(&mut self) -> Result<()> {
         let Some(feeder) = self.feeder.take() else { return Ok(()) };
         match feeder.0.join() {
-            Ok((items, result)) => {
+            Ok(Some((items, result))) => {
                 self.program.extend(items.0);
                 result
             }
+            Ok(None) => bail!("a gated pass's feeder never got its pass"),
             Err(_) => {
                 let message = "a gated pass's feeder panicked";
                 self.ctx.fault.record(message.to_owned());
@@ -2280,6 +2460,12 @@ impl Pacer {
     /// Marks the start of an interval (the pass will run from about now).
     pub fn begin(&mut self, now: Instant) {
         self.began = Some(now);
+    }
+
+    /// Forgets the interval begun last: the wait does not sleep and its
+    /// end is not folded into the estimate.
+    pub fn skip(&mut self) {
+        self.began = None;
     }
 
     /// When to wake for the pass begun last: `None` until an estimate exists.

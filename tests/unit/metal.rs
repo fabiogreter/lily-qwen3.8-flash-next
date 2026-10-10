@@ -922,17 +922,25 @@ fn wake_is_a_fence_signal_that_later_passes_wait_past() {
 }
 
 /// Waits the host releases, early or late, while the queue is blocked on
-/// them or before it gets there, are never taken for timed-out ones.
+/// them or before it gets there, are never taken for timed-out ones. Prints
+/// how long after the host's signal the work behind them started, the
+/// figure `EARLY_START_MARGIN_SECS` is set against.
 #[test]
 fn waits_the_host_releases_are_not_reported_as_timed_out() {
     let ctx = MetalContext::new().expect("metal context");
     let words = 1usize << 16;
     let a = Tensor::zeros(&ctx, &[words], DType::U32).expect("a");
     let b = Tensor::zeros(&ctx, &[words], DType::U32).expect("b");
-    let event = ctx.new_shared_event().expect("event");
+    let event = ctx.new_watched_event().expect("event");
+    let mut margins = Vec::new();
     for i in 1..=60u64 {
+        // Work ahead of the wait, in a pass of its own: the waiting pass
+        // starts with the wait, so its GPU start is the work behind it (the
+        // witness command buffer).
+        let busy = ctx.begin_concurrent().expect("pass");
+        copy_words(&ctx, &busy, &a, &b).expect("copy");
+        let busy = busy.commit().expect("commit");
         let pass = ctx.begin_concurrent().expect("pass");
-        copy_words(&ctx, &pass, &a, &b).expect("copy");
         pass.wait_event(&event, i).expect("wait");
         copy_words(&ctx, &pass, &b, &a).expect("copy");
         let delay = Duration::from_micros([0, 50, 300, 1500][i as usize % 4]);
@@ -942,9 +950,26 @@ fn waits_the_host_releases_are_not_reported_as_timed_out() {
         let pending = pass.commit().expect("commit");
         std::thread::sleep(delay);
         event.signal(i);
-        pending.wait().expect("a released wait reported as timed out");
+        busy.wait().expect("busy pass");
+        let done =
+            pending.wait_retain().expect("a released wait reported as timed out");
+        let start = done.timing().expect("timing").gpu_start_secs;
+        margins.push(start - event.signalled_at(i).expect("the signal is logged"));
     }
     assert!(ctx.fault().is_none(), "{:?}", ctx.fault());
+    margins.sort_by(f64::total_cmp);
+    println!(
+        "work behind a released wait started {:.3} to {:.3} ms after the host's signal (median {:.3})",
+        margins[0] * 1e3,
+        margins[margins.len() - 1] * 1e3,
+        margins[margins.len() / 2] * 1e3
+    );
+    // Causality says above zero; half the margin is left for the clocks.
+    assert!(
+        margins[0] > -EARLY_START_MARGIN_SECS / 2.0,
+        "work started {:.3} ms before the signal",
+        -margins[0] * 1e3
+    );
 }
 
 /// A wait the GPU went past without the host's signal (what a timed-out
@@ -955,7 +980,7 @@ fn a_wait_passed_before_the_host_signal_faults_the_context() {
     let words = 1usize << 16;
     let a = Tensor::zeros(&ctx, &[words], DType::U32).expect("a");
     let b = Tensor::zeros(&ctx, &[words], DType::U32).expect("b");
-    let event = ctx.new_shared_event().expect("event");
+    let event = ctx.new_watched_event().expect("event");
     let pass = ctx.begin().expect("pass");
     pass.wait_event(&event, 1).expect("wait");
     copy_words(&ctx, &pass, &a, &b).expect("copy");
@@ -963,11 +988,47 @@ fn a_wait_passed_before_the_host_signal_faults_the_context() {
     // as made later than the GPU starts the work (its feedback is checked
     // after the host signalled).
     event.signal_unlogged(1);
-    event.log.lock().expect("log").push(1, host_secs() + 10.0);
+    event
+        .log
+        .as_ref()
+        .expect("watched")
+        .lock()
+        .expect("log")
+        .push(1, host_secs() + 10.0);
     let pending = pass.commit().expect("commit");
     let err = pending.wait().expect_err("the early release goes unnoticed");
     assert!(format!("{err:#}").contains("queue wait timed out"), "{err:#}");
     assert!(ctx.fault().is_some());
+}
+
+/// Waits on events that are not watched (the parked pass's, and every wait
+/// without the expert cache) are submitted as before: no witness command
+/// buffer, no check; a wait on a watched event gets both.
+#[test]
+fn only_waits_on_watched_events_are_witnessed() {
+    let ctx = MetalContext::new().expect("metal context");
+    let words = 1usize << 12;
+    let a = Tensor::zeros(&ctx, &[words], DType::U32).expect("a");
+    let b = Tensor::zeros(&ctx, &[words], DType::U32).expect("b");
+    let plain = ctx.new_shared_event().expect("event");
+    let watched = ctx.new_watched_event().expect("event");
+    let cmds = |events: &[&SharedEvent]| {
+        let pass = ctx.begin().expect("pass");
+        for (k, event) in events.iter().enumerate() {
+            pass.wait_event(event, k as u64 + 1).expect("wait");
+            copy_words(&ctx, &pass, &a, &b).expect("copy");
+        }
+        let encoded = pass.end().expect("end");
+        let cmds = encoded.program.iter().filter(|i| matches!(i, Item::Cmd(_))).count();
+        (cmds, watches_of(&encoded.program).len())
+    };
+    assert_eq!(cmds(&[&plain]), (1, 0));
+    assert_eq!(cmds(&[&watched]), (2, 1));
+    assert_eq!(cmds(&[&plain, &watched]), (3, 1));
+    assert_eq!(cmds(&[&watched, &plain]), (3, 1));
+    // An unwatched event logs nothing, so no wait on it can be judged.
+    plain.signal(5);
+    assert_eq!(plain.signalled_at(5), None);
 }
 
 /// A real timed-out wait (about 4 s, see `queue_wait_timeout_probe`) is
@@ -980,7 +1041,7 @@ fn a_real_timed_out_wait_faults_the_context() {
     let words = 1usize << 16;
     let a = Tensor::zeros(&ctx, &[words], DType::U32).expect("a");
     let b = Tensor::zeros(&ctx, &[words], DType::U32).expect("b");
-    let event = ctx.new_shared_event().expect("event");
+    let event = ctx.new_watched_event().expect("event");
     let pass = ctx.begin().expect("pass");
     pass.wait_event(&event, 1).expect("wait");
     copy_words(&ctx, &pass, &a, &b).expect("copy");
@@ -995,11 +1056,15 @@ fn a_real_timed_out_wait_faults_the_context() {
 fn timed_out_wait_rule() {
     // Below the value once the work behind it completed: never waited.
     assert!(wait_released_early(3, 4, None, 10.0).is_some());
-    // Started before the host's signal: released early.
+    // Started well before the host's signal: released early.
     assert!(wait_released_early(4, 4, Some(10.0), 9.999).is_some());
-    // Started after it, or the signal time unknown: held (or unknowable).
+    // Started after it, within the margin before it, or the signal time
+    // unknown: held (or unknowable).
     assert!(wait_released_early(4, 4, Some(10.0), 10.0001).is_none());
+    assert!(wait_released_early(4, 4, Some(10.0), 10.0 - 50e-6).is_none());
     assert!(wait_released_early(9, 4, None, 1.0).is_none());
+    // The event below the value is a timeout whatever the clocks say.
+    assert!(wait_released_early(3, 4, Some(10.0), 10.0001).is_some());
     // No GPU timestamp (a failed command buffer reports zeros).
     assert!(wait_released_early(4, 4, Some(10.0), 0.0).is_none());
 }
@@ -1010,6 +1075,10 @@ fn signal_log_finds_the_first_signal_at_or_above_a_value() {
     assert_eq!(log.signalled_at(1), None);
     log.push(2, 1.0);
     log.push(5, 2.0);
+    // At or below the last value: the event did not move, nothing logged.
+    log.push(5, 2.5);
+    log.push(4, 3.0);
+    assert_eq!(log.entries.len(), 2);
     assert_eq!(log.signalled_at(1), Some(1.0));
     assert_eq!(log.signalled_at(3), Some(2.0));
     assert_eq!(log.signalled_at(5), Some(2.0));
@@ -1023,8 +1092,8 @@ fn signal_log_finds_the_first_signal_at_or_above_a_value() {
     assert_eq!(log.signalled_at(7), Some(7.0));
 }
 
-/// A gated pass's parts run only once the host signalled their waits, in
-/// order, and a pass committed after it waits for its last part.
+/// A gated pass's parts are submitted only once the host signalled their
+/// waits, in order, and a pass committed after it waits for its last part.
 #[test]
 fn gated_pass_submits_each_part_after_its_signal() {
     let ctx = MetalContext::new().expect("metal context");
@@ -1033,7 +1102,7 @@ fn gated_pass_submits_each_part_after_its_signal() {
         (0..4).map(|_| Tensor::zeros(&ctx, &[n], DType::U32).expect("x")).collect();
     let src: Vec<u32> = (0..n as u32).map(|i| i.wrapping_mul(2_654_435_761)).collect();
     x[0].write_bytes(bytemuck::cast_slice(&src)).expect("write");
-    let event = ctx.new_shared_event().expect("event");
+    let event = ctx.new_watched_event().expect("event");
     let reached = ctx.new_shared_event().expect("reached");
     let pass = ctx.begin().expect("pass");
     pass.gate_host_waits();
@@ -1044,18 +1113,8 @@ fn gated_pass_submits_each_part_after_its_signal() {
         }
         copy_words(&ctx, &pass, &x[k as usize], &x[k as usize + 1]).expect("copy");
     }
+    let signaller = gate_signaller(&ctx, &event, &reached, 2);
     let pending = pass.commit().expect("commit");
-    let signaller = {
-        let (event, reached) = (event.clone(), reached.clone());
-        std::thread::spawn(move || {
-            for k in 1..=2u64 {
-                assert!(reached.wait_until(k, 5000), "part {k} never ran");
-                std::thread::sleep(Duration::from_millis(20));
-                // Nothing after the gate was submitted, so nothing ran.
-                event.signal(k);
-            }
-        })
-    };
     // Submitted behind the gated pass: clears its last output, after it.
     let zeros = Tensor::zeros(&ctx, &[n], DType::U32).expect("zeros");
     let later = ctx.begin().expect("later");
@@ -1063,13 +1122,56 @@ fn gated_pass_submits_each_part_after_its_signal() {
     let later = later.commit().expect("commit later");
     pending.wait().expect("gated pass");
     later.wait().expect("later pass");
-    signaller.join().expect("signaller");
+    let signalled = signaller.join().expect("signaller");
     assert_eq!(x[2].to_u32().expect("read"), src);
     assert!(x[3].to_u32().expect("read").iter().all(|&v| v == 0));
     assert!(ctx.fault().is_none(), "{:?}", ctx.fault());
+    assert_parts_after(&ctx, &signalled);
 }
 
-/// Before the gate is opened nothing behind it has run.
+/// A thread that, for each of `parts` gates, waits until the GPU has
+/// signalled `reached` to the gate's value, checks that nothing behind the
+/// gate was submitted 20 ms later, and signals `event`; returns the host
+/// time just before each signal.
+fn gate_signaller(
+    ctx: &MetalContext,
+    event: &SharedEvent,
+    reached: &SharedEvent,
+    parts: u64,
+) -> std::thread::JoinHandle<Vec<f64>> {
+    let (event, reached, feeding) =
+        (event.clone(), reached.clone(), ctx.feeding.clone());
+    std::thread::spawn(move || {
+        let mut signalled = Vec::new();
+        for k in 1..=parts {
+            assert!(reached.wait_until(k, 5000), "part {k} never ran");
+            std::thread::sleep(Duration::from_millis(20));
+            let submitted = feeding.parts.lock().expect("parts").len() as u64;
+            assert_eq!(submitted, k - 1, "a part was submitted before its gate opened");
+            signalled.push(host_secs());
+            event.signal(k);
+        }
+        signalled
+    })
+}
+
+/// Every part of the gated pass on `ctx` was submitted once, in order, after
+/// its gate opened (`signalled`: the host time just before each signal).
+fn assert_parts_after(ctx: &MetalContext, signalled: &[f64]) {
+    let parts = ctx.feeding.parts.lock().expect("parts").clone();
+    assert_eq!(parts.len(), signalled.len(), "{parts:?}");
+    for (k, ((value, at), signal)) in parts.iter().zip(signalled).enumerate() {
+        assert_eq!(*value, k as u64 + 1);
+        assert!(
+            at >= signal,
+            "part {value} submitted {:.3} ms before its signal",
+            (signal - at) * 1e3
+        );
+    }
+}
+
+/// Before the gate is opened nothing behind it was submitted, so nothing
+/// ran.
 #[test]
 fn gated_pass_holds_the_work_behind_a_wait() {
     let ctx = MetalContext::new().expect("metal context");
@@ -1085,10 +1187,124 @@ fn gated_pass_holds_the_work_behind_a_wait() {
     copy_words(&ctx, &pass, &a, &b).expect("copy");
     let pending = pass.commit().expect("commit");
     std::thread::sleep(Duration::from_millis(30));
+    assert!(ctx.feeding.parts.lock().expect("parts").is_empty());
     assert!(b.to_u32().expect("read").iter().all(|&v| v == 0));
+    let signalled = host_secs();
     event.signal(1);
     pending.wait().expect("gated pass");
     assert_eq!(b.to_u32().expect("read"), data);
+    assert_parts_after(&ctx, &[signalled]);
+}
+
+/// Without a feeder thread the committing thread feeds the pass itself:
+/// the commit returns once the last part is submitted, and the pass is the
+/// same.
+#[test]
+fn gated_pass_is_fed_inline_when_no_feeder_thread_starts() {
+    let ctx = MetalContext::new().expect("metal context");
+    ctx.fail_feeder_spawn.set(true);
+    let n = 4096usize;
+    let x: Vec<Tensor> =
+        (0..4).map(|_| Tensor::zeros(&ctx, &[n], DType::U32).expect("x")).collect();
+    let src: Vec<u32> = (0..n as u32).map(|i| i ^ 0x5a5a_5a5a).collect();
+    x[0].write_bytes(bytemuck::cast_slice(&src)).expect("write");
+    let event = ctx.new_watched_event().expect("event");
+    let reached = ctx.new_shared_event().expect("reached");
+    let pass = ctx.begin().expect("pass");
+    pass.gate_host_waits();
+    for k in 0..3u64 {
+        if k > 0 {
+            pass.signal_event(&reached, k).expect("signal");
+            pass.wait_event(&event, k).expect("wait");
+        }
+        copy_words(&ctx, &pass, &x[k as usize], &x[k as usize + 1]).expect("copy");
+    }
+    let signaller = gate_signaller(&ctx, &event, &reached, 2);
+    let pending = pass.commit().expect("commit");
+    assert!(pending.feeder.is_none());
+    assert_eq!(event.signaled_value(), 2, "the commit returned before the last part");
+    pending.wait().expect("gated pass");
+    let signalled = signaller.join().expect("signaller");
+    assert_eq!(x[3].to_u32().expect("read"), src);
+    assert!(ctx.fault().is_none(), "{:?}", ctx.fault());
+    assert_parts_after(&ctx, &signalled);
+}
+
+/// A gate the host never opens faults the context after the feeder's
+/// patience, and everything waiting on the context returns: a pass
+/// committed meanwhile (waiting for the feeder), and the gated pass's drop.
+#[test]
+fn a_gate_never_opened_faults_the_context_after_the_patience() {
+    let mut ctx = MetalContext::new().expect("metal context");
+    ctx.gate_patience = Duration::from_millis(300);
+    let n = 4096usize;
+    let a = Tensor::zeros(&ctx, &[n], DType::U32).expect("a");
+    let b = Tensor::zeros(&ctx, &[n], DType::U32).expect("b");
+    let event = ctx.new_watched_event().expect("event");
+    let pass = ctx.begin().expect("pass");
+    pass.gate_host_waits();
+    copy_words(&ctx, &pass, &a, &b).expect("copy");
+    pass.wait_event(&event, 1).expect("wait");
+    copy_words(&ctx, &pass, &b, &a).expect("copy");
+    let t0 = Instant::now();
+    let pending = pass.commit().expect("commit");
+    let later = ctx.begin().expect("later");
+    copy_words(&ctx, &later, &a, &b).expect("copy");
+    let err = later.commit().map(|_| ()).expect_err("a pass behind a stuck gate");
+    assert!(format!("{err:#}").contains("gave up"), "{err:#}");
+    drop(pending);
+    assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
+    assert!(ctx.fault().is_some_and(|f| f.contains("gave up")), "{:?}", ctx.fault());
+    // Nothing was left blocked on the queue: the event is not needed.
+    assert_eq!(event.signaled_value(), 0);
+}
+
+/// A gated pass holds past Metal's queue wait limit (about 4 s,
+/// `queue_wait_timeout_probe`): nothing behind the wait is on the queue
+/// until the host signals.
+#[test]
+#[ignore = "takes 4.5 s"]
+fn a_gated_wait_holds_past_the_queue_wait_limit() {
+    let ctx = MetalContext::new().expect("metal context");
+    let n = 1usize << 16;
+    let a = Tensor::zeros(&ctx, &[n], DType::U32).expect("a");
+    let b = Tensor::zeros(&ctx, &[n], DType::U32).expect("b");
+    let data: Vec<u32> = (0..n as u32).map(|i| i.wrapping_mul(7)).collect();
+    a.write_bytes(bytemuck::cast_slice(&data)).expect("write");
+    let event = ctx.new_watched_event().expect("event");
+    let pass = ctx.begin().expect("pass");
+    pass.gate_host_waits();
+    pass.wait_event(&event, 1).expect("wait");
+    copy_words(&ctx, &pass, &a, &b).expect("copy");
+    let pending = pass.commit().expect("commit");
+    std::thread::sleep(Duration::from_millis(4500));
+    assert!(b.to_u32().expect("read").iter().all(|&v| v == 0));
+    event.signal(1);
+    pending.wait().expect("a gated wait past 4 s");
+    assert_eq!(b.to_u32().expect("read"), data);
+    assert!(ctx.fault().is_none(), "{:?}", ctx.fault());
+}
+
+/// A paced wait whose pass ends without reaching its milestone is not
+/// paced: no sleep on the pacer's estimate, and the estimate is unchanged.
+#[test]
+fn a_milestone_never_reached_skips_pacing() {
+    let ctx = MetalContext::new().expect("metal context");
+    let n = 4096usize;
+    let a = Tensor::zeros(&ctx, &[n], DType::U32).expect("a");
+    let b = Tensor::zeros(&ctx, &[n], DType::U32).expect("b");
+    let milestone = ctx.new_shared_event().expect("event");
+    let mut pacer = Pacer::default();
+    let t = Instant::now();
+    pacer.begin(t);
+    pacer.end(t + Duration::from_secs(2), false);
+    let pass = ctx.begin().expect("pass");
+    copy_words(&ctx, &pass, &a, &b).expect("copy");
+    pass.set_milestone(&milestone, 1);
+    let t0 = Instant::now();
+    pass.commit().expect("commit").wait_paced(&mut pacer).expect("wait");
+    assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
+    assert_eq!(pacer.ema_secs, Some(2.0));
 }
 
 /// How long a queue-level wait holds when nothing signals it in time: `n`

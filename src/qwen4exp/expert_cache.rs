@@ -196,6 +196,8 @@ pub(crate) const DECODE_IDS: usize = 256;
 /// and the request queue the service thread drains.
 pub struct ExpertCacheLink {
     pub routed: SharedEvent,
+    /// Watched ([`MetalContext::new_watched_event`]): a pass's waits on it
+    /// are checked for having held until the service thread's signal.
     pub ready: SharedEvent,
     next_seq: Cell<u64>,
     service: Arc<Service>,
@@ -314,7 +316,7 @@ impl ExpertCache {
             .collect::<Result<Vec<_>>>()?;
         let link = Rc::new(ExpertCacheLink {
             routed: ctx.new_shared_event()?,
-            ready: ctx.new_shared_event()?,
+            ready: ctx.new_watched_event()?,
             next_seq: Cell::new(0),
             service: Arc::new(Service {
                 requests: Mutex::new(VecDeque::new()),
