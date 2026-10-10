@@ -822,6 +822,12 @@ re-read check on the routed ids found no stale reads). A run on a real
   substitution; MoE-CORE, https://arxiv.org/abs/2610.01950: "The main
   configuration executes router-selected experts exactly; an optional
   score-based substitution path handles eligible low-score misses").
+  Its rule (Sec. 3.5): with b the best unselected score, a selected
+  expert scoring within (1+α)b may be replaced, one scoring higher never
+  ("Any high-score miss and any unmatched low-score miss remain on the
+  exact H2D path"); candidates are unselected resident experts scoring
+  within [(1-α)b, b], matched to the misses in rank order, and the
+  substitute keeps the missed expert's gate weight; α = 0.1 there.
   It changes outputs, so it needs a quality evaluation
   beside its speed; a first count of how many misses have a resident
   alternative within a margin needs only `lily-trace-routing
