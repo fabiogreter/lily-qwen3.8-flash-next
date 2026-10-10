@@ -845,6 +845,60 @@ fn map_reasoning_effort(value: &str) -> Result<Option<Option<String>>> {
     })
 }
 
+/// One request message as the chat template wants it: `text` is its content
+/// already flattened ([`template_content`]; `message.content` is ignored),
+/// `developer` becomes `system`, and an assistant turn carries its reasoning
+/// and its tool calls with object arguments.
+fn template_message(index: usize, message: InMessage, text: Value) -> Result<Value> {
+    let mut value = match message.role.as_str() {
+        "system" | "developer" => {
+            serde_json::json!({"role": "system", "content": text})
+        }
+        "user" => serde_json::json!({"role": "user", "content": text}),
+        "assistant" => {
+            let mut v = serde_json::json!({"role": "assistant", "content": text});
+            if let Some(r) = message.reasoning_content.or(message.reasoning) {
+                v["reasoning_content"] = Value::String(r);
+            }
+            if let Some(calls) = &message.tool_calls {
+                v["tool_calls"] = Value::Array(template_tool_calls(calls)?);
+            }
+            v
+        }
+        "tool" => serde_json::json!({"role": "tool", "content": text}),
+        other => bail!("message {index}: unsupported role {other:?}"),
+    };
+    if let Some(name) = message.name {
+        value["name"] = Value::String(name);
+    }
+    Ok(value)
+}
+
+/// The messages of a text-only request as the chat template wants them
+/// (what [`prepare_chat`] renders, for a whole recorded conversation in
+/// [`super::transcript`]). An image is refused: a transcript has no tower
+/// to expand its placeholders for.
+pub fn template_messages(messages: Vec<InMessage>) -> Result<Vec<Value>> {
+    messages
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut message)| {
+            let items = message
+                .content
+                .take()
+                .map(Content::into_items)
+                .transpose()
+                .with_context(|| format!("message {index}"))?
+                .unwrap_or_default();
+            ensure!(
+                items.iter().all(|i| matches!(i, ContentItem::Text(_))),
+                "message {index} carries an image, which a transcript does not render"
+            );
+            template_message(index, message, template_content(items))
+        })
+        .collect()
+}
+
 /// Validates a chat request and renders its prompt; `images` says what the
 /// server takes as image content.
 pub fn prepare_chat(
@@ -926,9 +980,10 @@ pub fn prepare_chat(
     let mut prepared_images: Vec<PreparedImage> = Vec::new();
     let mut grids: Vec<(usize, usize)> = Vec::new();
     let mut images_decoded = 0;
-    for (index, message) in request.messages.into_iter().enumerate() {
+    for (index, mut message) in request.messages.into_iter().enumerate() {
         let mut items = message
             .content
+            .take()
             .map(Content::into_items)
             .transpose()
             .with_context(|| format!("message {index}"))?
@@ -963,29 +1018,7 @@ pub fn prepare_chat(
                 digest: identity.digest,
             });
         }
-        let text = template_content(items);
-        let mut value = match message.role.as_str() {
-            "system" | "developer" => {
-                serde_json::json!({"role": "system", "content": text})
-            }
-            "user" => serde_json::json!({"role": "user", "content": text}),
-            "assistant" => {
-                let mut v = serde_json::json!({"role": "assistant", "content": text});
-                if let Some(r) = message.reasoning_content.or(message.reasoning) {
-                    v["reasoning_content"] = Value::String(r);
-                }
-                if let Some(calls) = &message.tool_calls {
-                    v["tool_calls"] = Value::Array(template_tool_calls(calls)?);
-                }
-                v
-            }
-            "tool" => serde_json::json!({"role": "tool", "content": text}),
-            other => bail!("message {index}: unsupported role {other:?}"),
-        };
-        if let Some(name) = message.name {
-            value["name"] = Value::String(name);
-        }
-        messages.push(value);
+        messages.push(template_message(index, message, template_content(items))?);
     }
     let last_role = messages.last().and_then(|m| m["role"].as_str()).unwrap_or("");
     ensure!(

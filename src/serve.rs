@@ -35,6 +35,7 @@ pub mod session;
 pub mod stream;
 pub mod timings;
 pub mod tools;
+pub mod transcript;
 
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs,
