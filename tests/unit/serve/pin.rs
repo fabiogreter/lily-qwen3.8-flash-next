@@ -554,3 +554,28 @@ fn a_failed_lock_unlocks_what_it_locked_and_waits_for_the_next_period() {
     assert!(pin.before_request(t0 + Duration::from_secs(120)).pinned());
     assert_eq!(wired(&bufs), vec![true; bufs.len()]);
 }
+
+#[test]
+fn the_hold_is_read_at_each_use_from_the_runtime_settings_handle() {
+    use std::sync::atomic::AtomicU64;
+    // No buffers and a skipped decision: nothing to lock, no Metal needed.
+    let pin = WeightPin::new(
+        Vec::new(),
+        PinDecision::Skip("test".into()),
+        60,
+        normal_pressure,
+    )
+    .expect("pin");
+    assert_eq!(
+        pin.hold(),
+        Some(Duration::from_secs(60)),
+        "its own value until handed one"
+    );
+    let hold = Arc::new(AtomicU64::new(30));
+    let pin = pin.with_hold(hold.clone());
+    assert_eq!(pin.hold(), Some(Duration::from_secs(30)));
+    hold.store(0, Ordering::Release);
+    assert_eq!(pin.hold(), None, "0 holds until pressure or the unload");
+    hold.store(90, Ordering::Release);
+    assert_eq!(pin.hold(), Some(Duration::from_secs(90)));
+}

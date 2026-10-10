@@ -82,7 +82,7 @@ describe('SettingsView', () => {
   it('shows when a change applies, per row, in the row tooltip', async () => {
     const { wrapper } = await setup();
     const title = (flag: string) => row(wrapper, flag).find('.nm').attributes('title');
-    expect(title('--pin-hold')).toContain('Applies: next release');
+    expect(title('--pin-hold')).toContain('Applies: hold re-armed on change');
     expect(title('--idle-unload')).toContain('Applies: timer re-armed on change');
     expect(title('--disk-cache-ttl')).toContain('Applies: next expiry pass');
     expect(title('--top-p')).toBe('Applies: next request');

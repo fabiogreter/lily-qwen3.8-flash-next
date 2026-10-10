@@ -25,8 +25,16 @@
  *   - 404 unknown setting (or unknown lineage: neither a cache entry now nor
  *     in the recorder's 7 days)
  *   - 409 the setting needs a restart and cannot be changed here
- * and the history routes answer 503 while there is no recorder
- * (`--stats-db off`, or a database lily could not open).
+ *   - 413 a settings write's body is larger than 64 KiB
+ * The history routes and the change log answer 503 while the recorder's
+ * database is not open. A settings write is made durable before it takes
+ * effect, and its 5xx say what happened:
+ *   - 503 nothing changed (no open database, `--stats-db off`, settings the
+ *     database could not be read, the write refused, or not taken up in time)
+ *   - 504 the outcome is unknown: the database took the change up but did
+ *     not confirm it in time ("the change may still apply; reload to see the
+ *     current value"); the page reloads the settings and the log
+ *   - 500 the change could not be worked out; nothing changed
  */
 
 // ---------------------------------------------------------------------------
@@ -375,7 +383,10 @@ export interface Setting {
   /** Section in the settings view, e.g. Sampling, Thinking, Lifecycle, Caches, Engine. */
   group: string;
   type: SettingType;
-  /** false = restart required, shown read-only. */
+  /**
+   * false = shown read-only: a restart is required, or (runtime settings
+   * with `--stats-db off`) nothing could keep the change; `help` then says so.
+   */
   editable: boolean;
   /** The command-line flag, e.g. `--top-p`. */
   flag: string;
@@ -400,7 +411,7 @@ export interface Setting {
   options: string[] | null;
   /** One-line definition, shown as a tooltip. */
   help: string | null;
-  /** When a change takes effect ("next request", "next release", ...); null when it cannot change. */
+  /** When a change takes effect ("next request", "hold re-armed on change", ...); null when it cannot change. */
   applies: string | null;
 }
 
@@ -408,19 +419,30 @@ export interface SettingsResponse {
   settings: Setting[];
 }
 
-/** PATCH body: `{ "<name>": value, ... }`, applied atomically (all or none). */
+/**
+ * PATCH body: `{ "<name>": value, ... }`, applied atomically (all or none),
+ * each name once (a name twice is a 400). A value is the flag's text (not
+ * trimmed) or a JSON number or boolean standing for it, checked by the
+ * flag's own parser (the 400 carries its message).
+ */
 export type SettingsPatch = Record<string, SettingValue>;
 
 export interface SettingsUpdateResponse {
-  /** The settings that changed, as they are now. */
+  /**
+   * The settings that changed, as they are now (listing order). A setting
+   * set to the value already in effect did not change and is left out (no
+   * override is made, nothing is logged); the flag's value set over an
+   * override keeps an override with that value (it pins it).
+   */
   updated: Setting[];
 }
 
-/** DELETE /v1/lily/settings/{name}: back to the flag or default value. */
+/** DELETE /v1/lily/settings/{name}: back to the flag or default value; the database row is deleted by name even when no override was in effect (needs the database, 503 without it). */
 export interface SettingResetResponse {
   setting: Setting;
 }
 
+/** One change: from the dashboard, or an override applied at startup. */
 export interface SettingsLogEntry {
   /** Unix ms. */
   t: number;
@@ -431,5 +453,6 @@ export interface SettingsLogEntry {
 }
 
 export interface SettingsLogResponse {
+  /** Newest first; the recorder keeps 7 days. */
   entries: SettingsLogEntry[];
 }

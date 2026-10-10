@@ -5,9 +5,6 @@
 //! for a value lily does not have. The fixtures in
 //! `dashboard/src/api/fixtures.ts` are these types serialized; a test compares
 //! them, and the dashboard's typecheck holds them against `types.ts`.
-//!
-//! The settings writes' answers are not here yet: their routes answer 409
-//! until runtime settings (phase 4) exist.
 
 use serde::Serialize;
 
@@ -389,6 +386,21 @@ pub enum SettingValue {
     Bool(bool),
 }
 
+impl SettingValue {
+    /// A JSON number, string or boolean as a value; `None` for anything else.
+    pub fn from_json(value: &serde_json::Value) -> Option<Self> {
+        use serde_json::Value;
+        match value {
+            Value::Number(n) => {
+                n.as_u64().map(Self::Int).or_else(|| n.as_f64().map(Self::Number))
+            }
+            Value::String(text) => Some(Self::Text(text.clone())),
+            Value::Bool(b) => Some(Self::Bool(*b)),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SettingType {
@@ -434,11 +446,41 @@ pub struct SettingsResponse {
     pub settings: Vec<Setting>,
 }
 
+/// `PATCH /v1/lily/settings`: the settings that changed, as they are now.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SettingsUpdateResponse {
+    pub updated: Vec<Setting>,
+}
+
+/// `DELETE /v1/lily/settings/{name}`: the setting back at its flag or
+/// default value.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SettingResetResponse {
+    pub setting: Setting,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SettingsLogSource {
     Dashboard,
     Startup,
+}
+
+impl SettingsLogSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dashboard => "dashboard",
+            Self::Startup => "startup",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "dashboard" => Some(Self::Dashboard),
+            "startup" => Some(Self::Startup),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

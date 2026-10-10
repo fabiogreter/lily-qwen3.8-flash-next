@@ -198,6 +198,33 @@ fn durations_parse_with_units() {
     assert!(parse_duration_secs("30x").is_err());
     assert!(parse_duration_secs("").is_err());
     assert!(parse_duration_secs("m").is_err());
+    // At most a year, flags and runtime settings alike.
+    assert_eq!(parse_duration_secs("365d").unwrap(), MAX_DURATION_SECS);
+    for text in ["366d", "31536001", "9999999999999999999999h"] {
+        assert_eq!(
+            format!("{:#}", parse_duration_secs(text).unwrap_err()),
+            format!("duration {text:?} is longer than the 365-day cap"),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn a_deadline_too_far_for_the_clock_is_no_deadline_never_a_panic() {
+    let now = Instant::now();
+    assert_eq!(earliest_deadline(now, [None, None]), None);
+    assert_eq!(
+        earliest_deadline(
+            now,
+            [Some(Duration::from_secs(5)), None, Some(Duration::from_secs(2))]
+        ),
+        Some(now + Duration::from_secs(2))
+    );
+    assert_eq!(earliest_deadline(now, [Some(Duration::MAX)]), None);
+    // The keep-alive's own sums saturate the same way.
+    let keep_alive = KeepAlive::new(Duration::MAX, now);
+    assert_eq!(keep_alive.next_tick(now, Some(Duration::MAX)), None);
+    assert_eq!(KeepAlive::new(TICK, now).next_tick(now, Some(Duration::MAX)), None);
 }
 
 #[test]
@@ -464,7 +491,7 @@ fn warm_up_on_load_and_reload() {
 #[test]
 fn engine_queue_limits_jobs_but_not_control_messages() {
     let queue = EngineQueue::new(2);
-    assert_eq!(queue.capacity(), 4);
+    assert_eq!(queue.capacity(), 5);
     assert!(queue.admit());
     assert!(queue.admit());
     assert!(!queue.admit(), "a third job exceeds --queue 2");
@@ -487,9 +514,52 @@ fn a_full_job_queue_still_takes_the_arrival_and_the_stop_wake() {
     assert!(queue.admit());
     assert!(tx.try_send(Cmd::Wake).is_ok(), "the stop wake fits next to one arrival");
     assert!(!queue.admit());
+    // A settings nudge fits too, beside both.
+    nudge_engine(&queue, &tx);
+    assert!(queue.settings_pending.load(Ordering::Acquire));
     // Draining skips the control messages and refuses no job here (none sent).
     assert_eq!(refuse_queued(&rx, &queue, 503, "stopping"), 0);
     assert!(queue.claim_arrival(), "the drained arrival was released");
+    assert!(!queue.settings_pending.load(Ordering::Acquire), "and the nudge");
+}
+
+#[test]
+fn a_settings_nudge_is_sent_once_until_the_engine_took_it() {
+    let queue = EngineQueue::new(1);
+    let (tx, rx) = mpsc::sync_channel::<Cmd>(queue.capacity());
+    nudge_engine(&queue, &tx);
+    nudge_engine(&queue, &tx);
+    nudge_engine(&queue, &tx);
+    assert!(matches!(rx.try_recv(), Ok(Cmd::Settings)));
+    assert!(rx.try_recv().is_err(), "one nudge in the channel at most");
+    queue.settings_taken();
+    nudge_engine(&queue, &tx);
+    assert!(matches!(rx.try_recv(), Ok(Cmd::Settings)));
+    // A channel that cannot take it leaves the next nudge free to try.
+    let (full, _keep) = mpsc::sync_channel::<Cmd>(0);
+    queue.settings_taken();
+    nudge_engine(&queue, &full);
+    assert!(!queue.settings_pending.load(Ordering::Acquire));
+}
+
+#[test]
+fn the_idle_timer_reads_its_timeout_at_each_use_and_a_change_re_arms_it() {
+    let t0 = Instant::now();
+    let s = Duration::from_secs;
+    let handle = Arc::new(AtomicU64::new(0));
+    let mut timer = IdleTimer::shared(handle.clone(), t0);
+    assert_eq!(timer.remaining(t0 + s(10)), None, "never, at first");
+    // 0 -> 2m: the delay counts from the last activity, not from the change.
+    handle.store(120, Ordering::Release);
+    assert_eq!(timer.remaining(t0 + s(10)), Some(s(110)));
+    assert_eq!(timer.timeout_secs(), 120);
+    timer.touch(t0 + s(60));
+    // Shortened below the time already idle: the timer has run out.
+    handle.store(30, Ordering::Release);
+    assert!(timer.expired(t0 + s(100)));
+    // Back to never.
+    handle.store(0, Ordering::Release);
+    assert!(!timer.expired(t0 + s(100_000)));
 }
 
 #[test]
@@ -645,6 +715,82 @@ fn the_idle_wait_deadline_is_never_delayed_by_ticks() {
         );
         assert!(ticks.iter().all(|&at| at < deadline));
     }
+}
+
+#[test]
+fn a_closed_window_stays_closed_when_it_later_grows_until_a_request_re_arms_it() {
+    // A longer `pin_hold` set long after the last request: the window the
+    // pin reports grows again, but the keep-alive stopped when it closed.
+    let (tx, rx) = mpsc::sync_channel::<Cmd>(4);
+    let mut keep_alive = KeepAlive::new(TICK, Instant::now());
+    let window = Arc::new(std::sync::Mutex::new(Some(Duration::ZERO)));
+    let read = |w: &Arc<std::sync::Mutex<Option<Duration>>>| *w.lock().unwrap();
+    tx.send(Cmd::Settings).unwrap();
+    let mut ticks = 0;
+    let got = recv_keeping_warm(
+        &rx,
+        None,
+        &mut keep_alive,
+        |_| read(&window),
+        || {
+            ticks += 1;
+            Ok(())
+        },
+    );
+    assert!(matches!(got, Ok(Cmd::Settings)));
+    assert!(!keep_alive.armed(), "stopped where the window closed");
+    // The nudge's wait: the window is open again, minutes of it.
+    *window.lock().unwrap() = Some(Duration::from_secs(600));
+    let sender = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(250));
+        tx.send(Cmd::Wake).unwrap();
+    });
+    let got = recv_keeping_warm(
+        &rx,
+        None,
+        &mut keep_alive,
+        |_| read(&window),
+        || {
+            ticks += 1;
+            Ok(())
+        },
+    );
+    assert!(matches!(got, Ok(Cmd::Wake)));
+    assert_eq!(ticks, 0, "no wake scheduled");
+    assert_eq!(
+        keep_alive.next_tick(Instant::now(), Some(Duration::from_secs(600))),
+        None
+    );
+    // A request touches it: the ticks are back.
+    keep_alive.touch(Instant::now());
+    assert!(
+        keep_alive.next_tick(Instant::now(), Some(Duration::from_secs(600))).is_some()
+    );
+    sender.join().unwrap();
+}
+
+#[test]
+fn the_wait_stops_the_keep_alive_at_the_windows_end_even_between_ticks() {
+    // The last tick falls inside the window, the next would not: the wait
+    // still wakes at the window's end to stop the ticks there.
+    let (tx, rx) = mpsc::sync_channel::<Cmd>(1);
+    let start = Instant::now();
+    let end = start + Duration::from_millis(80);
+    let mut keep_alive = KeepAlive::new(TICK, start);
+    let sender = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        tx.send(Cmd::Wake).unwrap();
+    });
+    let got = recv_keeping_warm(
+        &rx,
+        None,
+        &mut keep_alive,
+        |now| Some(end.saturating_duration_since(now)),
+        || Ok(()),
+    );
+    assert!(matches!(got, Ok(Cmd::Wake)));
+    assert!(!keep_alive.armed());
+    sender.join().unwrap();
 }
 
 #[test]

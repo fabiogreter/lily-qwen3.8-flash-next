@@ -214,6 +214,10 @@ struct Cli {
 
     /// Template reasoning effort when thinking is on: low, medium or xhigh
     /// (the template's default is xhigh).
+    // TODO(dashboard): the flag passes any text to the template, while the
+    // runtime setting takes low, medium, xhigh (high and max as xhigh) via
+    // `lily::serve::api::template_effort`; whether the flag should refuse
+    // or map the same way is the owner's pending decision.
     #[arg(long)]
     reasoning_effort: Option<String>,
 
@@ -384,10 +388,8 @@ fn run() -> Result<()> {
             budgets: ThinkingBudgets::parse(&cli.thinking_budget)?,
             tool_turn_factor: {
                 let f = cli.thinking_budget_tool_turn_factor;
-                anyhow::ensure!(
-                    f.is_finite() && f > 0.0,
-                    "--thinking-budget-tool-turn-factor must be a positive number"
-                );
+                // The dashboard's runtime setting checks with the same function.
+                lily::serve::api::check_tool_turn_factor(f)?;
                 f
             },
             nudges: cli.thinking_nudges,

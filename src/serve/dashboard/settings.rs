@@ -6,15 +6,17 @@
 //! ([`FlagValue`], from clap), so a duration shows as `30m` and its
 //! `value_s` is what `parse_duration_secs` makes of it. A few defaults are
 //! not clap's but computed (the checkpoint's sampling defaults, the disk
-//! tier's directory); the server passes those in. Nothing is editable yet:
-//! runtime settings are phase 4, and until then every setting is
-//! `editable: false` with no `applies`.
+//! tier's directory); the server passes those in. The runtime settings
+//! (`serve::runtime::RUNTIME`) are `editable` and say when a change
+//! `applies`; the database's overrides are laid over this listing by
+//! `RuntimeSettings::overlay` ([`with_override`]).
 //!
 //! The groups and names follow the dashboard's mock (`dashboard/src/mock/
 //! data.ts`), so the Settings view renders the same sections.
 
 use super::contract::{Setting, SettingSource, SettingType, SettingValue};
 use crate::serve::parse_duration_secs;
+use crate::serve::runtime;
 
 /// One command-line argument: clap's id (the `Cli` field name, which is
 /// also the setting's name), the text given on the command line (`None`
@@ -208,7 +210,7 @@ pub fn build(flags: &[FlagValue], computed: &[(&str, SettingValue)]) -> Vec<Sett
                 name: desc.name.to_owned(),
                 group: desc.group.to_owned(),
                 kind: kind_name(desc.kind),
-                editable: false,
+                editable: runtime::applies(desc.name).is_some(),
                 flag: format!("--{}", desc.name.replace('_', "-")),
                 default,
                 flag_value,
@@ -229,14 +231,39 @@ pub fn build(flags: &[FlagValue], computed: &[(&str, SettingValue)]) -> Vec<Sett
                     _ => None,
                 },
                 help: desc.help.map(str::to_owned),
-                applies: None,
+                applies: runtime::applies(desc.name).map(str::to_owned),
             }
         })
         .collect()
 }
 
-/// The names the dashboard lists, for tests that hold the table against
-/// the command line.
+/// The names the dashboard lists (the command line's settings).
 pub fn names() -> impl Iterator<Item = &'static str> {
     DESCRIPTORS.iter().map(|d| d.name)
+}
+
+/// Setting `name`'s flag text `text` as the JSON value the listing shows
+/// for it (a string for a setting the listing does not know).
+pub fn value_for(name: &str, text: &str) -> SettingValue {
+    match DESCRIPTORS.iter().find(|d| d.name == name) {
+        Some(desc) => value_of(desc.kind, text),
+        None => SettingValue::Text(text.trim().into()),
+    }
+}
+
+/// `setting` as the database's override `value` makes it: that value (with
+/// its seconds, for a duration) and `database` as the source.
+pub fn with_override(setting: &Setting, value: &SettingValue) -> Setting {
+    let value_s = match (setting.kind, value) {
+        (SettingType::Duration, SettingValue::Text(text)) => {
+            parse_duration_secs(text).ok()
+        }
+        _ => None,
+    };
+    Setting {
+        value: Some(value.clone()),
+        value_s,
+        source: SettingSource::Database,
+        ..setting.clone()
+    }
 }

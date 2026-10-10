@@ -18,6 +18,8 @@ import type {
   SettingsLogEntry,
   SettingsLogResponse,
   SettingsResponse,
+  SettingsUpdateResponse,
+  SettingResetResponse,
   SettingType,
   Status,
 } from './types';
@@ -349,7 +351,7 @@ export const settings: SettingsResponse = {
       "name": "temperature",
       "group": "Sampling",
       "type": "number",
-      "editable": false,
+      "editable": true,
       "flag": "--temperature",
       "default": null,
       "flag_value": 0.6,
@@ -361,13 +363,13 @@ export const settings: SettingsResponse = {
       "step": null,
       "options": null,
       "help": "Default when a request sets none; 0 is greedy.",
-      "applies": null
+      "applies": "next request"
     },
     {
       "name": "top_p",
       "group": "Sampling",
       "type": "number",
-      "editable": false,
+      "editable": true,
       "flag": "--top-p",
       "default": null,
       "flag_value": null,
@@ -379,13 +381,13 @@ export const settings: SettingsResponse = {
       "step": null,
       "options": null,
       "help": null,
-      "applies": null
+      "applies": "next request"
     },
     {
       "name": "top_k",
       "group": "Sampling",
       "type": "int",
-      "editable": false,
+      "editable": true,
       "flag": "--top-k",
       "default": 20,
       "flag_value": null,
@@ -397,13 +399,13 @@ export const settings: SettingsResponse = {
       "step": null,
       "options": null,
       "help": "0 keeps every token.",
-      "applies": null
+      "applies": "next request"
     },
     {
       "name": "min_p",
       "group": "Sampling",
       "type": "number",
-      "editable": false,
+      "editable": true,
       "flag": "--min-p",
       "default": null,
       "flag_value": null,
@@ -415,13 +417,13 @@ export const settings: SettingsResponse = {
       "step": null,
       "options": null,
       "help": null,
-      "applies": null
+      "applies": "next request"
     },
     {
       "name": "presence_penalty",
       "group": "Sampling",
       "type": "number",
-      "editable": false,
+      "editable": true,
       "flag": "--presence-penalty",
       "default": null,
       "flag_value": null,
@@ -433,13 +435,13 @@ export const settings: SettingsResponse = {
       "step": null,
       "options": null,
       "help": null,
-      "applies": null
+      "applies": "next request"
     },
     {
       "name": "frequency_penalty",
       "group": "Sampling",
       "type": "number",
-      "editable": false,
+      "editable": true,
       "flag": "--frequency-penalty",
       "default": null,
       "flag_value": null,
@@ -451,25 +453,25 @@ export const settings: SettingsResponse = {
       "step": null,
       "options": null,
       "help": null,
-      "applies": null
+      "applies": "next request"
     },
     {
       "name": "repetition_penalty",
       "group": "Sampling",
       "type": "number",
-      "editable": false,
+      "editable": true,
       "flag": "--repetition-penalty",
-      "default": null,
+      "default": 1,
       "flag_value": null,
-      "value": null,
+      "value": 1.05,
       "value_s": null,
-      "source": "default",
+      "source": "database",
       "min": 0.0,
       "max": null,
       "step": null,
       "options": null,
       "help": null,
-      "applies": null
+      "applies": "next request"
     },
     {
       "name": "thinking",
@@ -493,7 +495,7 @@ export const settings: SettingsResponse = {
       "name": "reasoning_effort",
       "group": "Thinking",
       "type": "enum",
-      "editable": false,
+      "editable": true,
       "flag": "--reasoning-effort",
       "default": null,
       "flag_value": null,
@@ -509,13 +511,13 @@ export const settings: SettingsResponse = {
         "xhigh"
       ],
       "help": "Unset: the template's default (xhigh).",
-      "applies": null
+      "applies": "next request"
     },
     {
       "name": "thinking_budget",
       "group": "Thinking",
       "type": "string",
-      "editable": false,
+      "editable": true,
       "flag": "--thinking-budget",
       "default": null,
       "flag_value": null,
@@ -527,13 +529,13 @@ export const settings: SettingsResponse = {
       "step": null,
       "options": null,
       "help": "Tokens by reasoning effort, one number for all, or off.",
-      "applies": null
+      "applies": "next request"
     },
     {
       "name": "thinking_budget_tool_turn_factor",
       "group": "Thinking",
       "type": "number",
-      "editable": false,
+      "editable": true,
       "flag": "--thinking-budget-tool-turn-factor",
       "default": null,
       "flag_value": null,
@@ -545,13 +547,13 @@ export const settings: SettingsResponse = {
       "step": null,
       "options": null,
       "help": null,
-      "applies": null
+      "applies": "next request"
     },
     {
       "name": "thinking_budget_grace",
       "group": "Thinking",
       "type": "int",
-      "editable": false,
+      "editable": true,
       "flag": "--thinking-budget-grace",
       "default": null,
       "flag_value": null,
@@ -563,13 +565,13 @@ export const settings: SettingsResponse = {
       "step": null,
       "options": null,
       "help": null,
-      "applies": null
+      "applies": "next request"
     },
     {
       "name": "thinking_nudges",
       "group": "Thinking",
       "type": "bool",
-      "editable": false,
+      "editable": true,
       "flag": "--thinking-nudges",
       "default": true,
       "flag_value": null,
@@ -581,13 +583,13 @@ export const settings: SettingsResponse = {
       "step": null,
       "options": null,
       "help": null,
-      "applies": null
+      "applies": "next request"
     },
     {
       "name": "tool_call_ends_thinking",
       "group": "Thinking",
       "type": "bool",
-      "editable": false,
+      "editable": true,
       "flag": "--tool-call-ends-thinking",
       "default": null,
       "flag_value": null,
@@ -599,7 +601,7 @@ export const settings: SettingsResponse = {
       "step": null,
       "options": null,
       "help": null,
-      "applies": null
+      "applies": "next request"
     },
     {
       "name": "thinking_texts",
@@ -623,7 +625,7 @@ export const settings: SettingsResponse = {
       "name": "idle_unload",
       "group": "Lifecycle",
       "type": "duration",
-      "editable": false,
+      "editable": true,
       "flag": "--idle-unload",
       "default": "0",
       "flag_value": "30m",
@@ -635,7 +637,7 @@ export const settings: SettingsResponse = {
       "step": null,
       "options": null,
       "help": "0 never unloads.",
-      "applies": null
+      "applies": "timer re-armed on change"
     },
     {
       "name": "pin_weights",
@@ -663,25 +665,25 @@ export const settings: SettingsResponse = {
       "name": "pin_hold",
       "group": "Lifecycle",
       "type": "duration",
-      "editable": false,
+      "editable": true,
       "flag": "--pin-hold",
-      "default": null,
+      "default": "1m",
       "flag_value": null,
-      "value": null,
-      "value_s": null,
-      "source": "default",
+      "value": "5m",
+      "value_s": 300,
+      "source": "database",
       "min": null,
       "max": null,
       "step": null,
       "options": null,
       "help": "0 holds the pin until memory pressure or the unload.",
-      "applies": null
+      "applies": "hold re-armed on change"
     },
     {
       "name": "disk_cache_ttl",
       "group": "Caches",
       "type": "duration",
-      "editable": false,
+      "editable": true,
       "flag": "--disk-cache-ttl",
       "default": null,
       "flag_value": null,
@@ -693,7 +695,7 @@ export const settings: SettingsResponse = {
       "step": null,
       "options": null,
       "help": "0 keeps entries until the budget evicts them.",
-      "applies": null
+      "applies": "next expiry pass"
     },
     {
       "name": "cache_bytes",
@@ -771,7 +773,7 @@ export const settings: SettingsResponse = {
       "name": "durable_min_tokens",
       "group": "Caches",
       "type": "int",
-      "editable": false,
+      "editable": true,
       "flag": "--durable-min-tokens",
       "default": null,
       "flag_value": null,
@@ -783,7 +785,7 @@ export const settings: SettingsResponse = {
       "step": null,
       "options": null,
       "help": "0 turns durable prefix entries off.",
-      "applies": null
+      "applies": "next request"
     },
     {
       "name": "decode_checkpoint_tokens",
@@ -1102,6 +1104,50 @@ export const settingsLog: SettingsLogResponse = {
       "source": "startup"
     }
   ]
+};
+
+export const settingsUpdate: SettingsUpdateResponse = {
+  "updated": [
+    {
+      "name": "repetition_penalty",
+      "group": "Sampling",
+      "type": "number",
+      "editable": true,
+      "flag": "--repetition-penalty",
+      "default": 1,
+      "flag_value": null,
+      "value": 1.05,
+      "value_s": null,
+      "source": "database",
+      "min": 0.0,
+      "max": null,
+      "step": null,
+      "options": null,
+      "help": null,
+      "applies": "next request"
+    }
+  ]
+};
+
+export const settingReset: SettingResetResponse = {
+  "setting": {
+    "name": "pin_hold",
+    "group": "Lifecycle",
+    "type": "duration",
+    "editable": true,
+    "flag": "--pin-hold",
+    "default": "1m",
+    "flag_value": null,
+    "value": "1m",
+    "value_s": 60,
+    "source": "default",
+    "min": null,
+    "max": null,
+    "step": null,
+    "options": null,
+    "help": "0 holds the pin until memory pressure or the unload.",
+    "applies": "hold re-armed on change"
+  }
 };
 
 export const history: History = {
@@ -2220,10 +2266,42 @@ export const error: ErrorBody = {
   }
 };
 
-export const errorSetting: ErrorBody = {
+export const errorInvalid: ErrorBody = {
   "error": {
-    "message": "runtime settings are not editable yet",
-    "setting": "temperature"
+    "message": "top_p must be in (0, 1]",
+    "setting": "top_p"
+  }
+};
+
+export const errorGuard: ErrorBody = {
+  "error": {
+    "message": "writes need Content-Type: application/json"
+  }
+};
+
+export const errorUnknown: ErrorBody = {
+  "error": {
+    "message": "unknown setting",
+    "setting": "nope"
+  }
+};
+
+export const errorRestartOnly: ErrorBody = {
+  "error": {
+    "message": "max_seq needs a restart and cannot be changed here",
+    "setting": "max_seq"
+  }
+};
+
+export const errorOutcomeUnknown: ErrorBody = {
+  "error": {
+    "message": "the change may still apply; reload to see the current value"
+  }
+};
+
+export const errorNoDatabase: ErrorBody = {
+  "error": {
+    "message": "settings changes are kept in the recorder's database, which is off (--stats-db off); nothing changed"
   }
 };
 

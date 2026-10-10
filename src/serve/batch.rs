@@ -687,6 +687,9 @@ impl<M: LanguageModel> Engine<M> {
                 // The GPU is busy: nothing to wake.
                 Ok(Cmd::Arrival) => queue.arrival_taken(),
                 Ok(Cmd::Wake) => {}
+                // The engine loop computes its wait from the new values
+                // once the batch is done.
+                Ok(Cmd::Settings) => queue.settings_taken(),
                 Err(_) => return None,
             }
         }

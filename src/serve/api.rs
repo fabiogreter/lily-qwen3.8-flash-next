@@ -599,6 +599,12 @@ pub struct ThinkingBudgets {
     pub xhigh: Option<usize>,
 }
 
+/// The largest thinking budget, grace window and tool-turn factor the
+/// server takes (flags and runtime settings alike): far above any context,
+/// so no product of them overflows.
+pub const MAX_THINKING_TOKENS: usize = 1 << 20;
+pub const MAX_TOOL_TURN_FACTOR: f64 = 100.0;
+
 impl ThinkingBudgets {
     pub fn parse(text: &str) -> Result<Self> {
         let text = text.trim();
@@ -607,6 +613,10 @@ impl ThinkingBudgets {
         }
         if let Ok(all) = text.parse::<usize>() {
             ensure!(all > 0, "a thinking budget must be a positive token count");
+            ensure!(
+                all <= MAX_THINKING_TOKENS,
+                "a thinking budget must be at most {MAX_THINKING_TOKENS} tokens"
+            );
             return Ok(Self { low: Some(all), medium: Some(all), xhigh: Some(all) });
         }
         let mut budgets = Self::default();
@@ -620,6 +630,10 @@ impl ThinkingBudgets {
             ensure!(
                 value > 0,
                 "thinking budget {part:?}: a budget must be a positive token count"
+            );
+            ensure!(
+                value <= MAX_THINKING_TOKENS,
+                "thinking budget {part:?}: a budget must be at most {MAX_THINKING_TOKENS} tokens"
             );
             let slot = match level.trim() {
                 "low" => &mut budgets.low,
@@ -672,6 +686,15 @@ impl Default for ThinkingDefaults {
 }
 
 impl ThinkingDefaults {
+    /// The checks the start and the runtime settings make: a tool-turn
+    /// factor that is a positive number no larger than
+    /// [`MAX_TOOL_TURN_FACTOR`], a grace of at most [`MAX_THINKING_TOKENS`].
+    /// (The budgets are checked as they are parsed.)
+    pub fn validate(&self) -> Result<()> {
+        check_tool_turn_factor(self.tool_turn_factor)?;
+        check_grace(self.grace)
+    }
+
     /// The server's budget for a chat turn at `effort` (the template's,
     /// `None` for its default), after a tool result when `tool_turn`.
     pub fn budget(&self, effort: Option<&str>, tool_turn: bool) -> Option<usize> {
@@ -770,7 +793,9 @@ pub struct Budget {
     pub clamped_from: Option<usize>,
 }
 
-fn resolve_sampling(
+/// A request's sampling: its fields over the server's `defaults` (the
+/// runtime settings' snapshot the request was prepared from), validated.
+pub(crate) fn resolve_sampling(
     fields: &SamplingFields,
     defaults: &SamplingParams,
 ) -> Result<SamplingParams> {
@@ -832,17 +857,47 @@ fn resolve_budget(
     }
 }
 
+/// `--thinking-budget-tool-turn-factor`'s check.
+pub fn check_tool_turn_factor(f: f64) -> Result<()> {
+    ensure!(
+        f.is_finite() && f > 0.0 && f <= MAX_TOOL_TURN_FACTOR,
+        "--thinking-budget-tool-turn-factor must be a positive number of at most {MAX_TOOL_TURN_FACTOR}"
+    );
+    Ok(())
+}
+
+/// `--thinking-budget-grace`'s check.
+pub fn check_grace(grace: usize) -> Result<()> {
+    ensure!(
+        grace <= MAX_THINKING_TOKENS,
+        "--thinking-budget-grace must be at most {MAX_THINKING_TOKENS} tokens"
+    );
+    Ok(())
+}
+
+/// A reasoning effort as the chat template knows it: `low`, `medium` or
+/// `xhigh` (`high` and `max` are `xhigh`); `None` for anything else. The
+/// one mapping for requests and the runtime setting.
+pub fn template_effort(value: &str) -> Option<&'static str> {
+    match value {
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" | "xhigh" | "max" => Some("xhigh"),
+        _ => None,
+    }
+}
+
 fn map_reasoning_effort(value: &str) -> Result<Option<Option<String>>> {
     // Outer None: no opinion. Some(None): thinking off. Some(Some(e)): effort.
-    Ok(match value {
-        "none" | "minimal" | "off" => Some(None),
-        "low" => Some(Some("low".into())),
-        "medium" => Some(Some("medium".into())),
-        "high" | "xhigh" | "max" => Some(Some("xhigh".into())),
-        other => {
-            bail!("unknown reasoning_effort {other:?}; use none, low, medium or high")
+    if matches!(value, "none" | "minimal" | "off") {
+        return Ok(Some(None));
+    }
+    match template_effort(value) {
+        Some(effort) => Ok(Some(Some(effort.to_owned()))),
+        None => {
+            bail!("unknown reasoning_effort {value:?}; use none, low, medium or high")
         }
-    })
+    }
 }
 
 /// One request message as the chat template wants it: `text` is its content

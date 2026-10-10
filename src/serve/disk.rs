@@ -31,7 +31,9 @@
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -172,10 +174,33 @@ pub struct DiskStore {
     dir: PathBuf,
     format: String,
     budget: u64,
-    /// Seconds an entry may go unused before it is deleted (0: never).
-    max_age: u64,
+    /// Seconds an entry may go unused before it is deleted (0: never); read
+    /// at each expiry pass, so a runtime change applies at the next one.
+    max_age: Arc<AtomicU64>,
+    /// No expiry pass runs until it opens (`None`: always open).
+    gate: Option<ExpiryGate>,
     entries: Vec<DiskEntry>,
     next_id: u64,
+}
+
+/// When the disk tier may start expiring entries: once the runtime
+/// settings are settled (the recorder's first open attempt applied the
+/// database's `disk_cache_ttl`, or there is none), or at `deadline` at the
+/// latest, so the flag's TTL never deletes what the stored one keeps.
+#[derive(Debug, Clone)]
+pub struct ExpiryGate {
+    settled: Arc<AtomicBool>,
+    deadline: Instant,
+}
+
+impl ExpiryGate {
+    pub fn new(settled: Arc<AtomicBool>, deadline: Instant) -> Self {
+        Self { settled, deadline }
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.settled.load(Ordering::Acquire) || Instant::now() >= self.deadline
+    }
 }
 
 fn now_secs() -> u64 {
@@ -197,6 +222,37 @@ impl DiskStore {
     /// bytes and a `max_age` in seconds (0 for none), indexing the entries
     /// already there, expiring the stale ones and trimming to budget.
     pub fn open(root: &Path, format: &str, budget: u64, max_age: u64) -> Result<Self> {
+        let mut store =
+            Self::index(root, format, budget, Arc::new(AtomicU64::new(max_age)))?;
+        store.expire();
+        store.trim(0);
+        Ok(store)
+    }
+
+    /// [`Self::open`] reading the maximum age from `max_age` (the runtime
+    /// settings' handle) and expiring nothing, at the open or later, until
+    /// `gate` opens.
+    pub fn open_gated(
+        root: &Path,
+        format: &str,
+        budget: u64,
+        max_age: Arc<AtomicU64>,
+        gate: ExpiryGate,
+    ) -> Result<Self> {
+        let mut store = Self::index(root, format, budget, max_age)?;
+        store.gate = Some(gate);
+        store.expire();
+        store.trim(0);
+        Ok(store)
+    }
+
+    /// The entries already under `root` for `format`.
+    fn index(
+        root: &Path,
+        format: &str,
+        budget: u64,
+        max_age: Arc<AtomicU64>,
+    ) -> Result<Self> {
         let dir = root.join(dir_name(format));
         fs::create_dir_all(&dir)
             .with_context(|| format!("creating {}", dir.display()))?;
@@ -236,25 +292,30 @@ impl DiskStore {
                 }
             }
         }
-        let mut store =
-            Self { dir, format: format.to_owned(), budget, max_age, entries, next_id };
-        store.expire();
-        store.trim(0);
-        Ok(store)
+        Ok(Self {
+            dir,
+            format: format.to_owned(),
+            budget,
+            max_age,
+            gate: None,
+            entries,
+            next_id,
+        })
     }
 
     /// Deletes entries unused for longer than the maximum age. Called on
     /// open, on every store and before every lookup, so the tier shrinks on
     /// its own even when nothing new is written.
     pub fn expire(&mut self) {
-        if self.max_age == 0 {
+        let max_age = self.max_age_secs();
+        if max_age == 0 || self.gate.as_ref().is_some_and(|g| !g.is_open()) {
             return;
         }
         let now = now_secs();
         let stale: Vec<String> = self
             .entries
             .iter()
-            .filter(|e| now.saturating_sub(e.last_used) > self.max_age)
+            .filter(|e| now.saturating_sub(e.last_used) > max_age)
             .map(|e| e.id.clone())
             .collect();
         for id in stale {
@@ -263,7 +324,19 @@ impl DiskStore {
     }
 
     pub fn max_age_secs(&self) -> u64 {
-        self.max_age
+        self.max_age.load(Ordering::Acquire)
+    }
+
+    /// Reads the maximum age from `max_age` from now on (the runtime
+    /// settings' handle) instead of the value it was opened with.
+    pub fn with_max_age(mut self, max_age: Arc<AtomicU64>) -> Self {
+        self.max_age = max_age;
+        self
+    }
+
+    /// Whether an expiry pass would run now (see [`ExpiryGate`]).
+    pub fn expiring(&self) -> bool {
+        self.gate.as_ref().is_none_or(ExpiryGate::is_open)
     }
 
     fn load_meta(path: &Path, format: &str) -> Result<Meta> {

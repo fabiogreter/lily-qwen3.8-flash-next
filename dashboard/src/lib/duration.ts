@@ -1,11 +1,11 @@
-// A port of `parse_duration_secs` (src/serve.rs), so the mock refuses what the
-// server refuses and with the same messages:
+// A port of `parse_duration_secs` (src/serve.rs), so the page and the mock
+// refuse what the server refuses, with the same messages:
 //
 //   trim; split at the first character that is not an ASCII digit or '.';
 //   the head must parse as a float (Rust `f64::from_str`: digits with at most
 //   one '.', so "1.5", ".5", "5." but not "." or "1.2.3"); the tail, trimmed
 //   and lower-cased, is "" or "s" (seconds), "m", "h" or "d"; the result is
-//   truncated to whole seconds (`as u64`).
+//   at most a year (`MAX_DURATION_SECS`); truncated to whole seconds (`as u64`).
 //
 // Errors carry the same text as lily's (the context line `invalid duration
 // {text:?}` and `unknown duration unit {unit:?} (use s, m, h or d)`; `{:?}` of
@@ -50,5 +50,10 @@ export function parseDurationSecs(input: string): number {
   const u = unit.trim().replace(/[A-Z]/g, (c) => c.toLowerCase()); // to_ascii_lowercase
   const scale = SCALES.get(u);
   if (scale === undefined) throw new DurationError(`unknown duration unit ${debugStr(u)} (use s, m, h or d)`);
-  return Math.floor(value * scale);
+  const secs = value * scale;
+  if (secs > MAX_DURATION_SECS) throw new DurationError(`duration ${debugStr(text)} is longer than the 365-day cap`);
+  return Math.floor(secs);
 }
+
+/** lily's `MAX_DURATION_SECS`: a year. */
+export const MAX_DURATION_SECS = 365 * 86_400;

@@ -24,7 +24,7 @@ import {
   buildSettingsLog,
   buildStatus,
 } from './data';
-import { DurationError, parseDurationSecs } from './duration';
+import { DurationError, parseDurationSecs } from '../lib/duration';
 
 /**
  * Validates one value the way the server will: a refusal is a 400 with a

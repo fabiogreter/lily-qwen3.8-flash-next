@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ago, agoSince, bucketLabel, bytes, clock, dateTime, DASH, duration, energy, label, pct, rate, show, timeLabel, tokens, whole } from './format';
+import { ago, agoSince, bounds, bucketLabel, bytes, clock, dateTime, DASH, duration, energy, label, pct, rate, show, timeLabel, tokens, whole } from './format';
 
 // The test setup pins TZ=UTC, so local time equals UTC here.
 const T = Date.UTC(2026, 9, 10, 14, 5, 9); // Sat 10 Oct 2026, 14:05:09
@@ -94,7 +94,8 @@ describe('misc', () => {
   });
   it('label and bucketLabel', () => {
     expect(label('repetition_penalty')).toBe('repetition penalty');
-    expect(bucketLabel('15m')).toBe('10 s');
+    expect(bucketLabel('15m')).toBe('1 min');
+    expect(bucketLabel('24h')).toBe('15 min');
     expect(bucketLabel('7d')).toBe('1 h');
   });
 });
@@ -109,5 +110,12 @@ describe('agoSince and whole', () => {
     expect(whole(1568.6, 'MHz')).toBe('1569 MHz');
     expect(whole(71.4)).toBe('71');
     expect(whole(null, 'MHz')).toBe(DASH);
+  });
+
+  it('bounds: both, one side or none', () => {
+    expect(bounds(0, 1)).toBe('0 to 1');
+    expect(bounds(0, null)).toBe('at least 0');
+    expect(bounds(null, 2)).toBe('at most 2');
+    expect(bounds(null, null)).toBeNull();
   });
 });

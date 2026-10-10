@@ -53,8 +53,86 @@ by a newer lily is left untouched and the history stays off
 (`state: "failed"`). On shutdown the recorder gets up to 2 s to write what
 it holds and checkpoint the WAL. `--stats-db off` records nothing: the
 history routes answer 503 and the per-session figures cover the last 1 024
-requests. Runtime settings are not
-built yet (409). The design is [dashboard.md](dashboard.md).
+requests. The design is [dashboard.md](dashboard.md).
+
+### Runtime settings
+
+Seventeen settings change without a restart, from the dashboard's Settings
+view or its routes; every other flag is shown read-only.
+
+| settings | a change applies |
+|---|---|
+| `--temperature`, `--top-p`, `--top-k`, `--min-p`, `--presence-penalty`, `--frequency-penalty`, `--repetition-penalty` (the defaults a request that sets none gets) | at the next request |
+| `--reasoning-effort` (`low`, `medium` or `xhigh`; `high` and `max` are stored as `xhigh`), `--thinking-budget`, `--thinking-budget-tool-turn-factor`, `--thinking-budget-grace`, `--thinking-nudges`, `--tool-call-ends-thinking` | at the next request |
+| `--durable-min-tokens` | at the next request's admission |
+| `--idle-unload` | at once: the timer is re-armed, the new delay counting from the last request (a delay shorter than the time already idle unloads now; the page asks first) |
+| `--pin-hold` | at once, the same way: a shorter hold than the time since the last request releases the pin now |
+| `--disk-cache-ttl` | at the next expiry pass (every lookup and store) |
+
+A request is prepared from one look at the settings, so a change never
+reaches a request already running. `--queue` (it sizes the engine's
+channel when the server starts) and `--decode-checkpoint-tokens` (a
+running generation keeps the interval it was admitted with while the batch
+admission budgets newcomers by the store's, and the expert cache's plan
+turns checkpoints off whatever the flag says) stay restart-only.
+
+**Limits**, the same for a flag and a runtime setting: durations at most
+365 days (`duration "400d" is longer than the 365-day cap`), thinking
+budgets and the grace at most 1 048 576 tokens, the tool-turn factor a
+positive number of at most 100.
+
+**Where a value comes from**: the database's override, else the flag, else
+the default. Overrides live in the `settings` table of `--stats-db` and are
+applied over the command line once the recorder has opened the database
+(until then the flags are in effect, and the startup lines that state the
+idle unload, the pin hold and the disk TTL say "the flag's value; database
+overrides may apply"); the log then says
+`settings: from the database, over the command line: <name> <value>, ...`
+at every start. The disk tier runs no expiry pass before that (at most
+30 s after the start), so the flag's TTL never deletes an entry the stored
+one keeps. A stored override for a setting this lily cannot change at
+runtime, or whose value no longer passes the flag's checks, is logged,
+left out and kept in the database; if the `settings` table cannot be read
+at all, the flags stay in effect and changes are refused (503) while the
+history works on.
+
+**The change log** (`settings_log`, kept 7 days) holds every change from
+the dashboard, and an entry at startup for each stored override that
+differs from the flag's or default value it replaces. Setting a value that
+is already in effect changes nothing and logs nothing; setting the flag's
+value while an override is in effect keeps an override with that value
+(it pins it against a later change of the flag).
+
+**Routes** (same loopback and write guard as the rest of the dashboard:
+writes need `Content-Type: application/json` and, when an `Origin` is
+sent, lily's own; a write's body is at most 64 KiB, 413 past it):
+
+- `GET /v1/lily/settings`: every setting with its value, `source`
+  (`database`, `flag` or `default`), `editable` and `applies`. With
+  `--stats-db off` the runtime settings are listed `editable: false`, the
+  reason in their `help`.
+- `PATCH /v1/lily/settings` with `{"<name>": value, ...}`: all of it or
+  none, each name once (twice is a 400). A value is the flag's text, not
+  trimmed (`"30m"`, `"low=8000,xhigh=16000"`), or a JSON number or boolean
+  standing for it, checked by the flag's own parser and limits, so a value
+  the command line would refuse is refused with the same message. Answers
+  `{"updated": [...]}` (the settings that changed, as they are now) once
+  the change is in the database and in effect; 404 for an unknown name,
+  409 for a restart-only one, 400 for an invalid value (`error.setting`
+  names it), 403 from the guard.
+- `DELETE /v1/lily/settings/{name}`: deletes the override (the row by
+  name, also a stale one the start ignored); the setting is back at its
+  flag or default value. Answers `{"setting": {...}}`.
+- `GET /v1/lily/settings/log`: the change log, newest first.
+
+A change is written before it takes effect, and a write's 5xx says what
+happened: 503 nothing changed (no open database, settings that could not
+be read, a write the database refused, or one the recorder did not take
+up within 3 s), 504 the outcome is unknown (the recorder took the change
+up but did not confirm it within 3 s: "the change may still apply; reload
+to see the current value"; the page reloads the settings and the log after
+any 5xx), 500 the change could not be worked out. The change log answers
+503 without the database.
 
 ## Batching
 

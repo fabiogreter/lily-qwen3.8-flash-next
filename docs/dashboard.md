@@ -3,7 +3,7 @@
 Status: **spec, agreed with the owner 2026-10-10; being built.** Prototypes are
 done (§ 9). Build order: the Vue app on mock data (§ 8), then lily serving it
 and the read routes (§ 3), the recorder (§ 4), runtime settings (§ 7) and
-machine sampling (§ 6). The first three are in (`src/serve/dashboard.rs`
+machine sampling (§ 6). The first four are in (`src/serve/dashboard.rs`
 says what each route serves, `src/serve/recorder.rs` what the recorder
 stores and how); with `--stats-db off` the per-session figures cover the
 server's last 1 024 requests and the history routes answer 503.
@@ -127,8 +127,13 @@ response with `Content-Type` and `Cache-Control`; `index.html` is
 - `PATCH /v1/lily/settings` takes several names, applied all or none, and
   returns `{updated: [...]}`; `DELETE` returns `{setting}`. Errors are
   `{"error": {"message", "setting"?}}` with 404 (unknown setting), 409
-  (restart-only setting), 400 (invalid value) or 403 (write guard). The guard
-  matches the media type `application/json`, so a `charset` parameter passes.
+  (restart-only setting), 400 (invalid value), 403 (write guard), 413 (a
+  write body over 64 KiB), 503 (no database, or it timed out before taking
+  the change: nothing changed), 504 (the outcome is unknown: the change may
+  still apply) or 500. After any 5xx on a write the page reloads the
+  settings and the log. The guard matches the media type `application/json`,
+  so a `charset` parameter passes. Setting the value already in effect is a
+  no-op and is left out of `updated`.
 
 ## 4. Recorder and database
 
@@ -189,7 +194,7 @@ As built (phase 3):
   holds and checkpoints the WAL; the wait is capped at 2 s.
 - `--stats-db` takes an absolute path or `off` (no `~` expansion); a
   directory lily creates is `0700`, the database and its WAL files `0600`.
-- The settings tables exist (empty until phase 4); `settings_log` is pruned
+- The settings tables hold the runtime overrides and their log (§ 7.3); `settings_log` is pruned
   at 7 days with the rest, `settings` never.
 
 ### 4.1 Tables
@@ -298,12 +303,20 @@ Plan:
 | thinking nudges | `--thinking-nudges` | next request |
 | a tool call ends thinking | `--tool-call-ends-thinking` | next request |
 | idle unload | `--idle-unload` | timer re-armed on change |
-| pin hold | `--pin-hold` | next release |
+| pin hold | `--pin-hold` | hold re-armed on change (a shorter hold releases at once) |
 | disk cache TTL | `--disk-cache-ttl` | next expiry pass |
+| durable prefix threshold | `--durable-min-tokens` | next request |
 
-To be checked in the code before they are added: `--queue`,
-`--durable-min-tokens`, `--decode-checkpoint-tokens`. Every other setting is
-shown read-only with its value and where it came from.
+Checked in the code (phase 4): `--durable-min-tokens` is read once per
+request at admission, so it is runtime. `--queue` sizes the engine's
+channel at startup and `--decode-checkpoint-tokens` is planned into the
+session budget and the batch admission (and turned off by the expert
+cache's plan), so both stay restart-only. Every other setting is shown
+read-only with its value and where it came from.
+
+"Timer re-armed on change": the new delay counts from the last request, as
+the old one did (the dashboard never moves the timer, § 2.2); a delay
+shorter than the time already idle unloads at once.
 
 Changes never touch a running request.
 
@@ -323,6 +336,18 @@ Precedence at startup: database override > CLI flag > built-in default. The
 startup log line says which settings came from the database. Each setting in
 the UI shows its source and has "reset", which deletes the override and
 returns to the flag or default value. Every change goes to `settings_log`.
+
+As built (phase 4): the recorder thread applies the stored overrides once
+the database is open (the flags are in effect until then; the disk tier runs
+no expiry pass until then, or 30 s, so a longer stored TTL is never
+undercut), and logs a `startup` entry for each override that differs from
+the value it replaces. A change is written first and in effect after,
+so the server and the database never disagree; without an open database
+(`--stats-db off`, opening, failed) a write that would change something
+answers 503 and changes nothing (`types.ts` has no "not persisted" answer,
+and an in-memory change would silently vanish at the restart). With
+`--stats-db off` the runtime settings are listed read-only. Durations are
+capped at 365 days, for the flags too.
 
 ### 7.4 Later: all settings in the database
 
@@ -390,6 +415,7 @@ tok/s) and **machine cost** (load, memory pressure, watts).
   real server (phase 2 on).
 - `--stats-db` default location (§ 4).
 - macmon probe result on this machine (§ 6.1).
-- Whether `--queue`, `--durable-min-tokens`, `--decode-checkpoint-tokens` can
-  change at runtime (§ 7.1).
+- ~~Whether `--queue`, `--durable-min-tokens`, `--decode-checkpoint-tokens`
+  can change at runtime (§ 7.1).~~ Phase 4: `--durable-min-tokens` yes, the
+  other two stay restart-only (§ 7.1).
 - The drop counter's place on the page (the channel holds 1 024 rows).

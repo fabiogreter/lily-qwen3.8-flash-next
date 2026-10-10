@@ -32,11 +32,23 @@
 //! token ids, image data or tool arguments; the request rows are the counts,
 //! durations and rates of [`Timings`].
 //!
+//! **Settings** (§ 7). `GET /v1/lily/settings` is the command line's listing
+//! with the database's overrides laid over it; the runtime ones are
+//! editable. A write passes the guard (403), then names its settings (404
+//! unknown, 409 restart-only) and values (400, the flag's own message), all
+//! of them before anything is applied, and is then made by the recorder
+//! ([`Recorder::change_settings`]): written to the database first, in effect
+//! after, answered once it is durable. 503 means nothing changed (no open
+//! database, a refused write, the recorder never took it up), 504 that the
+//! outcome is unknown (taken up but not confirmed in time), 500 that the
+//! change could not be worked out. A body past [`MAX_WRITE_BODY`] is 413.
+//! With `--stats-db off` the runtime settings are listed read-only; the
+//! change log is the database's (503 without it).
+//!
 //! Without the recorder (`--stats-db off`, or a database that could not be
 //! opened) the history routes answer 503 and the per-session figures cover
 //! the requests still in the [`REQUEST_ROWS`] ring. What is not built yet:
-//! the settings writes need runtime settings (409, after the write guard),
-//! and the machine's power, GPU and temperatures wait for the sampler
+//! the machine's power, GPU and temperatures wait for the sampler
 //! (`machine.sampler` is `off`).
 
 pub mod contract;
@@ -54,12 +66,16 @@ use contract::{
     CancelledBy, DiskTier, ErrorBody, ErrorDetail, ExpertTier, GpuTier, LifecycleState,
     LiveStatus, MachineStatus, MemoryPressure, NgramTier, QueueStatus, Range,
     RequestRow, RequestsResponse, SamplerState, Session, SessionTier, SessionsResponse,
-    Setting, SettingsLogResponse, SettingsResponse, Status, Tiers, WeightsTier,
+    Setting, SettingResetResponse, SettingsLogResponse, SettingsResponse,
+    SettingsUpdateResponse, Status, Tiers, WeightsTier,
 };
 use serde::Serialize;
 
 use super::http::Request;
-use super::recorder::{Recorder, RowSink, TierSnapshot};
+use super::recorder::{
+    Recorder, RowSink, SETTINGS_LOG_LIMIT, SETTINGS_WAIT, TierSnapshot,
+};
+use super::runtime::{self, Change, Refusal, RuntimeSettings};
 use super::session::{EntryView, Lineage, Lineages, SessionStore};
 use super::timings::Timings;
 use crate::engine::LanguageModel;
@@ -90,8 +106,14 @@ const LIVE_MIN_SPAN: Duration = Duration::from_secs(1);
 const NGRAM_RESIDENCY_TTL: Duration = Duration::from_secs(10);
 /// The live request rate and acceptance cover this span of finished rows.
 const LIVE_ROWS_MS: u64 = 60_000;
+/// The largest body a settings write takes (413 past it); the chat routes
+/// keep their own limit.
+pub const MAX_WRITE_BODY: usize = 64 << 10;
 /// Peers whose refusal is logged; past this many, refusals are not logged.
 const REFUSED_PEERS_LOGGED: usize = 1024;
+
+/// Why the runtime settings are read-only with `--stats-db off`.
+const NO_DATABASE: &str = "Read-only: changes are kept in the recorder's database, which is off (--stats-db off).";
 
 /// The headers every dashboard answer carries: no MIME sniffing, no framing
 /// (clickjacking), and a policy that lets the page load only its own files.
@@ -604,6 +626,10 @@ impl Response {
         )
     }
 
+    fn refusal(refusal: &Refusal) -> Self {
+        Self::error(refusal.status, &refusal.message, refusal.setting.as_deref())
+    }
+
     /// The headers besides `Content-Type` and `Content-Length`.
     pub fn headers(&self) -> Vec<(&'static str, &'static str)> {
         let mut headers = SECURITY_HEADERS.to_vec();
@@ -629,14 +655,13 @@ pub struct EngineNow {
     pub waiting: usize,
 }
 
-/// The dashboard's configuration: what the command line fixed.
+/// The dashboard's configuration: what the command line fixed, and the
+/// runtime settings over it.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub model: &'static str,
-    /// `--idle-unload`, 0 for never.
-    pub idle_unload_secs: u64,
-    /// `--pin-hold`, 0 for until pressure or the unload.
-    pub pin_hold_secs: u64,
+    /// The idle unload and the pin hold the status shows, among the rest.
+    pub runtime: Arc<RuntimeSettings>,
     /// `--max-batch` or its default, until a load caps it.
     pub max_batch: usize,
     /// `--queue`.
@@ -645,6 +670,7 @@ pub struct Config {
     pub max_sessions: usize,
     /// `--cache-bytes`; without it the budget is derived at the load.
     pub cache_bytes: Option<u64>,
+    /// Every setting as the command line gave it (`settings::build`).
     pub settings: Vec<Setting>,
 }
 
@@ -901,6 +927,13 @@ impl Dashboard {
         {
             return Response::error(403, why, None);
         }
+        if matches!(method, "PATCH" | "DELETE") && request.body.len() > MAX_WRITE_BODY {
+            return Response::error(
+                413,
+                "a settings write takes at most 64 KiB of body",
+                None,
+            );
+        }
         match (method, segments.as_slice()) {
             ("GET", ["status"]) => Response::json(200, &self.status(engine)),
             ("GET", ["sessions"]) => Response::json(200, &self.sessions()),
@@ -908,32 +941,23 @@ impl Dashboard {
                 Ok(limit) => Response::json(200, &self.requests(limit)),
                 Err(why) => Response::error(400, why, None),
             },
-            ("GET", ["settings"]) => Response::json(
-                200,
-                &SettingsResponse { settings: self.config.settings.clone() },
-            ),
-            ("GET", ["settings", "log"]) => {
-                Response::json(200, &SettingsLogResponse { entries: Vec::new() })
-            }
+            ("GET", ["settings"]) => Response::json(200, &self.settings()),
+            ("GET", ["settings", "log"]) => match self
+                .recorder
+                .read(|conn| super::recorder::settings_log(conn, SETTINGS_LOG_LIMIT))
+            {
+                Ok(entries) => Response::json(200, &SettingsLogResponse { entries }),
+                Err(unavailable) => {
+                    Response::error(503, unavailable.log_message(), None)
+                }
+            },
             ("GET", ["history"]) => self.history(query, None),
             ("GET", ["sessions", lineage, "history"]) => match lineage.parse::<u64>() {
                 Ok(id) => self.history(query, Some(id)),
                 Err(_) => Response::error(404, "unknown lineage", None),
             },
-            ("PATCH", ["settings"]) => {
-                Response::error(409, "runtime settings are not editable yet", None)
-            }
-            ("DELETE", ["settings", name]) => {
-                if self.config.settings.iter().any(|s| s.name == *name) {
-                    Response::error(
-                        409,
-                        "runtime settings are not editable yet",
-                        Some(name),
-                    )
-                } else {
-                    Response::error(404, "unknown setting", Some(name))
-                }
-            }
+            ("PATCH", ["settings"]) => self.update_settings(&request.body),
+            ("DELETE", ["settings", name]) => self.reset_setting(name),
             (
                 _,
                 ["status"]
@@ -982,8 +1006,10 @@ impl Dashboard {
             now.saturating_duration_since(last_finished.unwrap_or(self.started))
         };
         let pinned = self.board.pinned.load(Ordering::Acquire);
-        let pin_hold_s = (pinned && open == 0 && self.config.pin_hold_secs > 0)
-            .then(|| self.config.pin_hold_secs.saturating_sub(idle_for.as_secs()));
+        let pin_hold_secs = self.config.runtime.pin_hold_secs();
+        let idle_unload_secs = self.config.runtime.idle_unload_secs();
+        let pin_hold_s = (pinned && open == 0 && pin_hold_secs > 0)
+            .then(|| pin_hold_secs.saturating_sub(idle_for.as_secs()));
 
         // The live figures: the token counters over the last few seconds,
         // the finished rows over the last minute.
@@ -1064,8 +1090,7 @@ impl Dashboard {
             model: self.config.model.to_owned(),
             uptime_s: self.started.elapsed().as_secs(),
             pin_hold_s,
-            idle_unload_s: (self.config.idle_unload_secs > 0)
-                .then_some(self.config.idle_unload_secs),
+            idle_unload_s: (idle_unload_secs > 0).then_some(idle_unload_secs),
             idle_for_s: idle_for.as_secs(),
             queue: QueueStatus {
                 waiting: engine.waiting,
@@ -1241,6 +1266,83 @@ impl Dashboard {
             Ok(Some(history)) => Response::json(200, &history),
             Ok(None) => Response::error(404, "unknown lineage", None),
             Err(unavailable) => Response::error(503, unavailable.message(), None),
+        }
+    }
+
+    /// `GET /v1/lily/settings`: the command line's settings with the
+    /// database's overrides in effect.
+    /// With `--stats-db off` nothing can be kept, so the runtime settings
+    /// are listed read-only, the reason in their `help` (a write still
+    /// answers 503). While the database opens, or once it failed, they stay
+    /// editable: their writes answer 503 saying why.
+    pub fn settings(&self) -> SettingsResponse {
+        let mut settings = self.config.runtime.overlay(&self.config.settings);
+        if self.recorder.status().state == contract::RecorderState::Off {
+            for s in settings.iter_mut().filter(|s| s.editable) {
+                s.editable = false;
+                s.applies = None;
+                s.help = Some(match s.help.take() {
+                    Some(help) => format!("{help} {NO_DATABASE}"),
+                    None => NO_DATABASE.to_owned(),
+                });
+            }
+        }
+        SettingsResponse { settings }
+    }
+
+    /// The settings named in `entries`, as they are now, in the listing's
+    /// order.
+    fn listed<'a>(&self, names: impl Iterator<Item = &'a str> + Clone) -> Vec<Setting> {
+        self.settings()
+            .settings
+            .into_iter()
+            .filter(|s| names.clone().any(|n| n == s.name))
+            .collect()
+    }
+
+    /// `PATCH /v1/lily/settings`: `{"<name>": value, ...}`, all of it or
+    /// none (see the module docs).
+    fn update_settings(&self, body: &[u8]) -> Response {
+        let patch = match runtime::parse_patch(body) {
+            Ok(patch) => patch,
+            Err(why) => return Response::error(400, &why, None),
+        };
+        let change = match self.config.runtime.validate(&patch) {
+            Ok(change) => change,
+            Err(refusal) => return Response::refusal(&refusal),
+        };
+        if change.set.is_empty() {
+            return Response::json(
+                200,
+                &SettingsUpdateResponse { updated: Vec::new() },
+            );
+        }
+        match self.recorder.change_settings(change, SETTINGS_WAIT) {
+            Ok(entries) => Response::json(
+                200,
+                &SettingsUpdateResponse {
+                    updated: self.listed(entries.iter().map(|e| e.name.as_str())),
+                },
+            ),
+            Err(error) => Response::error(error.status, &error.message, None),
+        }
+    }
+
+    /// `DELETE /v1/lily/settings/{name}`: the override deleted, the setting
+    /// back at its flag or default value. It always goes to the recorder,
+    /// which deletes the row by name even when no override is in effect (a
+    /// stale row the start ignored).
+    fn reset_setting(&self, name: &str) -> Response {
+        if let Err(refusal) = runtime::writable(name) {
+            return Response::refusal(&refusal);
+        }
+        let change = Change { set: Vec::new(), reset: vec![name.to_owned()] };
+        if let Err(error) = self.recorder.change_settings(change, SETTINGS_WAIT) {
+            return Response::error(error.status, &error.message, Some(name));
+        }
+        match self.listed(std::iter::once(name)).pop() {
+            Some(setting) => Response::json(200, &SettingResetResponse { setting }),
+            None => Response::error(404, "unknown setting", Some(name)),
         }
     }
 

@@ -106,12 +106,20 @@ export function show(v: SettingValue | null | undefined): string {
   return v == null ? DASH : String(v);
 }
 
+/** A setting's bounds for the meta line: "0 to 1", "at least 0", "at most 2"; null without any. */
+export function bounds(min: number | null, max: number | null): string | null {
+  if (min != null && max != null) return `${min} to ${max}`;
+  if (min != null) return `at least ${min}`;
+  if (max != null) return `at most ${max}`;
+  return null;
+}
+
 /** "repetition_penalty" -> "repetition penalty" */
 export function label(name: string): string {
   return name.replace(/_/g, ' ');
 }
 
-/** Bucket width of a range as a short label ("1 min"). */
+/** Bucket width of a range as a short label ("1 min"), as the contract sets them (types.ts `Range`). */
 export function bucketLabel(range: Range): string {
-  return { '15m': '10 s', '1h': '1 min', '24h': '15 min', '7d': '1 h' }[range];
+  return { '15m': '1 min', '1h': '1 min', '24h': '15 min', '7d': '1 h' }[range];
 }

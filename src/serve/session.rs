@@ -88,7 +88,7 @@
 //! id is for the dashboard only; nothing in the cache's decisions reads it.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -929,8 +929,9 @@ pub struct SessionStore<M: LanguageModel> {
     max_decode_checkpoints: usize,
     clock: u64,
     disk: Option<DiskStore>,
-    /// Shortest shared prefix worth a durable disk entry (0: never).
-    durable_min_tokens: usize,
+    /// Shortest shared prefix worth a durable disk entry (0: never); read
+    /// at each admission, so a runtime change applies to the next request.
+    durable_min_tokens: Arc<AtomicUsize>,
     /// The least room the write ahead keeps free of writes (`None`: off).
     write_ahead_floor: Option<usize>,
     /// Bytes of the most recent new sessions at their release.
@@ -966,7 +967,7 @@ impl<M: LanguageModel> SessionStore<M> {
             max_decode_checkpoints: 0,
             clock: 0,
             disk: None,
-            durable_min_tokens: 0,
+            durable_min_tokens: Arc::new(AtomicUsize::new(0)),
             write_ahead_floor: None,
             recent_new: VecDeque::with_capacity(RECENT_NEW_SESSIONS),
             evictions: Evictions::default(),
@@ -997,9 +998,10 @@ impl<M: LanguageModel> SessionStore<M> {
         self
     }
 
-    /// Sets the shortest shared prefix worth a durable disk entry (0 turns
-    /// durable entries off). Only meaningful with a disk tier attached.
-    pub fn with_durable_min_tokens(mut self, min_tokens: usize) -> Self {
+    /// Reads the shortest shared prefix worth a durable disk entry (0 turns
+    /// durable entries off) from `min_tokens`, the runtime settings' handle.
+    /// Only meaningful with a disk tier attached.
+    pub fn with_durable_min_tokens(mut self, min_tokens: Arc<AtomicUsize>) -> Self {
         self.durable_min_tokens = min_tokens;
         self
     }
@@ -1060,7 +1062,7 @@ impl<M: LanguageModel> SessionStore<M> {
     }
 
     pub fn durable_min_tokens(&self) -> usize {
-        self.durable_min_tokens
+        self.durable_min_tokens.load(Ordering::Acquire)
     }
 
     pub fn disk(&self) -> Option<&DiskStore> {

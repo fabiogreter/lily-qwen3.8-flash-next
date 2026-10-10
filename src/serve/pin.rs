@@ -50,7 +50,7 @@
 //! [`LanguageModel::weight_buffers`]: crate::engine::LanguageModel::weight_buffers
 
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -457,8 +457,9 @@ impl Drop for InFlight {
 /// after it was freed.
 pub struct WeightPin {
     decision: PinDecision,
-    /// `--pin-hold`; `None` holds until pressure or the unload.
-    hold: Option<Duration>,
+    /// `--pin-hold` in seconds, 0 holding until pressure or the unload;
+    /// read at each use, so a runtime change applies at the next release.
+    hold_secs: Arc<AtomicU64>,
     shared: Arc<Shared>,
     monitor: Option<JoinHandle<()>>,
     bytes: u64,
@@ -508,7 +509,7 @@ impl WeightPin {
         };
         Ok(Self {
             decision,
-            hold: (hold_secs > 0).then(|| Duration::from_secs(hold_secs)),
+            hold_secs: Arc::new(AtomicU64::new(hold_secs)),
             shared,
             monitor,
             bytes,
@@ -529,6 +530,19 @@ impl WeightPin {
             state.mirror = flag;
         }
         self
+    }
+
+    /// Reads the hold from `hold_secs` from now on (the runtime settings'
+    /// handle) instead of the value it was created with.
+    pub fn with_hold(mut self, hold_secs: Arc<AtomicU64>) -> Self {
+        self.hold_secs = hold_secs;
+        self
+    }
+
+    /// The hold now: `None` holds until pressure or the unload.
+    fn hold(&self) -> Option<Duration> {
+        let secs = self.hold_secs.load(Ordering::Acquire);
+        (secs > 0).then(|| Duration::from_secs(secs))
     }
 
     pub fn pinned(&self) -> bool {
@@ -555,7 +569,7 @@ impl WeightPin {
             return false;
         }
         // The previous active period ended when no request came for the hold.
-        if let (Some(last), Some(hold)) = (self.last_request, self.hold)
+        if let (Some(last), Some(hold)) = (self.last_request, self.hold())
             && now.saturating_duration_since(last) >= hold
         {
             self.failed = false;
@@ -615,7 +629,7 @@ impl WeightPin {
     /// How long the pin is held without another request: `None` when
     /// nothing is pinned or the hold is unlimited, zero when it is over.
     pub fn hold_remaining(&self, now: Instant) -> Option<Duration> {
-        let (last, hold) = (self.last_request?, self.hold?);
+        let (last, hold) = (self.last_request?, self.hold()?);
         self.pinned().then(|| hold.saturating_sub(now.saturating_duration_since(last)))
     }
 
@@ -627,7 +641,7 @@ impl WeightPin {
     /// under memory pressure), zero when the window is over.
     pub fn keep_warm_remaining(&self, now: Instant) -> Option<Duration> {
         let last = self.last_request?;
-        let window = self.hold.unwrap_or(UNLIMITED_HOLD_KEEP_WARM);
+        let window = self.hold().unwrap_or(UNLIMITED_HOLD_KEEP_WARM);
         self.pinned()
             .then(|| window.saturating_sub(now.saturating_duration_since(last)))
     }
@@ -635,7 +649,7 @@ impl WeightPin {
     /// Releases the pin once its hold is over.
     pub fn release_if_held_out(&mut self, now: Instant) {
         if self.hold_remaining(now) == Some(Duration::ZERO) {
-            let hold = self.hold.map_or(0, |h| h.as_secs());
+            let hold = self.hold().map_or(0, |h| h.as_secs());
             self.release(&format!(
                 "released pin after {} idle",
                 super::describe_secs(hold)

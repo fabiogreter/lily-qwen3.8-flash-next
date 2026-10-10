@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { debugStr, DurationError, parseDurationSecs } from './duration';
+import { debugStr, DurationError, MAX_DURATION_SECS, parseDurationSecs } from './duration';
 
 // Cases mirror src/serve.rs `parse_duration_secs`.
 describe('parseDurationSecs', () => {
@@ -62,5 +62,10 @@ describe('parseDurationSecs', () => {
     expect(debugStr('a\nb\tc')).toBe('"a\\nb\\tc"');
     expect(debugStr('é')).toBe('"é"');
     expect(fail('5"')).toBe('unknown duration unit "\\"" (use s, m, h or d)');
+  });
+
+  it('caps at a year, as lily does', () => {
+    expect(parseDurationSecs('365d')).toBe(MAX_DURATION_SECS);
+    expect(() => parseDurationSecs('366d')).toThrow('duration "366d" is longer than the 365-day cap');
   });
 });

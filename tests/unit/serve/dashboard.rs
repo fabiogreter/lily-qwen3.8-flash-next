@@ -198,16 +198,17 @@ fn request(method: &str, path: &str, headers: &[(&str, &str)]) -> Request {
     }
 }
 
+/// `--temperature 0.6 --idle-unload 30m` (`runtime::testing`): the idle
+/// unload 30 minutes, the pin hold a minute.
 fn config() -> Config {
     Config {
         model: "qwen3.8-flash-next",
-        idle_unload_secs: 1800,
-        pin_hold_secs: 60,
+        runtime: crate::serve::runtime::testing::runtime(),
         max_batch: 4,
         queue: 32,
         max_sessions: 16,
         cache_bytes: None,
-        settings: settings::build(&[], &[]),
+        settings: crate::serve::runtime::testing::listing(),
     }
 }
 
@@ -229,9 +230,35 @@ fn answer(
     target: &str,
     headers: &[(&str, &str)],
 ) -> Response {
+    answer_with(d, method, target, headers, b"")
+}
+
+/// [`answer`] with a body.
+fn answer_with(
+    d: &Dashboard,
+    method: &str,
+    target: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Response {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let route = route(method, path).expect("a dashboard route");
-    d.respond(route, &request(method, path, headers), (path, query), LOCAL, READY)
+    let mut request = request(method, path, headers);
+    request.body = body.to_vec();
+    d.respond(route, &request, (path, query), LOCAL, READY)
+}
+
+const JSON: (&str, &str) = ("Content-Type", "application/json");
+
+/// `PATCH /v1/lily/settings` with `body`, as lily's own page sends it.
+fn patch(d: &Dashboard, body: serde_json::Value) -> Response {
+    let body = serde_json::to_vec(&body).expect("json");
+    answer_with(d, "PATCH", "/v1/lily/settings", &[JSON], &body)
+}
+
+/// `DELETE /v1/lily/settings/{name}`, as lily's own page sends it.
+fn reset(d: &Dashboard, name: &str) -> Response {
+    answer(d, "DELETE", &format!("/v1/lily/settings/{name}"), &[JSON])
 }
 
 fn body(response: &Response) -> serde_json::Value {
@@ -366,12 +393,17 @@ fn the_api_answers_its_routes_and_says_what_it_cannot_do_yet() {
         "/v1/lily/requests",
         "/v1/lily/requests?limit=5",
         "/v1/lily/settings",
-        "/v1/lily/settings/log",
     ] {
         assert_eq!(get(target).status, 200, "{target}");
     }
-    assert_eq!(body(&get("/v1/lily/settings/log")), serde_json::json!({"entries": []}));
-    // Without the recorder (`--stats-db off`): no history, said so.
+    // Without the recorder (`--stats-db off`): no history and no change
+    // log, said so.
+    let log = get("/v1/lily/settings/log");
+    assert_eq!(log.status, 503);
+    assert_eq!(
+        body(&log)["error"]["message"],
+        "the change log is kept in the recorder's database, which is off (--stats-db off)"
+    );
     let history = get("/v1/lily/history?range=1h");
     assert_eq!(history.status, 503);
     assert_eq!(body(&history)["error"]["message"], "history is off (--stats-db off)");
@@ -405,31 +437,9 @@ fn the_api_answers_its_routes_and_says_what_it_cannot_do_yet() {
 }
 
 #[test]
-fn settings_writes_pass_the_guard_first_and_are_refused_until_phase_four() {
+fn settings_writes_pass_the_guard_first() {
     let (_, d) = dashboard();
     let json = ("Content-Type", "application/json; charset=utf-8");
-    let own = ("Origin", "http://localhost:8000");
-    let patch = answer(&d, "PATCH", "/v1/lily/settings", &[json, own]);
-    assert_eq!(patch.status, 409);
-    assert_eq!(
-        body(&patch)["error"]["message"],
-        "runtime settings are not editable yet"
-    );
-    let ipv6 = answer(
-        &d,
-        "PATCH",
-        "/v1/lily/settings",
-        &[json, ("Origin", "http://[::1]:8000")],
-    );
-    assert_eq!(ipv6.status, 409);
-    let reset = answer(&d, "DELETE", "/v1/lily/settings/temperature", &[json]);
-    assert_eq!(reset.status, 409);
-    assert_eq!(body(&reset)["error"]["setting"], "temperature");
-    let unknown = answer(&d, "DELETE", "/v1/lily/settings/nope", &[json]);
-    assert_eq!(
-        (unknown.status, body(&unknown)["error"]["setting"].as_str()),
-        (404, Some("nope"))
-    );
     // The guard comes before anything else, the route's own answer included.
     for headers in [
         vec![],
@@ -437,12 +447,284 @@ fn settings_writes_pass_the_guard_first_and_are_refused_until_phase_four() {
         vec![json, ("Origin", "http://evil.example")],
         vec![json, ("Origin", "http://localhost:9999")],
     ] {
-        assert_eq!(answer(&d, "PATCH", "/v1/lily/settings", &headers).status, 403);
+        let body = br#"{"temperature": 0.5}"#;
+        let r = answer_with(&d, "PATCH", "/v1/lily/settings", &headers, body);
+        assert_eq!(r.status, 403);
         assert_eq!(
             answer(&d, "DELETE", "/v1/lily/settings/nope", &headers).status,
             403
         );
+        assert_eq!(
+            answer(&d, "DELETE", "/v1/lily/settings/temperature", &headers).status,
+            403
+        );
     }
+    // Lily's own origins pass (here to the 503 of a server without its
+    // database).
+    for origin in
+        ["http://localhost:8000", "http://[::1]:8000", "http://127.0.0.1:8000"]
+    {
+        let body = br#"{"temperature": 0.5}"#;
+        let r = answer_with(
+            &d,
+            "PATCH",
+            "/v1/lily/settings",
+            &[json, ("Origin", origin)],
+            body,
+        );
+        assert_eq!(r.status, 503, "{origin}");
+    }
+}
+
+#[test]
+fn a_write_names_unknown_and_restart_only_settings_and_refuses_invalid_values() {
+    let (_, d) = dashboard();
+    let error = |r: &Response| {
+        let b = body(r);
+        (
+            r.status,
+            b["error"]["setting"].as_str().map(str::to_owned),
+            b["error"]["message"].clone(),
+        )
+    };
+    let r = patch(&d, serde_json::json!({"temperature": 0.5, "nope": 1}));
+    assert_eq!(error(&r), (404, Some("nope".into()), "unknown setting".into()));
+    let r = patch(&d, serde_json::json!({"temperature": "warm", "max_seq": 1}));
+    assert_eq!(
+        error(&r),
+        (
+            409,
+            Some("max_seq".into()),
+            "max_seq needs a restart and cannot be changed here".into()
+        )
+    );
+    let r = patch(&d, serde_json::json!({"temperature": 0.5, "idle_unload": "10x"}));
+    assert_eq!(
+        error(&r),
+        (
+            400,
+            Some("idle_unload".into()),
+            "unknown duration unit \"x\" (use s, m, h or d)".into()
+        )
+    );
+    for (status, name) in [(404, "nope"), (409, "max_seq"), (409, "queue")] {
+        assert_eq!(error(&reset(&d, name)).0, status, "{name}");
+        assert_eq!(error(&reset(&d, name)).1.as_deref(), Some(name));
+    }
+    // Not an object of names and values.
+    for bad in [&b"[1]"[..], b"", b"{", b"\"x\""] {
+        let r = answer_with(&d, "PATCH", "/v1/lily/settings", &[JSON], bad);
+        assert_eq!(r.status, 400);
+        assert_eq!(
+            body(&r)["error"]["message"],
+            "the body must be a JSON object of setting names and values"
+        );
+    }
+    // A name twice is refused, not silently the last one.
+    let r = answer_with(
+        &d,
+        "PATCH",
+        "/v1/lily/settings",
+        &[JSON],
+        br#"{"pin_hold": "5s", "pin_hold": "1h"}"#,
+    );
+    assert_eq!(
+        (r.status, body(&r)["error"]["message"].clone()),
+        (400, "the body names pin_hold more than once".into())
+    );
+    // A body past 64 KiB is refused before it is read as JSON, after the
+    // guard; the chat routes keep their own limit.
+    let big = vec![b' '; MAX_WRITE_BODY + 1];
+    assert_eq!(
+        answer_with(&d, "PATCH", "/v1/lily/settings", &[JSON], &big).status,
+        413
+    );
+    assert_eq!(
+        answer_with(&d, "DELETE", "/v1/lily/settings/top_p", &[JSON], &big).status,
+        413
+    );
+    assert_eq!(answer_with(&d, "PATCH", "/v1/lily/settings", &[], &big).status, 403);
+    let at_cap = format!("{{{}}}", " ".repeat(MAX_WRITE_BODY - 2));
+    assert_eq!(
+        answer_with(&d, "PATCH", "/v1/lily/settings", &[JSON], at_cap.as_bytes())
+            .status,
+        200
+    );
+    // Nothing to change needs no database.
+    let r = patch(&d, serde_json::json!({}));
+    assert_eq!((r.status, body(&r)), (200, serde_json::json!({"updated": []})));
+}
+
+#[test]
+fn without_an_open_database_a_write_changes_nothing_and_says_why() {
+    let (_, d) = dashboard();
+    let r = patch(&d, serde_json::json!({"temperature": 0.5}));
+    assert_eq!(r.status, 503);
+    assert_eq!(
+        body(&r)["error"]["message"],
+        "settings changes are kept in the recorder's database, which is off (--stats-db off); nothing changed"
+    );
+    assert_eq!(d.config.runtime.snapshot().defaults.sampling.temperature, 0.6);
+    let temperature = body(&answer(&d, "GET", "/v1/lily/settings", &[]))["settings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "temperature")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        (temperature["value"].clone(), temperature["source"].clone()),
+        (0.6.into(), "flag".into())
+    );
+    // A reset always goes to the database (it deletes the row by name).
+    let r = reset(&d, "temperature");
+    assert_eq!(
+        (r.status, body(&r)["error"]["setting"].clone()),
+        (503, "temperature".into())
+    );
+    // With `--stats-db off` the runtime settings are listed read-only, and
+    // say why; the restart-only ones are as they were.
+    let all = body(&answer(&d, "GET", "/v1/lily/settings", &[]))["settings"].clone();
+    let get = |name: &str| {
+        all.as_array().unwrap().iter().find(|s| s["name"] == name).unwrap().clone()
+    };
+    for name in ["temperature", "idle_unload", "durable_min_tokens"] {
+        let s = get(name);
+        assert_eq!(
+            (s["editable"].clone(), s["applies"].clone()),
+            (false.into(), serde_json::Value::Null),
+            "{name}"
+        );
+        assert!(s["help"].as_str().unwrap().ends_with(
+            "Read-only: changes are kept in the recorder's database, which is off (--stats-db off)."
+        ));
+    }
+    assert_eq!(get("max_seq")["help"], serde_json::Value::Null);
+    // A recorder still opening its database refuses the same way: a file
+    // where its directory should be keeps it retrying.
+    let root = std::env::temp_dir()
+        .join(format!("lily-dashboard-test-settings-opening-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("blocker"), b"").unwrap();
+    let board = Arc::new(Board::default());
+    let config = config();
+    let recorder = crate::serve::recorder::Recorder::start(
+        Some(&root.join("blocker").join("lily.sqlite")),
+        &board,
+        Some(config.runtime.clone()),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while recorder.status().error.is_none() {
+        assert!(Instant::now() < deadline, "the open did not fail");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(recorder.status().state, RecorderState::Opening);
+    let opening = Dashboard::new(board, config).with_recorder(recorder.clone());
+    let r = patch(&opening, serde_json::json!({"pin_hold": "5s"}));
+    assert_eq!(r.status, 503);
+    assert_eq!(
+        body(&r)["error"]["message"],
+        "the recorder's database is not open yet (see the server log); nothing changed"
+    );
+    assert_eq!(opening.config.runtime.pin_hold_secs(), 60);
+    // While opening, the runtime settings stay editable.
+    assert!(
+        opening.settings().settings.iter().any(|s| s.name == "pin_hold" && s.editable)
+    );
+    recorder.finish(Duration::from_secs(2));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A dashboard over a running recorder on a fresh database, open.
+fn live(
+    tag: &str,
+) -> (PathBuf, Arc<Board>, Dashboard, crate::serve::recorder::Recorder) {
+    use crate::serve::recorder::Recorder;
+    let root = std::env::temp_dir()
+        .join(format!("lily-dashboard-test-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let board = Arc::new(Board::default());
+    let config = config();
+    let recorder = Recorder::start(
+        Some(&root.join("lily.sqlite")),
+        &board,
+        Some(config.runtime.clone()),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while recorder.status().state != RecorderState::Open {
+        assert!(Instant::now() < deadline, "the recorder did not open");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let d = Dashboard::new(board.clone(), config).with_recorder(recorder.clone());
+    (root, board, d, recorder)
+}
+
+#[test]
+fn a_write_is_durable_before_it_is_answered_and_a_reset_goes_back_to_the_flag() {
+    let (root, _, d, recorder) = live("settings-write");
+    let r = patch(&d, serde_json::json!({"temperature": "0.5", "idle_unload": " 5m"}));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let updated = body(&r)["updated"].as_array().unwrap().clone();
+    let names: Vec<_> =
+        updated.iter().map(|s| s["name"].as_str().unwrap().to_owned()).collect();
+    assert_eq!(names, ["temperature", "idle_unload"], "in the listing's order");
+    assert!(updated.iter().all(|s| s["source"] == "database" && s["editable"] == true));
+    assert_eq!(updated[0]["value"], 0.5);
+    assert_eq!(
+        (updated[1]["value"].clone(), updated[1]["value_s"].clone()),
+        ("5m".into(), 300.into())
+    );
+    // In effect: the next request's snapshot and the status.
+    assert_eq!(d.config.runtime.snapshot().defaults.sampling.temperature, 0.5);
+    assert_eq!(d.status(READY).idle_unload_s, Some(300));
+    // Durable: in the database already.
+    let stored = recorder.read(crate::serve::recorder::stored_settings).unwrap();
+    assert_eq!(
+        stored,
+        vec![
+            ("idle_unload".into(), "\"5m\"".into()),
+            ("temperature".into(), "0.5".into())
+        ]
+    );
+    // The same again changes nothing and logs nothing.
+    let r = patch(&d, serde_json::json!({"temperature": 0.5}));
+    assert_eq!(body(&r), serde_json::json!({"updated": []}));
+    // Reset: back to the flag's 30m, the override gone.
+    let r = reset(&d, "idle_unload");
+    assert_eq!(r.status, 200);
+    let setting = body(&r)["setting"].clone();
+    assert_eq!(
+        (setting["value"].clone(), setting["source"].clone()),
+        ("30m".into(), "flag".into())
+    );
+    assert_eq!(d.status(READY).idle_unload_s, Some(1800));
+    // The change log, newest first (a write's entries in its body's order,
+    // the last one newest).
+    let log = body(&answer(&d, "GET", "/v1/lily/settings/log", &[]));
+    let entries: Vec<_> = log["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["name"].as_str().unwrap().to_owned(),
+                e["old"].clone(),
+                e["new"].clone(),
+                e["source"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        entries,
+        vec![
+            ("idle_unload".into(), "5m".into(), "30m".into(), "dashboard".into()),
+            ("idle_unload".into(), "30m".into(), "5m".into(), "dashboard".into()),
+            ("temperature".into(), 0.6.into(), 0.5.into(), "dashboard".into()),
+        ]
+    );
+    recorder.finish(Duration::from_secs(2));
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -960,8 +1242,23 @@ fn settings_show_the_flag_text_its_default_and_where_the_value_came_from() {
         Some(vec!["low".into(), "medium".into(), "xhigh".into()])
     );
     assert_eq!(get("model").value, Some(SettingValue::Text("/models/q4".into())));
-    // Nothing can change at runtime yet.
-    assert!(all.iter().all(|s| !s.editable && s.applies.is_none()));
+    // The runtime settings are editable and say when a change applies;
+    // the rest need a restart.
+    for s in &all {
+        assert_eq!(
+            s.editable,
+            crate::serve::runtime::applies(&s.name).is_some(),
+            "{}",
+            s.name
+        );
+        assert_eq!(
+            s.applies.as_deref(),
+            crate::serve::runtime::applies(&s.name),
+            "{}",
+            s.name
+        );
+    }
+    assert!(get("idle_unload").editable && !get("max_seq").editable);
     // Bounds only on numbers, the duration's seconds only on durations.
     assert!(all.iter().all(|s| s.kind == SettingType::Duration || s.value_s.is_none()));
     assert!(
@@ -1273,26 +1570,93 @@ fn requests_fixture() -> RequestsResponse {
     }
 }
 
+/// The command line's settings: flags and defaults.
+fn settings_listing() -> Vec<Setting> {
+    settings::build(
+        &[
+            flag("temperature", Some("0.6"), None),
+            flag("thinking_nudges", None, Some("true")),
+            flag("idle_unload", Some("30m"), Some("0")),
+            flag("pin_hold", None, Some("1m")),
+            flag("max_seq", None, Some("131072")),
+            flag("model", Some("/models/q4"), None),
+        ],
+        &[
+            ("top_k", SettingValue::Int(20)),
+            ("repetition_penalty", SettingValue::Int(1)),
+            ("kv_cache", SettingValue::Text("q8".into())),
+        ],
+    )
+}
+
+/// [`settings_listing`] with two of the database's overrides (`pin_hold`
+/// and `repetition_penalty`).
 fn settings_fixture() -> SettingsResponse {
+    let overrides = [
+        ("pin_hold", SettingValue::Text("5m".into())),
+        ("repetition_penalty", SettingValue::Number(1.05)),
+    ];
     SettingsResponse {
-        settings: settings::build(
-            &[
-                flag("temperature", Some("0.6"), None),
-                flag("thinking_nudges", None, Some("true")),
-                flag("idle_unload", Some("30m"), Some("0")),
-                flag("max_seq", None, Some("131072")),
-                flag("model", Some("/models/q4"), None),
-            ],
-            &[
-                ("top_k", SettingValue::Int(20)),
-                ("kv_cache", SettingValue::Text("q8".into())),
-            ],
-        ),
+        settings: settings_listing()
+            .iter()
+            .map(|s| match overrides.iter().find(|(n, _)| *n == s.name) {
+                Some((_, value)) => settings::with_override(s, value),
+                None => s.clone(),
+            })
+            .collect(),
     }
 }
 
-/// Phase 2 always serves an empty log; these entries are the shape phase 4
-/// fills in.
+fn fixture_setting(name: &str) -> Setting {
+    settings_fixture().settings.into_iter().find(|s| s.name == name).expect(name)
+}
+
+/// A PATCH that changed one setting.
+fn settings_update_fixture() -> SettingsUpdateResponse {
+    SettingsUpdateResponse { updated: vec![fixture_setting("repetition_penalty")] }
+}
+
+/// A DELETE of `pin_hold`'s override: back at its default.
+fn setting_reset_fixture() -> SettingResetResponse {
+    let listing = settings_listing();
+    SettingResetResponse {
+        setting: listing.into_iter().find(|s| s.name == "pin_hold").expect("pin_hold"),
+    }
+}
+
+/// The write errors as the server words them: 400, 403, 404, 409, 503 and
+/// 504.
+fn write_errors() -> Vec<(&'static str, ErrorBody)> {
+    let error = |message: &str, setting: Option<&str>| ErrorBody {
+        error: ErrorDetail {
+            message: message.into(),
+            setting: setting.map(str::to_owned),
+        },
+    };
+    vec![
+        ("errorInvalid", error("top_p must be in (0, 1]", Some("top_p"))),
+        ("errorGuard", error("writes need Content-Type: application/json", None)),
+        ("errorUnknown", error("unknown setting", Some("nope"))),
+        (
+            "errorRestartOnly",
+            error(
+                "max_seq needs a restart and cannot be changed here",
+                Some("max_seq"),
+            ),
+        ),
+        ("errorOutcomeUnknown", error(crate::serve::recorder::OUTCOME_UNKNOWN, None)),
+        (
+            "errorNoDatabase",
+            error(
+                "settings changes are kept in the recorder's database, which is off (--stats-db off); nothing changed",
+                None,
+            ),
+        ),
+    ]
+}
+
+/// The change log as the database serves it: a change from the dashboard
+/// and an override applied at startup.
 fn settings_log_fixture() -> SettingsLogResponse {
     SettingsLogResponse {
         entries: vec![
@@ -1390,9 +1754,9 @@ fn fixtures_ts() -> String {
          import type {\n  CancelledBy,\n  ErrorBody,\n  History,\n  LifecycleState,\n  \
          MemoryPressure,\n  Range,\n  RecorderState,\n  RequestsResponse,\n  SamplerState,\n  SessionTier,\n  \
          SessionsResponse,\n  SettingSource,\n  SettingsLogEntry,\n  SettingsLogResponse,\n  \
-         SettingsResponse,\n  SettingType,\n  Status,\n} from './types';\n",
+         SettingsResponse,\n  SettingsUpdateResponse,\n  SettingResetResponse,\n  SettingType,\n  Status,\n} from './types';\n",
     );
-    let values: [(&str, &str, &dyn erased::Json); 12] = [
+    let values: [(&str, &str, &dyn erased::Json); 13] = [
         ("status", "Status", &busy_status()),
         ("statusUnloaded", "Status", &unloaded_status()),
         ("statusSmallMachine", "Status", &small_machine_status()),
@@ -1400,6 +1764,8 @@ fn fixtures_ts() -> String {
         ("requests", "RequestsResponse", &requests_fixture()),
         ("settings", "SettingsResponse", &settings_fixture()),
         ("settingsLog", "SettingsLogResponse", &settings_log_fixture()),
+        ("settingsUpdate", "SettingsUpdateResponse", &settings_update_fixture()),
+        ("settingReset", "SettingResetResponse", &setting_reset_fixture()),
         ("history", "History", &history_fixture()),
         ("sessionHistory", "History", &session_history_fixture()),
         ("historyEmpty", "History", &empty_history_fixture()),
@@ -1413,19 +1779,15 @@ fn fixtures_ts() -> String {
                 },
             },
         ),
-        (
-            "errorSetting",
-            "ErrorBody",
-            &ErrorBody {
-                error: ErrorDetail {
-                    message: "runtime settings are not editable yet".into(),
-                    setting: Some("temperature".into()),
-                },
-            },
-        ),
     ];
     for (name, ty, value) in values {
         out.push_str(&format!("\nexport const {name}: {ty} = {};\n", json(value)));
+    }
+    for (name, value) in write_errors() {
+        out.push_str(&format!(
+            "\nexport const {name}: ErrorBody = {};\n",
+            json(&value)
+        ));
     }
     for (name, ty, value) in variants() {
         let text = serde_json::to_string_pretty(&value).expect("serialize");

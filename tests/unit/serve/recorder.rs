@@ -212,7 +212,7 @@ fn a_database_from_a_newer_lily_is_left_untouched_and_the_history_off() {
         other => panic!("{other:?}"),
     }
     let board = Arc::new(Board::default());
-    let recorder = Recorder::start(Some(&path), &board);
+    let recorder = Recorder::start(Some(&path), &board, None);
     assert!(eventually(|| recorder.status().state == RecorderState::Failed));
     let status = recorder.status();
     assert!(!status.ok);
@@ -245,7 +245,7 @@ fn a_database_that_cannot_be_opened_yet_is_retried_while_rows_wait() {
     let path = blocker.join("lily.sqlite");
     let board = Arc::new(Board::default());
     let started = Instant::now();
-    let recorder = Recorder::start(Some(&path), &board);
+    let recorder = Recorder::start(Some(&path), &board, None);
     assert!(
         started.elapsed() < Duration::from_millis(500),
         "start never waits on SQLite"
@@ -272,7 +272,7 @@ fn a_stop_while_opening_ends_at_once() {
     let blocker = root.join("blocker");
     fs::write(&blocker, b"in the way").unwrap();
     let board = Arc::new(Board::default());
-    let recorder = Recorder::start(Some(&blocker.join("lily.sqlite")), &board);
+    let recorder = Recorder::start(Some(&blocker.join("lily.sqlite")), &board, None);
     assert!(eventually(|| recorder.status().error.is_some()));
     board.record(row(T0, Some(3), 10.0, 1, 10.0));
     let started = Instant::now();
@@ -295,7 +295,7 @@ fn the_recorder_thread_stores_the_boards_rows_and_seeds_the_lineage_counter() {
     }
     let board = Arc::new(Board::default());
     assert!(board.lineages().next().id < far, "the clock seed is below the stored id");
-    let recorder = Recorder::start(Some(&path), &board);
+    let recorder = Recorder::start(Some(&path), &board, None);
     assert!(eventually(|| recorder.status().state == RecorderState::Open));
     assert!(board.lineages().next().id > far, "raised above the database's ids");
     let status = recorder.status();
@@ -329,7 +329,7 @@ fn finish_writes_what_is_queued_checkpoints_and_never_waits_past_its_cap() {
     let root = temp_root("finish");
     let path = root.join("lily.sqlite");
     let board = Arc::new(Board::default());
-    let recorder = Recorder::start(Some(&path), &board);
+    let recorder = Recorder::start(Some(&path), &board, None);
     assert!(eventually(|| recorder.status().state == RecorderState::Open));
     let now = crate::serve::now_ms();
     for i in 0..50 {
@@ -805,7 +805,7 @@ fn stats_db_takes_an_absolute_path_or_off() {
 #[test]
 fn stats_db_off_disables_the_recorder() {
     let board = Arc::new(Board::default());
-    let recorder = Recorder::start(None, &board);
+    let recorder = Recorder::start(None, &board, None);
     assert_eq!(
         recorder.status(),
         RecorderStatus {
@@ -868,5 +868,331 @@ fn a_reader_facing_a_held_lock_answers_within_its_short_timeout() {
     assert!(took < Duration::from_secs(1), "{took:?}");
     holder.execute_batch("ROLLBACK").unwrap();
     drop(holder);
+    let _ = fs::remove_dir_all(&root);
+}
+
+// --- runtime settings ---------------------------------------------------------------
+
+#[test]
+fn stored_overrides_are_applied_over_the_command_line_once_the_database_opens() {
+    use crate::serve::dashboard::contract::{SettingValue, SettingsLogSource};
+    use crate::serve::runtime::testing::runtime;
+    let root = temp_root("settings-startup");
+    let path = root.join("lily.sqlite");
+    {
+        let (conn, _) = open(&path, 5).expect("database");
+        for (name, value) in [
+            ("temperature", "0.7"),
+            ("top_p", "5"),
+            ("max_seq", "1"),
+            ("pin_hold", "\"10s\""),
+            // Equal to the default in effect: an override, but no log entry.
+            ("disk_cache_ttl", "\"3d\""),
+        ] {
+            conn.execute(
+                "INSERT INTO settings (name, value, changed_t) VALUES (?1, ?2, 1)",
+                params![name, value],
+            )
+            .unwrap();
+        }
+    }
+    let settings = runtime();
+    let board = Arc::new(Board::default());
+    assert!(!settings.settled());
+    let recorder = Recorder::start(Some(&path), &board, Some(settings.clone()));
+    assert!(eventually(|| recorder.status().state == RecorderState::Open));
+    assert!(settings.settled(), "the disk tier may expire now");
+    assert!(settings.overrides().contains_key("disk_cache_ttl"));
+    // In effect before the recorder said `open`: database over the flag.
+    assert_eq!(settings.snapshot().defaults.sampling.temperature, 0.7);
+    assert_eq!(settings.pin_hold_secs(), 10);
+    // The rows it could not apply stay where they are.
+    let stored = recorder.read(stored_settings).unwrap();
+    assert_eq!(stored.len(), 5);
+    assert_eq!(settings.snapshot().defaults.sampling.top_p, 0.95, "top_p 5 left out");
+    // One `startup` entry per override applied.
+    let log = recorder.read(|c| settings_log(c, 10)).unwrap();
+    let mut entries: Vec<_> = log
+        .iter()
+        .map(|e| (e.name.as_str(), e.old.clone(), e.new.clone(), e.source))
+        .collect();
+    entries.sort_by_key(|e| e.0);
+    assert_eq!(
+        entries,
+        vec![
+            (
+                "pin_hold",
+                Some(SettingValue::Text("1m".into())),
+                Some(SettingValue::Text("10s".into())),
+                SettingsLogSource::Startup
+            ),
+            (
+                "temperature",
+                Some(SettingValue::Number(0.6)),
+                Some(SettingValue::Number(0.7)),
+                SettingsLogSource::Startup
+            ),
+        ]
+    );
+    recorder.finish(Duration::from_secs(2));
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_change_is_written_with_its_log_entry_before_it_takes_effect() {
+    use crate::serve::dashboard::contract::{SettingValue, SettingsLogSource};
+    use crate::serve::runtime::{Change, testing::runtime};
+    let root = temp_root("settings-change");
+    let path = root.join("lily.sqlite");
+    let settings = runtime();
+    let board = Arc::new(Board::default());
+    let recorder = Recorder::start(Some(&path), &board, Some(settings.clone()));
+    assert!(eventually(|| recorder.status().state == RecorderState::Open));
+    let change = Change {
+        set: vec![("disk_cache_ttl".into(), SettingValue::Text("12h".into()))],
+        reset: Vec::new(),
+    };
+    let entries = recorder.change_settings(change, SETTINGS_WAIT).expect("written");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(settings.disk_cache_ttl_secs(), 12 * 3600);
+    assert_eq!(
+        recorder.read(stored_settings).unwrap(),
+        vec![("disk_cache_ttl".into(), "\"12h\"".into())]
+    );
+    let change = Change { set: Vec::new(), reset: vec!["disk_cache_ttl".into()] };
+    recorder.change_settings(change, SETTINGS_WAIT).expect("reset");
+    assert_eq!(settings.disk_cache_ttl_secs(), 3 * 86_400, "back to the default");
+    assert!(recorder.read(stored_settings).unwrap().is_empty(), "the override deleted");
+    let log = recorder.read(|c| settings_log(c, 10)).unwrap();
+    assert_eq!(log.len(), 2);
+    assert_eq!(
+        (log[0].new.clone(), log[0].source),
+        (Some(SettingValue::Text("3d".into())), SettingsLogSource::Dashboard),
+        "newest first"
+    );
+    // A reset of a setting without an override changes and logs nothing.
+    let change = Change { set: Vec::new(), reset: vec!["pin_hold".into()] };
+    assert!(recorder.change_settings(change, SETTINGS_WAIT).unwrap().is_empty());
+    assert_eq!(recorder.read(|c| settings_log(c, 10)).unwrap().len(), 2);
+    recorder.finish(Duration::from_secs(2));
+    // A stopped recorder takes no change.
+    let change = Change {
+        set: vec![("pin_hold".into(), SettingValue::Text("5s".into()))],
+        reset: Vec::new(),
+    };
+    assert!(recorder.change_settings(change, SETTINGS_WAIT).is_err());
+    assert_eq!(settings.pin_hold_secs(), 60, "nothing changed");
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn without_a_database_or_a_thread_nothing_changes() {
+    use crate::serve::dashboard::contract::SettingValue;
+    use crate::serve::runtime::Change;
+    let change = || Change {
+        set: vec![("pin_hold".into(), SettingValue::Text("5s".into()))],
+        reset: Vec::new(),
+    };
+    let off = Recorder::off();
+    assert_eq!(
+        off.change_settings(change(), SETTINGS_WAIT),
+        Err(WriteError::not_applied(
+            "settings changes are kept in the recorder's database, which is off (--stats-db off); nothing changed"
+        ))
+    );
+    assert_eq!(off.read(|c| settings_log(c, 1)), Err(Unavailable::Off));
+    // Open but without its thread (the read side's tests): refused too.
+    let root = temp_root("settings-threadless");
+    let path = root.join("lily.sqlite");
+    drop(open(&path, 5).expect("database"));
+    let reading = Recorder::reading(&path, Arc::default());
+    assert_eq!(
+        reading.change_settings(change(), SETTINGS_WAIT),
+        Err(WriteError::not_applied("the recorder is not running; nothing changed"))
+    );
+    assert_eq!(reading.read(|c| settings_log(c, 1)), Ok(Vec::new()));
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A recorder on a fresh database at `tag`, open, persisting `settings`.
+fn live(tag: &str, settings: &Arc<RuntimeSettings>) -> (PathBuf, Arc<Board>, Recorder) {
+    let root = temp_root(tag);
+    let board = Arc::new(Board::default());
+    let recorder = Recorder::start(
+        Some(&root.join("lily.sqlite")),
+        &board,
+        Some(settings.clone()),
+    );
+    assert!(eventually(|| recorder.status().state == RecorderState::Open));
+    (root, board, recorder)
+}
+
+fn hold(text: &str) -> Change {
+    Change {
+        set: vec![("pin_hold".into(), SettingValue::Text(text.into()))],
+        reset: Vec::new(),
+    }
+}
+
+use crate::serve::dashboard::contract::SettingValue;
+use crate::serve::runtime::{Change, testing::runtime};
+
+#[test]
+fn without_a_database_the_settings_settle_at_once() {
+    let settings = runtime();
+    let _off =
+        Recorder::start(None, &Arc::new(Board::default()), Some(settings.clone()));
+    assert!(settings.settled());
+    // A first open that fails settles them too: the flags stay in effect.
+    let root = temp_root("settle-failing");
+    fs::write(root.join("blocker"), b"").unwrap();
+    let settings = runtime();
+    let board = Arc::new(Board::default());
+    let recorder = Recorder::start(
+        Some(&root.join("blocker").join("lily.sqlite")),
+        &board,
+        Some(settings.clone()),
+    );
+    assert!(eventually(|| settings.settled()));
+    assert_eq!(recorder.status().state, RecorderState::Opening);
+    recorder.finish(Duration::from_secs(2));
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_timeout_tells_a_change_never_made_from_one_being_written() {
+    // Nobody takes it up: abandoned, so it is never made (503).
+    let (recorder, rx) = Recorder::on_channel(4);
+    let got = recorder.change_settings(hold("5s"), Duration::from_millis(20));
+    assert_eq!(got.as_ref().map_err(|e| e.status), Err(503));
+    assert!(got.unwrap_err().message.contains("nothing changed"));
+    let Ok(Msg::Settings(write)) = rx.try_recv() else { panic!("the change was sent") };
+    assert!(!write.claim.take(), "the recorder may not make it any more");
+    // Taken up, not answered in time: the outcome is unknown (504).
+    let (recorder, rx) = Recorder::on_channel(4);
+    let writer = std::thread::spawn(move || {
+        let Ok(Msg::Settings(write)) = rx.recv() else { panic!("the change") };
+        assert!(write.claim.take());
+        std::thread::sleep(Duration::from_millis(200));
+        let _ = write.reply.try_send(Ok(Vec::new()));
+    });
+    let got = recorder.change_settings(hold("5s"), Duration::from_millis(50));
+    assert_eq!(got, Err(WriteError { status: 504, message: OUTCOME_UNKNOWN.into() }));
+    writer.join().unwrap();
+    // The claim decides once.
+    let claim = Claim::default();
+    assert!(claim.abandon());
+    assert!(!claim.take() && !claim.abandon());
+}
+
+#[test]
+fn a_failed_write_publishes_nothing_nudges_nothing_and_does_not_mark_the_recorder_for_good()
+ {
+    let settings = runtime();
+    let nudges = Arc::new(AtomicU64::new(0));
+    {
+        let nudges = nudges.clone();
+        settings.on_timers_changed(move || {
+            nudges.fetch_add(1, Ordering::Relaxed);
+        });
+    }
+    let (root, board, recorder) = live("settings-failing-write", &settings);
+    // The log table gone: the transaction fails after the settings row.
+    Connection::open(root.join("lily.sqlite"))
+        .unwrap()
+        .execute_batch("DROP TABLE settings_log")
+        .unwrap();
+    let got = recorder.change_settings(hold("5s"), SETTINGS_WAIT);
+    let error = got.unwrap_err();
+    assert_eq!(error.status, 503);
+    assert!(
+        error.message.starts_with("the database refused the change"),
+        "{}",
+        error.message
+    );
+    assert_eq!(settings.pin_hold_secs(), 60, "not published");
+    assert_eq!(nudges.load(Ordering::Relaxed), 0, "no nudge");
+    assert!(recorder.read(stored_settings).unwrap().is_empty(), "rolled back");
+    assert!(!recorder.status().ok);
+    // The next write that succeeds, of any kind, clears it.
+    board.record(row(super::super::now_ms(), None, 1.0, 1, 1.0));
+    assert!(eventually(|| recorder.status().ok), "a request row's write clears it");
+    recorder.finish(Duration::from_secs(2));
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn two_changes_of_one_setting_queue_up_with_their_own_old_and_new() {
+    let settings = runtime();
+    let (root, _board, recorder) = live("settings-two-changes", &settings);
+    std::thread::scope(|scope| {
+        for text in ["5s", "7s"] {
+            let recorder = &recorder;
+            scope.spawn(move || {
+                recorder.change_settings(hold(text), SETTINGS_WAIT).unwrap()
+            });
+        }
+    });
+    let mut log = recorder.read(|c| settings_log(c, 10)).unwrap();
+    log.reverse();
+    assert_eq!(log.len(), 2);
+    // Whichever came first, each starts where the one before ended.
+    assert_eq!(log[0].old, Some(SettingValue::Text("1m".into())));
+    assert_eq!(log[1].old, log[0].new);
+    assert_eq!(Some(settings.overrides()["pin_hold"].clone()), log[1].new);
+    recorder.finish(Duration::from_secs(2));
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn settings_that_cannot_be_read_leave_the_flags_and_refuse_changes() {
+    let root = temp_root("settings-unreadable");
+    let path = root.join("lily.sqlite");
+    {
+        let (conn, _) = open(&path, 5).expect("database");
+        conn.execute_batch("DROP TABLE settings").unwrap();
+    }
+    let settings = runtime();
+    let board = Arc::new(Board::default());
+    let recorder = Recorder::start(Some(&path), &board, Some(settings.clone()));
+    assert!(eventually(|| recorder.status().state == RecorderState::Open));
+    assert!(settings.settled() && settings.overrides().is_empty());
+    assert_eq!(
+        recorder.change_settings(hold("5s"), SETTINGS_WAIT),
+        Err(WriteError::not_applied(
+            "settings could not be read from the database (see the server log); nothing changed"
+        ))
+    );
+    // The history still works.
+    assert!(recorder.read(oldest).is_ok());
+    recorder.finish(Duration::from_secs(2));
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_reset_deletes_a_stale_row_the_start_ignored() {
+    let root = temp_root("settings-stale-reset");
+    let path = root.join("lily.sqlite");
+    {
+        let (conn, _) = open(&path, 5).expect("database");
+        conn.execute(
+            "INSERT INTO settings (name, value, changed_t) VALUES ('top_p', '5', 1)",
+            [],
+        )
+        .unwrap();
+    }
+    let settings = runtime();
+    let board = Arc::new(Board::default());
+    let recorder = Recorder::start(Some(&path), &board, Some(settings.clone()));
+    assert!(eventually(|| recorder.status().state == RecorderState::Open));
+    assert!(settings.overrides().is_empty(), "top_p 5 was ignored");
+    let reset = Change { set: Vec::new(), reset: vec!["top_p".into()] };
+    assert_eq!(recorder.change_settings(reset, SETTINGS_WAIT), Ok(Vec::new()));
+    assert!(recorder.read(stored_settings).unwrap().is_empty(), "the row is gone");
+    assert!(
+        recorder.read(|c| settings_log(c, 10)).unwrap().is_empty(),
+        "nothing changed"
+    );
+    recorder.finish(Duration::from_secs(2));
     let _ = fs::remove_dir_all(&root);
 }

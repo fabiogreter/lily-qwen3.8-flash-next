@@ -6,7 +6,8 @@
 //
 // Time: everything is relative to a `now` the caller passes (the mock backend
 // passes its clock). A history bucket's numbers depend only on its own time, so
-// the grid slides with `now` without the curves changing under the reader.
+// the grid slides with `now` without the curves changing under the reader; only
+// a partial last bucket (24h, 7d) grows as its minutes pass, as on the server.
 
 import type {
   CancelledBy,
@@ -23,7 +24,7 @@ import type {
   SettingValue,
   Status,
 } from '../api/types';
-import { parseDurationSecs } from './duration';
+import { parseDurationSecs } from '../lib/duration';
 
 /** Deterministic PRNG (mulberry32). */
 export function rng(seed: number): () => number {
@@ -144,8 +145,13 @@ function point(t: number, seed: number, stepMs: number): HistoryPoint {
 
 type RateKey = 'decode_tps_avg' | 'decode_tps_max' | 'prefill_tps_avg' | 'prefill_tps_max' | 'acceptance' | 'cache_hit';
 
-/** The interval summary the real server computes (docs/dashboard.md § 5): averages weighted by busy time, maxima the best bucket. */
-export function summarize(points: HistoryPoint[]): HistorySummary {
+/**
+ * The interval summary the real server computes (docs/dashboard.md § 5):
+ * averages weighted by busy time, maxima the best bucket, busy time over the
+ * wall time the grid covers. `lastCoveredMs` is how much of the last bucket
+ * the data covers (all of it unless the bucket is partial).
+ */
+export function summarize(points: HistoryPoint[], lastCoveredMs?: number): HistorySummary {
   const busy = points.filter((p) => p.decode_tps_avg != null);
   const sum = (f: (p: HistoryPoint) => number): number => points.reduce((s, p) => s + f(p), 0);
   const max = (k: RateKey): number | null => (busy.length ? busy.reduce((m, p) => Math.max(m, p[k] ?? 0), 0) : null);
@@ -156,6 +162,10 @@ export function summarize(points: HistoryPoint[]): HistorySummary {
     return digits === 1 ? round1(v) : round3(v);
   };
   const stepMs = points.length > 1 ? (points[1]?.t ?? 0) - (points[0]?.t ?? 0) : 0;
+  // Each bucket's share of the wall time: the step, the last one what it covers.
+  const covered = (i: number): number => (i === points.length - 1 && lastCoveredMs != null ? lastCoveredMs : stepMs);
+  const wall = points.reduce((s, _, i) => s + covered(i), 0);
+  const busyMs = points.reduce((s, p, i) => s + p.busy_share * covered(i), 0);
   const withPower = points.filter((p) => p.power_w != null);
   const powerSum = withPower.reduce((s, p) => s + (p.power_w ?? 0), 0);
   return {
@@ -164,7 +174,7 @@ export function summarize(points: HistoryPoint[]): HistorySummary {
     tokens_generated: sum((p) => p.decode_tokens),
     tokens_prefilled: sum((p) => p.prefill_tokens),
     requests: sum((p) => p.requests),
-    busy_share: points.length ? round3(sum((p) => p.busy_share) / points.length) : 0,
+    busy_share: wall > 0 ? round3(busyMs / wall) : points.length ? round3(sum((p) => p.busy_share) / points.length) : 0,
     cache_hit: wavg('cache_hit', 3),
     acceptance: wavg('acceptance', 3),
     power_avg_w: withPower.length ? round1(powerSum / withPower.length) : null,
@@ -172,14 +182,35 @@ export function summarize(points: HistoryPoint[]): HistorySummary {
   };
 }
 
-/** The complete grid of buckets ending at `now` (floored to the bucket width), oldest first. */
-export function buildHistory(range: Range, now: number, seed = 7): History {
+/**
+ * The grid at `now` as the server lays it out (src/serve/dashboard/history.rs):
+ * the data runs to the last complete minute (`dataEnd`), the last bucket is the
+ * one that minute falls in, stamped with its nominal end (`end`, later than now
+ * when the bucket is partial), and `lastCovered` is how much of it the data
+ * covers.
+ */
+export function grid(range: Range, now: number): { end: number; dataEnd: number; lastCovered: number; buckets: number; step: number } {
   const { span, step } = RANGE_CFG[range];
-  const end = Math.floor(now / step) * step;
-  const n = span / step;
+  const dataEnd = Math.floor(now / 60e3) * 60e3;
+  const end = Math.floor((dataEnd - 1) / step) * step + step;
+  return { end, dataEnd, lastCovered: dataEnd - (end - step), buckets: span / step, step };
+}
+
+/** The complete grid of buckets (see `grid`), oldest first. */
+export function buildHistory(range: Range, now: number, seed = 7): History {
+  const { end, lastCovered, buckets: n, step } = grid(range, now);
   const points: HistoryPoint[] = [];
   for (let k = 0; k < n; k++) points.push(point(end - (n - 1 - k) * step, seed, step));
-  return { range, step_s: step / 1000, points, summary: summarize(points) };
+  // A partial last bucket holds the share of its counts its minutes saw; its
+  // ratios (busy share, rates, machine means) are over those minutes.
+  const last = points[n - 1];
+  if (last && lastCovered < step) {
+    const f = lastCovered / step;
+    last.requests = Math.round(last.requests * f);
+    last.decode_tokens = Math.round(last.decode_tokens * f);
+    last.prefill_tokens = Math.round(last.prefill_tokens * f);
+  }
+  return { range, step_s: step / 1000, points, summary: summarize(points, lastCovered) };
 }
 
 // ---------------------------------------------------------------------------
@@ -240,7 +271,8 @@ export function buildSessionHistory(sessions: Session[], lineage: number, range:
     p.gpu_power_w = null;
     p.gpu_freq_mhz = null;
   }
-  const base = summarize(h.points);
+  const covered = grid(range, now).lastCovered;
+  const base = summarize(h.points, covered);
   const kd = base.decode.avg && entry.decode_tps_avg != null ? entry.decode_tps_avg / base.decode.avg : 1;
   const kp = base.prefill.avg && entry.prefill_tps_avg != null ? entry.prefill_tps_avg / base.prefill.avg : 1;
   for (const p of h.points) {
@@ -252,7 +284,7 @@ export function buildSessionHistory(sessions: Session[], lineage: number, range:
     p.decode_tokens = Math.round(p.decode_tokens * kd);
     p.prefill_tokens = Math.round(p.prefill_tokens * kp);
   }
-  h.summary = summarize(h.points);
+  h.summary = summarize(h.points, covered);
   return h;
 }
 
@@ -379,8 +411,9 @@ export function buildSettings(): Setting[] {
     s('tool_call_ends_thinking', 'Thinking', 'bool', true, { flag: '--tool-call-ends-thinking', applies: NEXT_REQUEST }),
     // Lifecycle and caches (runtime).
     s('idle_unload', 'Lifecycle', 'duration', '0', { flag: '--idle-unload', value: '30m', source: 'flag', help: '0 never unloads.', applies: 'timer re-armed on change' }),
-    s('pin_hold', 'Lifecycle', 'duration', '1m', { flag: '--pin-hold', applies: 'next release' }),
+    s('pin_hold', 'Lifecycle', 'duration', '1m', { flag: '--pin-hold', applies: 'hold re-armed on change' }),
     s('disk_cache_ttl', 'Caches', 'duration', '3d', { flag: '--disk-cache-ttl', applies: 'next expiry pass' }),
+    s('durable_min_tokens', 'Caches', 'int', 1024, { flag: '--durable-min-tokens', min: 0, help: '0 turns durable prefix entries off.', applies: NEXT_REQUEST }),
     // Restart-only (read-only in the dashboard).
     ro('model', 'Engine', '~/models/Qwen3.8-Flash-Next-lily-q4', '--model', 'flag'),
     ro('bind', 'Engine', '127.0.0.1:8000', '--bind', 'default'),
@@ -394,7 +427,6 @@ export function buildSettings(): Setting[] {
     ro('cache_bytes', 'Caches', 'auto', '--cache-bytes', 'default'),
     ro('max_sessions', 'Caches', 16, '--max-sessions', 'default'),
     ro('disk_cache_bytes', 'Caches', '100G', '--disk-cache-bytes', 'default'),
-    ro('durable_min_tokens', 'Caches', 1024, '--durable-min-tokens', 'default'),
     ro('decode_checkpoint_tokens', 'Caches', 2048, '--decode-checkpoint-tokens', 'default'),
     ro('ngram_table', 'Caches', 'paged', '--ngram-table', 'default'),
     ro('pin_weights', 'Lifecycle', 'auto', '--pin-weights', 'default'),

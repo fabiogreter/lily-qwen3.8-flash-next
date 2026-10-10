@@ -340,6 +340,90 @@ fn entries_expire_after_the_maximum_age() {
 }
 
 #[test]
+fn the_maximum_age_is_read_at_each_expiry_pass() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let root = temp_root("ttl-runtime");
+    let day = 86_400;
+    let mut store = DiskStore::open(&root, "fmt", 1 << 20, 0).expect("open");
+    let old = store_fake(&mut store, &[1], 10, None).expect("old");
+    backdate(&root, &old, 4 * day);
+    drop(store);
+    // The runtime settings' handle, 0 at first: nothing expires.
+    let ttl = Arc::new(AtomicU64::new(0));
+    let mut store = DiskStore::open(&root, "fmt", 1 << 20, ttl.load(Ordering::Acquire))
+        .expect("reopen")
+        .with_max_age(ttl.clone());
+    store.expire();
+    assert_eq!(store.len(), 1);
+    // A change applies at the next pass, without a reopen.
+    ttl.store(5 * day, Ordering::Release);
+    assert_eq!(store.max_age_secs(), 5 * day);
+    store.expire();
+    assert_eq!(store.len(), 1, "4 days unused is inside 5");
+    ttl.store(3 * day, Ordering::Release);
+    store.expire();
+    assert!(store.is_empty(), "and outside 3");
+    assert!(!root.join("fmt").join(&old).exists());
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_entry_the_stored_ttl_keeps_survives_a_start_whose_flag_ttl_would_expire_it() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+    let root = temp_root("ttl-startup");
+    let day = 86_400;
+    let mut store = DiskStore::open(&root, "fmt", 1 << 20, 0).expect("open");
+    let old = store_fake(&mut store, &[1], 10, None).expect("old");
+    backdate(&root, &old, 4 * day);
+    drop(store);
+    // The start: `--disk-cache-ttl 3d` in effect, the database (5d) not
+    // applied yet, the bound far off.
+    let ttl = Arc::new(AtomicU64::new(3 * day));
+    let settled = Arc::new(AtomicBool::new(false));
+    let gate =
+        ExpiryGate::new(settled.clone(), Instant::now() + Duration::from_secs(3600));
+    let mut store = DiskStore::open_gated(&root, "fmt", 1 << 20, ttl.clone(), gate)
+        .expect("reopen");
+    assert_eq!(store.len(), 1, "no expiry at the open");
+    assert!(!store.expiring());
+    store.expire();
+    assert_eq!(store.len(), 1, "nor before the overrides are settled");
+    // The recorder applies the stored 5d, then settles.
+    ttl.store(5 * day, Ordering::Release);
+    settled.store(true, Ordering::Release);
+    assert!(store.expiring());
+    store.expire();
+    assert_eq!(store.len(), 1, "4 days unused is inside the stored 5");
+    // Had the flag's TTL stayed, the first pass after settling expires it.
+    ttl.store(3 * day, Ordering::Release);
+    store.expire();
+    assert!(store.is_empty());
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_gate_that_is_never_settled_opens_at_its_bound() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::time::Instant;
+    let root = temp_root("ttl-bound");
+    let mut store = DiskStore::open(&root, "fmt", 1 << 20, 0).expect("open");
+    let old = store_fake(&mut store, &[1], 10, None).expect("old");
+    backdate(&root, &old, 10);
+    drop(store);
+    let gate = ExpiryGate::new(Arc::new(AtomicBool::new(false)), Instant::now());
+    let mut store =
+        DiskStore::open_gated(&root, "fmt", 1 << 20, Arc::new(AtomicU64::new(5)), gate)
+            .expect("reopen");
+    assert!(store.is_empty(), "past its bound the gate is open, the open expires");
+    store.expire();
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn a_reserved_entry_is_invisible_until_committed_and_a_crash_leaves_nothing_readable() {
     let root = temp_root("reserve");
     let mut store = DiskStore::open(&root, "fmt", 1 << 20, 0).expect("open");

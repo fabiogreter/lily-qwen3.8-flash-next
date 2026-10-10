@@ -65,6 +65,19 @@
 //! counted. The thread never panics on a SQLite error, and if it ends anyway
 //! the rows sent to it are counted as dropped.
 //!
+//! **Settings** (§ 7.3). The thread is the one writer of the runtime
+//! settings after startup. Once the database opens, before the recorder
+//! says `open`, it applies the stored overrides over the command line
+//! (`RuntimeSettings::apply_stored`), logs one line naming them and records a
+//! `startup` entry for each; a row it cannot apply is logged and kept. A
+//! change from the dashboard ([`Recorder::change_settings`]) comes through
+//! the same channel as the rows: the thread plans it against the state now,
+//! writes the `settings` rows and the `settings_log` entries in one
+//! transaction and only then puts it into effect, so the server and the
+//! database never disagree. The HTTP thread waits for that at most
+//! [`SETTINGS_WAIT`]; a change it stopped waiting for before the thread took
+//! it up is not made.
+//!
 //! **Shutdown.** [`Recorder::finish`] asks the thread to stop, waits for it
 //! at most a bounded time, and the thread's last act is a WAL checkpoint
 //! that truncates the WAL.
@@ -77,7 +90,7 @@
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
@@ -86,9 +99,11 @@ use std::time::{Duration, Instant};
 use rusqlite::{Connection, ErrorCode, OpenFlags, Transaction, params};
 
 use super::dashboard::contract::{
-    CancelledBy, RecorderState, RecorderStatus, RequestRow,
+    CancelledBy, RecorderState, RecorderStatus, RequestRow, SettingValue,
+    SettingsLogEntry, SettingsLogSource,
 };
 use super::dashboard::{Board, StoreView};
+use super::runtime::{Change, Entry, Plan, RuntimeSettings, same_value};
 use crate::stats::CpuTicks;
 
 /// The schema this lily writes (`PRAGMA user_version`). Migrations only go
@@ -125,6 +140,13 @@ const OPEN_BACKOFF: [Duration; 4] = [
 ];
 /// The WAL is truncated to this after a checkpoint.
 pub const JOURNAL_SIZE_LIMIT: i64 = 4 << 20;
+/// The kinds of write a settings change makes (see [`Writer::outcome`]).
+const SETTINGS_WRITES: [&str; 2] = ["writing settings", "writing the settings log"];
+/// How long a settings change waits for the recorder to make it durable:
+/// the writer's own busy timeout and a margin.
+pub const SETTINGS_WAIT: Duration = Duration::from_secs(3);
+/// The most change log entries `GET /v1/lily/settings/log` returns.
+pub const SETTINGS_LOG_LIMIT: usize = 500;
 
 /// The forward-only migrations: `MIGRATIONS[v]` takes version `v` to `v + 1`.
 const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [SCHEMA_V1];
@@ -268,6 +290,9 @@ pub struct Health {
     oldest: AtomicU64,
     /// The kinds of error logged so far, each once.
     logged: Mutex<HashSet<&'static str>>,
+    /// The `settings` table could not be read at the open (twice): the
+    /// command line stays in effect and settings changes are refused.
+    settings_unreadable: AtomicBool,
 }
 
 impl Default for Health {
@@ -280,6 +305,7 @@ impl Default for Health {
             db_bytes: AtomicU64::new(0),
             oldest: AtomicU64::new(0),
             logged: Mutex::default(),
+            settings_unreadable: AtomicBool::new(false),
         }
     }
 }
@@ -308,12 +334,74 @@ impl Health {
     }
 }
 
-/// What the board and [`Recorder::finish`] send the recorder thread.
+/// What the board, the settings routes and [`Recorder::finish`] send the
+/// recorder thread.
 #[derive(Debug)]
 pub enum Msg {
     Row(Box<RequestRow>),
+    Settings(Box<SettingsWrite>),
     /// Write what is pending, checkpoint and end.
     Stop,
+}
+
+/// A settings change for the recorder to write and put into effect.
+#[derive(Debug)]
+pub struct SettingsWrite {
+    change: Change,
+    /// The entries of what changed, or why nothing did.
+    reply: SyncSender<Result<Vec<Entry>, WriteError>>,
+    /// Who has it: the recorder (taken) or the HTTP thread (abandoned).
+    claim: Arc<Claim>,
+}
+
+/// Why a settings change was not made, or may have been, as the route
+/// answers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteError {
+    /// 503 nothing changed, 504 the outcome is unknown, 500 the change
+    /// could not be worked out.
+    pub status: u16,
+    pub message: String,
+}
+
+impl WriteError {
+    /// Nothing changed (503).
+    pub fn not_applied(message: impl Into<String>) -> Self {
+        Self { status: 503, message: message.into() }
+    }
+}
+
+/// The message of a change whose outcome the HTTP thread cannot know.
+pub const OUTCOME_UNKNOWN: &str =
+    "the change may still apply; reload to see the current value";
+
+/// Who decides a settings change's fate once the HTTP thread stops
+/// waiting: the recorder takes it before writing, the HTTP thread abandons
+/// it on its timeout; whichever comes first wins, so a timeout tells a
+/// change that will never be made (abandoned) from one being written.
+#[derive(Debug, Default)]
+pub struct Claim(AtomicU8);
+
+impl Claim {
+    const PENDING: u8 = 0;
+    const TAKEN: u8 = 1;
+    const ABANDONED: u8 = 2;
+
+    fn swap_from_pending(&self, to: u8) -> bool {
+        self.0
+            .compare_exchange(Self::PENDING, to, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// The recorder's: `true` when it may make the change.
+    pub fn take(&self) -> bool {
+        self.swap_from_pending(Self::TAKEN)
+    }
+
+    /// The HTTP thread's: `true` when the change will never be made.
+    pub fn abandon(&self) -> bool {
+        self.swap_from_pending(Self::ABANDONED)
+    }
 }
 
 /// The board's end of the channel to the recorder.
@@ -567,6 +655,71 @@ pub fn oldest(conn: &Connection) -> rusqlite::Result<Option<u64>> {
         [],
         |r| r.get(0),
     )
+}
+
+/// The overrides stored in the database: name and JSON text.
+pub fn stored_settings(conn: &Connection) -> rusqlite::Result<Vec<(String, String)>> {
+    let mut select = conn.prepare("SELECT name, value FROM settings ORDER BY name")?;
+    let rows = select.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    rows.collect()
+}
+
+/// A stored value (JSON text, NULL for none) as the contract's value; text
+/// that is not a JSON number, string or boolean reads as `None`.
+fn stored_value(text: Option<String>) -> Option<SettingValue> {
+    text.and_then(|t| serde_json::from_str(&t).ok())
+        .and_then(|v: serde_json::Value| SettingValue::from_json(&v))
+}
+
+/// The newest `limit` change log entries, newest first. An entry with a
+/// source this lily does not know is left out.
+pub fn settings_log(
+    conn: &Connection,
+    limit: usize,
+) -> rusqlite::Result<Vec<SettingsLogEntry>> {
+    let mut select = conn.prepare(
+        "SELECT t, name, old, new, source FROM settings_log
+         ORDER BY t DESC, rowid DESC LIMIT ?1",
+    )?;
+    let rows = select.query_map([limit as i64], |r| {
+        let (t, name, old, new, source): (u64, String, _, _, String) =
+            (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?);
+        Ok(SettingsLogSource::parse(&source).map(|source| SettingsLogEntry {
+            t,
+            name,
+            old: stored_value(old),
+            new: stored_value(new),
+            source,
+        }))
+    })?;
+    rows.filter_map(Result::transpose).collect()
+}
+
+/// A value as the database stores it: JSON text.
+fn json_text(value: &Option<SettingValue>) -> Option<String> {
+    value.as_ref().and_then(|v| serde_json::to_string(v).ok())
+}
+
+/// Inserts `entries` into the change log at `t` from `source`.
+fn log_entries(
+    tx: &Transaction<'_>,
+    entries: &[Entry],
+    source: SettingsLogSource,
+    t: u64,
+) -> rusqlite::Result<()> {
+    let mut insert = tx.prepare_cached(
+        "INSERT INTO settings_log (t, name, old, new, source) VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    for e in entries {
+        insert.execute(params![
+            t,
+            e.name,
+            json_text(&e.old),
+            json_text(&e.new),
+            source.as_str()
+        ])?;
+    }
+    Ok(())
 }
 
 // --- request rows and their minutes ------------------------------------------
@@ -1076,6 +1229,10 @@ impl Writer {
         let value = match result {
             Ok(value) => {
                 self.failing.remove(kind);
+                // A settings write that failed is a single change the
+                // dashboard was told about, not a kind of write that keeps
+                // failing: any success clears it.
+                self.failing.retain(|k| !SETTINGS_WRITES.contains(k));
                 Some(value)
             }
             Err(error) => {
@@ -1298,6 +1455,54 @@ impl Writer {
         self.read("reading lineage ids", max_lineage(&self.conn)).flatten()
     }
 
+    /// The overrides the database holds; a failure is logged and reads as
+    /// none (the command line stays in effect).
+    pub fn stored_settings(&self) -> Option<Vec<(String, String)>> {
+        self.read("reading the settings", stored_settings(&self.conn))
+    }
+
+    /// Writes `plan` at `t`: each changed setting's override set or deleted
+    /// and its change logged from the dashboard, in one transaction.
+    /// Returns why it failed (nothing is written then).
+    pub fn settings(&mut self, plan: &Plan, t: u64) -> Result<(), String> {
+        let result = (|| {
+            let tx = self.conn.transaction()?;
+            // A reset deletes the row by name, also one that was never in
+            // effect (a stale row the start ignored).
+            for name in plan.reset_rows() {
+                tx.execute("DELETE FROM settings WHERE name = ?1", [name])?;
+            }
+            for e in &plan.entries {
+                if let Some(value) = plan.override_of(&e.name) {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO settings (name, value, changed_t) VALUES (?1, ?2, ?3)",
+                        params![e.name, json_text(&Some(value.clone())), t],
+                    )?;
+                }
+            }
+            log_entries(&tx, &plan.entries, SettingsLogSource::Dashboard, t)?;
+            tx.commit()
+        })();
+        let why = result.as_ref().err().map(|e| e.to_string());
+        match (self.outcome("writing settings", result), why) {
+            (Some(()), _) => Ok(()),
+            (None, why) => Err(format!(
+                "the database refused the change ({}); nothing changed",
+                why.unwrap_or_default()
+            )),
+        }
+    }
+
+    /// Logs `entries` at `t` as applied at startup.
+    pub fn startup_entries(&mut self, entries: &[Entry], t: u64) -> bool {
+        let result = (|| {
+            let tx = self.conn.transaction()?;
+            log_entries(&tx, entries, SettingsLogSource::Startup, t)?;
+            tx.commit()
+        })();
+        self.outcome("writing the settings log", result).is_some()
+    }
+
     /// The last act before the thread ends: the retry, then a checkpoint.
     fn close(&mut self) {
         self.give_up_retry();
@@ -1335,6 +1540,10 @@ struct Recording {
     started_ms: u64,
     machine: Option<MachineMinute>,
     ticks: Option<CpuTicks>,
+    /// The runtime settings it persists (`None`: tests without any).
+    settings: Option<Arc<RuntimeSettings>>,
+    /// Settings changes received and not answered yet.
+    changes: Vec<SettingsWrite>,
 }
 
 /// What a wait on the channel saw.
@@ -1369,6 +1578,7 @@ impl Recording {
             if !batch.is_empty() {
                 writer.record(batch);
             }
+            self.change_settings(&mut writer);
             if let Waited::Stop = waited {
                 break;
             }
@@ -1391,37 +1601,155 @@ impl Recording {
     }
 
     /// Receives rows into `into` until `until`, a stop, or `cap` rows (the
-    /// excess counted as dropped); returns at the first row once one came.
+    /// excess counted as dropped), settings changes into `self.changes`;
+    /// returns at the first message once one came.
     fn receive(
-        &self,
+        &mut self,
         until: Instant,
         into: &mut Vec<RequestRow>,
         cap: usize,
     ) -> Waited {
-        let take = |into: &mut Vec<RequestRow>, row: Box<RequestRow>| {
-            if into.len() < cap {
-                into.push(*row);
-            } else {
-                self.health.drop_rows(1);
-            }
-        };
         let wait = until.saturating_duration_since(Instant::now());
         match self.rows.recv_timeout(wait) {
-            Ok(Msg::Row(row)) => take(into, row),
-            Ok(Msg::Stop) | Err(RecvTimeoutError::Disconnected) => return Waited::Stop,
+            Ok(msg) => {
+                if self.take(msg, into, cap) {
+                    return Waited::Stop;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => return Waited::Stop,
             Err(RecvTimeoutError::Timeout) => return Waited::Time,
         }
         // Whatever else is queued joins the batch.
         while into.len() < cap {
             match self.rows.try_recv() {
-                Ok(Msg::Row(row)) => take(into, row),
-                Ok(Msg::Stop) | Err(mpsc::TryRecvError::Disconnected) => {
-                    return Waited::Stop;
+                Ok(msg) => {
+                    if self.take(msg, into, cap) {
+                        return Waited::Stop;
+                    }
                 }
+                Err(mpsc::TryRecvError::Disconnected) => return Waited::Stop,
                 Err(mpsc::TryRecvError::Empty) => break,
             }
         }
         Waited::Time
+    }
+
+    /// Files `msg`: a row into `into` (past `cap` counted as dropped), a
+    /// settings change for later. `true` for a stop.
+    fn take(&mut self, msg: Msg, into: &mut Vec<RequestRow>, cap: usize) -> bool {
+        match msg {
+            Msg::Row(row) if into.len() < cap => into.push(*row),
+            Msg::Row(_) => self.health.drop_rows(1),
+            Msg::Settings(write) => self.changes.push(*write),
+            Msg::Stop => return true,
+        }
+        false
+    }
+
+    /// Answers every settings change received with `why`, making none.
+    fn refuse_changes(&mut self, why: &str) {
+        for write in self.changes.drain(..) {
+            let _ = write.reply.try_send(Err(WriteError::not_applied(why)));
+        }
+    }
+
+    /// The first attempt to open is over: the disk tier may expire with
+    /// the TTL in effect now.
+    fn settle(&self) {
+        if let Some(settings) = &self.settings {
+            settings.settle();
+        }
+    }
+
+    /// Makes the settings changes received: each planned against the state
+    /// now, written, then put into effect, and answered. A change whose
+    /// sender stopped waiting is not made.
+    fn change_settings(&mut self, writer: &mut Writer) {
+        for write in std::mem::take(&mut self.changes) {
+            let SettingsWrite { change, reply, claim } = write;
+            if !claim.take() {
+                // Its sender stopped waiting first: it is never made.
+                continue;
+            }
+            let result = match &self.settings {
+                None => Err(WriteError::not_applied(
+                    "this recorder keeps no settings; nothing changed",
+                )),
+                Some(settings) => match settings.plan(&change) {
+                    Err(why) => Err(WriteError {
+                        status: 500,
+                        message: format!(
+                            "the change could not be worked out ({why}); nothing changed"
+                        ),
+                    }),
+                    Ok(plan) => {
+                        let written = if plan.writes_anything() {
+                            writer.settings(&plan, super::now_ms())
+                        } else {
+                            Ok(())
+                        };
+                        match written {
+                            Ok(()) => {
+                                let entries = plan.entries.clone();
+                                settings.publish(plan);
+                                Ok(entries)
+                            }
+                            // Nothing written, nothing published.
+                            Err(why) => Err(WriteError::not_applied(why)),
+                        }
+                    }
+                },
+            };
+            let _ = reply.try_send(result);
+        }
+    }
+
+    /// Applies the overrides the database holds over the command line, logs
+    /// which, and records a `startup` entry for each.
+    fn apply_stored_settings(&self, writer: &mut Writer) {
+        let Some(settings) = &self.settings else { return };
+        // Read twice before giving up on them.
+        let Some(rows) = writer.stored_settings().or_else(|| writer.stored_settings())
+        else {
+            eprintln!(
+                "settings: the database's overrides could not be read; the command line stays in effect and settings changes are refused"
+            );
+            self.health.settings_unreadable.store(true, Ordering::Release);
+            return;
+        };
+        if rows.is_empty() {
+            return;
+        }
+        let startup = settings.apply_stored(&rows);
+        for (name, why) in &startup.ignored {
+            eprintln!(
+                "settings: ignoring the database's {name}: {why}; the row is kept"
+            );
+        }
+        if !startup.applied.is_empty() {
+            let list: Vec<String> = startup
+                .applied
+                .iter()
+                .map(|e| {
+                    format!("{} {}", e.name, json_text(&e.new).unwrap_or_default())
+                })
+                .collect();
+            eprintln!(
+                "settings: from the database, over the command line: {}",
+                list.join(", ")
+            );
+            // The log records what changed: an override equal to the value
+            // it replaces changed nothing.
+            let changed: Vec<Entry> = startup
+                .applied
+                .iter()
+                .filter(|e| !same_value(&e.old, &e.new))
+                .cloned()
+                .collect();
+            if !changed.is_empty() {
+                writer.startup_entries(&changed, super::now_ms());
+            }
+        }
     }
 
     /// Opens the database, retrying with [`OPEN_BACKOFF`] while rows wait in
@@ -1452,6 +1780,9 @@ impl Recording {
                         board.lineages().raise_above(max);
                     }
                     writer.publish_extent();
+                    // Before `open`: no change from the dashboard races it.
+                    self.apply_stored_settings(&mut writer);
+                    self.settle();
                     self.health.opened.store(true, Ordering::Release);
                     self.health.set_phase(RecorderState::Open, None);
                     eprintln!(
@@ -1472,7 +1803,11 @@ impl Recording {
                     );
                     eprintln!("recorder: {message}");
                     self.health.set_phase(RecorderState::Failed, Some(message));
+                    self.settle();
                     self.health.drop_rows(pending.len());
+                    self.refuse_changes(
+                        "the recorder's database cannot be used; nothing changed",
+                    );
                     return None;
                 }
                 Err(failure @ OpenFailure::Other(_)) => {
@@ -1484,13 +1819,19 @@ impl Recording {
                     }
                     self.health.set_phase(RecorderState::Opening, Some(error.clone()));
                     last_error = error;
+                    // The flags stay in effect until an open succeeds.
+                    self.settle();
                 }
             }
             let wait = OPEN_BACKOFF[attempt.min(OPEN_BACKOFF.len() - 1)];
             attempt += 1;
             let until = Instant::now() + wait;
             loop {
-                match self.receive(until, pending, ROW_CHANNEL) {
+                let waited = self.receive(until, pending, ROW_CHANNEL);
+                self.refuse_changes(
+                    "the recorder's database is not open yet (see the server log); nothing changed",
+                );
+                match waited {
                     Waited::Stop => {
                         self.health.drop_rows(pending.len());
                         return None;
@@ -1537,6 +1878,16 @@ pub enum Unavailable {
 }
 
 impl Unavailable {
+    /// For the change log, which lives in the same database.
+    pub fn log_message(self) -> &'static str {
+        match self {
+            Self::Off => {
+                "the change log is kept in the recorder's database, which is off (--stats-db off)"
+            }
+            other => other.message(),
+        }
+    }
+
     pub fn message(self) -> &'static str {
         match self {
             Self::Off => "history is off (--stats-db off)",
@@ -1590,13 +1941,22 @@ impl Recorder {
     }
 
     /// Starts the recorder thread on the database at `path` (`None`:
-    /// `--stats-db off`) and attaches the board's row sink. Returns at once;
-    /// the thread opens the database (see the module docs).
-    pub fn start(path: Option<&Path>, board: &Arc<Board>) -> Self {
+    /// `--stats-db off`) and attaches the board's row sink; the thread
+    /// persists `settings`. Returns at once; the thread opens the database
+    /// (see the module docs).
+    pub fn start(
+        path: Option<&Path>,
+        board: &Arc<Board>,
+        settings: Option<Arc<RuntimeSettings>>,
+    ) -> Self {
         let Some(path) = path else {
             eprintln!("recorder: off (--stats-db off); the dashboard shows no history");
+            if let Some(settings) = &settings {
+                settings.settle();
+            }
             return Self::off();
         };
+        let settle = settings.clone();
         let health = Arc::new(Health::default());
         let (rows, rx) = mpsc::sync_channel(ROW_CHANNEL);
         let recording = Recording {
@@ -1607,6 +1967,8 @@ impl Recorder {
             started_ms: super::now_ms(),
             machine: None,
             ticks: None,
+            settings,
+            changes: Vec::new(),
         };
         let thread = std::thread::Builder::new()
             .name("lily-recorder".into())
@@ -1617,6 +1979,9 @@ impl Recorder {
                 let message = format!("spawning the recorder thread: {error}");
                 eprintln!("recorder: {message}; serving without history");
                 health.set_phase(RecorderState::Failed, Some(message));
+                if let Some(settings) = &settle {
+                    settings.settle();
+                }
                 None
             }
         };
@@ -1699,6 +2064,105 @@ impl Recorder {
             oldest: (oldest > 0).then_some(oldest),
             error,
         }
+    }
+
+    /// Why a settings change cannot be made now, as the route answers it
+    /// (503); `None` while the database is open.
+    pub fn settings_unavailable(&self) -> Option<&'static str> {
+        if self.inner.path.is_none() {
+            return Some(
+                "settings changes are kept in the recorder's database, which is off (--stats-db off); nothing changed",
+            );
+        }
+        match self.inner.health.phase().0 {
+            RecorderState::Open
+                if self.inner.health.settings_unreadable.load(Ordering::Acquire) =>
+            {
+                Some(
+                    "settings could not be read from the database (see the server log); nothing changed",
+                )
+            }
+            RecorderState::Open => None,
+            RecorderState::Off | RecorderState::Opening => Some(
+                "the recorder's database is not open yet (see the server log); nothing changed",
+            ),
+            RecorderState::Failed => Some(
+                "the recorder's database cannot be used (see the server log); nothing changed",
+            ),
+        }
+    }
+
+    /// Has the recorder thread write `change` and put it into effect, and
+    /// waits at most `wait` for that. Returns the entries of what changed,
+    /// or why nothing did (503), or that the outcome is unknown (504: the
+    /// thread took the change up but did not answer in time), or that it
+    /// could not be worked out (500). A change the wait gave up on before
+    /// the thread took it up is never made.
+    pub fn change_settings(
+        &self,
+        change: Change,
+        wait: Duration,
+    ) -> Result<Vec<Entry>, WriteError> {
+        if let Some(why) = self.settings_unavailable() {
+            return Err(WriteError::not_applied(why));
+        }
+        let Some(sender) = &self.inner.stop else {
+            return Err(WriteError::not_applied(
+                "the recorder is not running; nothing changed",
+            ));
+        };
+        let (reply, answer) = mpsc::sync_channel(1);
+        let claim = Arc::new(Claim::default());
+        let write = SettingsWrite { change, reply, claim: claim.clone() };
+        match sender.try_send(Msg::Settings(Box::new(write))) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                return Err(WriteError::not_applied(
+                    "the recorder is busy; nothing changed, try again",
+                ));
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                return Err(WriteError::not_applied(
+                    "the recorder stopped; nothing changed",
+                ));
+            }
+        }
+        match answer.recv_timeout(wait) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) if claim.abandon() => {
+                Err(WriteError::not_applied(format!(
+                    "the database did not take the change up within {} s; nothing changed",
+                    wait.as_secs()
+                )))
+            }
+            // Taken and being written: it may land after this answer.
+            Err(RecvTimeoutError::Timeout) => {
+                Err(WriteError { status: 504, message: OUTCOME_UNKNOWN.to_owned() })
+            }
+            Err(RecvTimeoutError::Disconnected) => Err(WriteError::not_applied(
+                "the recorder stopped before writing the change; nothing changed",
+            )),
+        }
+    }
+
+    /// A recorder that says `open` over a channel the test reads itself
+    /// (the test plays the recorder thread).
+    #[cfg(test)]
+    pub fn on_channel(capacity: usize) -> (Self, Receiver<Msg>) {
+        let (tx, rx) = mpsc::sync_channel(capacity);
+        let health = Arc::new(Health::default());
+        health.opened.store(true, Ordering::Release);
+        health.set_phase(RecorderState::Open, None);
+        let recorder = Self {
+            inner: Arc::new(Inner {
+                path: Some(PathBuf::from("/nonexistent/lily.sqlite")),
+                health,
+                stop: Some(tx),
+                thread: Mutex::new(None),
+                read_failed: AtomicBool::new(false),
+            }),
+        };
+        (recorder, rx)
     }
 
     /// Runs `read` on a read-only connection of its own. A failure is

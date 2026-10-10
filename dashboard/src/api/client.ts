@@ -22,7 +22,7 @@ export interface Backend {
   requests(limit: number, signal?: AbortSignal): Promise<RequestsResponse>;
   settings(signal?: AbortSignal): Promise<SettingsResponse>;
   settingsLog(signal?: AbortSignal): Promise<SettingsLogResponse>;
-  /** Rejects with ApiError (400 invalid value, 404 unknown, 409 restart-only) and the server's message. */
+  /** Rejects with ApiError (400 invalid value, 404 unknown, 409 restart-only, 503 no database) and the server's message. */
   updateSettings(patch: SettingsPatch): Promise<SettingsUpdateResponse>;
   resetSetting(name: string): Promise<SettingResetResponse>;
 }

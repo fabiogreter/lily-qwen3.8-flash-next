@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { ApiError } from '../api/client';
 import { RANGES } from '../api/types';
 import { MockBackend } from './backend';
-import { buildHistory, RANGE_CFG, summarize } from './data';
+import { buildHistory, grid, RANGE_CFG, summarize } from './data';
 
 const NOW = Date.UTC(2026, 9, 10, 14, 20, 0);
 const clock = (): number => NOW;
@@ -60,15 +60,39 @@ describe('mock follows the contract', () => {
     expect(buildHistory('7d', NOW).points).toHaveLength(168);
   });
 
-  it('the history is the complete contiguous grid ending at now, oldest first', () => {
+  it('the history is the complete contiguous grid up to the last complete minute, oldest first', () => {
+    // Off the minute and off the 24h/7d buckets: 14:27:20.
+    const now = NOW + 7 * 60e3 + 20e3;
+    const lastMinuteEnd = NOW + 7 * 60e3;
     for (const r of RANGES) {
-      const h = buildHistory(r, NOW);
+      const h = buildHistory(r, now);
       const step = h.step_s * 1000;
       for (let i = 1; i < h.points.length; i++) expect(h.points[i]!.t - h.points[i - 1]!.t).toBe(step);
+      // As the server stamps it: the bucket the last complete minute falls in,
+      // by its nominal end.
       const last = h.points[h.points.length - 1]!.t;
-      expect(last).toBeLessThanOrEqual(NOW);
-      expect(NOW - last).toBeLessThan(step);
+      expect(last % step).toBe(0);
+      expect(last).toBeGreaterThanOrEqual(lastMinuteEnd);
+      expect(last - step).toBeLessThan(lastMinuteEnd);
     }
+    // 15m and 1h end at the last complete minute; 24h and 7d past now.
+    expect(buildHistory('1h', now).points.at(-1)!.t).toBe(lastMinuteEnd);
+    expect(buildHistory('24h', now).points.at(-1)!.t).toBe(NOW + 10 * 60e3);
+    expect(buildHistory('7d', now).points.at(-1)!.t).toBe(NOW + 40 * 60e3);
+    expect(grid('24h', now)).toEqual({ end: NOW + 10 * 60e3, dataEnd: lastMinuteEnd, lastCovered: 12 * 60e3, buckets: 96, step: 900e3 });
+  });
+
+  it('a partial last bucket holds the counts of the minutes it covers', () => {
+    // 14:20:00 exactly: the 24h bucket 14:15 to 14:30 has five minutes.
+    const h = buildHistory('24h', NOW);
+    const full = buildHistory('24h', NOW + 10 * 60e3);
+    const last = h.points.at(-1)!;
+    const same = full.points.at(-1)!;
+    expect(last.t).toBe(same.t);
+    expect(last.decode_tokens).toBe(Math.round(same.decode_tokens / 3));
+    expect(last.busy_share).toBe(same.busy_share);
+    // A bucket holding exactly a whole step is left as it is.
+    expect(buildHistory('1h', NOW).points.at(-1)!.t).toBe(NOW);
   });
 
   it('idle buckets have null rates, not zero; buckets with no data have every value null and counts 0', () => {
@@ -236,7 +260,7 @@ describe('mock settings', () => {
     const { settings } = await make().settings();
     const by = (n: string) => settings.find((s) => s.name === n)!;
     expect(by('idle_unload').applies).toBe('timer re-armed on change');
-    expect(by('pin_hold').applies).toBe('next release');
+    expect(by('pin_hold').applies).toBe('hold re-armed on change');
     expect(by('disk_cache_ttl').applies).toBe('next expiry pass');
     expect(by('temperature').applies).toBe('next request');
     expect(by('thinking_nudges').applies).toBe('next request');

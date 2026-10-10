@@ -1,14 +1,15 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
-import type { Setting } from '../api/types';
+import type { Setting, SettingValue } from '../api/types';
 import SectionHead from '../components/SectionHead.vue';
 import { useDashboard } from '../composables/context';
 import { usePrefs } from '../composables/usePrefs';
 import { useResource } from '../composables/useResource';
 import { useSettingsForm } from '../composables/useSettingsForm';
-import { dateTime, label, show } from '../lib/format';
+import { bounds, dateTime, label, show } from '../lib/format';
+import { parseDurationSecs } from '../lib/duration';
 
-const { backend } = useDashboard();
+const { backend, status } = useDashboard();
 const { paper, papers } = usePrefs();
 
 // Settings are read on entry and after each write, never polled.
@@ -17,7 +18,31 @@ const logRes = useResource((signal) => backend.settingsLog(signal));
 const settings = ref<Setting[] | null>(null);
 watch(settingsRes.data, (v) => (settings.value = v ? v.settings : null), { immediate: true });
 
-const form = useSettingsForm(backend, settings, () => void logRes.refresh());
+/**
+ * An idle unload no longer than the time the engine has been idle unloads it
+ * at once (the delay counts from the last request): say so before sending.
+ */
+function confirmChange(s: Setting, value: SettingValue): boolean {
+  const st = status.data.value;
+  if (s.name !== 'idle_unload' || typeof value !== 'string' || !st || st.state !== 'ready') return true;
+  let secs: number;
+  try {
+    secs = parseDurationSecs(value);
+  } catch {
+    return true; // the server refuses it with its own message
+  }
+  if (secs === 0 || secs > st.idle_for_s) return true;
+  return window.confirm(`lily will unload now: it has been idle for ${st.idle_for_s} s, longer than ${value}. Change it?`);
+}
+
+const form = useSettingsForm(backend, settings, () => void logRes.refresh(), {
+  // A 5xx may or may not have changed something: reload what the server says.
+  onUncertain: () => {
+    void settingsRes.refresh();
+    void logRes.refresh();
+  },
+  confirm: confirmChange,
+});
 const { drafts, errors, busy } = form;
 const licensesUrl = `${import.meta.env.BASE_URL}assets/licenses.txt`;
 
@@ -95,6 +120,8 @@ function onEnter(s: Setting): void {
               {{ s.value ? 'on' : 'off' }}
             </label>
             <select v-else-if="s.type === 'enum'" :name="s.name" :value="s.value == null ? '' : String(s.value)" :aria-busy="busy[s.name] ? 'true' : undefined" :aria-label="label(s.name)" @change="onSelect(s, $event)">
+              <!-- Unset (the flag not given, no default): shown as such, not as the first choice. -->
+              <option v-if="s.value == null" value="" disabled>unset</option>
               <option v-for="o in s.options" :key="o" :value="o">{{ o }}</option>
             </select>
             <input
@@ -117,7 +144,7 @@ function onEnter(s: Setting): void {
             <span :class="['src', s.source]">{{ s.source }}</span>
             <span v-if="s.source !== 'default'"> · default {{ show(s.default) }}</span>
             <span v-if="s.flag_value != null && s.source === 'database'"> · flag {{ show(s.flag_value) }}</span>
-            <span v-if="s.min != null"> · {{ s.min }} to {{ s.max }}</span>
+            <span v-if="bounds(s.min, s.max)"> · {{ bounds(s.min, s.max) }}</span>
           </div>
           <div><button v-if="s.source === 'database'" type="button" class="btn" :aria-busy="busy[s.name] ? 'true' : undefined" @click="form.reset(s)">reset</button></div>
         </div>
@@ -129,7 +156,7 @@ function onEnter(s: Setting): void {
       <div class="set-group">
         <div v-for="s in readOnly" :key="s.name" class="set-row ro">
           <div>
-            <div class="nm">{{ label(s.name) }}</div>
+            <div class="nm" :title="s.help ?? undefined">{{ label(s.name) }}</div>
             <div class="flagname">{{ s.flag }}</div>
           </div>
           <div class="ro-val">{{ show(s.value) }}</div>
@@ -141,9 +168,11 @@ function onEnter(s: Setting): void {
       </div>
     </section>
 
-    <section v-if="logRes.data.value" class="section">
+    <section v-if="logRes.data.value || logRes.error.value" class="section">
       <SectionHead title="Change log" :seed="1" hint="Kept 7 days" />
-      <ul class="log">
+      <!-- No database (--stats-db off, or not open): the server says why. -->
+      <p v-if="logRes.error.value && !logRes.data.value" class="muted" role="status">{{ logRes.error.value }}</p>
+      <ul v-if="logRes.data.value" class="log">
         <li v-for="(e, i) in logRes.data.value.entries" :key="i">
           <span class="muted">{{ dateTime(e.t) }}</span>
           <span>{{ label(e.name) }}</span>

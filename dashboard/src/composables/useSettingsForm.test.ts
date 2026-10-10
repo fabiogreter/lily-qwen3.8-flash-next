@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { ref } from 'vue';
+import { ApiError } from '../api/client';
 import { MockBackend } from '../mock/backend';
 import type { Setting } from '../api/types';
 import { coerce, useSettingsForm } from './useSettingsForm';
@@ -115,5 +116,37 @@ describe('useSettingsForm', () => {
     const a = form.commit(get('top_p'), '0.5');
     const b = form.commit(get('top_k'), '30');
     expect(await Promise.all([a, b])).toEqual([true, true]);
+  });
+
+  it('after a 5xx the view is asked to reload; after a 4xx it is not', async () => {
+    const backend = new MockBackend({ clock: () => 0 });
+    const settings = ref<Setting[] | null>((await backend.settings()).settings);
+    const onUncertain = vi.fn();
+    const form = useSettingsForm(backend, settings, vi.fn(), { onUncertain });
+    const top = settings.value!.find((s) => s.name === 'top_p')!;
+    const spy = vi.spyOn(backend, 'updateSettings');
+    for (const [status, reloads] of [[400, 0], [503, 1], [504, 2], [500, 3]] as const) {
+      spy.mockRejectedValueOnce(new ApiError(status, `answered ${status}`));
+      expect(await form.commit(top, '0.5')).toBe(false);
+      expect(form.errors.top_p).toBe(`answered ${status}`);
+      expect(onUncertain).toHaveBeenCalledTimes(reloads);
+    }
+    vi.spyOn(backend, 'resetSetting').mockRejectedValueOnce(new ApiError(504, 'unknown'));
+    expect(await form.reset(top)).toBe(false);
+    expect(onUncertain).toHaveBeenCalledTimes(4);
+    expect(form.busy.top_p).toBe(false);
+  });
+
+  it('a change the confirmation cancels is not sent', async () => {
+    const backend = new MockBackend({ clock: () => 0 });
+    const settings = ref<Setting[] | null>((await backend.settings()).settings);
+    const confirm = vi.fn(() => false);
+    const form = useSettingsForm(backend, settings, vi.fn(), { confirm });
+    const spy = vi.spyOn(backend, 'updateSettings');
+    const idle = settings.value!.find((s) => s.name === 'idle_unload')!;
+    expect(await form.commit(idle, '1m')).toBe(false);
+    expect(confirm).toHaveBeenCalledWith(idle, '1m');
+    expect(spy).not.toHaveBeenCalled();
+    expect(form.busy.idle_unload).toBeFalsy();
   });
 });

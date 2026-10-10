@@ -25,9 +25,11 @@
 //! process with status 1 for the supervisor to restart it.
 //!
 //! The same listener serves the dashboard ([`dashboard`]): the app at `/`
-//! and the read-only `/v1/lily/*` routes, to loopback peers only, answered
-//! on the connection's thread from what the engine publishes, so a page
-//! that polls never wakes the engine.
+//! and the `/v1/lily/*` routes, to loopback peers only, answered on the
+//! connection's thread from what the engine publishes, so a page that polls
+//! never wakes the engine. The settings it can change without a restart
+//! live in one shared [`runtime::RuntimeSettings`], which each consumer
+//! reads when it needs a value (docs/server.md, "Runtime settings").
 
 pub mod api;
 pub mod batch;
@@ -38,6 +40,7 @@ pub mod http;
 pub mod pin;
 pub mod recorder;
 pub mod request;
+pub mod runtime;
 pub mod session;
 pub mod stream;
 pub mod timings;
@@ -49,7 +52,7 @@ use std::net::{
 };
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{
     self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError,
 };
@@ -204,7 +207,12 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 /// their responses after the engine stopped.
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(3);
 
-/// Parses `3d`, `12h`, `90m`, `45s` or a bare number of seconds.
+/// The longest duration a flag or a runtime setting takes: a year. Longer
+/// ones are refused rather than turned into deadlines that overflow.
+pub const MAX_DURATION_SECS: u64 = 365 * 86_400;
+
+/// Parses `3d`, `12h`, `90m`, `45s` or a bare number of seconds, at most
+/// [`MAX_DURATION_SECS`].
 pub fn parse_duration_secs(text: &str) -> Result<u64> {
     let text = text.trim();
     let (digits, unit) = text
@@ -219,7 +227,22 @@ pub fn parse_duration_secs(text: &str) -> Result<u64> {
         "d" => 86_400.0,
         other => anyhow::bail!("unknown duration unit {other:?} (use s, m, h or d)"),
     };
-    Ok((value * scale) as u64)
+    let secs = value * scale;
+    ensure!(
+        secs <= MAX_DURATION_SECS as f64,
+        "duration {text:?} is longer than the 365-day cap"
+    );
+    Ok(secs as u64)
+}
+
+/// The earliest of `waits` from `now`, as a deadline; a wait too long for
+/// the clock (never one a setting can give, see [`MAX_DURATION_SECS`]) is
+/// no deadline at all rather than a panic.
+fn earliest_deadline(
+    now: Instant,
+    waits: impl IntoIterator<Item = Option<Duration>>,
+) -> Option<Instant> {
+    waits.into_iter().flatten().min().and_then(|wait| now.checked_add(wait))
 }
 
 /// Sampling defaults from the command line; unset fields fall back to the
@@ -420,19 +443,29 @@ impl RecoveryBudget {
 }
 
 /// The idle-unload clock: how long the engine may wait for the next request
-/// before it is worth unloading.
+/// before it is worth unloading. The timeout is read at each use, so a
+/// runtime change re-arms it: the new delay counts from the last activity.
 pub struct IdleTimer {
-    timeout: Option<Duration>,
+    /// Seconds, 0 for never.
+    timeout_secs: Arc<AtomicU64>,
     last_active: Instant,
 }
 
 impl IdleTimer {
     /// `timeout_secs == 0` never unloads.
     pub fn new(timeout_secs: u64, now: Instant) -> Self {
-        Self {
-            timeout: (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs)),
-            last_active: now,
-        }
+        Self::shared(Arc::new(AtomicU64::new(timeout_secs)), now)
+    }
+
+    /// A timer whose timeout is `timeout_secs` as it reads at each use (the
+    /// runtime settings' handle).
+    pub fn shared(timeout_secs: Arc<AtomicU64>, now: Instant) -> Self {
+        Self { timeout_secs, last_active: now }
+    }
+
+    /// The timeout now, seconds (0: never).
+    pub fn timeout_secs(&self) -> u64 {
+        self.timeout_secs.load(Ordering::Acquire)
     }
 
     /// Records activity (a request just finished, or the engine just loaded).
@@ -443,7 +476,8 @@ impl IdleTimer {
     /// How long to wait for the next request before the engine counts as
     /// idle: `None` when it never does, zero when it already is.
     pub fn remaining(&self, now: Instant) -> Option<Duration> {
-        let timeout = self.timeout?;
+        let secs = self.timeout_secs();
+        let timeout = (secs > 0).then(|| Duration::from_secs(secs))?;
         Some(timeout.saturating_sub(now.saturating_duration_since(self.last_active)))
     }
 
@@ -480,12 +514,17 @@ impl KeepAlive {
         self.last_gpu = None;
     }
 
+    /// Whether ticks can be due (not stopped).
+    pub fn armed(&self) -> bool {
+        self.last_gpu.is_some()
+    }
+
     /// When the next tick is due, given what is left of the window at
     /// `now`: `None` when the window is closed (`None` or zero), when the
     /// tick would fall at or after its end, or after a failed tick.
     pub fn next_tick(&self, now: Instant, window: Option<Duration>) -> Option<Instant> {
-        let ends = now + window.filter(|left| !left.is_zero())?;
-        let at = self.last_gpu? + self.interval;
+        let ends = now.checked_add(window.filter(|left| !left.is_zero())?)?;
+        let at = self.last_gpu?.checked_add(self.interval)?;
         (at < ends).then_some(at)
     }
 }
@@ -498,6 +537,9 @@ impl KeepAlive {
 /// arrives, even between ticks, a timeout once the deadline passed. A tick
 /// due together with the deadline yields to it. A failed tick is logged
 /// once and stops the ticks until the engine touches `keep_alive` again.
+/// So does the window's end: once it closed, only a request (or its
+/// arrival's wake) arms the ticks again, so a window that later grows
+/// (a longer `pin_hold` set long after the last request) schedules no wake.
 /// The ticks run on the engine thread itself, so they never overlap the
 /// engine's own GPU work.
 fn recv_keeping_warm<T>(
@@ -509,15 +551,27 @@ fn recv_keeping_warm<T>(
 ) -> std::result::Result<T, RecvTimeoutError> {
     loop {
         let now = Instant::now();
-        let next_tick = keep_alive
-            .next_tick(now, window(now))
+        let left = window(now);
+        if left.is_none_or(|left| left.is_zero()) {
+            keep_alive.stop();
+        }
+        // While armed, wake at the window's end too, to stop there.
+        let window_end = left
+            .filter(|left| keep_alive.armed() && !left.is_zero())
+            .and_then(|left| now.checked_add(left))
             .filter(|&at| deadline.is_none_or(|end| at < end));
-        let received = match next_tick.or(deadline) {
+        let next_tick = keep_alive
+            .next_tick(now, left)
+            .filter(|&at| deadline.is_none_or(|end| at < end));
+        let wake = [next_tick, window_end, deadline].into_iter().flatten().min();
+        let received = match wake {
             None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
             Some(at) => rx.recv_timeout(at.saturating_duration_since(now)),
         };
         match received {
-            Err(RecvTimeoutError::Timeout) if next_tick.is_some() => {
+            Err(RecvTimeoutError::Timeout)
+                if next_tick.is_some() || window_end.is_some() =>
+            {
                 let now = Instant::now();
                 if deadline.is_some_and(|end| now >= end) {
                     // Woken late, past the deadline: it goes first.
@@ -689,16 +743,21 @@ enum Cmd {
     /// the first submission after an idle second waits for overlaps that
     /// host work instead of following it. At most one is in the channel.
     Arrival,
+    /// The idle unload or the pin hold changed (runtime settings): the
+    /// engine computes its wait's deadline again. Carries nothing and
+    /// touches neither the GPU nor the timers. At most one is in the channel.
+    Settings,
 }
 
 /// The bookkeeping next to the engine's channel. `--queue` limits the jobs
 /// waiting in it, which the channel's capacity no longer does because it
 /// also carries control messages: its capacity is the limit plus one
-/// arrival plus one stop wake, and this counts the jobs.
+/// arrival, one stop wake and one settings nudge, and this counts the jobs.
 struct EngineQueue {
     limit: usize,
     waiting: AtomicUsize,
     arrival_pending: AtomicBool,
+    settings_pending: AtomicBool,
 }
 
 impl EngineQueue {
@@ -707,13 +766,26 @@ impl EngineQueue {
             limit: limit.max(1),
             waiting: AtomicUsize::new(0),
             arrival_pending: AtomicBool::new(false),
+            settings_pending: AtomicBool::new(false),
         }
     }
 
-    /// The channel's capacity: every job the limit admits plus the two
-    /// control messages, so neither can be refused for lack of room.
+    /// The channel's capacity: every job the limit admits plus the three
+    /// control messages (an arrival, a stop wake, a settings nudge), so
+    /// none can be refused for lack of room.
     fn capacity(&self) -> usize {
-        self.limit + 2
+        self.limit + 3
+    }
+
+    /// Whether the caller should send a [`Cmd::Settings`]: true unless one
+    /// is already in the channel.
+    fn claim_settings(&self) -> bool {
+        !self.settings_pending.swap(true, Ordering::AcqRel)
+    }
+
+    /// The engine took the settings nudge (or sending it failed).
+    fn settings_taken(&self) {
+        self.settings_pending.store(false, Ordering::Release);
     }
 
     /// Reserves a place for one job; false when the queue is full. A
@@ -849,8 +921,15 @@ impl<M: LanguageModel> Engine<M> {
         shared: &Shared,
         next_id: u64,
     ) -> Result<Self> {
-        let Shared { generator, shutdown, timings, queue: _, thinking_tokens, board } =
-            shared.clone();
+        let Shared {
+            generator,
+            shutdown,
+            timings,
+            queue: _,
+            thinking_tokens,
+            board,
+            settings,
+        } = shared.clone();
         // `LILY_KERNEL_PROFILE=1`: per-kernel GPU times per pass, printed
         // after every answered request (diagnostic; the profile transport
         // serializes dispatches, so throughput under it is not comparable;
@@ -966,26 +1045,28 @@ impl<M: LanguageModel> Engine<M> {
         });
         match &decision {
             pin::PinDecision::Pin => eprintln!(
-                "weights: pinning {:.1} GB in memory from the first request on, released {} or under \
+                "weights: pinning {:.1} GB in memory from the first request on, released {}{} or under \
                  memory pressure",
                 pin_bytes as f64 / 1e9,
-                if options.pin_hold_secs > 0 {
+                if settings.pin_hold_secs() > 0 {
                     format!(
                         "after {} without a request",
-                        describe_secs(options.pin_hold_secs)
+                        describe_secs(settings.pin_hold_secs())
                     )
                 } else {
                     "at the unload".to_owned()
-                }
+                },
+                settings.provisional(),
             ),
             pin::PinDecision::Skip(why) => eprintln!("pin skipped: {why}"),
         }
         let pin = pin::WeightPin::new(
             weight_buffers,
             decision,
-            options.pin_hold_secs,
+            settings.pin_hold_secs(),
             crate::stats::pressure_level,
         )?
+        .with_hold(settings.pin_hold_handle())
         .with_mirror(board.pin_mirror());
         let max_seq =
             effective_max_seq(options.max_seq, model.max_position_embeddings());
@@ -1100,14 +1181,17 @@ impl<M: LanguageModel> Engine<M> {
         {
             match model.persistence_format() {
                 Some(format) => {
-                    let disk = disk::DiskStore::open(
+                    // No expiry pass before the database's TTL is known:
+                    // the flag's could delete what the stored one keeps.
+                    let disk = disk::DiskStore::open_gated(
                         dir,
                         &format,
                         options.disk_cache_bytes,
-                        options.disk_cache_ttl_secs,
+                        settings.disk_cache_ttl_handle(),
+                        settings.expiry_gate(),
                     )?;
                     eprintln!(
-                        "session cache: disk tier at {} ({} entries, {} durable, {:.1}/{:.1} GB, entries expire after {}; \
+                        "session cache: disk tier at {} ({} entries, {} durable, {:.1}/{:.1} GB, entries expire after {}{}; \
                          durable prefix entries {})",
                         disk.dir().display(),
                         disk.len(),
@@ -1122,15 +1206,15 @@ impl<M: LanguageModel> Engine<M> {
                                 disk.max_age_secs() as f64 / 86_400.0
                             )
                         },
-                        if options.durable_min_tokens == 0 {
-                            "off".to_owned()
-                        } else {
-                            format!("from {} shared tokens", options.durable_min_tokens)
+                        settings.provisional(),
+                        match settings.durable_min_tokens() {
+                            0 => "off".to_owned(),
+                            n => format!("from {n} shared tokens"),
                         },
                     );
                     sessions = sessions
                         .with_disk(disk)
-                        .with_durable_min_tokens(options.durable_min_tokens);
+                        .with_durable_min_tokens(settings.durable_min_tokens_handle());
                     // Under the expert cache the budget is exactly the one
                     // session the plan reserved: every new session evicts the
                     // last one, and the small machine keeps its behaviour.
@@ -1814,12 +1898,13 @@ struct Shared {
     thinking_tokens: Option<Arc<ThinkingTokens>>,
     /// See [`Engine::board`].
     board: Arc<dashboard::Board>,
+    /// The settings that change without a restart.
+    settings: Arc<runtime::RuntimeSettings>,
 }
 
 /// Everything the HTTP thread needs without the engine.
 struct Front {
     shared: Shared,
-    defaults: Defaults,
     /// What chat requests may carry as images.
     images: ImagePolicy,
     max_seq: usize,
@@ -1829,7 +1914,6 @@ struct Front {
     /// little at shutdown so responses in flight get written).
     connections: Arc<AtomicUsize>,
     model_id: &'static str,
-    idle_unload_secs: u64,
     /// The dashboard's routes, answered from what the engine publishes.
     dashboard: dashboard::Dashboard,
 }
@@ -1847,7 +1931,7 @@ fn engine_loop<M: LanguageModel>(
     lifecycle: &Lifecycle,
     address: SocketAddr,
 ) {
-    let Shared { shutdown, queue, .. } = &shared;
+    let Shared { shutdown, queue, settings, .. } = &shared;
     // Exits with `code` after logging `what` and refusing the queued
     // requests with `status`/`client_message`.
     let exit_failed = |what: String,
@@ -1888,16 +1972,15 @@ fn engine_loop<M: LanguageModel>(
     eprintln!(
         "ready: serving {} on http://{address}{}",
         M::MODEL_ID,
-        if options.idle_unload_secs > 0 {
-            format!(
-                " (unloading after {} idle)",
-                describe_secs(options.idle_unload_secs)
-            )
-        } else {
-            String::new()
+        match (settings.idle_unload_secs(), settings.provisional()) {
+            (0, "") => String::new(),
+            (0, provisional) => format!(" (no idle unload{provisional})"),
+            (secs, provisional) => {
+                format!(" (unloading after {} idle{provisional})", describe_secs(secs))
+            }
         }
     );
-    let mut idle = IdleTimer::new(options.idle_unload_secs, Instant::now());
+    let mut idle = IdleTimer::shared(settings.idle_unload_handle(), Instant::now());
     let mut keep_alive = KeepAlive::new(KEEP_ALIVE_INTERVAL, Instant::now());
     while !shutdown.requested() {
         // An unloaded engine has nothing to time out; wait for a request.
@@ -1910,12 +1993,10 @@ fn engine_loop<M: LanguageModel>(
             None => recv_keeping_warm(&rx, None, &mut keep_alive, |_| None, || Ok(())),
             Some(loaded) => {
                 let writing = loaded.sessions.writing().then_some(WRITE_AHEAD_POLL);
-                let deadline =
-                    [idle.remaining(now), loaded.pin.hold_remaining(now), writing]
-                        .into_iter()
-                        .flatten()
-                        .min()
-                        .map(|wait| now + wait);
+                let deadline = earliest_deadline(
+                    now,
+                    [idle.remaining(now), loaded.pin.hold_remaining(now), writing],
+                );
                 recv_keeping_warm(
                     &rx,
                     deadline,
@@ -2017,6 +2098,8 @@ fn engine_loop<M: LanguageModel>(
                 }
             }
             Ok(Cmd::Wake) => {}
+            // The loop computes the deadline again from the new values.
+            Ok(Cmd::Settings) => queue.settings_taken(),
             Ok(Cmd::Arrival) => {
                 queue.arrival_taken();
                 if let Some(loaded) = engine.as_ref() {
@@ -2037,7 +2120,7 @@ fn engine_loop<M: LanguageModel>(
                 if let Some(loaded) = engine.take_if(|_| idle.expired(Instant::now())) {
                     next_id = loaded.unload(&format!(
                         "idle for {}",
-                        describe_secs(options.idle_unload_secs)
+                        describe_secs(idle.timeout_secs())
                     ));
                     lifecycle.set(State::Idle);
                 }
@@ -2052,6 +2135,14 @@ fn engine_loop<M: LanguageModel>(
     }
     if let Some(loaded) = engine {
         loaded.unload("stopping");
+    }
+}
+
+/// Has the engine compute its wait's deadline again ([`Cmd::Settings`]),
+/// unless a nudge is already in the channel. Never blocks.
+fn nudge_engine(queue: &EngineQueue, jobs: &SyncSender<Cmd>) {
+    if queue.claim_settings() && jobs.try_send(Cmd::Settings).is_err() {
+        queue.settings_taken();
     }
 }
 
@@ -2072,6 +2163,7 @@ fn refuse_queued(
                 refused += 1;
             }
             Cmd::Arrival => queue.arrival_taken(),
+            Cmd::Settings => queue.settings_taken(),
             Cmd::Wake => {}
         }
     }
@@ -2172,6 +2264,8 @@ fn run_with<M: LanguageModel + 'static>(
     let mut generator = Generator::from_model_dir(model_dir)?;
     generator.add_stop_tokens(&checkpoint_eos_ids(model_dir)?);
     let generator = Arc::new(generator);
+    // The limits the runtime settings hold the same values to.
+    options.thinking_controls.validate()?;
     let defaults = Defaults {
         sampling: sampling_defaults(model_dir, &options.sampling)?,
         thinking: options.thinking,
@@ -2185,6 +2279,21 @@ fn run_with<M: LanguageModel + 'static>(
         None => ThinkingTexts::default(),
     };
     let thinking_tokens = thinking_tokens(generator.tokenizer(), &texts)?.map(Arc::new);
+    // The settings view's listing and the runtime settings from the same
+    // command line; the database's overrides come over them once the
+    // recorder opened it.
+    let listing =
+        dashboard::settings::build(&options.flags, &computed_defaults(model_dir));
+    let settings = Arc::new(runtime::RuntimeSettings::new(
+        runtime::Snapshot {
+            defaults: defaults.clone(),
+            idle_unload_secs: options.idle_unload_secs,
+            pin_hold_secs: options.pin_hold_secs,
+            disk_cache_ttl_secs: options.disk_cache_ttl_secs,
+            durable_min_tokens: options.durable_min_tokens,
+        },
+        &listing,
+    ));
     eprintln!(
         "thinking controls: {}",
         describe_thinking_defaults(
@@ -2240,22 +2349,28 @@ fn run_with<M: LanguageModel + 'static>(
     let shutdown = Arc::new(Shutdown::default());
     let board = Arc::new(dashboard::Board::default());
     // Returns at once: the recorder's thread opens the database.
-    let recorder = recorder::Recorder::start(options.stats_db.as_deref(), &board);
+    // A change of the idle unload or the pin hold has the engine compute its
+    // wait again.
+    {
+        let (queue, jobs) = (queue.clone(), jobs.clone());
+        settings.on_timers_changed(move || nudge_engine(&queue, &jobs));
+    }
+    let recorder = recorder::Recorder::start(
+        options.stats_db.as_deref(),
+        &board,
+        Some(settings.clone()),
+    );
     let recorder_stop = recorder.clone();
     let dashboard = dashboard::Dashboard::new(
         board.clone(),
         dashboard::Config {
             model: M::MODEL_ID,
-            idle_unload_secs: options.idle_unload_secs,
-            pin_hold_secs: options.pin_hold_secs,
+            runtime: settings.clone(),
             max_batch: options.max_batch.unwrap_or(DEFAULT_MAX_BATCH),
             queue: options.queue,
             max_sessions: options.max_sessions,
             cache_bytes: options.cache_bytes.map(|b| b as u64),
-            settings: dashboard::settings::build(
-                &options.flags,
-                &computed_defaults(model_dir),
-            ),
+            settings: listing,
         },
     )
     .with_recorder(recorder);
@@ -2266,6 +2381,7 @@ fn run_with<M: LanguageModel + 'static>(
         queue,
         thinking_tokens,
         board,
+        settings,
     };
     let engine_thread = {
         let model_dir = model_dir.to_path_buf();
@@ -2308,14 +2424,12 @@ fn run_with<M: LanguageModel + 'static>(
     let connections = Arc::new(AtomicUsize::new(0));
     let front = Arc::new(Front {
         shared,
-        defaults,
         images,
         max_seq,
         jobs,
         lifecycle,
         connections: connections.clone(),
         model_id: M::MODEL_ID,
-        idle_unload_secs: options.idle_unload_secs,
         dashboard,
     });
     for stream in listener.incoming() {
@@ -2421,7 +2535,7 @@ fn handle(front: &Front, mut stream: TcpStream) {
                     "status": status,
                     "state": state.as_str(),
                     "model": front.model_id,
-                    "idle_unload_secs": front.idle_unload_secs,
+                    "idle_unload_secs": front.shared.settings.idle_unload_secs(),
                 }),
             );
         }
@@ -2455,6 +2569,9 @@ fn handle(front: &Front, mut stream: TcpStream) {
                 queue.arrival_taken();
             }
             let prepare_started = Instant::now();
+            // One look at the runtime settings for the whole request: a
+            // change made while it runs never reaches it.
+            let snapshot = front.shared.settings.snapshot();
             let prepared = if path == "/v1/chat/completions" {
                 serde_json::from_slice::<api::ChatRequest>(&request.body)
                     .context("parsing the chat request")
@@ -2462,7 +2579,7 @@ fn handle(front: &Front, mut stream: TcpStream) {
                         api::prepare_chat(
                             r,
                             front.shared.generator.tokenizer(),
-                            &front.defaults,
+                            &snapshot.defaults,
                             front.max_seq,
                             &front.images,
                         )
@@ -2474,7 +2591,7 @@ fn handle(front: &Front, mut stream: TcpStream) {
                         api::prepare_completion(
                             r,
                             front.shared.generator.tokenizer(),
-                            &front.defaults,
+                            &snapshot.defaults,
                             front.max_seq,
                         )
                     })

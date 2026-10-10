@@ -1,5 +1,5 @@
 import { reactive, type Ref } from 'vue';
-import { errorMessage, type Backend } from '../api/client';
+import { ApiError, errorMessage, type Backend } from '../api/client';
 import type { Setting, SettingValue } from '../api/types';
 
 /** A draft typed into a field, or a value from a toggle or select. */
@@ -28,12 +28,28 @@ export function coerce(setting: Pick<Setting, 'type'>, raw: RawValue): Coerced {
   }
 }
 
+export interface SettingsFormOptions {
+  /**
+   * After a write answered 5xx: the server may or may not have changed
+   * something (504: the outcome is unknown), so the view reloads the
+   * settings and the log rather than trusting what it shows.
+   */
+  onUncertain?: () => void;
+  /** Asked before a change is sent; false cancels it (nothing is sent). */
+  confirm?: (setting: Setting, value: SettingValue) => boolean;
+}
+
 /**
  * Editing state for the settings view: drafts per field, the server's refusal
  * per field, and the writes. `settings` is replaced with what the server
  * answers; `onChanged` runs after a successful write (the log reloads).
  */
-export function useSettingsForm(backend: Backend, settings: Ref<Setting[] | null>, onChanged: () => void) {
+export function useSettingsForm(
+  backend: Backend,
+  settings: Ref<Setting[] | null>,
+  onChanged: () => void,
+  options: SettingsFormOptions = {},
+) {
   const drafts = reactive<Record<string, string>>({});
   const errors = reactive<Record<string, string>>({});
   const busy = reactive<Record<string, boolean>>({});
@@ -47,6 +63,11 @@ export function useSettingsForm(backend: Backend, settings: Ref<Setting[] | null
   function clear(name: string): void {
     delete drafts[name];
     delete errors[name];
+  }
+
+  function failed(name: string, e: unknown): void {
+    errors[name] = errorMessage(e);
+    if (e instanceof ApiError && e.status >= 500) options.onUncertain?.();
   }
 
   /**
@@ -65,6 +86,7 @@ export function useSettingsForm(backend: Backend, settings: Ref<Setting[] | null
       clear(setting.name);
       return true;
     }
+    if (options.confirm && !options.confirm(setting, c.value)) return false;
     busy[setting.name] = true;
     try {
       const res = await backend.updateSettings({ [setting.name]: c.value });
@@ -73,7 +95,7 @@ export function useSettingsForm(backend: Backend, settings: Ref<Setting[] | null
       onChanged();
       return true;
     } catch (e) {
-      errors[setting.name] = errorMessage(e);
+      failed(setting.name, e);
       return false;
     } finally {
       busy[setting.name] = false;
@@ -91,7 +113,7 @@ export function useSettingsForm(backend: Backend, settings: Ref<Setting[] | null
       onChanged();
       return true;
     } catch (e) {
-      errors[setting.name] = errorMessage(e);
+      failed(setting.name, e);
       return false;
     } finally {
       busy[setting.name] = false;
