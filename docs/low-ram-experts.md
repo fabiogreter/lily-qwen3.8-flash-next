@@ -814,6 +814,16 @@ re-read check on the routed ids found no stale reads). A run on a real
   exchanges per pass; only fewer cached layers or a GPU-side check that
   skips the wait when nothing is missing would reduce it, and Metal has
   no conditional wait.
+- **Cache-aware routing** (not tried, parked 2026-10-10): with 10 of 512
+  experts per layer, the last picks often carry little of the gate's
+  weight. Where such a low-ranked pick misses and an expert scoring
+  nearly as high is resident, computing with the resident one would
+  avoid the read (published as cache-conditional routing and expert
+  substitution: always read a high-scoring miss, substitute only below
+  a score margin). It changes outputs, so it needs a quality evaluation
+  beside its speed; a first count of how many misses have a resident
+  alternative within a margin needs only `lily-trace-routing
+  --router-top` and the replay.
 
 ## Cross-layer prediction measurement
 
