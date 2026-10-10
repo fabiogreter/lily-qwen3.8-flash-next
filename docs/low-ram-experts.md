@@ -614,7 +614,8 @@ included; neighbouring rows 0.45). `tools/bench/expert_predictor.py`
 trains a two-layer MLP (layer norm, 2 560 to 1 024, GELU, 1 024 to
 24 576; 28M parameters) on six sessions' positions (about 450 000) for
 two epochs, binary cross-entropy (the script's defaults), and predicts the seventh's decoded
-positions, for each of the seven; `lily-cache-replay --prefetch 0:TOP`
+positions, for each of the seven; `lily-cache-replay --prefetch 0:TOP
+--pred-width 40`
 replays the top predictions per layer as reads issued at the token's
 start. Top-10 overlap with the routing actually taken: 46 to 51% per
 held-out session (B one layer ahead, same token: 79%).
@@ -657,6 +658,116 @@ reopen with a predictor that sees more than one position back (the draft
 head's states, for the verify pass's other rows) or a drive with lower
 read latency, where the late reads stop dominating.
 
+### Predictors inside the token, and a drive measured (2026-10-09/10)
+
+The whole-token predictor above sees only the previous position. A pass
+knows more as it goes: after layer K, the stream that layer K+1's MoE reads
+already says much about the layers after it. Tools for that, all offline:
+
+- `lily-trace-routing --cuts 3,7,15,23` writes, for every position, the
+  MoE read-in after each listed layer (`Qwen4ExpModel::enable_trunk_log`,
+  `<stem>.trunk.bf16`, `[cuts][tokens][hidden]`); `--router-top W` writes
+  each layer's top W router picks with their scores. The log changes no
+  logits, draws or routing, and its rows do not depend on the chunking
+  (cosine > 0.999).
+- `lily-render-chat --model <checkpoint> --out-dir <dir> <chat.json>...`
+  renders OpenAI-style chat requests through the server's own template
+  (`serve::transcript`) into `<stem>.u32` and `<stem>.json` in the
+  disk tier's layout, so public agent trajectories and generated runs
+  replay like recorded sessions.
+- `lily-cache-replay` replays several prediction planes per position
+  (`--planes N`, `<stem>.pred.u16`): the token start's (`--prefetch
+  0:TOP`), then one per cut (`0:TOP@3+7+15+23`), each issued when its
+  layer ends and predicting the layers after it; a trailing `r` lets a cut
+  cancel the queued reads for its layers that it does not pick.
+  `--predictor oracle` replays the routing itself, the ceiling under the
+  same timing; `--miss-log DIR` writes every decode miss; `--speculate
+  DRAFTS:ACCEPT` replays verify passes of the pending token and its
+  drafts with a seeded acceptance (token-start predictions cover the
+  first row, cuts every row; stall per accepted token). A plane's width
+  is explicit (`--pred-width`, 20 for `lily-trace-routing --predict`'s
+  two planes): a file whose length does not match planes, layers,
+  positions and width is refused.
+
+The predictors are MLPs trained offline (PyTorch) on a 3-million-position
+sample of agent traffic, one to two epochs, about nine minutes per model.
+Public agent trajectories (`nvidia/Open-SWE-Traces` and
+`nebius/SWE-rebench-openhands-trajectories`, CC-BY-4.0) and opencode runs
+of the hosted Qwen3.8-Flash on generated tasks render into traces with
+`lily-render-chat`. An input of token ids would record which ids
+occurred, so it is trained on public data only. On the q4-xl checkpoint
+(routing overlaps q4's by only 80%, so predictors are per checkpoint),
+replayed on sessions not trained on, timed with the serial drive model
+below, per decoded token:
+
+| prefetch | 64 GB stall | 40 GB stall |
+|----------|------------:|------------:|
+| none | 4.14 ms | 13.21 ms |
+| previous hidden state at token start, top 20 | 3.42 ms | 11.51 ms |
+| + cuts after layers 3, 7, 15, 23, replacing | 3.09 ms | 10.72 ms |
+| the same, top 12 | | 10.60 ms |
+| the routing itself (ceiling) | 0.34 ms | 4.19 ms |
+
+About 28% of the room to the ceiling. Measured by top-10 overlap against
+the plain whole-token model, on a screening split: a cut after layer 7
++10 points, the routing of the token's first four layers (known on the host
+by then) +5.3, twice the width +3.0, the next token's id +2.6, the
+previous position's routing +1.4, four previous hidden states +1.3;
+predicting two or three positions ahead, which a verify pass's draft rows
+would need, -7.5 and -13.5; soft targets, weighting misses and mixing
+the inputs did not help. Overlap still rose with data (0.41, 0.48, 0.535
+at 0.26M, 0.67M, 2.1M positions). Under speculative decoding (2 drafts,
+79% acceptance) the cuts still take 10% off the stall per accepted token
+(64 GB 4.32 to 3.84 ms, 40 GB 13.54 to 12.13 ms), the token-start model
+alone 3% (it sees only the first row).
+
+What it would cost is not measured. Estimated from the shapes: about 140M
+parameters, 290 MB of weights per token in bf16, 85% of them in the
+24 576-wide output layers, on the order of a millisecond per token on a
+small machine's memory bandwidth; as large as what it saves at 64 GB.
+A low-rank output layer, fewer cuts and 4-bit weights are the obvious
+cuts, each to be checked against the overlap it costs.
+
+**The drive.** `lily-ssd-probe --model <checkpoint>` reads random experts
+through the server's read pool (`expert_cache::read_experts`, the
+`load_slots` scheme into heap buffers) with `F_NOCACHE`
+(`ExpertStore::set_nocache`) and checks residency with `mincore`: one
+expert alone 0.51 ms; k experts at once about 0.28 + 0.225k ms (12.3 GB/s
+sustained, 4 450 experts a second); a demand read with D prefetches in
+flight 0.62, 0.74, 1.04, 1.89 and 3.59 ms at D = 1, 2, 4, 8, 16: the
+drive gives demand reads no priority. Read through the page cache, cold
+reads cost the same. `--ssd shared` models that (a 0.33 ms latency, then
+0.217 ms of transfer shared equally among the reads in flight, at most
+`--prefetch-depth` prefetches in flight; `SharedSsd`); it matches the
+probe within 15% except for large demand batches against a deep
+prefetch queue, where the drive shares by request, not by expert, and the
+model is optimistic. The serial model (one read at a time, 0.42 ms,
+demand first) stays the default.
+
+**The server against both.** `lily-bench --tokens-out STEM` writes the
+measured run's tokens as a trace; `LILY_EXPERT_NOCACHE=1` turns the page
+cache off for the expert reads. Both matter on a machine whose memory
+holds the checkpoint: without the knob, a miss on an expert read earlier
+in the run is a memory copy (0.15 ms per extra miss measured), which a
+64 GB machine's page cache could not hold; small-machine benches on this
+machine flatter the drive unless they set it, and start from a cold page
+cache (an APFS clone of the checkpoint, `cp -cR`, has none cached).
+On q4-xl, 8 192-token prompt, 1 024 sampled tokens, plain decode:
+
+| plan | slots | misses per token | decode | replayed misses | replayed stall (serial) |
+|------|------:|-----------------:|-------:|----------------:|------------------------:|
+| `--memory-limit-gb 71` | 23 115 | 0.72 | 15.0 to 15.7 ms | | |
+| `LILY_MEMORY_GB=64` | 15 736 | 19.24 | 26.3 to 26.6 ms | 19.33 | 8.1 ms |
+| `LILY_MEMORY_GB=40` | 6 416 | 113.7 | 82.9 ms | 113.9 | 47.8 ms |
+
+The replay reproduces the cache's misses and promotions to within 1%, but
+the server's stall is about 11 and 67 ms per token: about 0.6 ms per
+miss at both plans, where the probe reads a layer's misses (1.4 and 2.9
+on average) in less. The serial model underestimates the server by about
+27%, the shared model more; relative comparisons between predictors hold,
+absolute savings scale up with it. Where the server loses the
+difference is being measured.
+
 ### Prefill chunks of 8 192 tokens
 
 `LILY_PREFILL_CHUNK=8192` (a per-model value now, `Qwen4ExpModel::
@@ -694,7 +805,9 @@ re-read check on the routed ids found no stale reads). A run on a real
   agent sessions" above): the predictor costs about what it saves; a
   whole-token predictor from the previous hidden state saves about 0.35
   ms per cold token for little GPU time ("A whole-token predictor from the
-  hidden state"), not enough yet for the loader it needs.
+  hidden state"), not enough yet for the loader it needs; predictors that
+  also read the trunk after chosen layers save about 25% of the stall in
+  replay, at an unmeasured GPU cost ("Predictors inside the token").
 - **The handshake** (7% of a 2-draft step at zero misses when first
   measured, 11% of a plain token and 6% of a step on 2026-10-09) is 48
   sequential host-GPU
