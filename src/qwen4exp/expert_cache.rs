@@ -73,6 +73,8 @@ struct Service {
     decode_misses: AtomicU64,
     promotions: AtomicU64,
     stale: AtomicU64,
+    /// Resolutions the GPU did not wait for (see `serve`).
+    released: AtomicU64,
     /// Requests skipped because their pass was dropped (`QueuedRequests`),
     /// counted at the thread, so the ones the queue purge did not catch.
     skipped: AtomicU64,
@@ -321,6 +323,7 @@ impl ExpertCache {
                 decode_misses: AtomicU64::new(0),
                 promotions: AtomicU64::new(0),
                 stale: AtomicU64::new(0),
+                released: AtomicU64::new(0),
                 skipped: AtomicU64::new(0),
             }),
         });
@@ -445,7 +448,9 @@ impl ExpertCache {
         let pool = read_pool()?;
         // SAFETY: nothing reads the slab before this function returns, and
         // every entry names a distinct slot and expert.
-        unsafe { load_slots(&pool, &store, &slab, &tables, self.experts, &fill)? };
+        unsafe {
+            load_slots(&pool, &store, &slab, &tables, self.experts, &fill, None)?
+        };
         eprintln!(
             "expert cache: {filled} of {} slots filled ({} pinned) in {:.1}s",
             self.n_slots,
@@ -496,9 +501,10 @@ impl Drop for ExpertCache {
         let stats = self.link.stats();
         if stats.lookups > 0 {
             eprintln!(
-                "expert cache: {}, {} stale reads",
+                "expert cache: {}, {} stale reads, {} timed-out waits",
                 stats.describe(),
-                self.link.service.stale.load(Ordering::Relaxed)
+                self.link.service.stale.load(Ordering::Relaxed),
+                self.link.service.released.load(Ordering::Relaxed)
             );
         }
         self.link.service.stop.store(true, Ordering::Release);
@@ -530,13 +536,14 @@ unsafe fn load_slots(
     tables: &[usize],
     experts: usize,
     entries: &[(u32, usize, usize)],
+    trace: Option<(&MissTrace, u64)>,
 ) -> Result<()> {
     if entries.is_empty() {
         return Ok(());
     }
-    // Task `k` reads region `k % REGIONS` of entry `k / REGIONS`.
     let read = |k: usize| -> Result<()> {
-        let (i, r) = (k / REGIONS, k % REGIONS);
+        let start = trace.map(|(t, _)| t.now());
+        let (i, r) = claimed_read(k, entries.len());
         let (slot, layer, expert) = entries[i];
         // SAFETY: shared-storage slab region of n_slots * len bytes; the
         // caller guarantees no reader and distinct slots per entry, and
@@ -547,7 +554,11 @@ unsafe fn load_slots(
                 slab.lens[r],
             )
         };
-        store.read_region(layer, expert, r, dst)
+        store.read_region(layer, expert, r, dst)?;
+        if let (Some((t, seq)), Some(start)) = (trace, start) {
+            t.read(seq, k, start);
+        }
+        Ok(())
     };
     run_claimed(pool, entries.len() * REGIONS, read)?;
     for &(slot, layer, expert) in entries {
@@ -585,9 +596,8 @@ pub fn read_experts(
     }
     let bases: Vec<usize> =
         dst.iter_mut().take(experts.len()).map(|b| b.as_mut_ptr() as usize).collect();
-    // Task `k` reads region `k % REGIONS` of expert `k / REGIONS`.
     let read = |k: usize| -> Result<()> {
-        let (i, r) = (k / REGIONS, k % REGIONS);
+        let (i, r) = claimed_read(k, experts.len());
         let (layer, expert) = experts[i];
         // SAFETY: `dst[i]` is `bytes` long and borrowed mutably for the
         // call; each (expert, region) range is written by one task only.
@@ -601,6 +611,21 @@ pub fn read_experts(
     };
     run_claimed(pool, experts.len() * REGIONS, read)
 }
+
+/// The order a resolution's reads are claimed in: task `k` of `per_expert *
+/// n` reads region `REGIONS_BY_SIZE[k / n]` of expert `k % n`, so every
+/// expert's large code regions go first. Claims start a few microseconds
+/// apart as pool threads wake, and the read that starts last ends the
+/// resolution: with regions in file order, an expert's third code region
+/// (the down projection's) started some 60 microseconds after the first
+/// and finished last in four resolutions of five.
+fn claimed_read(k: usize, n: usize) -> (usize, usize) {
+    (k % n, REGIONS_BY_SIZE[k / n])
+}
+
+/// The regions largest first: the three code tensors, then the scales and
+/// biases.
+const REGIONS_BY_SIZE: [usize; REGIONS] = [0, 3, 6, 1, 2, 4, 5, 7, 8];
 
 /// Threads in the read pool; the service thread reads alongside them.
 pub const LOAD_THREADS: usize = 16;
@@ -641,10 +666,19 @@ pub fn run_claimed(
             }
         }
     };
+    // One pool job is spawned, and it spawns the others, so the calling
+    // thread starts its first read after one wake-up call rather than after
+    // all of them (about 18 microseconds for eight).
+    let helpers = tasks.min(pool.current_num_threads() + 1).saturating_sub(1);
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         pool.in_place_scope(|scope| {
-            for _ in 1..tasks.min(pool.current_num_threads() + 1) {
-                scope.spawn(|_| claim());
+            if helpers > 0 {
+                scope.spawn(|scope| {
+                    for _ in 1..helpers {
+                        scope.spawn(|_| claim());
+                    }
+                    claim();
+                });
             }
             claim();
         })
@@ -671,6 +705,120 @@ unsafe fn set_entry(
     unsafe { (tables[layer] as *mut u32).add(expert).write_volatile(slot) };
 }
 
+/// Timing of the service thread's resolutions, a diagnostic
+/// (`LILY_EXPERT_TRACE=<path>`): per resolution when the thread took the
+/// request, saw the GPU's signal, had looked every id up, had read the
+/// misses and had signalled `ready`; per region read its start, end and
+/// reading thread. Written as `<path>.layers.csv` and `<path>.reads.csv`
+/// when the service stops; nanoseconds since the service started. Off, the
+/// thread pays one branch per resolution and per read.
+struct MissTrace {
+    path: PathBuf,
+    base: std::time::Instant,
+    layers: Vec<LayerTiming>,
+    reads: Mutex<Vec<ReadTiming>>,
+}
+
+struct LayerTiming {
+    seq: u64,
+    layer: usize,
+    count: usize,
+    ids: usize,
+    misses: usize,
+    popped: u64,
+    seen: u64,
+    resolved: u64,
+    loaded: u64,
+    ready: u64,
+}
+
+struct ReadTiming {
+    seq: u64,
+    task: usize,
+    /// The pool thread's index, -1 for the service thread.
+    thread: i64,
+    start: u64,
+    end: u64,
+}
+
+impl MissTrace {
+    fn from_env() -> Option<Self> {
+        let path = std::env::var_os("LILY_EXPERT_TRACE")?;
+        Some(Self {
+            path: PathBuf::from(path),
+            base: std::time::Instant::now(),
+            layers: Vec::with_capacity(1 << 20),
+            reads: Mutex::new(Vec::with_capacity(1 << 20)),
+        })
+    }
+
+    fn now(&self) -> u64 {
+        self.base.elapsed().as_nanos() as u64
+    }
+
+    /// Records a region read of resolution `seq` that began at `start`.
+    fn read(&self, seq: u64, task: usize, start: u64) {
+        let end = self.now();
+        let thread = rayon::current_thread_index().map_or(-1, |i| i as i64);
+        self.reads.lock().unwrap_or_else(|e| e.into_inner()).push(ReadTiming {
+            seq,
+            task,
+            thread,
+            start,
+            end,
+        });
+    }
+
+    fn write(&self) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let with = |suffix: &str| {
+            let mut p = self.path.clone().into_os_string();
+            p.push(suffix);
+            PathBuf::from(p)
+        };
+        let mut out =
+            std::io::BufWriter::new(std::fs::File::create(with(".layers.csv"))?);
+        writeln!(out, "seq,layer,count,ids,misses,popped,seen,resolved,loaded,ready")?;
+        for t in &self.layers {
+            writeln!(
+                out,
+                "{},{},{},{},{},{},{},{},{},{}",
+                t.seq,
+                t.layer,
+                t.count,
+                t.ids,
+                t.misses,
+                t.popped,
+                t.seen,
+                t.resolved,
+                t.loaded,
+                t.ready
+            )?;
+        }
+        out.flush()?;
+        let mut out =
+            std::io::BufWriter::new(std::fs::File::create(with(".reads.csv"))?);
+        writeln!(out, "seq,task,thread,start,end")?;
+        for r in self.reads.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            writeln!(out, "{},{},{},{},{}", r.seq, r.task, r.thread, r.start, r.end)?;
+        }
+        out.flush()
+    }
+}
+
+impl Drop for MissTrace {
+    fn drop(&mut self) {
+        match self.write() {
+            Ok(()) => eprintln!(
+                "expert cache: {} resolutions traced to {}.*.csv",
+                self.layers.len(),
+                self.path.display()
+            ),
+            Err(e) => eprintln!("expert cache: writing the trace: {e}"),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn serve(
     pool: rayon::ThreadPool,
@@ -689,6 +837,7 @@ fn serve(
     let mut ids: Vec<u32> = Vec::new();
     let mut misses: Vec<(u32, usize, usize)> = Vec::new();
     let debug = std::env::var_os("LILY_EXPERT_CACHE_DEBUG").is_some();
+    let mut trace = MissTrace::from_env();
     let mut served = 0u64;
     let mut persisted = std::time::Instant::now();
     loop {
@@ -704,6 +853,7 @@ fn serve(
                 queue = service.wake.wait(queue).unwrap_or_else(|e| e.into_inner());
             }
         };
+        let popped = trace.as_ref().map_or(0, MissTrace::now);
         // A pass encoded ahead that was dropped instead of committed: its
         // layers never signal, and the ids at its buffer belong to whatever
         // pass runs next.
@@ -738,6 +888,8 @@ fn serve(
             service.skipped.fetch_add(1, Ordering::Relaxed);
             continue;
         }
+        let seen = trace.as_ref().map_or(0, MissTrace::now);
+        let seen_at = std::time::Instant::now();
         // SAFETY: the pass wrote `count` ids at `ids` before signalling.
         let routed_ids = unsafe {
             core::slice::from_raw_parts(request.ids as *const u32, request.count)
@@ -807,11 +959,13 @@ fn serve(
                 }
             }
         }
+        let resolved = trace.as_ref().map_or(0, MissTrace::now);
         // SAFETY: the GPU waits at this layer; the slots were just taken
         // from experts whose readers have completed, and are distinct.
-        if let Err(e) =
-            unsafe { load_slots(&pool, &store, &slab, &tables, experts, &misses) }
-        {
+        let traced = trace.as_ref().map(|t| (t, request.seq));
+        if let Err(e) = unsafe {
+            load_slots(&pool, &store, &slab, &tables, experts, &misses, traced)
+        } {
             eprintln!("expert cache: loading layer {}: {e:#}", request.layer);
             std::process::abort();
         }
@@ -819,7 +973,37 @@ fn serve(
         if decode {
             service.decode_misses.fetch_add(misses.len() as u64, Ordering::Relaxed);
         }
+        // The GPU waits at this layer for `ready`, so it cannot have
+        // signalled a later layer yet; if it has, a queue-level wait timed
+        // out (Metal 4 then releases the queue silently) and the pass ran on
+        // with experts that were not loaded.
+        if routed.signaled_value() > request.seq
+            && service.released.fetch_add(1, Ordering::Relaxed) == 0
+        {
+            eprintln!(
+                "expert cache: layer {} of a {}-id pass ran on before its experts were loaded (a GPU wait timed out after {:.0} ms); that pass computed with missing experts",
+                request.layer,
+                request.count,
+                (std::time::Instant::now() - seen_at).as_secs_f64() * 1e3
+            );
+        }
+        let loaded = trace.as_ref().map_or(0, MissTrace::now);
         ready.signal(request.seq);
+        if let Some(t) = trace.as_mut() {
+            let ready = t.now();
+            t.layers.push(LayerTiming {
+                seq: request.seq,
+                layer: request.layer,
+                count: request.count,
+                ids: ids.len(),
+                misses: misses.len(),
+                popped,
+                seen,
+                resolved,
+                loaded,
+                ready,
+            });
+        }
         // Off the GPU's critical path: the pass has its slots.
         served += 1;
         if adapt && served.is_multiple_of(PROMOTE_EVERY) {

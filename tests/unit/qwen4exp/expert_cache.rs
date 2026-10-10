@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Condvar, Mutex};
 
-use super::{QueuedRequests, Request, Service};
+use super::{QueuedRequests, REGIONS, Request, Service};
 
 fn service() -> Arc<Service> {
     Arc::new(Service {
@@ -20,6 +20,7 @@ fn service() -> Arc<Service> {
         decode_misses: AtomicU64::new(0),
         promotions: AtomicU64::new(0),
         stale: AtomicU64::new(0),
+        released: AtomicU64::new(0),
         skipped: AtomicU64::new(0),
     })
 }
@@ -180,4 +181,24 @@ fn read_experts_match_the_store() {
     }
     let mut short = vec![vec![0u8; bytes - 1]];
     assert!(super::read_experts(&pool, &store, &experts[..1], &mut short).is_err());
+}
+
+/// Every (expert, region) pair of a resolution is claimed exactly once, the
+/// code regions of all experts before any scales or biases.
+#[test]
+fn claim_order_covers_every_read_once_large_regions_first() {
+    for n in [1usize, 2, 5] {
+        let order: Vec<(usize, usize)> =
+            (0..n * REGIONS).map(|k| super::claimed_read(k, n)).collect();
+        let mut seen = order.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), n * REGIONS, "n {n}");
+        assert!(seen.iter().all(|&(i, r)| i < n && r < REGIONS));
+        let codes = [0usize, 3, 6];
+        assert!(
+            order[..3 * n].iter().all(|(_, r)| codes.contains(r)),
+            "n {n}: {order:?}"
+        );
+    }
 }

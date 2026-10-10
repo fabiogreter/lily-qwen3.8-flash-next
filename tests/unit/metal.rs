@@ -920,3 +920,54 @@ fn wake_is_a_fence_signal_that_later_passes_wait_past() {
     ctx.inject_fault("injected for the test");
     assert!(ctx.wake().is_err());
 }
+
+/// How long a queue-level wait holds when nothing signals it in time: a
+/// pass of `n` (wait `e = k`, signal `f = k`) pairs is committed at once and
+/// the host raises `e` to `k` every `LILY_WAIT_PROBE_STEP_MS`; printed is,
+/// per `k`, whether `f` had already reached `k` before the host signalled
+/// (the wait timed out and the queue went on) and when it did.
+/// `cargo test --release --lib -- --ignored --nocapture queue_wait_timeout`.
+#[test]
+#[ignore = "timing probe; run with --ignored --nocapture"]
+fn queue_wait_timeout_probe() {
+    let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_owned());
+    let step_ms: u64 = env("LILY_WAIT_PROBE_STEP_MS", "250").parse().expect("step");
+    let n: u64 = env("LILY_WAIT_PROBE_N", "40").parse().expect("n");
+    let ctx = MetalContext::new().expect("metal context");
+    let e = ctx.new_shared_event().expect("event");
+    let f = ctx.new_shared_event().expect("event");
+    // `LILY_WAIT_PROBE_MB`: a copy of this many MiB between the pairs, so
+    // each wait sits between two command buffers that do work, as in a pass.
+    let mb: usize = env("LILY_WAIT_PROBE_MB", "0").parse().expect("mb");
+    let bufs = (mb > 0).then(|| {
+        let words = mb << 18;
+        (
+            Tensor::zeros(&ctx, &[words], DType::U32).expect("src"),
+            Tensor::zeros(&ctx, &[words], DType::U32).expect("dst"),
+        )
+    });
+    let pass = ctx.begin().expect("pass");
+    for k in 1..=n {
+        pass.wait_event(&e, k).expect("wait");
+        if let Some((src, dst)) = &bufs {
+            copy_words(&ctx, &pass, src, dst).expect("copy");
+        }
+        pass.signal_event(&f, k).expect("signal");
+    }
+    let t0 = Instant::now();
+    let pending = pass.commit().expect("commit");
+    for k in 1..=n {
+        let at = t0 + Duration::from_millis(step_ms * k);
+        while Instant::now() < at {
+            std::hint::spin_loop();
+        }
+        let before = f.signaled_value();
+        e.signal(k);
+        let t = t0.elapsed().as_secs_f64();
+        println!(
+            "k {k:>3} at {t:7.3} s: f was {before:>3} before e = k{}",
+            if before >= k { "  <- timed out" } else { "" }
+        );
+    }
+    pending.wait().expect("pass");
+}
