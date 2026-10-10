@@ -133,6 +133,8 @@ const DESCRIPTORS: &[Descriptor] = &[
     d("vision", ENGINE, Kind::Enum(&["auto", "off"])),
     d("image_max_pixels", ENGINE, Kind::Int),
     d("image_min_pixels", ENGINE, Kind::Int),
+    d("stats_db", ENGINE, Kind::Text)
+        .help("The dashboard's history; off records none."),
 ];
 
 /// A setting's text as the JSON value its kind reads as; a text that does

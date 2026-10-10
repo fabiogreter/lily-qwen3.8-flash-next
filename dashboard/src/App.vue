@@ -56,6 +56,9 @@ const recorder = computed(() => status.data.value?.recorder ?? null);
 const recorderNote = computed(() => {
   const r = recorder.value;
   if (!r) return '';
+  if (r.state === 'off') return 'history is off (--stats-db off)';
+  if (r.state === 'opening') return `recorder opening its database${r.error ? `: ${r.error}` : ''}`;
+  if (r.state === 'failed') return `recorder failed${r.error ? `: ${r.error}` : ''}; history is not being kept`;
   if (!r.ok) return 'recorder unavailable, history is not being kept';
   if (r.dropped_rows > 0) return `recorder dropped ${r.dropped_rows} request row${r.dropped_rows === 1 ? '' : 's'}`;
   return '';

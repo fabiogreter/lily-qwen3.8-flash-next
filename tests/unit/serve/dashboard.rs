@@ -371,11 +371,21 @@ fn the_api_answers_its_routes_and_says_what_it_cannot_do_yet() {
         assert_eq!(get(target).status, 200, "{target}");
     }
     assert_eq!(body(&get("/v1/lily/settings/log")), serde_json::json!({"entries": []}));
+    // Without the recorder (`--stats-db off`): no history, said so.
     let history = get("/v1/lily/history?range=1h");
     assert_eq!(history.status, 503);
-    assert_eq!(body(&history)["error"]["message"], "history needs the recorder");
+    assert_eq!(body(&history)["error"]["message"], "history is off (--stats-db off)");
     assert_eq!(get("/v1/lily/sessions/12/history?range=15m").status, 503);
-    assert_eq!(get("/v1/lily/sessions/abc/history").status, 404);
+    assert_eq!(get("/v1/lily/sessions/abc/history?range=15m").status, 404);
+    // A range the contract does not name is refused first.
+    for target in [
+        "/v1/lily/history",
+        "/v1/lily/history?range=2h",
+        "/v1/lily/history?range=",
+        "/v1/lily/sessions/12/history?range=1d",
+    ] {
+        assert_eq!(get(target).status, 400, "{target}");
+    }
     assert_eq!(get("/v1/lily/requests?limit=-1").status, 400);
     let unknown = get("/v1/lily/nope");
     assert_eq!(unknown.status, 404);
@@ -444,6 +454,104 @@ fn the_request_limit_defaults_caps_and_refuses_garbage() {
     assert_eq!(request_limit("limit=100000"), Ok(200));
     assert!(request_limit("limit=ten").is_err());
     assert!(request_limit("limit=").is_err());
+}
+
+// --- the history, from the recorder ------------------------------------------
+
+/// A dashboard reading the database at `path`, which `rows` were written to.
+fn recorded(tag: &str, rows: &[RequestRow]) -> (PathBuf, Arc<Board>, Dashboard) {
+    use crate::serve::recorder::{Recorder, Writer, open};
+    let root = std::env::temp_dir()
+        .join(format!("lily-dashboard-test-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let path = root.join("lily.sqlite");
+    let (conn, _) = open(&path, 1).expect("database");
+    let mut writer = Writer::new(conn, Some(path.clone()), Arc::default(), 0);
+    assert!(writer.record(rows.to_vec()));
+    writer.publish_extent();
+    let health = writer.health().clone();
+    drop(writer);
+    let (board, d) = dashboard();
+    let d = d.with_recorder(Recorder::reading(&path, health));
+    (root, board, d)
+}
+
+#[test]
+fn the_history_routes_serve_the_recorders_grid() {
+    // Two requests just before the last hour edge, read as of just after
+    // it: inside the last complete bucket of every range.
+    let edge = super::super::now_ms() / 3_600_000 * 3_600_000;
+    let (root, board, d) = recorded(
+        "history",
+        &[
+            row(edge - 40_000, Some(7), 100, 2000.0),
+            row(edge - 30_000, Some(8), 50, 500.0),
+        ],
+    );
+    let at = |range, lineage| body(&d.history_at(range, lineage, edge + 1));
+    for (range, name, n, step) in [
+        (Range::QuarterHour, "15m", 15, 60),
+        (Range::Hour, "1h", 60, 60),
+        (Range::Day, "24h", 96, 900),
+        (Range::Week, "7d", 168, 3600),
+    ] {
+        let h = at(range, None);
+        assert_eq!(h["range"], name);
+        assert_eq!(
+            (h["points"].as_array().unwrap().len(), h["step_s"].as_u64()),
+            (n, Some(step))
+        );
+        assert_eq!(h["summary"]["requests"], 2, "{name}");
+        assert_eq!(h["points"][n - 1]["requests"], 2, "{name}: the last bucket");
+    }
+    let one = at(Range::QuarterHour, Some(7));
+    assert_eq!(one["summary"]["requests"], 1);
+    assert_eq!(one["summary"]["tokens_generated"], 100);
+    assert!(one["points"].as_array().unwrap().iter().all(|p| p["cpu_load"].is_null()));
+    // The routes themselves, on the real clock.
+    let get = |target: &str| answer(&d, "GET", target, &[]);
+    let r = get("/v1/lily/history?range=15m");
+    assert_eq!(
+        (r.status, body(&r)["points"].as_array().map(Vec::len)),
+        (200, Some(15))
+    );
+    assert_eq!(get("/v1/lily/sessions/8/history?range=7d").status, 200);
+    // A lineage neither recorded nor in the cache is unknown; one in the
+    // cache that the recorder has nothing of has the empty grid.
+    assert_eq!(get("/v1/lily/sessions/99/history?range=15m").status, 404);
+    board.publish(StoreView {
+        entries: vec![entry(Some(99), true, edge)],
+        ..StoreView::default()
+    });
+    let empty = get("/v1/lily/sessions/99/history?range=15m");
+    assert_eq!(empty.status, 200);
+    assert_eq!(body(&empty)["summary"]["requests"], 0);
+    // The status reports the recorder's health and extent.
+    let status = d.status(READY).recorder;
+    assert!(status.ok && status.db_bytes > 0, "{status:?}");
+    assert!(status.oldest.is_some_and(|t| t <= edge - 40_000));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn with_the_recorder_per_session_figures_come_from_the_database_not_the_ring() {
+    let now = super::super::now_ms();
+    // Older than anything the ring would still hold: the ring is empty.
+    let (root, board, d) =
+        recorded("sessions", &[row(now - 3_600_000, Some(7), 100, 2000.0)]);
+    board.publish(StoreView {
+        entries: vec![entry(Some(7), true, now)],
+        ..StoreView::default()
+    });
+    assert!(lock(&board.rows).is_empty());
+    let sessions = d.sessions().sessions;
+    let s = &sessions[0];
+    assert_eq!((s.lineage, s.requests, s.decode_tps_avg), (Some(7), 1, Some(50.0)));
+    assert_eq!(
+        (s.decode_tps_max, s.cache_hit, s.acceptance),
+        (Some(50.0), Some(0.9), Some(0.75))
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 // --- what the engine publishes -----------------------------------------------
@@ -901,6 +1009,13 @@ fn variants() -> Vec<(&'static str, &'static str, serde_json::Value)> {
     let sources =
         [SettingSource::Default, SettingSource::Flag, SettingSource::Database];
     let log_sources = [SettingsLogSource::Dashboard, SettingsLogSource::Startup];
+    let ranges = Range::ALL;
+    let recorder_states = [
+        RecorderState::Off,
+        RecorderState::Opening,
+        RecorderState::Open,
+        RecorderState::Failed,
+    ];
     // Exhaustive matches: the lists above name every variant.
     let _ = |a: LifecycleState, b: MemoryPressure, c: SamplerState, d: SessionTier| {
         use LifecycleState as L;
@@ -934,6 +1049,15 @@ fn variants() -> Vec<(&'static str, &'static str, serde_json::Value)> {
             SettingsLogSource::Dashboard | SettingsLogSource::Startup => {}
         }
     };
+    let _ = |a: Range| match a {
+        Range::QuarterHour | Range::Hour | Range::Day | Range::Week => {}
+    };
+    let _ = |a: RecorderState| match a {
+        RecorderState::Off
+        | RecorderState::Opening
+        | RecorderState::Open
+        | RecorderState::Failed => {}
+    };
     let ok = "serialize";
     vec![
         ("lifecycleStates", "LifecycleState[]", v(states).expect(ok)),
@@ -941,6 +1065,8 @@ fn variants() -> Vec<(&'static str, &'static str, serde_json::Value)> {
         ("samplerStates", "SamplerState[]", v(samplers).expect(ok)),
         ("sessionTiers", "SessionTier[]", v(tiers).expect(ok)),
         ("cancellations", "CancelledBy[]", v(cancels).expect(ok)),
+        ("ranges", "Range[]", v(ranges).expect(ok)),
+        ("recorderStates", "RecorderState[]", v(recorder_states).expect(ok)),
         ("settingTypes", "SettingType[]", v(types).expect(ok)),
         ("settingSources", "SettingSource[]", v(sources).expect(ok)),
         (
@@ -1004,10 +1130,12 @@ fn busy_status() -> Status {
             weights: WeightsTier { bytes: 45_960_000_000, pinned: true },
         },
         recorder: RecorderStatus {
+            state: RecorderState::Open,
             ok: true,
             dropped_rows: 0,
             db_bytes: 6_606_028,
             oldest: Some(1_759_501_200_000),
+            error: None,
         },
     }
 }
@@ -1057,18 +1185,32 @@ fn unloaded_status() -> Status {
             weights: WeightsTier { bytes: 45_960_000_000, pinned: false },
         },
         recorder: RecorderStatus {
+            state: RecorderState::Off,
             ok: false,
             dropped_rows: 0,
             db_bytes: 0,
             oldest: None,
+            error: None,
         },
     }
 }
 
-/// Small-machine mode before its first lookup: the expert tier's null.
+/// Small-machine mode before its first lookup: the expert tier's null; the
+/// recorder still opening its database, rows waiting.
 fn small_machine_status() -> Status {
     let mut status = busy_status();
     status.tiers.experts = Some(ExpertTier { slots: 1536, used: 1536, hit_rate: None });
+    status.recorder = RecorderStatus {
+        state: RecorderState::Opening,
+        ok: false,
+        dropped_rows: 3,
+        db_bytes: 0,
+        oldest: None,
+        error: Some(
+            "opening /Users/me/Library/Application Support/lily/lily.sqlite: database is locked"
+                .into(),
+        ),
+    };
     status
 }
 
@@ -1172,6 +1314,71 @@ fn settings_log_fixture() -> SettingsLogResponse {
     }
 }
 
+/// The fixtures' clock: the status fixture's `now`, 14:20 UTC.
+const FIXTURE_NOW: u64 = 1_760_106_000_000;
+
+/// A busy minute of the fixtures: `k` scales it.
+fn fixture_minute(k: f64) -> crate::serve::recorder::Minute {
+    crate::serve::recorder::Minute {
+        requests: 2,
+        decode_tokens: 2400.0 * k,
+        prefill_tokens: 6000.0 * k,
+        decode_busy_ms: 30_000.0,
+        prefill_busy_ms: 3_000.0 * k,
+        busy_ms: 33_000.0,
+        prompt_tokens: 90_000,
+        cached_tokens: 84_000,
+        drafted_tokens: 1200,
+        accepted_tokens: 930,
+        sessions_max: 2,
+    }
+}
+
+/// The 15-minute history at [`FIXTURE_NOW`]: five buckets with no data at
+/// all (the server was off), five idle ones (machine figures, no rates) and
+/// five busy ones, the last two with power.
+fn history_fixture() -> History {
+    use history::MachineRow;
+    let last = FIXTURE_NOW / 60_000 - 1;
+    let minutes: Vec<_> =
+        (0..5).map(|i| (last - i, fixture_minute(1.0 + i as f64 / 4.0))).collect();
+    let machine: Vec<MachineRow> = (0..10)
+        .map(|i| MachineRow {
+            minute: last - i,
+            cpu_load: Some(if i < 5 { 0.25 } else { 0.04 }),
+            pressure_level: Some(if i == 0 { 2 } else { 1 }),
+            swap_bytes: Some(1_181_116_006),
+            gpu_active: None,
+            power_w: (i < 2).then_some(71.5),
+            gpu_power_w: (i < 2).then_some(48.25),
+            gpu_freq_mhz: (i < 2).then_some(1578.0),
+        })
+        .collect();
+    let queue = [(FIXTURE_NOW - 30_000, 12.0), (FIXTURE_NOW - 31_000, 40.0)];
+    history::build(Range::QuarterHour, FIXTURE_NOW, &minutes, Some(&machine), &queue)
+}
+
+/// One session's 15 minutes: busy in two of them, no machine series.
+fn session_history_fixture() -> History {
+    let last = FIXTURE_NOW / 60_000 - 1;
+    let mut m = fixture_minute(0.5);
+    m.sessions_max = 1;
+    let queue = [(FIXTURE_NOW - 30_000, 12.0)];
+    history::build(
+        Range::QuarterHour,
+        FIXTURE_NOW,
+        &[(last, m), (last - 3, m)],
+        None,
+        &queue,
+    )
+}
+
+/// A cache entry the recorder has nothing of: every bucket and the summary
+/// empty.
+fn empty_history_fixture() -> History {
+    history::build(Range::QuarterHour, FIXTURE_NOW, &[], None, &[])
+}
+
 /// The fixtures file as the Rust types serialize it.
 fn fixtures_ts() -> String {
     let json = |value: &dyn erased::Json| value.json();
@@ -1180,12 +1387,12 @@ fn fixtures_ts() -> String {
          // Regenerate: LILY_UPDATE_FIXTURES=1 cargo test --locked --lib serve::dashboard\n\
          // The typecheck holds every value against types.ts (literals, nulls and no\n\
          // excess fields), so a drift on either side fails `npm run typecheck`.\n\
-         import type {\n  CancelledBy,\n  ErrorBody,\n  LifecycleState,\n  MemoryPressure,\n  \
-         RequestsResponse,\n  SamplerState,\n  SessionTier,\n  SessionsResponse,\n  \
-         SettingSource,\n  SettingsLogEntry,\n  SettingsLogResponse,\n  SettingsResponse,\n  \
-         SettingType,\n  Status,\n} from './types';\n",
+         import type {\n  CancelledBy,\n  ErrorBody,\n  History,\n  LifecycleState,\n  \
+         MemoryPressure,\n  Range,\n  RecorderState,\n  RequestsResponse,\n  SamplerState,\n  SessionTier,\n  \
+         SessionsResponse,\n  SettingSource,\n  SettingsLogEntry,\n  SettingsLogResponse,\n  \
+         SettingsResponse,\n  SettingType,\n  Status,\n} from './types';\n",
     );
-    let values: [(&str, &str, &dyn erased::Json); 9] = [
+    let values: [(&str, &str, &dyn erased::Json); 12] = [
         ("status", "Status", &busy_status()),
         ("statusUnloaded", "Status", &unloaded_status()),
         ("statusSmallMachine", "Status", &small_machine_status()),
@@ -1193,12 +1400,15 @@ fn fixtures_ts() -> String {
         ("requests", "RequestsResponse", &requests_fixture()),
         ("settings", "SettingsResponse", &settings_fixture()),
         ("settingsLog", "SettingsLogResponse", &settings_log_fixture()),
+        ("history", "History", &history_fixture()),
+        ("sessionHistory", "History", &session_history_fixture()),
+        ("historyEmpty", "History", &empty_history_fixture()),
         (
             "error",
             "ErrorBody",
             &ErrorBody {
                 error: ErrorDetail {
-                    message: "history needs the recorder".into(),
+                    message: "history is off (--stats-db off)".into(),
                     setting: None,
                 },
             },
@@ -1286,6 +1496,9 @@ fn every_nullable_field_is_null_in_some_fixture() {
     walk(&serde_json::to_value(requests_fixture()).unwrap(), "requests", &mut nulls);
     walk(&serde_json::to_value(settings_fixture()).unwrap(), "settings", &mut nulls);
     walk(&serde_json::to_value(settings_log_fixture()).unwrap(), "log", &mut nulls);
+    for h in [history_fixture(), session_history_fixture(), empty_history_fixture()] {
+        walk(&serde_json::to_value(h).unwrap(), "history", &mut nulls);
+    }
     for nullable in [
         "status.pin_hold_s",
         "status.idle_unload_s",
@@ -1306,6 +1519,7 @@ fn every_nullable_field_is_null_in_some_fixture() {
         "status.tiers.experts.hit_rate",
         "status.tiers.ngram",
         "status.recorder.oldest",
+        "status.recorder.error",
         "sessions.sessions[].lineage",
         "sessions.sessions[].decode_tps_avg",
         "sessions.sessions[].decode_tps_max",
@@ -1330,6 +1544,29 @@ fn every_nullable_field_is_null_in_some_fixture() {
         "settings.settings[].help",
         "settings.settings[].applies",
         "log.entries[].old",
+        "history.points[].decode_tps_avg",
+        "history.points[].decode_tps_max",
+        "history.points[].prefill_tps_avg",
+        "history.points[].prefill_tps_max",
+        "history.points[].acceptance",
+        "history.points[].cache_hit",
+        "history.points[].queue_ms_p50",
+        "history.points[].queue_ms_max",
+        "history.points[].cpu_load",
+        "history.points[].gpu_active",
+        "history.points[].memory_pressure",
+        "history.points[].swap_bytes",
+        "history.points[].power_w",
+        "history.points[].gpu_power_w",
+        "history.points[].gpu_freq_mhz",
+        "history.summary.decode.avg",
+        "history.summary.decode.max",
+        "history.summary.prefill.avg",
+        "history.summary.prefill.max",
+        "history.summary.cache_hit",
+        "history.summary.acceptance",
+        "history.summary.power_avg_w",
+        "history.summary.energy_wh",
     ] {
         assert!(nulls.contains(nullable), "no fixture has {nullable} null");
     }

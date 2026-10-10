@@ -390,6 +390,7 @@ export function buildSettings(): Setting[] {
     ro('mtp_drafts', 'Engine', 2, '--mtp-drafts', 'default'),
     ro('queue', 'Engine', 32, '--queue', 'default'),
     ro('vision', 'Engine', 'auto', '--vision', 'default'),
+    ro('stats_db', 'Engine', '~/Library/Application Support/lily/lily.sqlite', '--stats-db', 'default'),
     ro('cache_bytes', 'Caches', 'auto', '--cache-bytes', 'default'),
     ro('max_sessions', 'Caches', 16, '--max-sessions', 'default'),
     ro('disk_cache_bytes', 'Caches', '100G', '--disk-cache-bytes', 'default'),
@@ -468,6 +469,6 @@ export function buildStatus(tick: number, sessions: Session[], now: number): Sta
       ngram: { bytes: Math.round(30.6 * GiB), resident_share: round3(0.86 + r() * 0.02) },
       weights: { bytes: Math.round(42.8 * GiB), pinned: true },
     },
-    recorder: { ok: true, dropped_rows: 0, db_bytes: Math.round(6.3 * 1024 ** 2), oldest: now - 7 * DAY },
+    recorder: { state: 'open', ok: true, dropped_rows: 0, db_bytes: Math.round(6.3 * 1024 ** 2), oldest: now - 7 * DAY, error: null },
   };
 }

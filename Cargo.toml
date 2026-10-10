@@ -67,6 +67,11 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 # The expert cache's read threads (`qwen4exp::expert_cache`): one pool for
 # the life of the cache instead of threads started per resolution.
 rayon = "1.12.0"
+# The dashboard's 7-day history (`serve::recorder`). `bundled` compiles
+# SQLite into the binary, so no system library or version is assumed.
+# `fallible_uint` reads and writes `u64` columns (ids, counts, unix ms) as
+# SQLite's i64, refusing a value out of range instead of wrapping it.
+rusqlite = { version = "0.40.2", features = ["bundled", "fallible_uint"] }
 
 # Metal and the Objective-C runtime. The engine is macOS-only; `lib.rs` gates
 # every GPU module on `target_os = "macos"` so the crate still type-checks

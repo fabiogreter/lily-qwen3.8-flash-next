@@ -3,12 +3,11 @@
 //! § 3.4): snake_case names, unix milliseconds, bytes, milliseconds, tokens
 //! per second, ratios in `0..=1`, and `null` (never an absent field, never 0)
 //! for a value lily does not have. The fixtures in
-//! `dashboard/src/api/fixtures/` are these types serialized; a test compares
+//! `dashboard/src/api/fixtures.ts` are these types serialized; a test compares
 //! them, and the dashboard's typecheck holds them against `types.ts`.
 //!
-//! The history shapes and the settings writes' answers are not here yet:
-//! their routes answer 503 and 409 until the recorder (phase 3) and runtime
-//! settings (phase 4) exist.
+//! The settings writes' answers are not here yet: their routes answer 409
+//! until runtime settings (phase 4) exist.
 
 use serde::Serialize;
 
@@ -162,12 +161,27 @@ pub struct Tiers {
     pub weights: WeightsTier,
 }
 
+/// Where the recorder is: `off` (`--stats-db off`), `opening` (its thread
+/// is opening the database, retrying after a failure), `open`, `failed` (it
+/// will not open, or its thread ended).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecorderState {
+    Off,
+    Opening,
+    Open,
+    Failed,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RecorderStatus {
+    pub state: RecorderState,
     pub ok: bool,
     pub dropped_rows: u64,
     pub db_bytes: u64,
     pub oldest: Option<u64>,
+    /// Why it is `opening` or `failed`; `None` otherwise.
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -184,6 +198,112 @@ pub struct Status {
     pub machine: MachineStatus,
     pub tiers: Tiers,
     pub recorder: RecorderStatus,
+}
+
+// --- GET /v1/lily/history and /v1/lily/sessions/{lineage}/history -----------
+
+/// A history's interval; each has its own bucket width ([`Range::step_ms`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Range {
+    #[serde(rename = "15m")]
+    QuarterHour,
+    #[serde(rename = "1h")]
+    Hour,
+    #[serde(rename = "24h")]
+    Day,
+    #[serde(rename = "7d")]
+    Week,
+}
+
+impl Range {
+    pub const ALL: [Self; 4] = [Self::QuarterHour, Self::Hour, Self::Day, Self::Week];
+
+    /// The range a `range=` value names, as the contract spells it.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "15m" => Some(Self::QuarterHour),
+            "1h" => Some(Self::Hour),
+            "24h" => Some(Self::Day),
+            "7d" => Some(Self::Week),
+            _ => None,
+        }
+    }
+
+    /// The interval, milliseconds.
+    pub fn span_ms(self) -> u64 {
+        match self {
+            Self::QuarterHour => 15 * 60_000,
+            Self::Hour => 3_600_000,
+            Self::Day => 86_400_000,
+            Self::Week => 7 * 86_400_000,
+        }
+    }
+
+    /// The bucket width (docs/dashboard.md § 3.4), milliseconds: a whole
+    /// number of minutes that divides the interval.
+    pub fn step_ms(self) -> u64 {
+        match self {
+            Self::QuarterHour | Self::Hour => 60_000,
+            Self::Day => 900_000,
+            Self::Week => 3_600_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HistoryPoint {
+    /// Bucket end, unix ms.
+    pub t: u64,
+    pub busy_share: f64,
+    pub requests: u64,
+    pub decode_tps_avg: Option<f64>,
+    pub decode_tps_max: Option<f64>,
+    pub prefill_tps_avg: Option<f64>,
+    pub prefill_tps_max: Option<f64>,
+    pub decode_tokens: u64,
+    pub prefill_tokens: u64,
+    pub acceptance: Option<f64>,
+    pub cache_hit: Option<f64>,
+    pub queue_ms_p50: Option<f64>,
+    pub queue_ms_max: Option<f64>,
+    pub sessions_max: u64,
+    /// The machine series: `None` throughout a session's history.
+    pub cpu_load: Option<f64>,
+    pub gpu_active: Option<f64>,
+    pub memory_pressure: Option<MemoryPressure>,
+    pub swap_bytes: Option<u64>,
+    pub power_w: Option<f64>,
+    pub gpu_power_w: Option<f64>,
+    pub gpu_freq_mhz: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Rate {
+    pub avg: Option<f64>,
+    pub max: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HistorySummary {
+    pub decode: Rate,
+    pub prefill: Rate,
+    pub tokens_generated: u64,
+    pub tokens_prefilled: u64,
+    pub requests: u64,
+    pub busy_share: f64,
+    pub cache_hit: Option<f64>,
+    pub acceptance: Option<f64>,
+    pub power_avg_w: Option<f64>,
+    pub energy_wh: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct History {
+    pub range: Range,
+    pub step_s: u64,
+    /// The complete grid, oldest first.
+    pub points: Vec<HistoryPoint>,
+    pub summary: HistorySummary,
 }
 
 // --- GET /v1/lily/sessions ---------------------------------------------------

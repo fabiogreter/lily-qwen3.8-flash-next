@@ -133,6 +133,13 @@ struct Cli {
     #[arg(long, default_value = "1m")]
     pin_hold: String,
 
+    /// The dashboard's 7-day history: a SQLite database of request numbers
+    /// (counts, durations, rates; never text or tokens), machine load and
+    /// cache tiers per minute. `off` records nothing and the dashboard shows
+    /// no history. Default: ~/Library/Application Support/lily/lily.sqlite.
+    #[arg(long, value_name = "PATH|off")]
+    stats_db: Option<String>,
+
     /// Where the Qwen3.8-Flash-Next n-gram table lives: `paged` reads rows
     /// from the checkpoint files through the page cache (32 GB less GPU
     /// memory), `resident` uploads it whole.
@@ -328,6 +335,9 @@ fn flag_values(matches: &ArgMatches) -> Vec<FlagValue> {
                 "disk_cache_dir" => {
                     Some(default_disk_cache_dir().display().to_string())
                 }
+                "stats_db" => {
+                    Some(lily::serve::recorder::default_path().display().to_string())
+                }
                 _ => arg
                     .get_default_values()
                     .first()
@@ -402,6 +412,8 @@ fn run() -> Result<()> {
         pin_hold_secs: parse_duration_secs(&cli.pin_hold)?,
         inject_metal_fault: cli.debug_inject_metal_fault,
         flags: flag_values(&matches),
+        stats_db: lily::serve::recorder::stats_db(cli.stats_db.as_deref())
+            .map_err(anyhow::Error::msg)?,
     };
     lily::serve::run(&cli.model, options)
 }

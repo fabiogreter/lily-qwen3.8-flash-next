@@ -13,7 +13,11 @@
 //! token rates come from two counters the engine bumps (a relaxed atomic add
 //! per drawn token, one per prefill chunk), sampled by the HTTP threads.
 //! Machine figures (CPU load, memory, swap, pressure) are read on the HTTP
-//! thread directly.
+//! thread directly. The history and the per-session figures come from the
+//! recorder's database (`serve::recorder`), which the board feeds each
+//! finished request's row through a bounded channel (`try_send`; a full
+//! channel drops the row and counts it), read here through a read-only
+//! connection of the HTTP thread's own.
 //!
 //! **This machine only** (§ 3.2). Every dashboard route refuses with 403 a
 //! peer that is not loopback, whatever `--bind` says, and a `Host` that is
@@ -28,31 +32,34 @@
 //! token ids, image data or tool arguments; the request rows are the counts,
 //! durations and rates of [`Timings`].
 //!
-//! What phase 2 cannot answer yet: the history routes need the recorder
-//! (503), the settings writes need runtime settings (409, after the write
-//! guard), the per-session figures cover the requests still in the
-//! [`REQUEST_ROWS`] ring, and the machine's power, GPU and temperatures wait
-//! for the sampler (`machine.sampler` is `off`).
+//! Without the recorder (`--stats-db off`, or a database that could not be
+//! opened) the history routes answer 503 and the per-session figures cover
+//! the requests still in the [`REQUEST_ROWS`] ring. What is not built yet:
+//! the settings writes need runtime settings (409, after the write guard),
+//! and the machine's power, GPU and temperatures wait for the sampler
+//! (`machine.sampler` is `off`).
 
 pub mod contract;
+pub mod history;
 pub mod settings;
 
 use std::borrow::Cow;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use contract::{
     CancelledBy, DiskTier, ErrorBody, ErrorDetail, ExpertTier, GpuTier, LifecycleState,
-    LiveStatus, MachineStatus, MemoryPressure, NgramTier, QueueStatus, RecorderStatus,
+    LiveStatus, MachineStatus, MemoryPressure, NgramTier, QueueStatus, Range,
     RequestRow, RequestsResponse, SamplerState, Session, SessionTier, SessionsResponse,
     Setting, SettingsLogResponse, SettingsResponse, Status, Tiers, WeightsTier,
 };
 use serde::Serialize;
 
 use super::http::Request;
+use super::recorder::{Recorder, RowSink, TierSnapshot};
 use super::session::{EntryView, Lineage, Lineages, SessionStore};
 use super::timings::Timings;
 use crate::engine::LanguageModel;
@@ -65,8 +72,8 @@ mod assets {
 }
 
 /// Request rows the board keeps (newest last): `GET /v1/lily/requests`
-/// serves the newest of them and the per-session figures are computed over
-/// all of them until the recorder keeps history. About 150 bytes a row.
+/// serves the newest of them, and without the recorder the per-session
+/// figures are computed over all of them. About 150 bytes a row.
 pub const REQUEST_ROWS: usize = 1024;
 /// `GET /v1/lily/requests` without a `limit`.
 const DEFAULT_REQUEST_LIMIT: usize = 40;
@@ -225,6 +232,8 @@ pub struct Board {
     prefilled: AtomicU64,
     pinned: Arc<AtomicBool>,
     lineages: Arc<Lineages>,
+    /// The recorder's channel, once it started.
+    recorder: OnceLock<RowSink>,
 }
 
 impl Default for Board {
@@ -237,6 +246,7 @@ impl Default for Board {
             prefilled: AtomicU64::new(0),
             pinned: Arc::new(AtomicBool::new(false)),
             lineages: Arc::new(Lineages::default()),
+            recorder: OnceLock::new(),
         }
     }
 }
@@ -245,6 +255,12 @@ impl Board {
     /// The process's lineage counter, which every session store shares.
     pub fn lineages(&self) -> Arc<Lineages> {
         self.lineages.clone()
+    }
+
+    /// Hands every later request row to the recorder too; a second sink is
+    /// refused (`false`).
+    pub fn attach_recorder(&self, sink: RowSink) -> bool {
+        self.recorder.set(sink).is_ok()
     }
 
     /// The flag the weights' pin mirrors its state into.
@@ -298,8 +314,12 @@ impl Board {
         activity.last_finished = Some(now);
     }
 
-    /// A finished request's numbers.
+    /// A finished request's numbers: kept in the ring and offered to the
+    /// recorder, which never makes this wait.
     pub fn record(&self, row: RequestRow) {
+        if let Some(sink) = self.recorder.get() {
+            sink.send(row.clone());
+        }
         let mut rows = lock(&self.rows);
         if rows.len() == REQUEST_ROWS {
             rows.pop_front();
@@ -324,6 +344,30 @@ impl Board {
 
     fn store(&self) -> Arc<StoreView> {
         lock(&self.store).clone()
+    }
+
+    /// The cache's tiers now, for the recorder's minute snapshot: the
+    /// published view, the sessions requests hold and the pin.
+    pub fn tier_snapshot(&self) -> TierSnapshot {
+        let store = (*self.store()).clone();
+        // Cloned under the lock, scanned outside it.
+        let active = lock(&self.activity).active.clone();
+        // A request's session the published view still lists is counted
+        // there, as the status route counts it.
+        let (active_sessions, active_bytes) = active
+            .iter()
+            .filter(|a| {
+                !store.entries.iter().any(|e| {
+                    !e.on_disk && e.lineage.is_some_and(|l| l.id == a.lineage.id)
+                })
+            })
+            .fold((0, 0), |(n, b), a| (n + 1, b + a.bytes));
+        TierSnapshot {
+            store,
+            active_sessions,
+            active_bytes,
+            weights_pinned: self.pinned.load(Ordering::Acquire),
+        }
     }
 }
 
@@ -663,8 +707,9 @@ fn ratio(part: u64, whole: u64) -> Option<f64> {
     (whole > 0).then(|| round(part as f64 / whole as f64, 1e4))
 }
 
-/// A lineage's figures over the rows the board holds (docs/dashboard.md § 5:
-/// averages over busy time, the maximum the best minute).
+/// A lineage's figures (docs/dashboard.md § 5: averages over busy time, the
+/// maximum the best minute), from the recorder or, without it, over the rows
+/// the board holds.
 #[derive(Debug, Default, Clone, PartialEq)]
 struct Figures {
     requests: usize,
@@ -673,6 +718,19 @@ struct Figures {
     prefill_tps_avg: Option<f64>,
     cache_hit: Option<f64>,
     acceptance: Option<f64>,
+}
+
+impl Figures {
+    fn of(t: history::SessionTotals) -> Self {
+        Self {
+            requests: t.requests as usize,
+            decode_tps_avg: t.decode_tps_avg,
+            decode_tps_max: t.decode_tps_max,
+            prefill_tps_avg: t.prefill_tps_avg,
+            cache_hit: t.cache_hit,
+            acceptance: t.acceptance,
+        }
+    }
 }
 
 fn figures<'a>(rows: impl Iterator<Item = &'a RequestRow>) -> Figures {
@@ -734,6 +792,7 @@ pub struct Dashboard {
     meter: Mutex<Meter>,
     /// Peers whose refusal was logged.
     refused: Mutex<HashSet<IpAddr>>,
+    recorder: Recorder,
 }
 
 impl Dashboard {
@@ -755,7 +814,14 @@ impl Dashboard {
             started: Instant::now(),
             meter: Mutex::default(),
             refused: Mutex::default(),
+            recorder: Recorder::off(),
         }
+    }
+
+    /// Serves the history and the per-session figures from `recorder`.
+    pub fn with_recorder(mut self, recorder: Recorder) -> Self {
+        self.recorder = recorder;
+        self
     }
 
     /// Answers `request` on `route`; `path` and `query` are its target's
@@ -849,11 +915,9 @@ impl Dashboard {
             ("GET", ["settings", "log"]) => {
                 Response::json(200, &SettingsLogResponse { entries: Vec::new() })
             }
-            ("GET", ["history"]) => {
-                Response::error(503, "history needs the recorder", None)
-            }
+            ("GET", ["history"]) => self.history(query, None),
             ("GET", ["sessions", lineage, "history"]) => match lineage.parse::<u64>() {
-                Ok(_) => Response::error(503, "history needs the recorder", None),
+                Ok(id) => self.history(query, Some(id)),
                 Err(_) => Response::error(404, "unknown lineage", None),
             },
             ("PATCH", ["settings"]) => {
@@ -1024,12 +1088,7 @@ impl Dashboard {
                 ngram,
                 weights: WeightsTier { bytes: weights_bytes, pinned },
             },
-            recorder: RecorderStatus {
-                ok: false,
-                dropped_rows: 0,
-                db_bytes: 0,
-                oldest: None,
-            },
+            recorder: self.recorder.status(),
         }
     }
 
@@ -1062,11 +1121,28 @@ impl Dashboard {
     pub fn sessions(&self) -> SessionsResponse {
         let store = self.board.store();
         let active = lock(&self.board.activity).active.clone();
-        let rows: Vec<RequestRow> = lock(&self.board.rows).iter().cloned().collect();
         let now_ms = super::now_ms();
-        let of = |lineage: Option<u64>| match lineage {
-            Some(id) => figures(rows.iter().filter(|r| r.lineage == Some(id))),
-            None => Figures::default(),
+        let ids: BTreeSet<u64> = active
+            .iter()
+            .map(|a| a.lineage.id)
+            .chain(store.entries.iter().filter_map(|e| e.lineage.map(|l| l.id)))
+            .collect();
+        let recorded = self.recorder.read(|conn| {
+            ids.iter()
+                .map(|&id| Ok((id, Figures::of(history::session_totals(conn, id)?))))
+                .collect::<rusqlite::Result<HashMap<u64, Figures>>>()
+        });
+        // Without the recorder: the rows the board holds.
+        let rows: Vec<RequestRow> = match recorded {
+            Ok(_) => Vec::new(),
+            Err(_) => lock(&self.board.rows).iter().cloned().collect(),
+        };
+        let of = |lineage: Option<u64>| match (lineage, &recorded) {
+            (Some(id), Ok(recorded)) => recorded.get(&id).cloned().unwrap_or_default(),
+            (Some(id), Err(_)) => {
+                figures(rows.iter().filter(|r| r.lineage == Some(id)))
+            }
+            (None, _) => Figures::default(),
         };
         let session = |lineage: Option<Lineage>,
                        tier,
@@ -1129,6 +1205,43 @@ impl Dashboard {
             )
         }));
         SessionsResponse { sessions }
+    }
+
+    /// `GET /v1/lily/history?range=` (`lineage` `None`) and
+    /// `GET /v1/lily/sessions/{lineage}/history?range=`: 400 for a range
+    /// the contract does not name, 503 without the recorder, 404 for a
+    /// lineage that is neither a cache entry now nor in the database.
+    fn history(&self, query: &str, lineage: Option<u64>) -> Response {
+        let Some(range) = query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("range="))
+            .and_then(Range::parse)
+        else {
+            return Response::error(
+                400,
+                "range must be one of 15m, 1h, 24h or 7d",
+                None,
+            );
+        };
+        self.history_at(range, lineage, super::now_ms())
+    }
+
+    /// [`Self::history`] at the time `now_ms`.
+    fn history_at(&self, range: Range, lineage: Option<u64>, now_ms: u64) -> Response {
+        // The cache as published, read before (never during) the SQLite work.
+        let listed = lineage.is_some_and(|id| {
+            let store = self.board.store();
+            store.entries.iter().any(|e| e.lineage.is_some_and(|l| l.id == id))
+                || lock(&self.board.activity).active.iter().any(|a| a.lineage.id == id)
+        });
+        match self
+            .recorder
+            .read(|conn| history::read(conn, range, now_ms, lineage, listed))
+        {
+            Ok(Some(history)) => Response::json(200, &history),
+            Ok(None) => Response::error(404, "unknown lineage", None),
+            Err(unavailable) => Response::error(503, unavailable.message(), None),
+        }
     }
 
     /// `GET /v1/lily/requests?limit=`: the newest `limit` rows, newest first.

@@ -28,15 +28,33 @@ other OpenAI-compatible servers:
 ## The dashboard
 
 `http://127.0.0.1:8000/` (the `--bind` address) serves a dashboard built into
-the binary: what the server is doing, its cache tiers, recent requests and
-every setting. It reads `/v1/lily/status`, `/sessions`, `/requests` and
-`/settings`, which answer from what the engine already publishes, so an open
-page never wakes an idle or unloaded engine. Every dashboard route answers
-loopback peers only, under `127.0.0.1`, `localhost` or `[::1]` with lily's
-port as `Host` (403 otherwise, whatever `--bind` says), and forbids framing.
-History and
-runtime settings are not built yet (503 and 409). The design is
-[dashboard.md](dashboard.md).
+the binary: what the server is doing, its cache tiers, recent requests, the
+last 7 days and every setting. It reads `/v1/lily/status`, `/sessions`,
+`/requests`, `/history` and `/settings`, which answer from what the engine
+already publishes and from the recorder's database, so an open page never
+wakes an idle or unloaded engine. Every dashboard route answers loopback
+peers only, under `127.0.0.1`, `localhost` or `[::1]` with lily's port as
+`Host` (403 otherwise, whatever `--bind` says), and forbids framing.
+
+The history lives in a SQLite database, `--stats-db <path>` (an absolute
+path; default `~/Library/Application Support/lily/lily.sqlite`, no `~`
+expansion): one row of numbers per finished request (counts, durations,
+rates, never text or tokens), per-minute rollups, machine load and the cache
+tiers, all kept 7 days and an hour. A directory lily creates for it is
+`0700`, the database and its WAL files `0600`. A recorder thread of its own
+opens and writes it, so the start never waits on SQLite: an open that fails
+is retried (1 s, 2 s, 5 s, then every 30 s) while `/v1/lily/status` says
+`recorder.state: "opening"` with the error. The engine only offers each row
+to a bounded channel; a full one drops the row (counted as
+`recorder.dropped_rows`, as are rows of a batch that failed twice). A file
+that is not a database or is corrupt is renamed to
+`<path>.corrupt-<unix seconds>` and a fresh one started; a database written
+by a newer lily is left untouched and the history stays off
+(`state: "failed"`). On shutdown the recorder gets up to 2 s to write what
+it holds and checkpoint the WAL. `--stats-db off` records nothing: the
+history routes answer 503 and the per-session figures cover the last 1 024
+requests. Runtime settings are not
+built yet (409). The design is [dashboard.md](dashboard.md).
 
 ## Batching
 

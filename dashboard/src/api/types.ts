@@ -22,8 +22,11 @@
  * written:
  *   - 400 a value is invalid (the message is the command-line parser's)
  *   - 403 the write guard refused (not loopback, wrong Content-Type or Origin)
- *   - 404 unknown setting (or unknown lineage)
+ *   - 404 unknown setting (or unknown lineage: neither a cache entry now nor
+ *     in the recorder's 7 days)
  *   - 409 the setting needs a restart and cannot be changed here
+ * and the history routes answer 503 while there is no recorder
+ * (`--stats-db off`, or a database lily could not open).
  */
 
 // ---------------------------------------------------------------------------
@@ -159,13 +162,24 @@ export interface Tiers {
   weights: WeightsTier;
 }
 
+/**
+ * `off` (`--stats-db off`), `opening` (the recorder's thread is opening the
+ * database, retrying after a failure), `open`, `failed` (it will not open,
+ * e.g. a newer lily's schema, or its thread ended).
+ */
+export type RecorderState = 'off' | 'opening' | 'open' | 'failed';
+
 export interface RecorderStatus {
+  state: RecorderState;
+  /** Open and no kind of write failing. */
   ok: boolean;
-  /** Request rows the recorder's channel dropped since start. */
+  /** Request rows dropped since start: a full channel, a batch that failed twice, a row SQLite refused. */
   dropped_rows: number;
   db_bytes: number;
   /** Unix ms of the oldest stored sample; null when the database is empty or off. */
   oldest: number | null;
+  /** Why it is `opening` or `failed`, as the server log says it; null otherwise. */
+  error: string | null;
 }
 
 export interface Status {
@@ -198,9 +212,13 @@ export interface Status {
  * has every value field null, `busy_share` 0 and every count 0.
  */
 export interface HistoryPoint {
-  /** Bucket end, unix ms. */
+  /**
+   * Bucket end, unix ms. The data runs to the last complete minute, so the
+   * last bucket of 24h and 7d is usually partial: its `t` is its nominal end
+   * (later than now) and its `busy_share` is over the minutes it covers.
+   */
   t: number;
-  /** Share of the bucket the engine was busy, 0..1. */
+  /** Share of the bucket the engine was busy, 0..1 (of the covered part, for a partial last bucket). */
   busy_share: number;
   requests: number;
   decode_tps_avg: number | null;
@@ -259,8 +277,9 @@ export interface History {
   step_s: number;
   /**
    * The complete contiguous grid from now minus the range to now at `step_s`,
-   * oldest first. Every bucket is present: the page places a bucket by its
-   * index, never by its timestamp.
+   * oldest first, the last bucket holding the last complete minute (and
+   * possibly partial, see `HistoryPoint.t`). Every bucket is present: the
+   * page places a bucket by its index, never by its timestamp.
    */
   points: HistoryPoint[];
   summary: HistorySummary;
@@ -273,8 +292,9 @@ export type SessionTier = 'gpu' | 'disk';
 
 /**
  * One cache entry, identified by its lineage id (docs/dashboard.md § 4.2).
- * Until the recorder exists (phase 3) the per-session figures (`requests`,
- * the rates, `cache_hit`, `acceptance`) cover the server's last 1024 requests.
+ * The per-session figures (`requests`, the rates, `cache_hit`, `acceptance`)
+ * cover the recorder's 7 days; without the recorder (`--stats-db off`) they
+ * cover the server's last 1024 requests.
  */
 export interface Session {
   /** null for an entry written before lineage ids existed; it has no history. */

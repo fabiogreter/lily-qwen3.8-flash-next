@@ -36,6 +36,7 @@ pub mod data_uri;
 pub mod disk;
 pub mod http;
 pub mod pin;
+pub mod recorder;
 pub mod request;
 pub mod session;
 pub mod stream;
@@ -299,6 +300,8 @@ pub struct ServeOptions {
     /// The command line as given, for the dashboard's settings view (empty:
     /// every setting shows as its default or unset).
     pub flags: Vec<dashboard::settings::FlagValue>,
+    /// The dashboard's history database (`--stats-db`; `None`: off).
+    pub stats_db: Option<std::path::PathBuf>,
 }
 
 // --- lifecycle ---------------------------------------------------------------
@@ -2150,6 +2153,9 @@ fn describe_thinking_defaults(d: &api::ThinkingDefaults, available: bool) -> Str
     )
 }
 
+/// The most shutdown waits for the recorder to write and checkpoint.
+const RECORDER_FINISH: Duration = Duration::from_secs(2);
+
 fn run_with<M: LanguageModel + 'static>(
     model_dir: &Path,
     options: ServeOptions,
@@ -2233,6 +2239,9 @@ fn run_with<M: LanguageModel + 'static>(
     let lifecycle = Arc::new(Lifecycle::new(State::Loading));
     let shutdown = Arc::new(Shutdown::default());
     let board = Arc::new(dashboard::Board::default());
+    // Returns at once: the recorder's thread opens the database.
+    let recorder = recorder::Recorder::start(options.stats_db.as_deref(), &board);
+    let recorder_stop = recorder.clone();
     let dashboard = dashboard::Dashboard::new(
         board.clone(),
         dashboard::Config {
@@ -2248,7 +2257,8 @@ fn run_with<M: LanguageModel + 'static>(
                 &computed_defaults(model_dir),
             ),
         },
-    );
+    )
+    .with_recorder(recorder);
     let shared = Shared {
         generator,
         shutdown: shutdown.clone(),
@@ -2334,6 +2344,9 @@ fn run_with<M: LanguageModel + 'static>(
     drop(listener);
     eprintln!("stopping: listener closed, waiting for the engine");
     let _ = engine_thread.join();
+    // The engine's last rows are in the channel: written, then the WAL
+    // checkpointed, within a bounded wait.
+    recorder_stop.finish(RECORDER_FINISH);
     let deadline = Instant::now() + SHUTDOWN_DRAIN;
     while connections.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));

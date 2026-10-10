@@ -3,9 +3,10 @@
 Status: **spec, agreed with the owner 2026-10-10; being built.** Prototypes are
 done (§ 9). Build order: the Vue app on mock data (§ 8), then lily serving it
 and the read routes (§ 3), the recorder (§ 4), runtime settings (§ 7) and
-machine sampling (§ 6). The first two are in; until the recorder exists the
-per-session figures cover the server's last 1 024 requests and the history
-routes answer 503 (`src/serve/dashboard.rs` says what each route serves).
+machine sampling (§ 6). The first three are in (`src/serve/dashboard.rs`
+says what each route serves, `src/serve/recorder.rs` what the recorder
+stores and how); with `--stats-db off` the per-session figures cover the
+server's last 1 024 requests and the history routes answer 503.
 
 A small web dashboard served by lily itself at `/`: what the server is doing
 now, what it did over the last 7 days, what the machine pays for it, and the
@@ -111,7 +112,12 @@ response with `Content-Type` and `Cache-Control`; `index.html` is
 - Lists come wrapped (`{sessions: [...]}`), leaving room for totals later.
 - History is the complete grid from `now - range` to `now` at `step_s`,
   oldest first; buckets with no data are all `null` (counts 0). Steps:
-  15m and 1h at 60 s, 24h at 900 s, 7d at 3 600 s.
+  15m and 1h at 60 s, 24h at 900 s, 7d at 3 600 s. Data runs to the last
+  complete minute, so the last bucket may be partial: it carries its nominal
+  end as `t` and its `busy_share` over the minutes it covers.
+- `recorder.state` is `off` (`--stats-db off`), `opening` (the database is
+  being opened, with retries; `error` says why it is not open yet), `open` or
+  `failed` (`error` says why); the history routes answer 503 unless `open`.
 - Memory pressure is lily's own names everywhere: `normal`, `warning`,
   `critical` or `null`; a history bucket carries the worst in it.
 - Machine power is `{cpu_w, gpu_w, ane_w, sys_w}` or `null`, with
@@ -141,6 +147,50 @@ Location: new flag `--stats-db <path>`, default
 `~/Library/Application Support/lily/lily.sqlite` (assumption; the owner may
 prefer next to `--disk-cache-dir`). `--stats-db off` disables the recorder
 and the history views, nothing else.
+
+As built (phase 3):
+
+- The engine gains no hook: the board it already publishes request rows to
+  offers each one to the recorder's channel (1 024 rows, `try_send`). The
+  recorder samples the machine itself every 10 s (CPU load, pressure, swap,
+  RAM in use, lily's footprint) and snapshots the tiers from the published
+  cache view once a minute.
+- HTTP handlers open a read-only connection per answer with a 250 ms busy
+  timeout (a lock held elsewhere answers 503 quickly); nothing they do
+  holds a lock the engine takes.
+- The recorder thread opens the database, never the main thread: a failed
+  open is retried after 1 s, 2 s, 5 s, then every 30 s, the status saying
+  `opening` and the error; rows wait meanwhile (counted if dropped).
+- Schema version in `PRAGMA user_version`, migrations forward-only; v1 sets
+  `auto_vacuum = INCREMENTAL` before its tables, the connection
+  `journal_size_limit` 4 MiB. A file that is not a database or fails
+  `quick_check` is renamed to `<path>.corrupt-<unix seconds>` (with its
+  `-wal`, `-shm`) and a fresh one started. A newer schema is never renamed:
+  the recorder is `failed` ("database <path> has schema N, this lily knows
+  M: history off") and the file untouched.
+- A batch of rows that fails is retried once with the next, then dropped
+  and counted; a row SQLite refuses (a value it cannot hold) is skipped and
+  counted. A SQLite error is logged once per kind of write and shows as
+  `recorder.ok = false` until that write succeeds again; reads at the start
+  (lineage ids, the oldest sample) are only logged.
+- A request counts as at most 24 h long and never starting before the
+  process; the clamped durations are what is stored. Accepted draft tokens
+  are stored clamped to the drafted, and a failed request's queue time is
+  NULL (left out of the queue figures).
+- Once the database is open the lineage counter is raised above the largest
+  id in `requests`, as it is above the disk tier's. Sessions created before
+  that took clock-seeded ids, above every earlier process's unless the
+  clock went back.
+- Pruning hourly at the hour 7 d + 1 h back (the 7d range's oldest bucket
+  stays whole), then `incremental_vacuum` and `wal_checkpoint(TRUNCATE)`.
+  A machine or tier minute stored twice (the clock went back) keeps the
+  latest.
+- On shutdown `Recorder::finish` stops the thread, which writes what it
+  holds and checkpoints the WAL; the wait is capped at 2 s.
+- `--stats-db` takes an absolute path or `off` (no `~` expansion); a
+  directory lily creates is `0700`, the database and its WAL files `0600`.
+- The settings tables exist (empty until phase 4); `settings_log` is pruned
+  at 7 days with the rest, `settings` never.
 
 ### 4.1 Tables
 
@@ -175,6 +225,17 @@ Throughput, per series (decode, prefill, both directions summed):
 - **Average over an interval** = tokens in the interval / **busy** time in the
   interval (time a request of that kind was running), not wall time: wall
   time would mostly measure idleness.
+- **Busy time, as measured**: a request row gives its finish time and its
+  prefill and decode durations; the decode is placed as the `decode_ms`
+  ending at the finish, the prefill as the `prefill_ms` ending where the
+  decode starts. A minute's decode busy time is the length of the union of
+  the decode intervals overlapping it (two requests decoding together for
+  10 s count 10 s, so the average is the batch's throughput), prefill busy
+  the same over the prefill intervals of requests that computed tokens, and
+  `busy_share` the union of whole requests over the bucket. A request's
+  tokens are spread evenly over its interval, so a minute gets the share it
+  overlapped. Request counts, cache hit, acceptance and queue times belong
+  to the minute a request finished in.
 - **Max over an interval** = the best 1-minute bucket in it, not the best
   single request: short requests give noisy peaks.
 - Prefill rates are per computed token (as `Timings` already defines them):
@@ -331,4 +392,4 @@ tok/s) and **machine cost** (load, memory pressure, watts).
 - macmon probe result on this machine (§ 6.1).
 - Whether `--queue`, `--durable-min-tokens`, `--decode-checkpoint-tokens` can
   change at runtime (§ 7.1).
-- The recorder's channel size and the drop counter's place on the page.
+- The drop counter's place on the page (the channel holds 1 024 rows).
