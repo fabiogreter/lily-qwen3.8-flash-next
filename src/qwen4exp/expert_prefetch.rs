@@ -19,13 +19,19 @@
 //!   for every layer in turn, those not resident, each take an LRU slot
 //!   ([`SlotPolicy::reserve`], stamped with that request's sequence number,
 //!   as the replay stamps a prefetch with the next request's tick, so that
-//!   request's misses cannot take it) and queue a read of it.
+//!   request's misses cannot take it) and queue a read of it. The evicted
+//!   expert's table entry is cleared at once, as a demand miss clears it.
+//! - The reservations stamped for one request leave as many LRU slots free
+//!   as that pass routes ids ([`Prefetcher::taken`]'s `keep_free`): past
+//!   that a pick is given up (`full`), since the request's own misses could
+//!   then find no slot. The replay caps its prefetches the same way.
 //! - Once a cut layer's request is resolved (its `ready` signalled), the
 //!   cut's plane does the same for the layers after it; with `replace` it
 //!   first cancels the queued reads for those layers that it does not pick.
 //! - Reads start in queue order, at most `depth` in flight, each expert's
-//!   nine regions at once on a pool of their own; demand reads never wait
-//!   for a prefetch to start, and the drive serves both as it will.
+//!   nine regions at once on a pool of its own per read in flight (a lane),
+//!   so a read never waits behind another prefetch's; demand reads never
+//!   wait for a prefetch to start, and the drive serves both as it will.
 //! - At a layer's request, a routed expert whose read is still queued is
 //!   read with the demand misses, into the slot it took; one in flight is
 //!   waited for; the layer's other queued reads are cancelled and their
@@ -49,6 +55,7 @@
 //! never reads a slot whose data is still on its way.
 
 use std::collections::VecDeque;
+use std::io::Read as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -58,10 +65,6 @@ use anyhow::{Context as _, Result, ensure};
 
 use super::cache_replay::{NO_PREDICTION, PrefetchReplay};
 use super::expert_store::{Lookup, SlotPolicy};
-
-/// Picks per row when `LILY_EXPERT_PREFETCH_WIDTH` is not set: what the
-/// offline selection of the trained predictors writes.
-pub const DEFAULT_WIDTH: usize = 24;
 
 /// Precomputed predictions ([`cache_replay::Predictions`]' layout), read
 /// whole.
@@ -95,18 +98,26 @@ impl PredictionFile {
         Ok(Self { positions: ids.len() / per_position, ids, planes, layers, width })
     }
 
-    /// Reads `path` (little-endian `u16`s) as [`Self::new`] lays it out.
+    /// Reads `path` (little-endian `u16`s) as [`Self::new`] lays it out,
+    /// straight into the ids.
     pub fn open(
         path: &Path,
         planes: usize,
         layers: usize,
         width: usize,
     ) -> Result<Self> {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        ensure!(bytes.len().is_multiple_of(2), "{}: not u16s", path.display());
-        let ids =
-            bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+        let read = || -> Result<Vec<u16>> {
+            let mut file = std::fs::File::open(path)?;
+            let len = usize::try_from(file.metadata()?.len())?;
+            ensure!(len.is_multiple_of(2), "not u16s");
+            let mut ids = vec![0u16; len / 2];
+            file.read_exact(bytemuck::cast_slice_mut(&mut ids))?;
+            for id in &mut ids {
+                *id = u16::from_le(*id);
+            }
+            Ok(ids)
+        };
+        let ids = read().with_context(|| format!("reading {}", path.display()))?;
         Self::new(ids, planes, layers, width)
             .with_context(|| format!("predictions {}", path.display()))
     }
@@ -177,17 +188,29 @@ impl PrefetchSetup {
             file.max_id().is_none_or(|e| usize::from(e) < experts),
             "a predicted id is past the model's {experts} experts"
         );
+        if plan.top > file.width {
+            eprintln!(
+                "expert cache: prefetch top {} over rows of {}: at most {} picks per row are read",
+                plan.top, file.width, file.width
+            );
+        }
         Ok(Self { plan, depth, file })
     }
 
     /// From the environment, or `None` without `LILY_EXPERT_PREFETCH_FILE`:
     /// the file, `LILY_EXPERT_PREFETCH` (the plan in `lily-cache-replay
-    /// --prefetch`'s syntax, required), `LILY_EXPERT_PREFETCH_PLANES` (the
-    /// file's planes, by default one per plane the plan reads),
-    /// `LILY_EXPERT_PREFETCH_WIDTH` ([`DEFAULT_WIDTH`]) and
+    /// --prefetch`'s syntax), `LILY_EXPERT_PREFETCH_PLANES` and
+    /// `LILY_EXPERT_PREFETCH_WIDTH` (the file's layout, all required: the
+    /// file has no header, and a wrong layout whose size divides would be
+    /// misread), `LILY_EXPERT_PREFETCH_POSITIONS` (optional, checked) and
     /// `LILY_EXPERT_PREFETCH_DEPTH` (1).
     pub fn from_env(layers: usize, experts: usize) -> Result<Option<Self>> {
         let Some(path) = std::env::var_os("LILY_EXPERT_PREFETCH_FILE") else {
+            if std::env::var_os("LILY_EXPERT_PREFETCH").is_some() {
+                eprintln!(
+                    "expert cache: LILY_EXPERT_PREFETCH without LILY_EXPERT_PREFETCH_FILE is ignored"
+                );
+            }
             return Ok(None);
         };
         let spec = std::env::var("LILY_EXPERT_PREFETCH").context(
@@ -201,11 +224,23 @@ impl PrefetchSetup {
                 .map(|v| v.parse().with_context(|| format!("{name}={v}")))
                 .transpose()
         };
-        let planes = var("LILY_EXPERT_PREFETCH_PLANES")?
-            .unwrap_or(1 + plan.cuts.count_ones() as usize);
-        let width = var("LILY_EXPERT_PREFETCH_WIDTH")?.unwrap_or(DEFAULT_WIDTH);
+        let layout = |name: &str| -> Result<usize> {
+            var(name)?.with_context(|| {
+                format!("LILY_EXPERT_PREFETCH_FILE needs {name} (the file's layout)")
+            })
+        };
+        let planes = layout("LILY_EXPERT_PREFETCH_PLANES")?;
+        let width = layout("LILY_EXPERT_PREFETCH_WIDTH")?;
         let depth = var("LILY_EXPERT_PREFETCH_DEPTH")?.unwrap_or(1);
         let file = PredictionFile::open(Path::new(&path), planes, layers, width)?;
+        if let Some(n) = var("LILY_EXPERT_PREFETCH_POSITIONS")? {
+            ensure!(
+                file.positions == n,
+                "{} holds {} positions at {planes} planes x {layers} layers x {width}, not {n}",
+                Path::new(&path).display(),
+                file.positions
+            );
+        }
         Self::new(plan, depth, file, layers, experts).map(Some)
     }
 
@@ -234,9 +269,11 @@ impl PrefetchSetup {
 pub struct PrefetchCounts {
     /// Decode passes whose position the file covers.
     pub tokens: u64,
-    /// Reads issued, less those cancelled before they started.
-    pub reads: u64,
-    /// Of those, the ones whose layer then routed to them, still resident.
+    /// Reads issued (a slot reserved), cancelled ones included; every count
+    /// only grows, so [`Self::since`] is a difference of each.
+    pub issued: u64,
+    /// Of the reads not cancelled, the ones whose layer then routed to them,
+    /// still resident.
     pub useful: u64,
     /// Routed while still queued (read with the demand misses) or in flight
     /// (waited for).
@@ -244,7 +281,8 @@ pub struct PrefetchCounts {
     /// Cancelled before they started: their layer passed without routing to
     /// them, a later plane did not pick them, or a lookup took their slot.
     pub cancelled: u64,
-    /// Picks given up because no LRU slot was free.
+    /// Picks given up because no LRU slot was free to a prefetch, or the
+    /// slots stamped for the next request reached the cap.
     pub full: u64,
     /// Reads landed and their summed time, microseconds.
     pub landed: u64,
@@ -256,7 +294,7 @@ impl PrefetchCounts {
     pub fn since(self, earlier: PrefetchCounts) -> PrefetchCounts {
         PrefetchCounts {
             tokens: self.tokens - earlier.tokens,
-            reads: self.reads - earlier.reads,
+            issued: self.issued - earlier.issued,
             useful: self.useful - earlier.useful,
             late: self.late - earlier.late,
             cancelled: self.cancelled - earlier.cancelled,
@@ -266,15 +304,20 @@ impl PrefetchCounts {
         }
     }
 
-    /// `prefetch: r reads (x/token), u useful, l late, c cancelled, f full,
-    /// read m ms`.
+    /// Reads issued and not cancelled: `lily-cache-replay`'s prefetch reads.
+    pub fn reads(&self) -> u64 {
+        self.issued - self.cancelled
+    }
+
+    /// `prefetch over T tokens: R reads (r/token), U useful (u/token), L
+    /// late, C cancelled, F full, M ms per read`.
     pub fn describe(&self) -> String {
         let per = |n: u64| n as f64 / self.tokens.max(1) as f64;
         format!(
             "prefetch over {} tokens: {} reads ({:.2}/token), {} useful ({:.2}/token), {} late, {} cancelled, {} full, {:.2} ms per read",
             self.tokens,
-            self.reads,
-            per(self.reads),
+            self.reads(),
+            per(self.reads()),
             self.useful,
             per(self.useful),
             self.late,
@@ -293,9 +336,10 @@ pub(crate) struct Read {
     pub slot: u32,
 }
 
-/// Starts a read; whatever runs it calls [`Reads::landed`] once the slot
-/// holds the expert and is no longer written.
-pub(crate) type Launch = Box<dyn Fn(&Arc<Reads>, Read) + Send + Sync>;
+/// Starts a read on lane `lane` (below the depth, no other read in flight
+/// on it); whatever runs it calls [`Reads::landed`] once the slot holds the
+/// expert and is no longer written.
+pub(crate) type Launch = Box<dyn Fn(&Arc<Reads>, Read, usize) + Send + Sync>;
 
 /// The reads queued and in flight, shared by the service thread and the
 /// jobs that read.
@@ -306,6 +350,7 @@ pub(crate) struct Reads {
     /// The length of [`ReadState::landed`], so the service thread can skip
     /// the lock when nothing landed.
     unpublished: AtomicUsize,
+    /// Reads landed, which a wait for one in flight watches.
     landed: AtomicU64,
     read_ns: AtomicU64,
 }
@@ -313,7 +358,8 @@ pub(crate) struct Reads {
 #[derive(Default)]
 struct ReadState {
     queue: VecDeque<Read>,
-    in_flight: Vec<Read>,
+    /// With their lanes.
+    in_flight: Vec<(Read, usize)>,
     /// Landed, table entries not set yet.
     landed: Vec<Read>,
 }
@@ -349,10 +395,13 @@ impl Reads {
                     return;
                 }
                 let Some(read) = s.queue.pop_front() else { return };
-                s.in_flight.push(read);
-                read
+                let lane = (0..self.depth)
+                    .find(|&l| s.in_flight.iter().all(|&(_, x)| x != l))
+                    .expect("a free lane below the depth");
+                s.in_flight.push((read, lane));
+                (read, lane)
             };
-            (self.launch)(self, read);
+            (self.launch)(self, read.0, read.1);
         }
     }
 
@@ -361,32 +410,42 @@ impl Reads {
     pub(crate) fn landed(self: &Arc<Self>, read: Read, took: Duration) {
         {
             let mut s = self.lock();
-            if let Some(i) = s.in_flight.iter().position(|r| *r == read) {
+            if let Some(i) = s.in_flight.iter().position(|&(r, _)| r == read) {
                 s.in_flight.swap_remove(i);
             }
             s.landed.push(read);
             self.unpublished.fetch_add(1, Ordering::Release);
         }
-        self.landed.fetch_add(1, Ordering::Relaxed);
+        self.landed.fetch_add(1, Ordering::Release);
         self.read_ns.fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
         self.start_queued();
     }
 
     fn in_flight(&self, layer: usize, expert: u32) -> bool {
-        self.lock().in_flight.iter().any(|r| r.layer == layer && r.expert == expert)
+        self.lock()
+            .in_flight
+            .iter()
+            .any(|&(r, _)| r.layer == layer && r.expert == expert)
     }
 
-    /// Spins until no read of `layer`'s `expert` is in flight. The GPU, or
-    /// a lookup about to reuse the slot, waits on it: a blocking wait would
-    /// wake tens of microseconds late.
+    /// Spins until no read of `layer`'s `expert` is in flight, looking again
+    /// only when a read has landed. The GPU, or a lookup about to reuse the
+    /// slot, waits on it: a blocking wait would wake tens of microseconds
+    /// late.
     fn wait(&self, layer: usize, expert: u32) {
-        let mut spins = 0u32;
-        while self.in_flight(layer, expert) {
-            spins += 1;
-            if spins.is_multiple_of(1024) {
-                std::thread::yield_now();
-            } else {
-                std::hint::spin_loop();
+        loop {
+            let seen = self.landed.load(Ordering::Acquire);
+            if !self.in_flight(layer, expert) {
+                return;
+            }
+            let mut spins = 0u32;
+            while self.landed.load(Ordering::Acquire) == seen {
+                spins += 1;
+                if spins.is_multiple_of(1024) {
+                    std::thread::yield_now();
+                } else {
+                    std::hint::spin_loop();
+                }
             }
         }
     }
@@ -409,6 +468,8 @@ pub(crate) struct Prefetcher {
     /// `prefetched`), for counting the useful reads.
     issued: Vec<Vec<u32>>,
     counts: PrefetchCounts,
+    /// The tick the last reservations were stamped with, and how many.
+    stamped: (u64, usize),
     /// Scratch: the reads taken from [`ReadState::landed`], a plane's picks.
     landed: Vec<Read>,
     picks: Vec<u16>,
@@ -431,6 +492,7 @@ impl Prefetcher {
             pos: None,
             issued: vec![Vec::new(); layers],
             counts: PrefetchCounts::default(),
+            stamped: (0, 0),
             landed: Vec::new(),
             picks: Vec::new(),
         }
@@ -446,17 +508,22 @@ impl Prefetcher {
 
     /// A request was taken from the queue, before the GPU signalled it:
     /// `layer` of a pass at `pos` (`None`: not a decode pass, or no position
-    /// known). A decode pass's layer 0 starts its token: plane 0 is issued,
-    /// stamped `tick` (the request's sequence number), sparing slots used at
-    /// `busy_from` or later. Anything but a decode pass cancels what is
-    /// queued.
+    /// known) that routes `keep_free` ids per layer at most. A decode pass's
+    /// layer 0 starts its token: plane 0 is issued, stamped `tick` (the
+    /// request's sequence number), sparing slots used at `busy_from` or
+    /// later and leaving `keep_free` LRU slots to the request's misses; an
+    /// evicted expert's entry is cleared through `set(layer, expert, NONE)`.
+    /// Anything but a decode pass cancels what is queued.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn taken(
         &mut self,
         layer: usize,
         pos: Option<usize>,
+        keep_free: usize,
         policy: &mut SlotPolicy,
         tick: u64,
         busy_from: u64,
+        set: &mut impl FnMut(usize, usize, u32),
     ) {
         match pos {
             Some(p) if layer == 0 => {
@@ -470,7 +537,13 @@ impl Prefetcher {
                     self.counts.tokens += 1;
                 }
                 for target in 0..self.layers {
-                    self.issue(0, target, p, policy, tick, busy_from);
+                    self.issue(
+                        (0, target, p),
+                        keep_free,
+                        policy,
+                        (tick, busy_from),
+                        set,
+                    );
                 }
             }
             Some(_) => {}
@@ -538,10 +611,10 @@ impl Prefetcher {
                     misses.push((read.slot, layer, e as usize));
                     *flag = false;
                     self.counts.late += 1;
-                } else if let Some(read) =
-                    s.in_flight.iter().find(|r| r.layer == layer && r.expert == e)
+                } else if let Some(&(read, _)) =
+                    s.in_flight.iter().find(|(r, _)| r.layer == layer && r.expert == e)
                 {
-                    awaited.push(*read);
+                    awaited.push(read);
                     self.counts.late += 1;
                 }
                 // Landed: the table entry is set before `ready`.
@@ -583,15 +656,17 @@ impl Prefetcher {
         }
     }
 
-    /// `layer`'s request was resolved and signalled: after a cut, its plane
-    /// for the layers after it, stamped `tick` (the next request's sequence
-    /// number), sparing slots used at `busy_from` or later.
+    /// `layer`'s request, of a pass routing `keep_free` ids per layer at
+    /// most, was resolved and signalled: after a cut, its plane for the
+    /// layers after it, stamped `tick` (the next request's sequence number),
+    /// sparing slots used at `busy_from` or later, as [`Self::taken`].
     pub(crate) fn resolved(
         &mut self,
         layer: usize,
+        keep_free: usize,
         policy: &mut SlotPolicy,
-        tick: u64,
-        busy_from: u64,
+        (tick, busy_from): (u64, u64),
+        set: &mut impl FnMut(usize, usize, u32),
     ) {
         let Some(p) = self.pos else { return };
         if !self.plan.is_cut(layer) {
@@ -606,20 +681,28 @@ impl Prefetcher {
                     r.layer == target && !keep.contains(&r.expert)
                 });
             }
-            self.issue(plane, target, p, policy, tick, busy_from);
+            self.issue((plane, target, p), keep_free, policy, (tick, busy_from), set);
         }
     }
 
-    /// Reads `plane`'s picks for `target` at `pos` that are not resident.
+    /// Reads `plane`'s picks for `target` at `pos` that are not resident,
+    /// while the slots stamped `tick` leave `keep_free` LRU slots.
     fn issue(
         &mut self,
-        plane: usize,
-        target: usize,
-        pos: usize,
+        (plane, target, pos): (usize, usize, usize),
+        keep_free: usize,
         policy: &mut SlotPolicy,
-        tick: u64,
-        busy_from: u64,
+        (tick, busy_from): (u64, u64),
+        set: &mut impl FnMut(usize, usize, u32),
     ) {
+        if self.stamped.0 != tick {
+            self.stamped = (tick, 0);
+        }
+        // The request stamped `tick` finds a slot for each of its misses
+        // while the LRU slots stamped `tick` before it (these reservations,
+        // cancelled ones included, as an emptied slot keeps its stamp) leave
+        // as many as it routes.
+        let cap = (policy.n_slots() - policy.pinned()).saturating_sub(keep_free);
         let mut picks = std::mem::take(&mut self.picks);
         picks.clear();
         picks.extend_from_slice(self.file.picks(plane, target, pos, self.plan.top));
@@ -628,14 +711,22 @@ impl Prefetcher {
             if policy.slot_of(target, e).is_some() {
                 continue;
             }
+            if self.stamped.1 >= cap {
+                self.counts.full += 1;
+                break;
+            }
             match policy.reserve(target, e, tick, busy_from) {
                 Lookup::Miss { slot, evicted } => {
                     if let Some((l, x)) = evicted {
+                        // No pass reads the slot (`reserve`), so neither
+                        // does any its table entry.
+                        set(l, x, SlotPolicy::NONE);
                         self.release(l, x);
                     }
+                    self.stamped.1 += 1;
                     self.outstanding[target * self.experts + e] = true;
                     self.issued[target].push(u32::from(expert));
-                    self.counts.reads += 1;
+                    self.counts.issued += 1;
                     self.reads.push(Read {
                         layer: target,
                         expert: u32::from(expert),
@@ -666,9 +757,8 @@ impl Prefetcher {
         if let Some(i) = s.queue.iter().position(|r| r.layer == layer && r.expert == e)
         {
             s.queue.remove(i);
-            self.counts.reads -= 1;
             self.counts.cancelled += 1;
-        } else if s.in_flight.iter().any(|r| r.layer == layer && r.expert == e) {
+        } else if s.in_flight.iter().any(|&(r, _)| r.layer == layer && r.expert == e) {
             drop(s);
             self.reads.wait(layer, e);
         }
@@ -693,7 +783,6 @@ impl Prefetcher {
             self.outstanding[r.layer * self.experts + e] = false;
             self.issued[r.layer].retain(|&x| x != r.expert);
             policy.forget(r.layer, e);
-            self.counts.reads -= 1;
             self.counts.cancelled += 1;
         }
     }

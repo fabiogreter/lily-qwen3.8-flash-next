@@ -925,7 +925,14 @@ pub fn load(
             cache.fill_and_serve(store, policy, live, adapt, usage_out, prefetch)?;
             Some(cache)
         }
-        None => None,
+        None => {
+            if std::env::var_os("LILY_EXPERT_PREFETCH_FILE").is_some() {
+                eprintln!(
+                    "expert cache: not engaged, so LILY_EXPERT_PREFETCH_FILE is ignored"
+                );
+            }
+            None
+        }
     };
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     for (idx, layer_type) in config.layer_types.iter().enumerate() {

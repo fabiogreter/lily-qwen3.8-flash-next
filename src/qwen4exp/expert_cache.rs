@@ -508,14 +508,22 @@ impl ExpertCache {
         let prefetcher = match prefetch {
             Some(setup) => {
                 // Each read in flight reads an expert's regions at once, on
-                // threads of its own so demand reads keep the whole pool.
-                let pool = Arc::new(
-                    rayon::ThreadPoolBuilder::new()
-                        .num_threads(REGIONS * setup.depth)
-                        .thread_name(|i| format!("expert-prefetch-{i}"))
-                        .build()?,
-                );
-                let launch = prefetch_launch(pool, store.clone(), slab);
+                // a pool of its own (one per lane), so demand reads keep the
+                // whole read pool and no prefetch's job waits behind
+                // another's.
+                let lanes = (0..setup.depth)
+                    .map(|lane| {
+                        Ok(Arc::new(
+                            rayon::ThreadPoolBuilder::new()
+                                .num_threads(REGIONS)
+                                .thread_name(move |i| {
+                                    format!("expert-prefetch-{lane}-{i}")
+                                })
+                                .build()?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let launch = prefetch_launch(lanes, store.clone(), slab);
                 Some(Prefetcher::new(setup, self.slot_of.len(), experts, launch))
             }
             None => None,
@@ -883,16 +891,17 @@ unsafe fn read_slots(
     run_claimed(pool, entries.len() * REGIONS, read)
 }
 
-/// How the prefetch reads ([`Prefetcher`]): each one a job on `pool`, which
-/// reads the expert's regions as a demand miss's are read, from that job's
-/// thread and the pool's others ([`run_claimed`]), straight into its slot.
-/// A failed read ends the process, as a failed demand read does.
+/// How the prefetch reads ([`Prefetcher`]): each one a job on its lane's
+/// pool, which reads the expert's regions as a demand miss's are read, from
+/// that job's thread and the pool's others ([`run_claimed`]), straight into
+/// its slot. A failed read ends the process, as a failed demand read does.
 fn prefetch_launch(
-    pool: Arc<rayon::ThreadPool>,
+    lanes: Vec<Arc<rayon::ThreadPool>>,
     store: Arc<ExpertStore>,
     slab: SlabPointers,
 ) -> Launch {
-    Box::new(move |reads: &Arc<Reads>, read: Read| {
+    Box::new(move |reads: &Arc<Reads>, read: Read, lane: usize| {
+        let pool = &lanes[lane];
         let (inner, store, reads) = (pool.clone(), store.clone(), reads.clone());
         pool.spawn(move || {
             let started = std::time::Instant::now();
@@ -1068,11 +1077,12 @@ unsafe fn set_entry(
 /// (`LILY_EXPERT_TRACE=<path>`): per resolution when the thread took the
 /// request, saw the GPU's signal, had looked every id up, had read the
 /// misses (and had the routed experts' prefetches, `late`) and had
-/// signalled `ready`; per region read of a miss its start, end and reading
-/// thread (prefetch reads are not traced). Written as `<path>.layers.csv`
-/// and `<path>.reads.csv` when the service stops; nanoseconds since the
-/// service started. Off, the
-/// thread pays one branch per resolution and per read. On, it perturbs what
+/// signalled `ready`; per region read of a resolution its start, end and
+/// reading thread (a prefetch still queued at its layer is read and traced
+/// with the misses; prefetch reads in the background are not traced).
+/// Written as `<path>.layers.csv` and `<path>.reads.csv` when the service
+/// stops; nanoseconds since the service started. Off, the thread pays one
+/// branch per resolution and per read. On, it perturbs what
 /// it measures a little: a clock read per mark, a lock per region read, and
 /// now and then a vector growing. The first [`MissTrace::MAX_LAYERS`]
 /// resolutions and [`MissTrace::MAX_READS`] reads are kept (about 40 MB
@@ -1092,9 +1102,10 @@ struct LayerTiming {
     layer: usize,
     count: usize,
     ids: usize,
-    /// The policy's misses, and routed experts whose prefetch was still
-    /// queued (read with the misses) or in flight (waited for).
+    /// The policy's misses.
     misses: usize,
+    /// Routed experts whose prefetch was still queued (read with the misses,
+    /// and traced among their reads) or in flight (waited for).
     late: usize,
     popped: u64,
     seen: u64,
@@ -1211,6 +1222,68 @@ impl Drop for MissTrace {
     }
 }
 
+/// What a request's lookups leave to read and to wait for ([`look_up`]).
+#[derive(Default)]
+pub(crate) struct Resolution {
+    /// `(slot, layer, expert)` to read: the policy's misses, then the routed
+    /// experts whose prefetch was still queued.
+    pub misses: Vec<(u32, usize, usize)>,
+    /// The experts whose slots the misses took.
+    pub evicted: Vec<(usize, usize)>,
+    /// The prefetches in flight the layer waits for.
+    pub awaited: Vec<Read>,
+}
+
+/// One request's lookups as the service thread makes them, the reads
+/// aside: `layer`'s routed `ids` (sorted, distinct, in range) at `seq`, a
+/// decode-class pass or not. Counts them in `usage`, takes a slot for each
+/// miss (an evicted expert's table entry cleared through `set`), and with a
+/// prefetcher settles the layer's prefetches, into `out`. Returns the
+/// policy's misses, `Err(expert)` when no slot was free for `expert`.
+pub(crate) fn look_up(
+    policy: &mut SlotPolicy,
+    usage: &mut LiveUsage,
+    mut prefetcher: Option<&mut Prefetcher>,
+    (layer, seq, decode): (usize, u64, bool),
+    ids: &[u32],
+    out: &mut Resolution,
+    set: &mut impl FnMut(usize, usize, u32),
+) -> Result<usize, usize> {
+    let Resolution { misses, evicted, awaited } = out;
+    misses.clear();
+    evicted.clear();
+    awaited.clear();
+    if let Some(pf) = prefetcher.as_deref_mut() {
+        pf.before_lookups(layer, ids, policy);
+    }
+    // TODO: hits are stamped in id order, so an earlier miss can evict a
+    // resident expert this request routes later, which then misses too;
+    // stamping the hits first would avoid it. Measured in replay: 0.2% of
+    // prefill misses, decode unchanged (2026-10-10), so left as is.
+    for &e in ids {
+        let expert = e as usize;
+        usage.record(layer, expert, decode);
+        match policy.lookup(layer, expert, seq) {
+            Lookup::Hit(_) => {}
+            Lookup::Miss { slot, evicted: taken } => {
+                if let Some((l, x)) = taken {
+                    // The GPU waits at this layer; the evicted expert's
+                    // readers have completed.
+                    set(l, x, NONE);
+                    evicted.push((l, x));
+                }
+                misses.push((slot, layer, expert));
+            }
+            Lookup::Full => return Err(expert),
+        }
+    }
+    let missed = misses.len();
+    if let Some(pf) = prefetcher {
+        pf.after_lookups(layer, ids, misses, evicted, policy, awaited);
+    }
+    Ok(missed)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn serve(
     pool: rayon::ThreadPool,
@@ -1228,13 +1301,17 @@ fn serve(
     service: Arc<Service>,
 ) {
     let mut ids: Vec<u32> = Vec::new();
-    let mut misses: Vec<(u32, usize, usize)> = Vec::new();
-    // With a prefetch: the slots the lookups took from other experts, and
-    // the prefetches in flight the layer waits for.
-    let mut evicted_by: Vec<(usize, usize)> = Vec::new();
-    let mut awaited: Vec<Read> = Vec::new();
+    let mut res = Resolution::default();
     // The last request signalled: a pass may still read its slots.
     let mut last_ready = 0u64;
+    // SAFETY: the tables are shared-storage `U32 [E]` buffers, and every
+    // entry written through this is one no pass in flight reads: a routed
+    // expert's while the GPU waits at its layer, an evicted one's whose
+    // slot no pass in flight uses, a prefetched one's before the `ready`
+    // of any layer that could route to it.
+    let mut set_table = |layer: usize, expert: usize, slot: u32| unsafe {
+        set_entry(&tables, experts, layer, expert, slot)
+    };
     let debug = std::env::var_os("LILY_EXPERT_CACHE_DEBUG").is_some();
     let mut trace = MissTrace::from_env();
     // `LILY_EXPERT_WARM=0` leaves the GPU idle while misses are read.
@@ -1278,9 +1355,11 @@ fn serve(
             pf.taken(
                 request.layer,
                 request.pos.filter(|_| decode),
+                request.count,
                 policy,
                 request.seq,
                 last_ready,
+                &mut set_table,
             );
         }
         // The GPU is stalled behind this request from the moment it
@@ -1351,61 +1430,31 @@ fn serve(
         if decode {
             service.decode_lookups.fetch_add(ids.len() as u64, Ordering::Relaxed);
         }
-        misses.clear();
-        evicted_by.clear();
-        awaited.clear();
-        if let Some(pf) = prefetcher.as_mut() {
-            pf.before_lookups(request.layer, &ids, policy);
+        if let Some(&e) = ids.last()
+            && e as usize >= experts
+        {
+            eprintln!("expert cache: routed id {e} out of range; the pass is corrupt");
+            std::process::abort();
         }
-        // TODO: hits are stamped in id order, so an earlier miss can evict a
-        // resident expert this request routes later, which then misses too;
-        // stamping the hits first would avoid it. Measured in replay: 0.2%
-        // of prefill misses, decode unchanged (2026-10-10), so left as is.
-        for &e in &ids {
-            let expert = e as usize;
-            if expert >= experts {
+        let missed = match look_up(
+            policy,
+            usage,
+            prefetcher.as_mut(),
+            (request.layer, request.seq, decode),
+            &ids,
+            &mut res,
+            &mut set_table,
+        ) {
+            Ok(missed) => missed,
+            Err(expert) => {
                 eprintln!(
-                    "expert cache: routed id {e} out of range; the pass is corrupt"
+                    "expert cache: no slot free for layer {} expert {expert} (LRU region too small)",
+                    request.layer
                 );
                 std::process::abort();
             }
-            usage.record(request.layer, expert, decode);
-            match policy.lookup(request.layer, expert, request.seq) {
-                Lookup::Hit(_) => {}
-                Lookup::Miss { slot, evicted } => {
-                    if let Some((l2, e2)) = evicted {
-                        // SAFETY: the GPU waits at this layer; the evicted
-                        // expert's readers have completed.
-                        unsafe { set_entry(&tables, experts, l2, e2, NONE) };
-                        if prefetcher.is_some() {
-                            evicted_by.push((l2, e2));
-                        }
-                    }
-                    misses.push((slot, request.layer, expert));
-                }
-                Lookup::Full => {
-                    eprintln!(
-                        "expert cache: no slot free for layer {} expert {expert} (LRU region too small)",
-                        request.layer
-                    );
-                    std::process::abort();
-                }
-            }
-        }
-        // The policy's misses; a prefetch still queued for a routed expert
-        // is read with them.
-        let missed = misses.len();
-        if let Some(pf) = prefetcher.as_mut() {
-            pf.after_lookups(
-                request.layer,
-                &ids,
-                &mut misses,
-                &evicted_by,
-                policy,
-                &mut awaited,
-            );
-        }
-        let waits = !misses.is_empty() || !awaited.is_empty();
+        };
+        let waits = !res.misses.is_empty() || !res.awaited.is_empty();
         if waits && let Some(w) = warmer.as_mut() {
             w.start();
         }
@@ -1414,7 +1463,7 @@ fn serve(
         // from experts whose readers have completed, and are distinct.
         let traced = trace.as_ref().map(|t| (t, request.seq));
         if let Err(e) = unsafe {
-            load_slots(&pool, store, &slab, &tables, experts, &misses, traced)
+            load_slots(&pool, store, &slab, &tables, experts, &res.misses, traced)
         } {
             eprintln!("expert cache: loading layer {}: {e:#}", request.layer);
             std::process::abort();
@@ -1424,12 +1473,10 @@ fn serve(
             service.decode_misses.fetch_add(missed as u64, Ordering::Relaxed);
         }
         if let Some(pf) = prefetcher.as_mut() {
-            pf.wait(&awaited);
-            // SAFETY: the GPU waits at this layer, and the slots of landed
-            // reads are no longer written.
-            pf.publish(policy, |layer, expert, slot| unsafe {
-                set_entry(&tables, experts, layer, expert, slot)
-            });
+            pf.wait(&res.awaited);
+            // The GPU waits at this layer, and the slots of landed reads are
+            // no longer written.
+            pf.publish(policy, &mut set_table);
         }
         // The GPU waits at this layer for `ready` (or, in a gated pass, has
         // not been handed what follows it), so it cannot have signalled a
@@ -1461,7 +1508,7 @@ fn serve(
                 count: request.count,
                 ids: ids.len(),
                 misses: missed,
-                late: misses.len() - missed + awaited.len(),
+                late: res.misses.len() - missed + res.awaited.len(),
                 popped,
                 seen,
                 resolved,
@@ -1480,7 +1527,13 @@ fn serve(
         if let Some(pf) = prefetcher.as_mut() {
             // After a cut its plane (after the promotion, as in the replay),
             // stamped as the next request will be.
-            pf.resolved(request.layer, policy, request.seq + 1, request.seq);
+            pf.resolved(
+                request.layer,
+                request.count,
+                policy,
+                (request.seq + 1, request.seq),
+                &mut set_table,
+            );
             *service.prefetch.lock().unwrap_or_else(|e| e.into_inner()) = pf.counts();
         }
         if let Some(path) = usage_out

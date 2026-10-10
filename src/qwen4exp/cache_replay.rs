@@ -637,7 +637,9 @@ pub struct ReplayCounts {
     pub prefetch_reads: u64,
     /// Of those, the ones the target layer's request then routed to.
     pub prefetch_useful: u64,
-    /// Prefetches given up because no LRU slot was free at the tick.
+    /// Prefetches given up because no LRU slot was free at the tick, or the
+    /// slots taken for the next request left only as many as its pass routes
+    /// ids.
     pub prefetch_full: u64,
     /// Timed replay: prefetches still queued when their layer had passed,
     /// cancelled unread (not in `prefetch_reads`).
@@ -705,6 +707,11 @@ pub struct CacheSim {
     /// The index of the next session replayed, which seeds its draws
     /// ([`Self::starting_at_session`]).
     session_index: u64,
+    /// The routed ids of the decode pass being replayed (rows x top-k): the
+    /// LRU slots prefetches leave free for each of its requests.
+    keep_free: usize,
+    /// The tick the last prefetches were stamped with, and how many.
+    stamped: (u64, usize),
 }
 
 impl CacheSim {
@@ -734,6 +741,8 @@ impl CacheSim {
             miss_log: None,
             ssd: SsdModel::Serial,
             session_index: 0,
+            keep_free: 0,
+            stamped: (0, 0),
         })
     }
 
@@ -862,6 +871,15 @@ impl CacheSim {
         // The read happens at the next request's tick, so that request's own
         // misses cannot take the slot, as they cannot take one a pass reads.
         let tick = self.tick + 1;
+        if self.stamped.0 != tick {
+            self.stamped = (tick, 0);
+        }
+        // The slots stamped `tick` leave that request's misses as many LRU
+        // slots as its pass routes ids, as in the server
+        // (`expert_prefetch::Prefetcher`), where a request that finds none
+        // free cannot go on.
+        let cap = (self.policy.n_slots() - self.policy.pinned())
+            .saturating_sub(self.keep_free);
         for &e in &pred.ids[at..at + p.top.min(pred.width)] {
             if e == NO_PREDICTION || p.budget.is_some_and(|b| prefetched.len() >= b) {
                 break;
@@ -871,8 +889,13 @@ impl CacheSim {
             if self.policy.slot_of(target, expert).is_some() {
                 continue;
             }
+            if self.stamped.1 >= cap {
+                counts.prefetch_full += 1;
+                break;
+            }
             match self.policy.lookup(target, expert, tick) {
                 Lookup::Miss { .. } => {
+                    self.stamped.1 += 1;
                     counts.prefetch_reads += 1;
                     prefetched.push(u32::from(e));
                 }
@@ -1010,6 +1033,7 @@ impl CacheSim {
                         (1 + drafts, a)
                     }
                 };
+                self.keep_free = rows * top_k;
                 // Rows with routing (and predictions) from the trace.
                 let known = match self.config.speculation {
                     Some(SpecReplay { rejected: RejectedRows::Random, .. }) => {
