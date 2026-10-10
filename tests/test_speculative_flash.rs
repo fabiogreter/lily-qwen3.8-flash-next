@@ -99,6 +99,63 @@ fn speculative_output_is_invariant_to_the_draft_count() -> Result<()> {
     Ok(())
 }
 
+/// Under the expert cache every MoE layer of a pass waits for its misses to
+/// be read; a prefill pass is gated, submitted layer by layer as they are
+/// (`ComputePass::gate_host_waits`), and a decode or verify pass waits on
+/// the queue. Both produce what the resident model does, and no wait is
+/// reported as timed out (that faults the context and fails the run).
+#[test]
+#[ignore = "requires LILY_MODEL_DIR_FLASH"]
+fn the_expert_cache_generates_what_the_resident_model_does() -> Result<()> {
+    let dir = model_dir()?;
+    let ctx = MetalContext::new()?;
+    let load = |expert_slots| {
+        <Qwen4ExpModel as LanguageModel>::load(
+            &ctx,
+            Path::new(&dir),
+            &LoadOptions { mtp_drafts: 2, expert_slots, ..LoadOptions::default() },
+        )
+    };
+    let sampled = SamplingParams {
+        temperature: 0.8,
+        top_k: 40,
+        top_p: 0.95,
+        seed: 11,
+        ..SamplingParams::greedy()
+    };
+    let runs = |model: &Qwen4ExpModel| -> Result<Vec<Vec<u32>>> {
+        let mut generator = Generator::from_model_dir(Path::new(&dir))?;
+        generator.add_stop_tokens(&model.eos_token_ids());
+        // Four times the prompt: a prefill pass of more rows than a verify
+        // pass, so it is gated.
+        let prompt = prompt(&generator)?.repeat(4);
+        let mut out = Vec::new();
+        for (params, drafts) in [(SamplingParams::greedy(), 0), (sampled, 2)] {
+            out.push(run(&ctx, model, &generator, &prompt, &params, drafts, 48)?.0);
+        }
+        Ok(out)
+    };
+    let resident = load(None)?;
+    assert!(resident.expert_cache_stats().is_none());
+    let expected = runs(&resident)?;
+    let (layers, experts, _) = resident.moe_shape();
+    drop(resident);
+    // An eighth of the experts not resident: a prefill misses some in every
+    // layer, and no resolution can need more than the LRU region holds.
+    let cached = load(Some(layers * experts * 7 / 8))?;
+    let actual = runs(&cached)?;
+    let stats = cached.expert_cache_stats().context("no expert cache")?;
+    assert!(stats.misses > 0, "nothing was read: {}", stats.describe());
+    assert_eq!(
+        actual,
+        expected,
+        "the cached model's tokens differ ({})",
+        stats.describe()
+    );
+    assert!(ctx.fault().is_none(), "{:?}", ctx.fault());
+    Ok(())
+}
+
 /// A session written to and read from the disk-tier layout continues exactly
 /// like the original: prefix caches, recurrent snapshot and draft-head state.
 #[test]

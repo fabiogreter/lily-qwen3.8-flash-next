@@ -19,7 +19,11 @@
 //! [`SlotPolicy`] (writing the evicted expert's table entry to [`NONE`]
 //! and the loaded one's to its slot), and signals `ready`. The GPU is
 //! stalled at the wait meanwhile, so no kernel reads a slot being
-//! refilled.
+//! refilled. A prefill pass is gated instead
+//! ([`crate::metal::ComputePass::gate_host_waits`]): what follows a layer's
+//! wait is submitted only once `ready` is signalled, because a queue wait
+//! that blocks for seconds is released by Metal on its own, and the waits
+//! of a long prefill add up to that (`docs/low-ram-experts.md`).
 //!
 //! The service thread also keeps [`LiveUsage`]: every resolved expert is
 //! counted (decode-time and prefill-time apart), every
@@ -1163,10 +1167,12 @@ fn serve(
         if decode {
             service.decode_misses.fetch_add(misses.len() as u64, Ordering::Relaxed);
         }
-        // The GPU waits at this layer for `ready`, so it cannot have
-        // signalled a later layer yet; if it has, a queue-level wait timed
-        // out (Metal 4 then releases the queue silently) and the pass ran on
-        // with experts that were not loaded.
+        // The GPU waits at this layer for `ready` (or, in a gated pass, has
+        // not been handed what follows it), so it cannot have signalled a
+        // later layer yet; if it has, a queue-level wait timed out (Metal 4
+        // then releases the queue silently) and the pass ran on with experts
+        // that were not loaded. The pass's commit feedback faults the context
+        // for it (`metal::Watch`); this counts and names the layer.
         if routed.signaled_value() > request.seq
             && service.released.fetch_add(1, Ordering::Relaxed) == 0
         {

@@ -89,6 +89,12 @@ const CAPACITY_STEP: usize = 8192;
 /// Most draft tokens a speculative step may verify at once (the spec scratch
 /// is sized for it).
 pub const MAX_DRAFTS: usize = 3;
+/// Prefill passes of more rows than this are gated
+/// ([`crate::metal::ComputePass::gate_host_waits`]); the others route as
+/// few experts per layer as a verify pass of [`MAX_DRAFTS`] + 1 rows, whose
+/// misses take well under the queue wait's time limit even when every one
+/// misses (`docs/low-ram-experts.md`, "Timed-out waits").
+const GATED_PREFILL_ROWS: usize = MAX_DRAFTS + 1;
 // Every verify pass (MAX_DRAFTS + 1 rows) and every draft-head batch takes
 // the fused hyper-connection read.
 const _: () = assert!(MAX_DRAFTS < HC_FUSED_MAX_ROWS);
@@ -2848,6 +2854,16 @@ impl Qwen4ExpModel {
         let conv_slot = state.conv_slot;
         let verify = matches!(mode, BatchMode::Verify { .. });
         pass.set_label(if verify { "verify" } else { "prefill" });
+        if !verify && m > GATED_PREFILL_ROWS {
+            // Under the expert cache every MoE layer waits for its misses,
+            // and a long prefill's waits add up to seconds (5.6 s for 4 096
+            // rows at 40 GB), past the 4 s after which Metal releases a
+            // queue wait and the pass runs on with experts not loaded. Gated,
+            // the pass is submitted layer by layer as the misses are read,
+            // so the queue never waits. Without the cache there are no
+            // waits and nothing changes.
+            pass.gate_host_waits();
+        }
         if verify {
             ensure!(
                 m <= MAX_DRAFTS + 1,
