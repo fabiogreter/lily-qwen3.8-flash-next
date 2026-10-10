@@ -1233,6 +1233,107 @@ this curve all of them would add about a point, worth 0.1 to 0.2 ms. (A
 61 GB input tensor on MPS trained to garbage without an error; the
 trainer now keeps inputs over 24 GB in host memory.)
 
+### The final predictors, end to end and on held-out sessions (2026-10-11)
+
+**What did not help.** On cut 7 (0.582 at 3M positions): adding the
+current token's routing up to the cut 0.581, the previous token's
+routing 0.577, four previous tokens' hidden states instead of one
+0.583. Past the cut's own read, more context carries nothing a small
+model can use, so neither a sequence model nor draft-head states (which
+could recover at most the draft-row gap above, 0.8 to 3 points) was
+built. What helped was capacity and time: two epochs 0.594, 2 048 units
+0.593; with the rank-256 output, 2 048 units and three epochs 0.592
+against 0.559.
+
+**The final set.** Token start and cuts 3, 7, 15, 23, each 2 048 units,
+rank-256 output, 6M training positions, three epochs, plus cut-only
+twins of the four cut models for a verify pass's draft rows. Top-10
+overlap on the tuning split (unquantized):
+
+| | token start | cut 3 | cut 7 | cut 15 | cut 23 |
+|---|---:|---:|---:|---:|---:|
+| final set | 0.544 | 0.590 | 0.597 | 0.611 | 0.644 |
+| cut-only twins | | 0.560 | 0.578 | 0.591 | 0.636 |
+| step 4 finalist (1 024 units, 3M, one epoch) | 0.527 | | 0.559 | | |
+
+At these shapes 4 bits with groups of 64 cost about a point (cut 7
+0.587), not 0.2 to 0.3 as before; the loss sits in the two low-rank
+output factors (each at 8 bits alone: 0.593, 0.591; the input layer at
+8 bits: 0.587). Input layer at 4 bits and the output factors at 8 bits
+matches the unquantized models within 0.001 on all nine; 87 MB for the
+five planes (32 slots), 121 MB with the twins (44).
+
+Replayed at the server's plans (tuning split, shared drive, depth 1,
+slots removed), stall per decoded token, or per accepted token with two
+drafts at 79% acceptance:
+
+| | 64 GB recorded | 64 GB others | 40 GB recorded | 40 GB others |
+|---|---:|---:|---:|---:|
+| none | 5.31 ms | 4.73 ms | 34.04 ms | 29.95 ms |
+| final set, top 20 (40 GB: top 10) | 3.90 ms | 4.06 ms | 29.35 ms | 27.36 ms |
+| step 4 finalist, same | 4.16 ms | 4.30 ms | 30.17 ms | 28.16 ms |
+| two drafts, none | 4.84 ms | 4.42 ms | 29.16 ms | 26.28 ms |
+| two drafts, final set, top 10 (40 GB: top 3) | 4.14 ms | 4.11 ms | 28.52 ms | 26.16 ms |
+| the same, cut-only twins on every row | 4.14 ms | 4.15 ms | 28.56 ms | 26.25 ms |
+
+Under speculation the verify pass routes three rows, the drive is
+busier with demand reads and a wrong prefetch costs more: the saving
+falls to about half at 64 GB and to almost nothing at 40 GB, where top 3
+is best and top 10 is worse than none. The cut-only twins cost at most
+0.1 ms against full cut models on the draft rows, so the gap the
+draft-head states could close is worth no more than that.
+
+**End to end.** The final set's 4-bit (groups of 64) predictions for the
+anchor as a prediction file, three repetitions per plan against seven
+without (two meant as prefetch runs ran without it, a script error),
+plain decode, fresh clone each (all twenty token digests equal the
+reference):
+
+| | off | final set | replayed |
+|---|---:|---:|---:|
+| 64 GB, top 20, median decode | 23.67 s | 23.17 s | |
+| misses per token | 19.24 | 12.1 | 12.08 |
+| saving per token | | 0.5 ms (runs spread 22.1 to 24.4 s) | 1.15 ms |
+| 40 GB, top 10, median decode | 56.87 s | 54.66 s | |
+| misses per token | 124.2 | 75.6 | 75.6 |
+| saving per token | | 2.2 ms | 2.70 ms |
+
+On the anchor the final set leaves the same misses as the step 5
+predictor (its overlaps there are 0.48 to 0.57, lower than on agent
+traffic). At 40 GB the server gets 80% of the replayed saving (the runs agree
+within 0.15 s); at 64 GB the saving is within the run-to-run noise
+(step 5's runs with the same misses gave 0.6 ms).
+
+**Held-out sessions.** Two recorded sessions and eight others (personal,
+public trajectories, generated runs) were kept out of every training
+run and every choice above, and evaluated once with the variant and
+settings fixed beforehand (input layer 4 bits, output factors 8 bits;
+plain top 20 / top 10, two drafts top 10 / top 3). Top-10 overlap on
+the recorded ones: token start 0.529, cuts 0.578, 0.590, 0.608, 0.643
+(tuning split 0.544 to 0.644 unquantized). Stall per decoded or
+accepted token:
+
+| | 64 GB recorded | 64 GB others | 40 GB recorded | 40 GB others |
+|---|---:|---:|---:|---:|
+| none | 4.82 ms | 5.10 ms | 33.16 ms | 33.31 ms |
+| final set | 3.66 ms | 3.98 ms | 28.80 ms | 29.02 ms |
+| the routing itself (ceiling) | 0.39 ms | 0.41 ms | 15.80 ms | 15.75 ms |
+| two drafts, none | 4.42 ms | 4.66 ms | 28.86 ms | 29.34 ms |
+| two drafts, final set | 3.85 ms | 4.10 ms | 28.33 ms | 28.80 ms |
+| the same, cut-only twins on every row | 3.86 ms | 4.11 ms | 28.38 ms | 28.82 ms |
+
+The saving holds out of sample: plain decode 1.1 ms per token at 64 GB
+and 4.3 ms at 40 GB on both groups, a quarter of the stall at 64 GB and
+a quarter of the room to the ceiling at 40; with two drafts 0.55 ms at
+both plans. The cost of running the models is not measured at these
+shapes: the probe's 4-bit low-rank set (smaller, 61 MB) cost 0.07 ms
+resident and 0.09 ms per accepted token with two drafts; at 87 MB,
+mostly streamed every token, about 0.1 ms is the working assumption,
+roughly twice that on a machine with half the memory bandwidth. Net,
+then, about +1.0 ms (64 GB) and +4.2 ms (40 GB) per plainly decoded
+token, about 4.5% and 8% of the anchor's decode time, and +0.4 to 0.45 ms per accepted
+token with two drafts, the server's default.
+
 ### Prefill chunks of 8 192 tokens
 
 `LILY_PREFILL_CHUNK=8192` (a per-model value now, `Qwen4ExpModel::
@@ -1272,9 +1373,11 @@ likely the timed-out waits above, which such slow passes run into; at
   agent sessions" above): the predictor costs about what it saves; a
   whole-token predictor from the previous hidden state saves about 0.35
   ms per cold token for little GPU time ("A whole-token predictor from the
-  hidden state"), not enough yet for the loader it needs; predictors that
-  also read the trunk after chosen layers save about 25% of the stall in
-  replay, at an unmeasured GPU cost ("Predictors inside the token").
+  hidden state"); predictors that also read the trunk after chosen
+  layers save about a quarter of the stall, out of sample, for about 0.1
+  ms of GPU time ("The final predictors, end to end and on held-out
+  sessions"); with two drafts about half that. Not built into the server
+  yet.
 - **The handshake** (7% of a 2-draft step at zero misses when first
   measured, 11% of a plain token and 6% of a step on 2026-10-09) is 48
   sequential host-GPU
