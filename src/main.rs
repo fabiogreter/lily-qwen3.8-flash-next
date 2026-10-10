@@ -171,9 +171,9 @@ struct Cli {
     /// automatically, however little is missing. In that mode only part of
     /// the routed experts stays in memory and the rest is read from the
     /// checkpoint files as requests route to them, which costs prefill and
-    /// decode speed the more experts are left out; speculative decoding is
-    /// off, requests are served one at a time (--max-batch above 1 refuses
-    /// to start), the K/V caches are q8 only and the session cache holds
+    /// decode speed the more experts are left out; requests are served one
+    /// at a time (--max-batch above 1 refuses to start), speculative
+    /// decoding stays on, the K/V caches are q8 only and the session cache holds
     /// one full session, the rest spilling to the disk tier. See
     /// docs/low-ram-experts.md. To try that mode on a bigger machine,
     /// LILY_MEMORY_GB=64 plans as if the machine had 64 GB.
