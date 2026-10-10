@@ -67,7 +67,6 @@ const FAST: Intervals = Intervals {
     idle: Duration::from_millis(80),
     page_open: Duration::from_millis(150),
     first: Duration::from_millis(20),
-    poll: Duration::from_millis(5),
 };
 
 /// Idle waits of half a minute, for tests that show a wait being cut short.
@@ -76,7 +75,6 @@ const SLOW: Intervals = Intervals {
     idle: Duration::from_secs(30),
     page_open: Duration::from_secs(10),
     first: Duration::from_millis(10),
-    poll: Duration::from_secs(30),
 };
 
 /// Waits up to 10 s for `done`.
@@ -125,8 +123,8 @@ fn spawn_script(
 fn the_short_wait_runs_while_busy_or_the_page_is_open() {
     let i = Intervals::default();
     assert_eq!(
-        (i.busy, i.idle, i.page_open, i.first, i.poll),
-        (BUSY_INTERVAL, IDLE_INTERVAL, PAGE_OPEN, FIRST_WINDOW, POLL)
+        (i.busy, i.idle, i.page_open, i.first),
+        (BUSY_INTERVAL, IDLE_INTERVAL, PAGE_OPEN, FIRST_WINDOW)
     );
     assert_eq!(BUSY_INTERVAL, Duration::from_secs(2));
     assert_eq!(IDLE_INTERVAL, Duration::from_secs(30));
@@ -373,24 +371,103 @@ fn a_page_that_opens_in_the_middle_of_an_idle_wait_wakes_it_at_once() {
     machine.finish(Duration::from_secs(5));
 }
 
+/// A `busy` predicate that reads `flag` and counts how often the sampler
+/// looked.
+fn counted(
+    flag: &Arc<AtomicBool>,
+    looks: &Arc<AtomicU64>,
+) -> impl Fn() -> bool + Send + 'static {
+    let (flag, looks) = (flag.clone(), looks.clone());
+    move || {
+        looks.fetch_add(1, Ordering::Relaxed);
+        flag.load(Ordering::Relaxed)
+    }
+}
+
 #[test]
-fn an_engine_that_becomes_busy_is_noticed_within_a_poll() {
-    let busy = Arc::new(AtomicBool::new(false));
-    let intervals = Intervals { poll: Duration::from_millis(20), ..SLOW };
-    let (machine, played) = spawn_script(
-        vec![],
+fn an_idle_sampler_wakes_only_when_a_reading_is_due() {
+    let (busy, looks) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicU64::new(0)));
+    let intervals = Intervals { idle: Duration::from_millis(150), ..FAST };
+    let (machine, played) = spawn_script(vec![], counted(&busy, &looks), intervals);
+    std::thread::sleep(Duration::from_millis(800));
+    machine.finish(Duration::from_secs(5));
+    let readings = count(&played);
+    assert!((3..=7).contains(&readings), "{readings} readings in 800 ms");
+    // Each wait looks twice: right after the call before it, to pick the
+    // window, and once when it wakes, due. Nothing polls in between (every
+    // 5 ms would be some 30 looks a reading).
+    let looks = looks.load(Ordering::Relaxed) as usize;
+    assert!(looks <= 2 * readings, "{looks} looks for {readings} readings");
+    assert!(!machine.short_cadence(), "an ended sampler has no cadence");
+}
+
+#[test]
+fn an_opened_request_wakes_an_idle_sampler_at_once() {
+    use crate::serve::dashboard::Board;
+    let board = Arc::new(Board::default());
+    let looks = Arc::new(AtomicU64::new(0));
+    let played = calls();
+    let machine = Machine::spawn(
         {
-            let busy = busy.clone();
-            move || busy.load(Ordering::Relaxed)
+            let played = played.clone();
+            move || Ok(Script::new(vec![], &played))
         },
-        intervals,
+        {
+            let (board, looks) = (Arc::downgrade(&board), looks.clone());
+            move || {
+                looks.fetch_add(1, Ordering::Relaxed);
+                board.upgrade().is_some_and(|b| b.busy())
+            }
+        },
+        SLOW,
     );
+    board.attach_machine(machine.clone());
+    assert!(eventually(|| count(&played) == 1), "the first call");
+    assert!(eventually(|| machine.listening.load(Ordering::Relaxed)), "waiting");
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(count(&played), 1, "idle: the next one is half a minute away");
+    assert_eq!(looks.load(Ordering::Relaxed), 1, "one look, then asleep");
+    assert!(!machine.short_cadence());
+    let asked = Instant::now();
+    board.opened();
+    assert!(eventually(|| count(&played) >= 4), "readings at the busy cadence");
+    assert!(asked.elapsed() < Duration::from_secs(2), "{:?}", asked.elapsed());
+    assert!(machine.short_cadence());
+    machine.finish(Duration::from_secs(5));
+}
+
+#[test]
+fn a_reload_wakes_an_idle_sampler_at_once() {
+    use crate::serve::dashboard::Board;
+    let board = Arc::new(Board::default());
+    let (loading, looks) =
+        (Arc::new(AtomicBool::new(false)), Arc::new(AtomicU64::new(0)));
+    let (machine, played) = spawn_script(vec![], counted(&loading, &looks), SLOW);
+    board.attach_machine(machine.clone());
     assert!(eventually(|| count(&played) == 1));
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(count(&played), 1);
-    busy.store(true, Ordering::Relaxed);
+    // What the engine does: the state first, then the nudge.
+    let asked = Instant::now();
+    loading.store(true, Ordering::Relaxed);
+    board.working();
     assert!(eventually(|| count(&played) >= 3), "calls at the busy cadence");
+    assert!(asked.elapsed() < Duration::from_secs(2), "{:?}", asked.elapsed());
     machine.finish(Duration::from_secs(5));
+}
+
+#[test]
+fn a_nudge_without_a_waiting_sampler_wakes_nothing() {
+    let machine = Machine::new(OFF, PAGE_OPEN);
+    machine.nudge();
+    assert!(!*lock(&machine.woken));
+    // Waiting out an idle window: the first nudge wakes it, the next finds
+    // the flag already lowered.
+    machine.listening.store(true, Ordering::Relaxed);
+    machine.nudge();
+    assert!(std::mem::take(&mut *lock(&machine.woken)));
+    machine.nudge();
+    assert!(!*lock(&machine.woken));
 }
 
 #[test]

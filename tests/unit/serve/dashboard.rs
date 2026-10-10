@@ -78,19 +78,37 @@ fn app_routes_fall_back_to_the_index_and_files_match_exactly() {
     }
 }
 
+/// What a browser's navigation sends as `Accept`.
+const BROWSER: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+
 #[test]
 fn the_dashboard_routes_leave_the_api_and_health_alone() {
     for method in ["GET", "HEAD"] {
-        assert_eq!(route(method, "/"), Some(Route::Page), "{method}");
-        assert_eq!(route(method, "/assets/index-vgMbpbb6.js"), Some(Route::Page));
-        assert_eq!(route(method, "/sessions/7"), Some(Route::Page));
+        for accept in [None, Some(BROWSER), Some("*/*")] {
+            assert_eq!(route(method, "/", accept), Some(Route::Page), "{method}");
+            assert_eq!(
+                route(method, "/assets/licenses.txt", accept),
+                Some(Route::Page)
+            );
+        }
+        assert_eq!(route(method, "/sessions/7", Some(BROWSER)), Some(Route::Page));
     }
-    assert_eq!(route("GET", "/healthz"), Some(Route::Page));
+    assert_eq!(route("GET", "/healthz", Some(BROWSER)), Some(Route::Page));
     for method in ["GET", "HEAD", "POST", "PATCH", "DELETE", "PUT"] {
-        assert_eq!(route(method, "/v1/lily/status"), Some(Route::Api), "{method}");
-        assert_eq!(route(method, "/v1/lily/nope"), Some(Route::Api), "{method}");
+        for accept in [None, Some(BROWSER)] {
+            assert_eq!(
+                route(method, "/v1/lily/status", accept),
+                Some(Route::Api),
+                "{method}"
+            );
+            assert_eq!(
+                route(method, "/v1/lily/nope", accept),
+                Some(Route::Api),
+                "{method}"
+            );
+        }
     }
-    assert_eq!(route("GET", "/v1/lily"), Some(Route::Api));
+    assert_eq!(route("GET", "/v1/lily", None), Some(Route::Api));
     for (method, path) in [
         ("GET", "/health"),
         ("HEAD", "/health"),
@@ -101,9 +119,50 @@ fn the_dashboard_routes_leave_the_api_and_health_alone() {
         ("GET", "/v1/unknown"),
         ("POST", "/v1/chat/completions"),
         ("POST", "/"),
+        ("POST", "/sessions"),
         ("GET", "*"),
     ] {
-        assert_eq!(route(method, path), None, "{method} {path}");
+        for accept in [None, Some(BROWSER)] {
+            assert_eq!(route(method, path, accept), None, "{method} {path}");
+        }
+    }
+}
+
+#[test]
+fn only_a_browsers_navigation_falls_back_to_the_app() {
+    // What clients probe for (an Ollama client, a version check, a metrics
+    // scraper) is not the dashboard's: the server's own 404, as before the
+    // dashboard existed (the dispatch's last arm, `serve::handle`).
+    for path in ["/models", "/api/tags", "/version", "/metrics", "/sessions"] {
+        for accept in [None, Some("*/*"), Some("application/json")] {
+            for method in ["GET", "HEAD"] {
+                assert_eq!(
+                    route(method, path, accept),
+                    None,
+                    "{method} {path} {accept:?}"
+                );
+            }
+        }
+    }
+    // A browser's navigation to one of the app's routes gets the app.
+    for path in ["/sessions", "/sessions/42", "/settings/", "/models"] {
+        assert_eq!(route("GET", path, Some(BROWSER)), Some(Route::Page), "{path}");
+        assert_eq!(page(path), page("/index.html"), "{path}");
+    }
+    assert_eq!(route("GET", "/sessions", Some("TEXT/HTML")), Some(Route::Page));
+    // Not under `/api/`, and not for a path naming a file, whatever it accepts.
+    for path in [
+        "/api",
+        "/api/tags",
+        "/api/version",
+        "/favicon.ico",
+        "/robots.txt",
+        "/x.js",
+        "/sessions/report.json",
+        "/assets/gone-12345678.js",
+        "/assets/",
+    ] {
+        assert_eq!(route("GET", path, Some(BROWSER)), None, "{path}");
     }
 }
 
@@ -243,7 +302,7 @@ fn answer_with(
     body: &[u8],
 ) -> Response {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    let route = route(method, path).expect("a dashboard route");
+    let route = route(method, path, Some(BROWSER)).expect("a dashboard route");
     let mut request = request(method, path, headers);
     request.body = body.to_vec();
     d.respond(route, &request, (path, query), LOCAL, READY)
@@ -281,7 +340,7 @@ fn every_dashboard_route_refuses_a_peer_that_is_not_loopback() {
     let remote =
         Connection { peer: at(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20))), port: 8000 };
     for (method, target) in ROUTES {
-        let route = route(method, target).expect("route");
+        let route = route(method, target, Some(BROWSER)).expect("route");
         let r = d.respond(
             route,
             &request(method, target, &[]),
@@ -306,7 +365,7 @@ fn every_dashboard_route_refuses_a_host_that_is_not_lilys_own() {
             if let Some(host) = host {
                 request.headers.push(("Host".into(), host.into()));
             }
-            let route = route(method, target).expect("route");
+            let route = route(method, target, Some(BROWSER)).expect("route");
             let r = d.respond(route, &request, (target, ""), LOCAL, READY);
             assert_eq!(r.status, 403, "{method} {target} {host:?}");
         }
@@ -364,9 +423,9 @@ fn pages_carry_their_cache_headers_and_the_api_is_never_cached() {
     let index = answer(&d, "GET", "/sessions/3", &[]);
     assert_eq!((index.status, index.cache_control), (200, "no-cache"));
     assert_eq!(index.content_type, "text/html; charset=utf-8");
-    let missing = answer(&d, "GET", "/assets/gone-12345678.js", &[]);
-    assert_eq!((missing.status, missing.content_type), (404, "application/json"));
-    assert_eq!(answer(&d, "GET", "/favicon.ico", &[]).status, 404);
+    // A file that does not exist is not the dashboard's (the server's 404).
+    assert_eq!(route("GET", "/assets/gone-12345678.js", Some(BROWSER)), None);
+    assert_eq!(route("GET", "/favicon.ico", Some(BROWSER)), None);
     let status = answer(&d, "GET", "/v1/lily/status", &[]);
     assert_eq!((status.status, status.cache_control), (200, "no-store"));
 }

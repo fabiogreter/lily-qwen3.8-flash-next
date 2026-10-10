@@ -13,7 +13,9 @@
 //! a handful of Mach and sysctl calls, a few microseconds each, sampled at
 //! phase boundaries only. The dashboard's machine figures ([`cpu_ticks`],
 //! [`memory_use`], [`swap_used`]) are more of the same, read on the HTTP
-//! thread that answers `/v1/lily/status`. They are declared here rather than
+//! thread that answers `/v1/lily/status` and on the dashboard recorder's
+//! thread, which samples them (with [`pressure_level`] and [`task_memory`])
+//! for the 7-day history (`serve::recorder`). They are declared here rather than
 //! taken from the `libc` crate, whose Mach bindings are deprecated.
 
 use std::cell::Cell;

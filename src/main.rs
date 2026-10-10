@@ -349,9 +349,10 @@ fn flag_values(matches: &ArgMatches) -> Vec<FlagValue> {
                 "disk_cache_dir" => {
                     Some(default_disk_cache_dir().display().to_string())
                 }
-                "stats_db" => {
-                    Some(lily::serve::recorder::default_path().display().to_string())
-                }
+                "stats_db" => Some(lily::serve::recorder::default_path().map_or_else(
+                    || "off".to_owned(),
+                    |path| path.display().to_string(),
+                )),
                 _ => arg
                     .get_default_values()
                     .first()

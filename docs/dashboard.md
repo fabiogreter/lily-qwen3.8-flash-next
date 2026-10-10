@@ -1,7 +1,8 @@
 # Dashboard
 
-Status: **spec, agreed with the owner 2026-10-10; being built.** Prototypes are
-done (§ 9). Build order: the Vue app on mock data (§ 8), then lily serving it
+Status: **spec, agreed with the owner 2026-10-10; all five phases built**
+(branch `dashboard`, not merged: § 10 lists what is still to verify before
+merge). Prototypes are done (§ 9). Build order: the Vue app on mock data (§ 8), then lily serving it
 and the read routes (§ 3), the recorder (§ 4), runtime settings (§ 7) and
 machine sampling (§ 6). All five are in (`src/serve/dashboard.rs` says what
 each route serves, `src/serve/recorder.rs` what the recorder stores and
@@ -80,8 +81,14 @@ The response shapes are defined once, in `dashboard/src/api/types.ts`: that
 file is the contract the server implements (§ 3.4).
 
 Existing routes (`/health`, `/v1/models`, `/v1/timings`, the completions)
-stay as they are. Unknown paths under `/` that are not `/v1/*` or
-`/assets/*` serve `index.html`, so client-side routes survive a reload.
+stay as they are. An unknown GET or HEAD serves `index.html`, so client-side
+routes survive a reload, only when it is a browser's navigation: a path with
+no extension, not under `/api/` or `/v1/`, with an `Accept` that names
+`text/html`. Every other unknown path (a client probing `/models`,
+`/api/tags`, `/version`, `/metrics`; a file of the app that does not exist)
+gets the server's own 404 (`{"error": {"message": "not found", "type":
+"invalid_request_error"}}`), exactly as before the dashboard, and does not
+count as the page being open.
 
 ### 3.2 Loopback only, and the write guard
 
@@ -135,6 +142,12 @@ response with `Content-Type` and `Cache-Control`; `index.html` is
   settings and the log. The guard matches the media type `application/json`,
   so a `charset` parameter passes. Setting the value already in effect is a
   no-op and is left out of `updated`.
+- **API-only for now**: the server fills these fields and the app's types
+  carry them, but no view shows them yet: `live.active_sessions`,
+  `machine.power.ane_w`, `recorder.db_bytes`, `recorder.oldest`, the history's
+  `queue_ms_p50`, `queue_ms_max` and `sessions_max`, and a setting's
+  `value_s`. They stay in the contract (and its tests); a view may use them
+  later without a server change.
 
 ## 4. Recorder and database
 
@@ -158,9 +171,10 @@ As built (phase 3):
 
 - The engine gains no hook: the board it already publishes request rows to
   offers each one to the recorder's channel (1 024 rows, `try_send`). The
-  recorder samples the machine itself every 10 s (CPU load, pressure, swap,
-  RAM in use, lily's footprint) and snapshots the tiers from the published
-  cache view once a minute.
+  recorder samples the machine itself (CPU load, pressure, swap, RAM in use,
+  lily's footprint) every 10 s, every 60 s while lily is quiet (§ 6, the
+  idle wake-up budget), and snapshots the tiers from the published cache
+  view once a minute.
 - HTTP handlers open a read-only connection per answer with a 250 ms busy
   timeout (a lock held elsewhere answers 503 quickly); nothing they do
   holds a lock the engine takes.
@@ -303,8 +317,10 @@ taken outside the sandbox by the owner: `Sampler::new()` about 0.7 s,
   later one for none after lily waited on a condition variable until the next
   reading is due, so a window is exactly the time since the previous call. The
   wait is woken by the page opening (`Machine::touch`, only when the page was
-  closed) and by the shutdown (`Machine::finish`, a 1 s cap), and looks at the
-  engine's activity every 2 s.
+  closed), by the engine starting work (`Board::opened` and, for a reload or
+  a recovery, `Board::working`, through `Machine::nudge`: a fence and a
+  relaxed load, the notify only on the idle-to-busy edge) and by the shutdown
+  (`Machine::finish`, a 1 s cap). Nothing polls the engine in between.
 - **Failures**: a call that errors, a value that is not finite or is out of
   range (power or system power above 1 000 W, frequency above 10 000 MHz,
   temperature outside -20 to 150 °C), or a first call back in under half its
@@ -349,7 +365,7 @@ taken outside the sandbox by the owner: `Sampler::new()` about 0.7 s,
   `gpu_active_ratio`, `gpu_freq_mhz` and the two average temperatures (`temp_c`
   needs both).
 - **Recorder** (schema 2): every reading goes to a bounded queue the recorder
-  drains on its 10 s tick. A reading carries its window, the monotonic time
+  drains on its 10 s tick (60 s while quiet). A reading carries its window, the monotonic time
   since the previous call placed by the wall clock at its end, so a clock that
   jumps moves a window and never stretches it. The recorder spreads it over the
   minutes it overlaps and merges each part into the minute's row (time-weighted
@@ -361,6 +377,22 @@ taken outside the sandbox by the owner: `Sampler::new()` about 0.7 s,
   `power_covered_ms`), a bucket's `energy_wh` is the sum of mean system power
   times `sys_covered_ms`, `power_avg_w` the mean over the same time, and a minute
   without coverage adds nothing and is not filled in.
+- **Idle wake-up budget** (also in [server.md](server.md), "Idle wake-ups"):
+
+  | state | sampler | recorder |
+  |---|---|---|
+  | engine unloaded, no page within 10 s | every 30 s | every 60 s, and hourly to prune |
+  | engine loaded and idle, no page | every 30 s | every 10 s |
+  | page open | every 2 s | every 10 s |
+  | request running, load, reload, recovery | every 2 s | every 10 s |
+
+  The recorder's 60 s cadence needs all three: the engine unloaded after a
+  load with no request open, no dashboard request within 10 s, the sampler
+  not at its 2 s cadence. It blocks on its channel until the next sample, so
+  rows and settings changes still arrive at once and a row that finds lily
+  busy brings the next sample forward; the minute rows aggregate the samples a
+  minute got, so the history stays complete. Work that starts during its 60 s
+  wait is sampled when the wait ends, at most a minute later.
 - **Resources**: a sampler thread at the utility QoS, a call every 2 s at most
   and every 30 s idle. `macmon` 0.9.0 holds IOHID and SMC handles for the
   sampler's life and takes a `mach_host_self` send right per call (a possible
@@ -495,9 +527,11 @@ tok/s) and **machine cost** (load, memory pressure, watts).
   cannot end the server (§ 6, `TODO(dashboard)` in `src/serve/machine.rs`).
 - `settings_log` retention: 7 days like the rest, or kept forever (it is
   tiny)? Default 7 days.
-- Whether the background service may be stopped for testing against the
-  real server (phase 2 on).
-- `--stats-db` default location (§ 4).
+- ~~Whether the background service may be stopped for testing against the
+  real server (phase 2 on).~~ Owner: not during development; the end-to-end
+  run against the real server is pending (below).
+- ~~`--stats-db` default location (§ 4).~~ Resolved as built:
+  `~/Library/Application Support/lily/lily.sqlite` (`recorder::default_path`).
 - ~~macmon probe result on this machine (§ 6.1).~~ Phase 5: it works outside
   the sandbox; the real-hardware test is `serve::machine::tests::real_macmon_reads_plausible_figures`
   (`#[ignore]`, run with `-- --ignored`).
@@ -505,3 +539,22 @@ tok/s) and **machine cost** (load, memory pressure, watts).
   can change at runtime (§ 7.1).~~ Phase 4: `--durable-min-tokens` yes, the
   other two stay restart-only (§ 7.1).
 - The drop counter's place on the page (the channel holds 1 024 rows).
+
+**Before merge**: the verification still to do.
+
+1. The Metal test suites (`serve::tests` against the GPU, the engine's) on
+   the branch rebased on main.
+2. A launchd run of the service with the dashboard on: the recorder's
+   database created where § 4 says with its permissions, the sampler running.
+3. Idle cost measured: wake-ups per thread against the budget in § 6 (engine
+   unloaded, page closed) and the sampler's cost to decode (the A/B above).
+4. A browser pass over every view, light and dark, against the real server.
+5. The guards from a browser: a non-loopback peer, a rebound `Host`, a
+   cross-site write, framing.
+6. Robustness: a corrupt and a newer-schema database, a locked one, the
+   sampler failing, `--stats-db off` and `--machine-stats off`.
+7. A long run (a day or more): the database's size, pruning, the WAL, no
+   leaked memory in the sampler.
+8. A real opencode session through the dashboard-enabled server: rows,
+   sessions and history as opencode's turns produce them, and unknown-path
+   probes still answered 404.

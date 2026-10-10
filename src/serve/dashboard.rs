@@ -344,9 +344,27 @@ impl Board {
         *lock(&self.store) = Arc::new(store);
     }
 
-    /// A request was taken on.
+    /// A request was taken on; an idle sampler starts its busy cadence.
     pub fn opened(&self) {
         lock(&self.activity).open += 1;
+        self.working();
+    }
+
+    /// The engine started work: a request taken on, a reload or a recovery
+    /// began. Wakes the sampler out of an idle wait ([`Machine::nudge`]: a
+    /// fence and a relaxed load unless it is waiting).
+    pub fn working(&self) {
+        if let Some(machine) = self.machine.get() {
+            machine.nudge();
+        }
+    }
+
+    /// Whether the engine is unloaded after a load with no request open:
+    /// what lets the recorder sample the machine at its quiet cadence. The
+    /// first load counts as busy (no load finished yet).
+    pub fn unloaded_and_quiet(&self) -> bool {
+        let activity = lock(&self.activity);
+        activity.loaded.is_none() && activity.loads > 0 && activity.open == 0
     }
 
     /// A request's session was acquired: `tokens` of prompt, `bytes` of it
@@ -510,24 +528,42 @@ pub fn failed_row(t: u64, lineage: Option<u64>) -> RequestRow {
 /// A request the dashboard answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
-    /// `/`, `/assets/*` and every other GET or HEAD outside `/v1` and
-    /// `/health`.
+    /// A GET or HEAD of `/`, of a file of the app, or a browser navigating
+    /// to one of the app's own routes ([`route`]).
     Page,
     /// Anything under `/v1/lily/`.
     Api,
 }
 
-/// Whether the dashboard answers `method path` (`path` without its query).
-/// The OpenAI routes, `/health` and everything else under `/v1` are not its.
-pub fn route(method: &str, path: &str) -> Option<Route> {
+/// Whether the dashboard answers `method path` (`path` without its query),
+/// `accept` being the request's `Accept` header. The OpenAI routes,
+/// `/health` and everything else under `/v1` are not its. Of the other GETs
+/// and HEADs it answers `/` and the files of the app, and serves the app
+/// (`index.html`, so its own routes survive a reload) for a path with no
+/// extension outside `/api/` only when the request accepts `text/html`, as
+/// a browser's navigation does. Everything else (a client probing for
+/// `/models`, `/api/tags`, `/version` or `/metrics`, a file that does not
+/// exist) is not the dashboard's and gets the server's own 404, as it did
+/// before the dashboard existed.
+pub fn route(method: &str, path: &str, accept: Option<&str>) -> Option<Route> {
     if path == "/v1/lily" || path.starts_with("/v1/lily/") {
-        Some(Route::Api)
-    } else if matches!(method, "GET" | "HEAD")
-        && path.starts_with('/')
-        && path != "/v1"
-        && !path.starts_with("/v1/")
-        && path != "/health"
+        return Some(Route::Api);
+    }
+    if !matches!(method, "GET" | "HEAD")
+        || !path.starts_with('/')
+        || path == "/v1"
+        || path.starts_with("/v1/")
+        || path == "/health"
     {
+        return None;
+    }
+    let file = path.rsplit('/').next().unwrap_or("");
+    let app_file = path == "/" || path.starts_with("/assets/") || file.contains('.');
+    let navigation = !app_file
+        && path != "/api"
+        && !path.starts_with("/api/")
+        && accept.is_some_and(|a| a.to_ascii_lowercase().contains("text/html"));
+    if (app_file && page(path).is_some()) || navigation {
         Some(Route::Page)
     } else {
         None

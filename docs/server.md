@@ -34,7 +34,14 @@ last 7 days and every setting. It reads `/v1/lily/status`, `/sessions`,
 already publishes and from the recorder's database, so an open page never
 wakes an idle or unloaded engine. Every dashboard route answers loopback
 peers only, under `127.0.0.1`, `localhost` or `[::1]` with lily's port as
-`Host` (403 otherwise, whatever `--bind` says), and forbids framing.
+`Host` (403 otherwise, whatever `--bind` says), and forbids framing. A path
+that is not the dashboard's (no `/v1/lily/` route, no file of the app) gets
+the app only when a browser navigates to it: a GET or HEAD of a path with no
+extension, outside `/api/` and `/v1/`, whose `Accept` names `text/html`, so
+the app's own routes survive a reload. Anything else (a client probing
+`/models`, `/api/tags`, `/version` or `/metrics`) answers the server's
+`404` `{"error": {"message": "not found", "type": "invalid_request_error"}}`,
+as before the dashboard.
 
 The history lives in a SQLite database, `--stats-db <path>` (an absolute
 path; default `~/Library/Application Support/lily/lily.sqlite`, no `~`
@@ -67,9 +74,34 @@ is running or a dashboard request came in within the last 10 s, 30 s after it
 otherwise, so the history has idle samples too. lily does the waiting itself
 (`macmon` is asked for no window after the first, so it measures exactly the
 time since its last call): the wait is cut short when the page opens (a
-dashboard request after the page was closed), polls the engine's activity
-every 2 s and ends at once at shutdown, so a page opened in the middle of an
-idle wait gets a fresh reading immediately.
+dashboard request after the page was closed) and when the engine starts work
+(a request taken on, a reload, a recovery after a GPU fault), and ends at once
+at shutdown, so a page opened or a request arriving in the middle of an idle
+wait gets a fresh reading immediately. Nothing polls in between: the engine
+pays a fence and a relaxed load per request, and a lock and a notify only when
+it finds the sampler in an idle wait.
+
+**Idle wake-ups.** How often lily's own threads wake, by state (the engine's
+own idle timers, the pin's hold and the disk tier's write-ahead, are not the
+dashboard's and are unchanged):
+
+| state | sampler (`lily-machine`) | recorder (`lily-recorder`) |
+|---|---|---|
+| engine unloaded, no page within 10 s | every 30 s | every 60 s (and at the hour, to prune) |
+| engine loaded and idle, no page | every 30 s | every 10 s |
+| page open (a dashboard request within 10 s) | every 2 s | every 10 s |
+| a request running, a load, a reload, a recovery | every 2 s | every 10 s |
+| `--machine-stats off` | no thread | as above, the sampler's column never short |
+| `--stats-db off` | as above | no thread |
+
+The recorder's 60 s cadence holds while the engine is unloaded after a load
+with no request open, no dashboard request came within 10 s and the sampler is
+not at its 2 s cadence. It blocks on its channel until the next sample is
+due, so a request's row and a settings change still arrive at once, and a row
+that finds lily busy again brings the next sample forward; the minute rows
+aggregate whatever samples a minute got, so the history stays complete. A page
+or a request that starts during the recorder's 60 s wait is sampled at its
+end, at most a minute late (the sampler's power readings are not delayed).
 
 `/v1/lily/status` shows the latest reading as `machine.power`, `gpu_active`,
 `gpu_freq_mhz` and `temp_c` while it is younger than three waits (6 s, or 90 s
@@ -188,6 +220,22 @@ up but did not confirm it within 3 s: "the change may still apply; reload
 to see the current value"; the page reloads the settings and the log after
 any 5xx), 500 the change could not be worked out. The change log answers
 503 without the database.
+
+## Notes for upgrading
+
+A server that starts from a script or the launchd service may refuse flags
+it took before the dashboard: a duration over 365 days (`--idle-unload`,
+`--pin-hold`, `--disk-cache-ttl`), a thinking budget or
+`--thinking-budget-grace` over 1 048 576 tokens, and
+`--thinking-budget-tool-turn-factor` over 100 now stop the start with the
+flag's message. Two threads are new: `lily-machine` (the sampler, unless
+`--machine-stats off`) and `lily-recorder` (unless `--stats-db off`). The
+recorder creates `~/Library/Application Support/lily/lily.sqlite` by default
+(its directory `0700` if lily creates it, the database and its WAL files
+`0600`); a service whose `HOME` is unset writes it under its working
+directory, so set `--stats-db` there. Unknown paths answer `404` as before,
+except a browser's navigation (a path with no extension whose `Accept` names
+`text/html`), which gets the dashboard (see The dashboard above).
 
 ## Batching
 

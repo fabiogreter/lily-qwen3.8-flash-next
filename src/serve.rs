@@ -2019,6 +2019,8 @@ fn engine_loop<M: LanguageModel>(
                 }
                 if engine.is_none() {
                     lifecycle.set(State::Reloading);
+                    // A load is work: the sampler's busy cadence starts now.
+                    shared.board.working();
                     let started = Instant::now();
                     match Engine::<M>::load(model_dir, options, &shared, next_id) {
                         Ok(loaded) => {
@@ -2060,6 +2062,7 @@ fn engine_loop<M: LanguageModel>(
                 if let Some(fault) = fault {
                     let faulted = engine.take().expect("engine loaded");
                     lifecycle.set(State::Recovering);
+                    shared.board.working();
                     let window = describe_secs(RECOVERY_WINDOW.as_secs());
                     let Some(attempt) = recoveries.record(Instant::now()) else {
                         exit_failed(
@@ -2517,7 +2520,9 @@ fn handle(front: &Front, mut stream: TcpStream) {
     };
     // Before anything that could reach the engine: the dashboard's routes
     // only read what it published.
-    if let Some(route) = dashboard::route(&request.method, &path) {
+    if let Some(route) =
+        dashboard::route(&request.method, &path, request.header("Accept"))
+    {
         let connection = dashboard::Connection {
             peer: stream.peer_addr().ok(),
             port: stream.local_addr().map_or(0, |a| a.port()),

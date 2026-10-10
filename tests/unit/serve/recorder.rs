@@ -1020,6 +1020,17 @@ fn the_tier_snapshot_counts_the_sessions_requests_hold() {
 // --- the flag and the read side ------------------------------------------------------
 
 #[test]
+fn the_default_database_needs_an_absolute_home() {
+    assert_eq!(
+        default_path_in(Some("/Users/x".into())),
+        Some(PathBuf::from("/Users/x/Library/Application Support/lily/lily.sqlite"))
+    );
+    assert_eq!(default_path_in(None), None);
+    assert_eq!(default_path_in(Some("".into())), None);
+    assert_eq!(default_path_in(Some("relative".into())), None);
+}
+
+#[test]
 fn stats_db_takes_an_absolute_path_or_off() {
     assert_eq!(stats_db(Some("off")), Ok(None));
     assert_eq!(stats_db(Some("/x/y.sqlite")), Ok(Some(PathBuf::from("/x/y.sqlite"))));
@@ -1514,4 +1525,89 @@ fn a_minute_never_holds_more_than_sixty_seconds_of_coverage() {
     assert_eq!(row.covered_ms, Some(60_000));
     assert!(close(row.sys_w.1, (10.0 * 40.0 + 40.0 * 20.0) / 60.0), "{row:?}");
     assert_eq!((row.sys_w.0, row.sys_w.2), (Some(10.0), Some(40.0)));
+}
+
+// --- the cadence ----------------------------------------------------------------
+
+#[test]
+fn the_machine_is_sampled_every_minute_only_while_lily_is_quiet() {
+    let s = Duration::from_secs;
+    assert_eq!((SAMPLE_EVERY, QUIET_SAMPLE_EVERY), (s(10), s(60)));
+    // Unloaded, no page for longer than it stays open, the sampler idle.
+    assert_eq!(sample_every(true, None, false), QUIET_SAMPLE_EVERY);
+    assert_eq!(sample_every(true, Some(s(3600)), false), QUIET_SAMPLE_EVERY);
+    assert_eq!(
+        sample_every(true, Some(PAGE_OPEN + Duration::from_millis(1)), false),
+        QUIET_SAMPLE_EVERY
+    );
+    // Any of the three otherwise brings the 10 s cadence back.
+    assert_eq!(sample_every(false, None, false), SAMPLE_EVERY);
+    assert_eq!(sample_every(true, Some(s(3)), false), SAMPLE_EVERY);
+    assert_eq!(sample_every(true, Some(PAGE_OPEN), false), SAMPLE_EVERY);
+    assert_eq!(sample_every(true, None, true), SAMPLE_EVERY);
+}
+
+#[test]
+fn the_recorders_cadence_follows_the_engine_the_page_and_the_sampler() {
+    use crate::serve::dashboard::Loaded;
+    use crate::serve::machine::Intervals;
+    let board = Arc::new(Board::default());
+    let machine = Machine::running();
+    board.attach_machine(machine.clone());
+    let (_tx, rx) = mpsc::sync_channel(1);
+    let recording = Recording {
+        path: PathBuf::new(),
+        health: Arc::default(),
+        rows: rx,
+        board: Arc::downgrade(&board),
+        started_ms: 0,
+        machine: None,
+        ticks: None,
+        settings: None,
+        changes: Vec::new(),
+    };
+    let at = Instant::now();
+    let every = |r: &Recording| r.next_sample(Some(at)) - at;
+    assert!(recording.next_sample(None) <= Instant::now(), "the first at once");
+    // The first load has not finished: busy.
+    assert_eq!(every(&recording), SAMPLE_EVERY);
+    let loaded = Loaded { max_batch: 1, weights_bytes: 0, ngram: None };
+    board.loaded(loaded.clone());
+    assert_eq!(every(&recording), SAMPLE_EVERY, "loaded");
+    board.unloaded(StoreView::default());
+    assert_eq!(every(&recording), QUIET_SAMPLE_EVERY, "unloaded, nobody looking");
+    // A request open (a reload's for it, say) is not quiet.
+    board.opened();
+    assert_eq!(every(&recording), SAMPLE_EVERY);
+    board.closed(None, Instant::now());
+    assert_eq!(every(&recording), QUIET_SAMPLE_EVERY);
+    // The page asked.
+    machine.touch();
+    assert_eq!(every(&recording), SAMPLE_EVERY, "the page is open");
+    // The sampler at its busy cadence (a reload has no request yet).
+    let quiet_board = Arc::new(Board::default());
+    quiet_board.loaded(loaded);
+    quiet_board.unloaded(StoreView::default());
+    let busy = Machine::spawn(
+        || Ok(Blank),
+        || true,
+        Intervals { first: Duration::from_millis(1), ..Intervals::default() },
+    );
+    quiet_board.attach_machine(busy.clone());
+    let recording = Recording { board: Arc::downgrade(&quiet_board), ..recording };
+    assert!(eventually(|| busy.short_cadence()));
+    assert_eq!(every(&recording), SAMPLE_EVERY, "the sampler is busy");
+    busy.finish(Duration::from_secs(5));
+    assert!(!busy.short_cadence());
+    assert_eq!(every(&recording), QUIET_SAMPLE_EVERY);
+}
+
+/// A machine source that waits out what it is asked for and reads nothing.
+struct Blank;
+
+impl crate::serve::machine::Source for Blank {
+    fn read(&mut self, window: Duration) -> Result<Reading, String> {
+        std::thread::sleep(window);
+        Ok(Reading::default())
+    }
 }

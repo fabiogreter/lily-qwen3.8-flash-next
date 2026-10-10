@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use super::{ChunkedResponse, PROBE_WINDOW, Watched};
+use super::{ChunkedResponse, PROBE_WINDOW, Watched, head, reason};
 
 /// The server's and the client's end of one loopback connection, the
 /// request already read off the server's end.
@@ -165,4 +165,20 @@ fn dropping_a_watched_connection_closes_it() {
     let mut buf = [0u8; 8];
     assert_eq!(client.read(&mut buf).expect("eof"), 0);
     let _ = client.write_all(b"x");
+}
+
+#[test]
+fn every_status_lily_answers_has_its_reason_phrase() {
+    // The OpenAI routes' and the dashboard's (the settings writes' 409, 413
+    // and 504 among them); the interim probe writes its own head.
+    let statuses = [200, 400, 403, 404, 405, 409, 411, 413, 500, 503, 504];
+    for status in statuses {
+        assert!(!reason(status).is_empty(), "{status} has no reason phrase");
+    }
+    assert_eq!(reason(504), "Gateway Timeout");
+    assert_eq!(reason(413), "Payload Too Large");
+    assert!(
+        head(504, "application/json", &[])
+            .starts_with("HTTP/1.1 504 Gateway Timeout\r\n")
+    );
 }

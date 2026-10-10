@@ -5,7 +5,8 @@
 //! hands each finished request's row to the [`Board`]; the board also offers
 //! it to the recorder's bounded channel with `try_send`, so a recorder that
 //! falls behind costs the engine nothing: the row is dropped and counted
-//! ([`RecorderStatus::dropped_rows`], § 2.3). Every [`SAMPLE_EVERY`] the
+//! ([`RecorderStatus::dropped_rows`], § 2.3). Every [`SAMPLE_EVERY`] (every
+//! [`QUIET_SAMPLE_EVERY`] while lily is quiet, below) the
 //! recorder thread samples the machine itself (CPU load, memory pressure,
 //! swap, RAM in use, lily's resident memory, the same calls the status route
 //! makes), takes the readings the machine sampler (`serve::machine`) queued
@@ -13,6 +14,18 @@
 //! from the view the engine last published. It never sends the engine anything, never
 //! takes a lock the engine holds across work (a board lock only for a clone,
 //! never across a SQLite call) and never runs on the engine's thread.
+//!
+//! **Quiet cadence** ([`sample_every`]). While the engine is unloaded with
+//! no request open, no dashboard request came in within [`PAGE_OPEN`] and the
+//! machine sampler is not at its busy cadence, the recorder samples every
+//! [`QUIET_SAMPLE_EVERY`] and does not wake in between: it blocks on its
+//! channel until the next sample (or the hourly prune) is due, so rows and
+//! settings changes still arrive at once. Every wake-up looks again, so a row
+//! or a change that finds lily busy brings the next sample forward to
+//! [`SAMPLE_EVERY`] after the last; a page or a request that starts during a
+//! quiet wait is caught at its end, at most a minute later. The minute rows
+//! aggregate whatever samples a minute got, so the history stays complete
+//! with fewer of them.
 //!
 //! **Opening.** The thread opens the database, never the main thread, so the
 //! server's start never waits on SQLite. An open that fails is retried after
@@ -116,7 +129,7 @@ use super::dashboard::contract::{
     SettingsLogEntry, SettingsLogSource,
 };
 use super::dashboard::{Board, StoreView};
-use super::machine::{Reading, Sample};
+use super::machine::{PAGE_OPEN, Reading, Sample};
 use super::runtime::{Change, Entry, Plan, RuntimeSettings, same_value};
 use crate::stats::CpuTicks;
 
@@ -136,6 +149,8 @@ pub const MAX_SPAN_MS: u64 = 86_400_000;
 pub const ROW_CHANNEL: usize = 1024;
 /// How often the recorder samples the machine.
 pub const SAMPLE_EVERY: Duration = Duration::from_secs(10);
+/// How often it does while lily is quiet ([`sample_every`]).
+pub const QUIET_SAMPLE_EVERY: Duration = Duration::from_secs(60);
 /// How often rows older than the retention are deleted.
 const PRUNE_EVERY: Duration = Duration::from_secs(3600);
 /// The most rows written in one transaction.
@@ -1123,7 +1138,8 @@ impl Stat {
     }
 }
 
-/// One reading of the machine's own counters, taken every [`SAMPLE_EVERY`];
+/// One reading of the machine's own counters, taken every [`SAMPLE_EVERY`]
+/// ([`QUIET_SAMPLE_EVERY`] while lily is quiet);
 /// `None` where its probe has nothing. The power, GPU and temperature
 /// figures come from the sampler's windows instead ([`PowerMinute`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -1869,6 +1885,24 @@ impl Writer {
 
 // --- the thread --------------------------------------------------------------------
 
+/// The wait between the recorder's machine samples: [`QUIET_SAMPLE_EVERY`]
+/// while the engine is unloaded with no request open (`quiet`), the last
+/// dashboard request came `since_page` ago, longer than [`PAGE_OPEN`] (or
+/// never: `None`), and the machine sampler is not at its busy cadence
+/// (`sampler_short`); [`SAMPLE_EVERY`] otherwise.
+pub fn sample_every(
+    quiet: bool,
+    since_page: Option<Duration>,
+    sampler_short: bool,
+) -> Duration {
+    let page_seen = since_page.is_some_and(|age| age <= PAGE_OPEN);
+    if quiet && !page_seen && !sampler_short {
+        QUIET_SAMPLE_EVERY
+    } else {
+        SAMPLE_EVERY
+    }
+}
+
 /// Marks the recorder not ok when its thread ends, a panic included.
 struct Ended(Arc<Health>);
 
@@ -1925,9 +1959,12 @@ impl Recording {
         if !pending.is_empty() {
             writer.record(std::mem::take(&mut pending));
         }
-        let mut next_sample = Instant::now();
+        // When the last machine sample was taken (`None`: none yet, one is
+        // due at once).
+        let mut sampled: Option<Instant> = None;
         let mut next_prune = Instant::now();
         loop {
+            let next_sample = self.next_sample(sampled);
             let until = next_sample.min(next_prune);
             let mut batch = Vec::new();
             let waited = self.receive(until, &mut batch, BATCH_ROWS);
@@ -1939,11 +1976,12 @@ impl Recording {
                 break;
             }
             let now = Instant::now();
-            if now >= next_sample {
+            // Looked at again: a row that woke the wait can find lily busy.
+            if now >= self.next_sample(sampled) {
                 if !self.sample(&mut writer, super::now_ms()) {
                     break;
                 }
-                next_sample = now + SAMPLE_EVERY;
+                sampled = Some(now);
             }
             if now >= next_prune {
                 writer.prune(super::now_ms());
@@ -2200,6 +2238,20 @@ impl Recording {
                 }
             }
         }
+    }
+
+    /// When the next machine sample is due, the last one having been taken
+    /// at `sampled`: at once for the first, then at the cadence lily's state
+    /// now asks for ([`sample_every`]).
+    fn next_sample(&self, sampled: Option<Instant>) -> Instant {
+        let Some(at) = sampled else { return Instant::now() };
+        let Some(board) = self.board.upgrade() else { return at + SAMPLE_EVERY };
+        let machine = board.machine();
+        at + sample_every(
+            board.unloaded_and_quiet(),
+            machine.and_then(|m| m.since_touch()),
+            machine.is_some_and(|m| m.short_cadence()),
+        )
     }
 
     /// Writes what the sampler measured since the last tick: its windows
@@ -2559,12 +2611,21 @@ impl Recorder {
     }
 }
 
-/// `--stats-db`'s default: `~/Library/Application Support/lily/lily.sqlite`.
-pub fn default_path() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join("Library").join("Application Support").join("lily").join("lily.sqlite")
+/// `--stats-db`'s default: `~/Library/Application Support/lily/lily.sqlite`,
+/// or `None` when `HOME` is unset or not absolute (history is then off
+/// rather than written relative to whatever the working directory is).
+pub fn default_path() -> Option<PathBuf> {
+    default_path_in(std::env::var_os("HOME"))
+}
+
+fn default_path_in(home: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let home = PathBuf::from(home?);
+    home.is_absolute().then(|| {
+        home.join("Library")
+            .join("Application Support")
+            .join("lily")
+            .join("lily.sqlite")
+    })
 }
 
 /// `--stats-db`'s text as a path: `None` for `off`, the default without the
@@ -2572,7 +2633,15 @@ pub fn default_path() -> PathBuf {
 /// `--disk-cache-dir`).
 pub fn stats_db(flag: Option<&str>) -> Result<Option<PathBuf>, String> {
     match flag {
-        None => Ok(Some(default_path())),
+        None => {
+            let path = default_path();
+            if path.is_none() {
+                eprintln!(
+                    "recorder: HOME is not an absolute path, so there is no default database; history is off (pass --stats-db <path>)"
+                );
+            }
+            Ok(path)
+        }
         Some("off") => Ok(None),
         Some("") => Err("--stats-db needs an absolute path, or off".to_owned()),
         Some(path) if !Path::new(path).is_absolute() => Err(format!(

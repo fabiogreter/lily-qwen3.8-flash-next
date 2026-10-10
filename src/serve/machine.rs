@@ -22,9 +22,20 @@
 //! noise); every later one asks for [`Duration::ZERO`] after lily itself has
 //! waited, on a condition variable, until the next reading is due. A reading's
 //! window is then exactly the time since the previous call, and the wait can be
-//! cut short: [`Machine::touch`] wakes it when the page opens, [`Machine::stop`]
-//! when the server shuts down, and the engine's activity is polled every
-//! [`POLL`]. Nothing waits out a 30 s call.
+//! cut short: [`Machine::touch`] wakes it when the page opens, [`Machine::nudge`]
+//! when the engine starts work (a request taken on, a reload, a recovery),
+//! [`Machine::stop`] when the server shuts down. Nothing waits out a 30 s call,
+//! and nothing polls: an idle sampler wakes once per idle window.
+//!
+//! **Waking on work** costs the engine one fence and one relaxed load per
+//! request taken on (and per reload or recovery). The sampler raises a flag
+//! before each look at the engine and lowers it when the look picks the busy
+//! window; [`Machine::nudge`] notifies the condition variable only when it
+//! finds the flag raised, so only the idle-to-busy edge pays for a lock and a
+//! notify. The two sequentially consistent fences (one after the sampler
+//! raises the flag, one before the nudge reads it) make sure that either the
+//! sampler's look sees the work or the nudge sees the flag: work that starts
+//! during an idle wait is never left for the next idle reading.
 //!
 //! **The window** ([`Intervals::pick`]) is chosen while waiting: the next
 //! reading is due 2 s after the previous one while the engine is busy or the
@@ -32,7 +43,9 @@
 //! otherwise, so the 7-day history has idle samples too. A page that opens in
 //! the middle of an idle wait gets its first fresh reading at once (the last
 //! idle reading shows meanwhile, as it is still fresh), and the 2 s cadence
-//! starts from it. Nothing can call faster than the busy window, so a source
+//! starts from it; so does work that starts then ([`Machine::nudge`]). Work
+//! that no request accounts for (tokens drawn outside one) is noticed at the
+//! next reading only. Nothing can call faster than the busy window, so a source
 //! that returns at once cannot spin the thread; and the first call, the only
 //! one with a window to wait out, is not trusted if it comes back in less than
 //! half of it ([`Failures`]).
@@ -92,7 +105,7 @@
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering, fence};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -108,8 +121,11 @@ pub const PAGE_OPEN: Duration = Duration::from_secs(10);
 /// The first call's window: `macmon` has no baseline yet, and a reading over
 /// no time at all would be noise.
 pub const FIRST_WINDOW: Duration = Duration::from_secs(1);
-/// How often a wait looks at whether the engine became busy.
-pub const POLL: Duration = Duration::from_secs(2);
+/// A wait this close to its end counts as over: a timed wait on the
+/// condition variable can return a little early, and waiting out the rest
+/// would be a second wake-up for nothing (the window is measured, not
+/// assumed).
+const DUE_SLACK: Duration = Duration::from_millis(2);
 /// A reading is shown while it is younger than this many of its windows.
 pub const FRESH_WINDOWS: u32 = 3;
 /// The shortest window freshness is measured in, however short the one
@@ -291,8 +307,6 @@ pub struct Intervals {
     pub page_open: Duration,
     /// The first call's window.
     pub first: Duration,
-    /// How often a wait looks at whether the engine became busy.
-    pub poll: Duration,
 }
 
 impl Default for Intervals {
@@ -302,7 +316,6 @@ impl Default for Intervals {
             idle: IDLE_INTERVAL,
             page_open: PAGE_OPEN,
             first: FIRST_WINDOW,
-            poll: POLL,
         }
     }
 }
@@ -403,6 +416,12 @@ pub struct Machine {
     /// Set by whatever wakes the sampler's wait early.
     woken: Mutex<bool>,
     wake: Condvar,
+    /// The sampler is looking at the engine or waiting out the idle window:
+    /// work that starts wakes it ([`Machine::nudge`]).
+    listening: AtomicBool,
+    /// The sampler's last look picked the busy window (the engine busy or
+    /// the page open); the recorder's cadence follows it.
+    short: AtomicBool,
     skipped: AtomicU64,
     thread: Mutex<Option<JoinHandle<()>>>,
     /// The thread has ended (or never started).
@@ -422,6 +441,8 @@ impl Machine {
             stop: AtomicBool::new(false),
             woken: Mutex::new(false),
             wake: Condvar::new(),
+            listening: AtomicBool::new(false),
+            short: AtomicBool::new(false),
             skipped: AtomicU64::new(0),
             thread: Mutex::new(None),
             finished: AtomicBool::new(false),
@@ -565,8 +586,8 @@ impl Machine {
 
     /// Waits until the next reading is due, `at` being when the previous call
     /// returned: the busy or the idle interval after it, as the engine and the
-    /// page say at each look (every `poll`, and at once when woken). `None`
-    /// when asked to stop.
+    /// page say at each look (on entry, and whenever the wait is woken: the
+    /// page opened, the engine started work). `None` when asked to stop.
     fn wait_until_due(
         &self,
         busy: &impl Fn() -> bool,
@@ -577,21 +598,51 @@ impl Machine {
             if self.stop.load(Ordering::Acquire) {
                 return None;
             }
+            // Raised before the look: work that starts after it nudges this
+            // wait (the module docs say why the fences).
+            self.listening.store(true, Ordering::Relaxed);
+            fence(Ordering::SeqCst);
             let interval = intervals.pick(busy(), self.since_touch());
+            let short = interval == intervals.busy;
+            self.short.store(short, Ordering::Relaxed);
+            if short {
+                // A short wait need not be cut short by work.
+                self.listening.store(false, Ordering::Relaxed);
+            }
             let remaining = (at + interval).saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            if remaining <= DUE_SLACK {
                 return Some(interval);
             }
             let mut woken = lock(&self.woken);
             if !*woken {
                 woken = self
                     .wake
-                    .wait_timeout(woken, remaining.min(intervals.poll))
+                    .wait_timeout(woken, remaining)
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .0;
             }
             *woken = false;
         }
+    }
+
+    /// The engine started work (a request taken on, a reload, a recovery):
+    /// wakes the sampler if it is waiting out the idle window, so the busy
+    /// cadence starts now. A fence and a relaxed load when it is not (busy
+    /// already, or no sampler thread); the lock and the notify only on the
+    /// idle-to-busy edge.
+    pub fn nudge(&self) {
+        fence(Ordering::SeqCst);
+        if self.listening.load(Ordering::Relaxed)
+            && self.listening.swap(false, Ordering::Relaxed)
+        {
+            self.wake();
+        }
+    }
+
+    /// Whether the sampler's last look picked the busy window (the engine
+    /// busy or the page open). `false` without a running thread.
+    pub fn short_cadence(&self) -> bool {
+        self.short.load(Ordering::Relaxed)
     }
 
     fn wake(&self) {
@@ -645,7 +696,8 @@ impl Machine {
     }
 
     /// Readings skipped so far (a failed call, an implausible value, a call
-    /// back too early); not part of the dashboard's contract.
+    /// back too early); tests only, not part of the dashboard's contract.
+    #[cfg(test)]
     pub fn skipped(&self) -> u64 {
         self.skipped.load(Ordering::Relaxed)
     }
@@ -717,6 +769,9 @@ impl Drop for Ended<'_> {
         if std::thread::panicking() {
             self.0.fail("the sampler thread panicked".to_owned());
         }
+        // Nothing samples at either cadence any more.
+        self.0.short.store(false, Ordering::Relaxed);
+        self.0.listening.store(false, Ordering::Relaxed);
         self.0.finished.store(true, Ordering::Release);
     }
 }

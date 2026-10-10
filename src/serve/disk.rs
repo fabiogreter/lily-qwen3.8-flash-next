@@ -328,13 +328,16 @@ impl DiskStore {
     }
 
     /// Reads the maximum age from `max_age` from now on (the runtime
-    /// settings' handle) instead of the value it was opened with.
+    /// settings' handle) instead of the value it was opened with. Tests only:
+    /// the server opens the tier with the handle ([`Self::open_gated`]).
+    #[cfg(test)]
     pub fn with_max_age(mut self, max_age: Arc<AtomicU64>) -> Self {
         self.max_age = max_age;
         self
     }
 
-    /// Whether an expiry pass would run now (see [`ExpiryGate`]).
+    /// Whether an expiry pass would run now (see [`ExpiryGate`]); tests only.
+    #[cfg(test)]
     pub fn expiring(&self) -> bool {
         self.gate.as_ref().is_none_or(ExpiryGate::is_open)
     }
