@@ -537,7 +537,9 @@ hand-written pool doing the same measured the same.
 64 GB (1.39 misses per missed layer) and 1.7 ms at 40 GB (2.86). Measured
 with `LILY_EXPERT_TRACE=<stem>` (per resolution: request taken, GPU signal
 seen, ids looked up, reads done, `ready` signalled; per region read: start,
-end, thread; written as `<stem>.layers.csv` and `<stem>.reads.csv`), q4-xl,
+end, thread; written as `<stem>.layers.csv` and `<stem>.reads.csv`, the
+first 524 288 resolutions and 1 048 576 reads; the trace costs a clock read
+per mark and a lock per read, so it perturbs what it measures a little), q4-xl,
 8K prompt, 1 024 sampled tokens, plain decode, every run on a fresh APFS
 clone of the checkpoint with `LILY_EXPERT_NOCACHE=1`. Per token at 64 GB
 (15 736 slots, 19.2 misses and 14.0 missed layers per token) against the
@@ -564,18 +566,26 @@ The hold itself was close to the probe: 0.64 ms per missed layer against
   straight into the slab changed nothing. Now the service thread has a
   warm pass committed on a second Metal context for the length of each
   resolution with misses: one SIMD group polling a host-written word,
-  capped at 65 536 polls. It ends about 0.25 ms after the release (the GPU
-  sees the host's write late), and that overlap costs 0.02 ms per missed
-  layer against the 0.08 (64 GB) to 0.6 ms (40 GB) per missed layer it
-  saves. A warm pass running all the
+  capped at 65 536 polls (about 7 ms of GPU time when nobody releases it,
+  `a_warm_pass_nobody_releases_ends_at_its_cap`). It ends about 0.25 ms
+  after the release (the GPU sees the host's write late), and that overlap
+  costs 0.02 ms per missed layer against the 0.08 (64 GB) to 0.6 ms (40 GB)
+  per missed layer it saves. A warm pass running all the
   time instead slowed 64 GB to 41.7 ms per token: two queues with work
-  time-slice in milliseconds. `LILY_EXPERT_WARM=0` turns it off.
+  time-slice in milliseconds. `LILY_EXPERT_WARM=0` turns it off. The warm
+  thread builds its context while the service thread goes on (resolutions
+  before it is ready are not warmed). The word it polls lives in a page
+  the service thread's `Warmer` owns, not the warm thread, so a warm pass
+  that fails (which turns warming off for the cache's life) or panics
+  cannot leave a release writing to freed memory.
 - **The pacer overslept.** A paced wait sleeps until an average of past
   pass lengths minus 1.5 ms, and under misses a token takes 18 to 32 ms
   (p10 to p90 at 64 GB): the host woke late for about half of them and the
   parked next pass waited at its first layer. A pass now carries a
   milestone, its last cache handshake (`ComputePass::set_milestone`): the
-  paced wait blocks on `ready` reaching it and paces only the rest. Same as
+  paced wait blocks on `ready` reaching it and paces only the rest (a pass
+  that ends without reaching it, on an error path, is not paced and does
+  not count towards the estimate). Same as
   no pacing at all, which measured 24.49 against 26.24 at 64 GB and 14.45
   against 15.05 at the reference.
 - **The reads started late.** The nine reads of a missed expert started
@@ -660,7 +670,7 @@ host-signalled event:
 |-----------------------------------------|--------------------------------|----------------------------------------------------------------|------------------------------------|
 | `ready`, each cached MoE layer           | prefill (more than 4 rows)     | the layer's misses: 85 ms a layer at 40 GB, 5.6 s a pass         | yes at 40 GB; 64 GB at 3.8 to 4 s   |
 | `ready`, each cached MoE layer           | decode, verify (up to 4 rows), short prefills | a few ms a layer; at most 40 experts a layer, about 9 ms when all miss, 0.45 s a pass | only with a drive or host stalled for seconds |
-| `StepSync`, a parked pass's first input  | decode, verify, batched rows   | the pass before it plus the host's per-token callbacks (ms; the token stream's channel is unbounded, so a slow client does not hold them) | only with a stalled host |
+| `StepSync`, a parked pass's first input  | decode, verify, batched rows   | the pass before it plus the host's per-token callbacks (ms; the token stream's channel is unbounded, so a slow client does not hold them) | only with a stalled host; not watched, below |
 | none                                     | the warm pass, blits, vision, everything resident | (the warm pass polls a host-written word, capped at 65 536 polls) | no |
 
 The draft head's experts are resident, so draft passes have no cache
@@ -672,7 +682,14 @@ and a feeder thread submits each later part only once the host has
 signalled that part's wait (polling for 0.2 ms, then blocking). The queue
 never blocks on a host event, so nothing can time out however long the
 reads take; later submissions on the context wait until the feeder has
-submitted the last part, which keeps the queue's order. `encode_batch`
+submitted the last part, which keeps the queue's order. A feeder that
+waits 30 s at one gate (`GATE_PATIENCE`; the slowest legitimate wait is
+one layer's misses, 0.16 s on average for 8 192 rows at 40 GB) gives up and
+faults the context, so a host that never signals fails the request and
+reloads the engine instead of hanging it (a queue wait would have been
+released after 4 s, with the wrong experts); one that panics faults the
+context too, and when no feeder thread can be started the committing
+thread feeds the pass itself. `encode_batch`
 gates every prefill pass of more than 4 rows (`GATED_PREFILL_ROWS`, a
 verify pass's size); without the cache a prefill has no waits and is
 submitted as before. A part costs the host's wake-up and commit after
@@ -682,13 +699,18 @@ passes keep their queue waits, which the table bounds well under the
 limit; gating them would cost those 5 ms per token.
 
 **One that happens anyway fails the request.** Every pass's commit
-feedback now checks its waits (`metal::Watch`): the command buffer behind
-a wait must have started after the host signalled the event (each
-`SharedEvent::signal` logs its value and time, the last 4 096), and the
-event must not be below the value when that command buffer has completed.
-A wait that did not hold records a context fault; the pass's wait reports
+feedback now checks its waits on `ready`, a watched event
+(`MetalContext::new_watched_event`, `metal::Watch`): the command buffer
+behind a wait must not have started more than 0.1 ms before the host
+signalled the event (each `SharedEvent::signal` of a watched event logs its
+value and time when it raises the event, the last 4 096), and the event
+must not be below the value when that command buffer has completed. A
+wait that did not hold records a context fault; the pass's wait reports
 it before anything reads the pass's outputs, because a pass with waits
-takes its waits' feedback first. An empty command buffer behind the last
+takes its waits' feedback first. The parked pass's `StepSync` wait is not
+watched, under the cache or without it: it blocks for milliseconds, and
+without the cache passes are submitted exactly as before (no log, no
+extra command buffer). An empty command buffer behind the last watched
 wait has that feedback arrive as soon as the wait is passed: waiting for
 the feedback of the command buffer that follows it, which in a decode
 pass runs to the end, cost 0.15 ms per token at the reference. The fault
@@ -698,10 +720,15 @@ recomputing the pass: the pass read slots the service thread was
 rewriting and wrote attention and recurrent state from the wrong experts,
 lily keeps no copy of the in-place recurrent state to recompute from, and
 a decode-class pass gets there only if the drive or the host stalled for
-seconds, so a reload is proportionate. Waits the host released start 0.1
-to 0.5 ms after its signal (`waits_the_host_releases_are_not_reported_as_timed_out`);
-a real timeout is caught (`a_real_timed_out_wait_faults_the_context`,
-ignored, 4.5 s). A GPU signal after every wait, which the host could
+seconds, so a reload is proportionate. The work behind waits the host released
+started 5 microseconds to 3 ms after its signal, 0.1 ms in the median,
+never before it (`waits_the_host_releases_are_not_reported_as_timed_out`
+prints it); the 0.1 ms margin is for the two clocks (the GPU's timestamps
+are converted to the host's), since a false fault costs a reload, and a
+real timeout comes seconds after the submission. A real timeout is caught
+(`a_real_timed_out_wait_faults_the_context`, ignored, 4.5 s), and a gated
+wait holds past 4 s (`a_gated_wait_holds_past_the_queue_wait_limit`,
+ignored). A GPU signal after every wait, which the host could
 check before it signals, measured 0.22 ms per 48 waits
 (`witness_signal_cost_probe`) and was not used. The service thread's
 count of timed-out waits stays as a diagnostic.
