@@ -2257,6 +2257,10 @@ impl Drop for PendingPass<'_> {
             // (a part not submitted would leave whoever waits for the host
             // events it signals waiting), unless the context faults.
             let _ = self.join_feeder();
+            // TODO: after a context fault wait_fence returns early, so the
+            // slot's command memory goes back to the pool while parts may
+            // still run on the GPU; harmless today only because any fault
+            // reloads the engine (predates gated passes).
             let _ = self.ctx.wait_fence(self.fence_value);
             self.program.clear();
             self.slot = None;
