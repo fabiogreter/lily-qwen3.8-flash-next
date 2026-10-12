@@ -56,7 +56,7 @@
     --warn: #d4b062;
     --crit: #d98a7f;
     --grain-ink: #f3e9d6;
-    --grain-opacity: 0.1;
+    --grain-opacity: 0.05;
     --mottle-ink: #0e0d0b;
     --mottle-opacity: 0.3;
     --node: rgba(255, 245, 225, 0.035);
@@ -84,7 +84,7 @@
   --warn: #d4b062;
   --crit: #d98a7f;
   --grain-ink: #f3e9d6;
-  --grain-opacity: 0.1;
+  --grain-opacity: 0.05;
   --mottle-ink: #0e0d0b;
   --mottle-opacity: 0.3;
   --node: rgba(255, 245, 225, 0.035);
