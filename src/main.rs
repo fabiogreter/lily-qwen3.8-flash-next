@@ -223,12 +223,10 @@ struct Cli {
     thinking: bool,
 
     /// Template reasoning effort when thinking is on: low, medium or xhigh
-    /// (the template's default is xhigh).
-    // TODO(dashboard): the flag passes any text to the template, while the
-    // runtime setting takes low, medium, xhigh (high and max as xhigh) via
-    // `lily::serve::api::template_effort`; whether the flag should refuse
-    // or map the same way is the owner's pending decision.
-    #[arg(long)]
+    /// (`high` and `max` are xhigh; the template's default is xhigh). Any
+    /// other value refuses to start, as a request's or the dashboard's would
+    /// be refused.
+    #[arg(long, value_parser = parse_reasoning_effort)]
     reasoning_effort: Option<String>,
 
     /// Thinking budget of chat requests, by the template's reasoning
@@ -300,6 +298,14 @@ struct Cli {
     /// be exercised end to end.
     #[arg(long, hide = true)]
     debug_inject_metal_fault: Option<u64>,
+}
+
+/// `--reasoning-effort` as the template names it, through the mapping
+/// requests and the runtime setting use.
+fn parse_reasoning_effort(text: &str) -> Result<String, String> {
+    lily::serve::api::template_effort(text)
+        .map(str::to_owned)
+        .ok_or_else(|| "use low, medium or xhigh (high and max are xhigh)".to_owned())
 }
 
 fn parse_bytes(text: &str) -> Result<usize> {
@@ -457,6 +463,24 @@ mod tests {
         assert!(
             Cli::try_parse_from(["lily", "--model", "m", "--kv-cache", "q4"]).is_err()
         );
+    }
+
+    /// `--reasoning-effort` takes the template's names and the request
+    /// aliases, stored as the template's name, and refuses anything else.
+    #[test]
+    fn reasoning_effort_maps_the_aliases_and_refuses_unknown_values() {
+        let effort = |value: &str| {
+            Cli::try_parse_from(["lily", "--model", "m", "--reasoning-effort", value])
+                .map(|cli| cli.reasoning_effort)
+        };
+        assert_eq!(effort("low").expect("low"), Some("low".into()));
+        assert_eq!(effort("medium").expect("medium"), Some("medium".into()));
+        for alias in ["high", "xhigh", "max"] {
+            assert_eq!(effort(alias).expect(alias), Some("xhigh".into()));
+        }
+        for unknown in ["none", "HIGH", "extreme", ""] {
+            assert!(effort(unknown).is_err(), "{unknown:?} was accepted");
+        }
     }
 
     /// The dashboard's settings view names flags by the `Cli` field: a
