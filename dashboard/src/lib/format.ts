@@ -38,6 +38,17 @@ export function rate(x: number | null | undefined): string {
   return x >= 99.95 ? String(Math.round(x)) : x.toFixed(1);
 }
 
+/** Milliseconds: one decimal below 10, whole numbers above. */
+export function ms(x: number | null | undefined): string {
+  if (x == null) return DASH;
+  return x >= 9.95 ? String(Math.round(x)) : x.toFixed(1);
+}
+
+/** A count with its noun, e.g. "1 entry", "3 entries". */
+export function count(n: number, one: string, many: string): string {
+  return `${n} ${n === 1 ? one : many}`;
+}
+
 /** Seconds since something happened. */
 export function ago(s: number | null | undefined): string {
   if (s == null) return DASH;

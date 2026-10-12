@@ -6,7 +6,7 @@ import RangeSwitch from '../components/RangeSwitch.vue';
 import SectionHead from '../components/SectionHead.vue';
 import { HISTORY_POLL_MS, useDashboard } from '../composables/context';
 import { useResource } from '../composables/useResource';
-import { agoSince, bytes, pct, rate, tokens } from '../lib/format';
+import { agoSince, bytes, count, pct, rate, tokens } from '../lib/format';
 
 const { backend, range, status } = useDashboard();
 
@@ -38,7 +38,7 @@ const prefillSeries = avgMaxSeries('prefill_tps_avg', 'prefill_tps_max');
 <template>
   <main>
     <section class="section first">
-      <SectionHead title="Cache entries" :seed="8" :aside="`${sessions.length} entries`" />
+      <SectionHead title="Cache entries" :seed="8" :aside="count(sessions.length, 'entry', 'entries')" />
       <p v-if="list.error.value" class="inline-error" role="alert">{{ list.error.value }}</p>
       <div class="tablewrap">
         <table class="ink">

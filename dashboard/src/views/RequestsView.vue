@@ -3,7 +3,7 @@ import SectionHead from '../components/SectionHead.vue';
 import { HISTORY_POLL_MS, useDashboard } from '../composables/context';
 import { useResource } from '../composables/useResource';
 import type { RequestRow } from '../api/types';
-import { clock, pct, rate, tokens } from '../lib/format';
+import { clock, ms, pct, rate, tokens } from '../lib/format';
 
 const { backend } = useDashboard();
 const LIMIT = 40;
@@ -52,7 +52,7 @@ const res = useResource((signal) => backend.requests(LIMIT, signal), { intervalM
               <td>{{ tokens(r.generated_tokens) }}</td>
               <td>{{ rate(r.decode_tps) }}</td>
               <td>{{ pct(acceptance(r)) }}</td>
-              <td :class="{ muted: r.queue_ms < 10 }">{{ r.queue_ms }}</td>
+              <td :class="{ muted: r.queue_ms < 10 }">{{ ms(r.queue_ms) }}</td>
               <td>{{ r.batch }}</td>
               <td class="l">
                 <span v-if="r.failed" class="tag">failed</span

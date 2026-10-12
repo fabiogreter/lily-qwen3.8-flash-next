@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ago, agoSince, bounds, bucketLabel, bytes, clock, dateTime, DASH, duration, energy, label, pct, rate, show, timeLabel, tokens, whole } from './format';
+import { ago, agoSince, bounds, bucketLabel, bytes, clock, count, dateTime, DASH, duration, energy, label, ms, pct, rate, show, timeLabel, tokens, whole } from './format';
 
 // The test setup pins TZ=UTC, so local time equals UTC here.
 const T = Date.UTC(2026, 9, 10, 14, 5, 9); // Sat 10 Oct 2026, 14:05:09
@@ -117,5 +117,22 @@ describe('agoSince and whole', () => {
     expect(bounds(0, null)).toBe('at least 0');
     expect(bounds(null, 2)).toBe('at most 2');
     expect(bounds(null, null)).toBeNull();
+  });
+});
+
+describe('ms', () => {
+  it('keeps one decimal below 10 and rounds above', () => {
+    expect(ms(0.249)).toBe('0.2');
+    expect(ms(9.96)).toBe('10');
+    expect(ms(1908.586)).toBe('1909');
+    expect(ms(null)).toBe(DASH);
+  });
+});
+
+describe('count', () => {
+  it('uses the singular for exactly one', () => {
+    expect(count(0, 'entry', 'entries')).toBe('0 entries');
+    expect(count(1, 'entry', 'entries')).toBe('1 entry');
+    expect(count(2, 'entry', 'entries')).toBe('2 entries');
   });
 });

@@ -147,18 +147,18 @@ const temps = computed(() => (m.value.temp_c ? `CPU ${Math.round(m.value.temp_c.
     <!-- engine -->
     <rect class="node engine" x="710" y="60" width="240" height="196" rx="4" />
     <text class="n-title" x="728" y="86">GPU engine</text>
-    <text class="n-sub" x="932" y="86" text-anchor="end">{{ st.model }}</text>
-    <text class="n-big" x="728" y="130">{{ rate(st.live.decode_tps) }}</text>
-    <text class="n-sub" x="728" y="148">decode tok/s</text>
-    <text class="n-val" x="852" y="130">{{ st.live.prefill_tps ? Math.round(st.live.prefill_tps) : '–' }}</text>
-    <text class="n-sub" x="852" y="148">prefill tok/s</text>
-    <line class="hair" x1="728" x2="932" y1="162" y2="162" style="stroke: var(--hair)" />
-    <text class="n-small" x="728" y="184">{{ mtp != null ? 'MTP, ' + mtp + ' drafts per step' : 'MTP' }}</text>
-    <text class="n-small" x="932" y="184" text-anchor="end">{{ accept != null ? pct(accept) + ' accepted' : 'idle' }}</text>
-    <rect class="track" x="728" y="194" width="204" height="3" />
-    <rect v-if="accept != null" class="fill" x="728" y="193" :width="204 * accept" height="5" filter="url(#ink-line)" />
-    <text class="n-small" x="728" y="226">GPU {{ pct(m.gpu_active) }} · {{ whole(m.gpu_freq_mhz, 'MHz') }}</text>
-    <text class="n-small" x="728" y="244">{{ pinned ? 'weights pinned' : 'weights not pinned' }}{{ st.pin_hold_s != null ? ', hold ' + duration(st.pin_hold_s) : '' }}</text>
+    <text class="n-sub" x="728" y="106">{{ st.model }}</text>
+    <text class="n-big" x="728" y="142">{{ rate(st.live.decode_tps) }}</text>
+    <text class="n-sub" x="728" y="158">decode tok/s</text>
+    <text class="n-val" x="852" y="142">{{ st.live.prefill_tps ? Math.round(st.live.prefill_tps) : '–' }}</text>
+    <text class="n-sub" x="852" y="158">prefill tok/s</text>
+    <line class="hair" x1="728" x2="932" y1="170" y2="170" style="stroke: var(--hair)" />
+    <text class="n-small" x="728" y="190">{{ mtp != null ? 'MTP, ' + mtp + ' drafts per step' : 'MTP' }}</text>
+    <text class="n-small" x="932" y="190" text-anchor="end">{{ accept != null ? pct(accept) + ' accepted' : 'idle' }}</text>
+    <rect class="track" x="728" y="199" width="204" height="3" />
+    <rect v-if="accept != null" class="fill" x="728" y="198" :width="204 * accept" height="5" filter="url(#ink-line)" />
+    <text class="n-small" x="728" y="228">GPU {{ pct(m.gpu_active) }} · {{ whole(m.gpu_freq_mhz, 'MHz') }}</text>
+    <text class="n-small" x="728" y="246">{{ pinned ? 'weights pinned' : 'weights not pinned' }}{{ st.pin_hold_s != null ? ', hold ' + duration(st.pin_hold_s) : '' }}</text>
 
     <!-- gpu sessions -->
     <rect class="node" x="990" y="40" width="170" height="100" rx="3" />
@@ -172,10 +172,10 @@ const temps = computed(() => (m.value.temp_c ? `CPU ${Math.round(m.value.temp_c.
     <template v-if="disk">
       <rect class="node" x="990" y="176" width="170" height="112" rx="3" />
       <text class="n-title" x="1004" y="198">Disk tier</text>
-      <text class="n-val" x="1004" y="225">{{ disk.entries }}<tspan class="n-sub" dx="5">entries, {{ disk.durable_entries }} durable</tspan></text>
+      <text class="n-val" x="1004" y="225">{{ disk.entries }}<tspan class="n-sub" dx="5">{{ disk.entries === 1 ? 'entry' : 'entries' }}, {{ disk.durable_entries }} durable</tspan></text>
       <rect class="track" x="1004" y="238" width="142" height="3" />
-      <rect class="fill" x="1004" y="237" :width="Math.max(2, 142 * diskShare)" height="5" />
-      <rect class="fill-2" :x="1004 + Math.max(2, 142 * diskShare) + 2" y="237" :width="Math.max(2, 142 * durShare)" height="5" />
+      <rect v-if="diskShare > 0" class="fill" x="1004" y="237" :width="Math.max(2, 142 * diskShare)" height="5" />
+      <rect v-if="durShare > 0" class="fill-2" :x="1004 + (diskShare > 0 ? Math.max(2, 142 * diskShare) + 2 : 0)" y="237" :width="Math.max(2, 142 * durShare)" height="5" />
       <text class="n-sub" x="1004" y="262">{{ bytes(disk.used_bytes) }} of {{ bytes(disk.budget_bytes) }}</text>
       <line x1="1004" x2="1016" y1="276" y2="276" stroke="var(--s1)" stroke-width="2" /><text class="n-sub" x="1020" y="280">evicted</text>
       <line x1="1072" x2="1084" y1="276" y2="276" stroke="var(--s2)" stroke-width="2" /><text class="n-sub" x="1088" y="280">durable</text>
