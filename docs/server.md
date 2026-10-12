@@ -163,6 +163,17 @@ running generation keeps the interval it was admitted with while the batch
 admission budgets newcomers by the store's, and the expert cache's plan
 turns checkpoints off whatever the flag says) stay restart-only.
 
+**Test and benchmark servers** run with `--stats-db off`. Every lily on the
+machine shares the default database, so a server started for an e2e run, a
+benchmark or a bisect would otherwise take the settings stored from the
+dashboard over its own flags (a stored temperature or thinking budget
+changes what is measured) and add its requests to the history of the
+service. With `--stats-db off` the flags are the whole configuration and
+nothing is recorded. `tools/e2e/durable.py` and `tools/e2e/vision.py` pass
+it to the servers they start; a server started by hand for
+`tools/bench/http_bench.py` needs it on its command line. `lily-bench` and
+`lily-probe` read and write no database.
+
 **Limits**, the same for a flag and a runtime setting: durations at most
 365 days (`duration "400d" is longer than the 365-day cap`), thinking
 budgets and the grace at most 1 048 576 tokens, the tool-turn factor a

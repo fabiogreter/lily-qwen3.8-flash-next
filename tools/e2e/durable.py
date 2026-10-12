@@ -57,6 +57,13 @@ class Server:
                "--max-seq", "16384", "--cache-bytes", "2G", "--max-sessions", "4",
                "--disk-cache-dir", self.disk_dir, "--disk-cache-bytes", "20G",
                "--durable-min-tokens", str(self.min_tokens), "--ngram-preload", "false"]
+        # A test server keeps out of the dashboard's database: no rows in the
+        # owner's history, no stored setting overriding these flags
+        # (docs/server.md, "Test and benchmark servers"). A baseline binary
+        # older than the dashboard has no such flag.
+        help_text = subprocess.run([self.args.lily, "--help"], capture_output=True, text=True).stdout
+        if "--stats-db" in help_text:
+            cmd += ["--stats-db", "off"]
         for attempt in range(3):
             self.log = open(self.log_path, "ab")
             self.log.write(f"\n=== {time.strftime('%H:%M:%S')} start: {' '.join(cmd)}\n".encode())

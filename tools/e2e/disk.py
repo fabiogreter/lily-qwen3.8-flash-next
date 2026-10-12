@@ -2,7 +2,7 @@
 """Disk-tier check against a lily server started with a small GPU cache, e.g.
 
     lily --model ... --bind 127.0.0.1:8123 --cache-bytes 700M --max-sessions 2 \
-         --disk-cache-dir /tmp/lily-sessions --disk-cache-bytes 20G
+         --disk-cache-dir /tmp/lily-sessions --disk-cache-bytes 20G --stats-db off
 
 (q8 K/V caches, the default; with `--kv-cache bf16` the server refuses a
 budget below 8 GiB.) Three conversations of ~1 000 prompt tokens each fill
