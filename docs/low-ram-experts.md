@@ -1068,7 +1068,8 @@ Two cache policies replayed against these predictions, neither kept
 ### What the predictors cost inside the server (2026-10-10)
 
 The predictors built into the decode and verify passes with their trained
-shapes and random weights (branch `predictor-cost-probe`, not merged;
+shapes and random weights (a throwaway patch against b6cb97e, kept
+outside the repository, never merged;
 `LILY_PRED_PROBE=bf16|lowrank|q4|q4-lowrank|q8|q8-lowrank`). Each cut
 model runs right after its layer, the token-start model after the final
 hidden state over every row of a pass. The top-20 ids reach the host on
