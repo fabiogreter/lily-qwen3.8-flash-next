@@ -172,7 +172,7 @@ empty and nothing else running.
 | decode 8K, 2 drafts | 109.9 (109.2 to 110.8), 67% accepted | 109.6 (108.9 to 110.5), 67% accepted |
 | decode 32K, 2 drafts | 89.9 (88.6 to 90.1), 52% accepted | 88.8 (88.4 to 89.1), 52% accepted |
 
-The 1K plain-decode gap is the window right after the load. The two
+The 1K gap is the window right after the load. The two
 commits emit the same tokens (equal digests) and `f8ff23e` is steadily
 about 36 ms slower in the 1K prefill and about 1.7 ms per decode step at
 1K, while at 8K, which starts decoding only after a 3 s prefill, there is
@@ -184,9 +184,12 @@ interleaved `13f7b54`, `f8ff23e`, `13f7b54`, `f8ff23e`) decode at 92.7 and
 94.9 tok/s on `13f7b54` against 95.1 and 94.8 on `f8ff23e`, and prefill
 spends 470 against 471 ms on the GPU: no difference once the load is
 behind. A request arriving right after the server became ready may pay it.
-The 1K cell with two drafts (116.3 against 100.6) was not rechecked
-settled; `spec.rs`, `model.rs` and `lily-bench`'s warm-up changed between
-the two commits, so that gap is not explained by this test.
+The same A/B with two drafts per step (the same five prompts, 256 tokens)
+decodes at 105.9 and 107.6 tok/s on `13f7b54` against 107.7 and 107.6 on
+`f8ff23e`, with the same 700 of 1 150 drafts accepted on every server and
+each prompt within about 1 tok/s across the four. So the matrix's 1K
+cells with drafts (116.3 against 100.6) are the same window, and
+`13f7b54`'s figures stand for both commits.
 
 ### The matrix of 2026-09-18
 
