@@ -227,12 +227,13 @@ prefill at 8K and 968 at 32K, decode 54.4 plain and 67.7 with two drafts
 left the draft head unloaded, 941 and 978 prefill, 51.4 and 49.9 plain.
 Without the ranking (uniform placement, n-gram table preloaded, the
 matrix tool's defaults) the same 8K cell decoded at 37.2 plain and 42.5
-with drafts. Details and disturbances: `docs/performance.md`, "Smaller
+with drafts, 9.8% of decode lookups missing against 2.1%. Details and disturbances: `docs/performance.md`, "Smaller
 machines".
 
 ### Live usage
 
-Measured the same way (60 GB balloon, `--memory-gb 64`, the shipped
+Measured like the first table of "Measured" (60 GB balloon,
+`--memory-gb 64`, an option since replaced by `LILY_MEMORY_GB`, the shipped
 ranking, `p4.txt`, the prompt with the highest decode miss rate of
 p3 to p5 under that ranking), 8K prompt and 1 024 decoded tokens, digests
 identical to the resident path in every row (cfce735e33882488), 0 stale

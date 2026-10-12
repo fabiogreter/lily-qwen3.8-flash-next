@@ -207,14 +207,14 @@ Moving experts around between RAM and disk does of course cost time. On a
 simulated 64 GB machine with the checkpoint's pages cold, an 8K prompt was
 measured at about 950 tok/s prefill and decode at about 54 tok/s plain and
 68 tok/s with speculative decoding, which runs in this mode as everywhere
-(against about 2 700 and 110 with everything resident, 2026-10-12). That
-assumes the shipped usage ranking: copy
-`tools/bench/expert-usage-qwen38-flash-next.json` next to the checkpoint as
-`expert-usage.json`. Without it the first run places experts uniformly and
-decodes at about 37 and 42 tok/s, until the server has saved the usage it
-measured. Note that in practice, performance
-may be worse, as there is additional RAM required to hold the session KV
-cache. If anyone wants to test with a real 64 GB machine, your feedback is
+(against about 2 700 tok/s prefill and 87 plain / 110 drafted decode with
+everything resident, in the same benchmark, 2026-10-12). That assumes the
+shipped usage ranking: copy `tools/bench/expert-usage-qwen38-flash-next.json`
+next to the checkpoint as `expert-usage.json`. Without it a first run
+places experts uniformly; measured that way (with the n-gram table also
+preloaded) it decoded at about 37 and 42 tok/s, until the server has saved
+the usage it measured. Note that in practice, performance may be worse,
+as there is additional RAM required to hold the session KV cache. If anyone wants to test with a real 64 GB machine, your feedback is
 welcome. Less than 64 GB is probably impractical.
 
 The cache sizes itself from physical memory, keeping 12 GB free for the

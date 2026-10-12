@@ -157,8 +157,8 @@ first tokens of `docs/bench/2026-10-01-expert-gemm/prompt-lily.txt`. The 60
 commits between them are mostly the expert cache for smaller machines, its
 prefetch research and replay tools, and the dashboard; on a machine that
 holds the checkpoint they were not meant to change a step, and at 8K and
-32K they do not. Right after a reboot, on mains power, swap empty, nothing
-else running.
+32K they do not. It ran first after a reboot, on mains power, with swap
+empty and nothing else running.
 
 | tok/s | `13f7b54` | `f8ff23e` |
 |---|---|---|
@@ -172,18 +172,21 @@ else running.
 | decode 8K, 2 drafts | 109.9 (109.2 to 110.8), 67% accepted | 109.6 (108.9 to 110.5), 67% accepted |
 | decode 32K, 2 drafts | 89.9 (88.6 to 90.1), 52% accepted | 88.8 (88.4 to 89.1), 52% accepted |
 
-**The 1K column measures the seconds after the load, not the engine.** The
-two commits emit the same tokens (equal digests) and `f8ff23e` is steadily
-about 36 ms slower in the 1K prefill and about 1.5 ms per decode step at
+The 1K plain-decode gap is the window right after the load. The two
+commits emit the same tokens (equal digests) and `f8ff23e` is steadily
+about 36 ms slower in the 1K prefill and about 1.7 ms per decode step at
 1K, while at 8K, which starts decoding only after a 3 s prefill, there is
 no difference. A 1K run is over within about 1.7 s of the load, and on
 `f8ff23e` something still runs in that window (not identified). Over HTTP,
-with each server idle for 120 s after it reported ready, the same 1K
-prompts (q4, plain decode, five fresh prompts per server, servers
+with each server idle for 120 s after it reported ready, 1K prompts
+(q4, plain decode, the same five fresh prompts on every server, servers
 interleaved `13f7b54`, `f8ff23e`, `13f7b54`, `f8ff23e`) decode at 92.7 and
 94.9 tok/s on `13f7b54` against 95.1 and 94.8 on `f8ff23e`, and prefill
 spends 470 against 471 ms on the GPU: no difference once the load is
 behind. A request arriving right after the server became ready may pay it.
+The 1K cell with two drafts (116.3 against 100.6) was not rechecked
+settled; `spec.rs`, `model.rs` and `lily-bench`'s warm-up changed between
+the two commits, so that gap is not explained by this test.
 
 ### The matrix of 2026-09-18
 
@@ -294,8 +297,11 @@ Same method as the series below: `tools/bench/http_bench.py matrix`, a
 fresh real-text prompt per run, 256 greedy tokens, three repeats, servers
 with `--max-seq 131072 --disk-cache-bytes 0 --stats-db off`, one server per
 checkpoint and draft count, run back to back (q4-xl with and without
-drafts, then q4) on one quiet machine after a reboot, swap empty. Prefill
-rows from the 2-draft servers. Medians of three, range in parentheses:
+drafts, then q4) after the two matrices of the same morning, on an
+otherwise quiet machine. Swap held 1.4 to 2.3 GB of 3 GB, left from the
+64 GB balloon run before it, and the background preload left 16.8 GB (q4)
+and 30.3 GB (q4-xl) of the 32 GB n-gram table resident on the 2-draft
+servers, all of it on the others. Prefill rows from the 2-draft servers. Medians of three, range in parentheses:
 
 | tok/s | 4K | 16K | 32K | 64K |
 |---|---:|---:|---:|---:|
@@ -307,19 +313,22 @@ rows from the 2-draft servers. Medians of three, range in parentheses:
 | decode q4, no drafts | 88.7 (88.0 to 89.4) | 88.0 (87.5 to 88.9) | 84.7 (84.2 to 85.0) | 83.2 (83.1 to 83.2) |
 
 Acceptance 64 % on both checkpoints. The servers without drafts prefill
-2 484 to 2 643 tok/s: they skip the n-gram table's cold pages (about 100
-ms a request) that the 2-draft servers read. One q4 4K prefill with drafts
+2 484 to 2 643 tok/s: they skip the n-gram table, whose cold pages cost
+the 2-draft servers about 100 ms a request, partly because of the
+incomplete preload. One q4 4K prefill with drafts
 ran at 1 720 tok/s and did not move the median.
 
-Against 2026-10-07, prefill is 3 to 16 % faster, decode with drafts level
-to 6 % faster, and q4-xl without drafts 10 to 13 % faster. The change
+Against 2026-10-07, prefill is 6 to 14 % faster, decode with drafts
+within -1 to +5 %, and decode without drafts 9 to 14 % faster on q4-xl
+and 0 to 8 % on q4. The change
 lies before `13f7b54`: the matrix above shows none at 8K and 32K between
 `13f7b54` and `f8ff23e`. The one engine change between the 2026-10-07
 builds (`a4a23d7`, `6d45554`) and `13f7b54` is the switch of the K/V
-caches from bf16 to q8 (`bbaaa61`), introduced as equally fast; the other
-difference is the machine, which on 2026-10-07 had a conversion and a
-build running during parts of the series and today had just been
-rebooted. How much each contributes was not measured.
+caches from bf16 to q8 (`0793330` to `bbaaa61`), introduced as equally
+fast (`docs/server.md`, "Memory"); the other difference is the machine,
+which on 2026-10-07 had a conversion and a build running during parts of
+the series and today ran after a reboot and two hours of matrices, with
+swap in use. How much each contributes was not measured.
 
 ### The README series, 2026-10-07 (q4 and q4-xl)
 
@@ -580,8 +589,8 @@ the checkpoint as they are routed to (`docs/low-ram-experts.md`).
 Last measured 2026-10-12, `f8ff23e` against `13f7b54`, q4, the 64 GB plan
 (`LILY_MEMORY_GB=64`, 16 246 of 24 576 experts resident), the checkpoint's
 pages cold under a 60 GiB locked balloon, the shipped ranking
-(`LILY_EXPERT_USAGE`), no n-gram preload, the real-text prompt of the
-matrix above, 256 tokens, interleaved per repeat, median of three, range
+(`LILY_EXPERT_USAGE`), no n-gram preload,
+`docs/bench/2026-10-01-expert-gemm/prompt-lily.txt`, 256 tokens, interleaved per repeat, median of three, range
 in parentheses:
 
 | tok/s | `13f7b54` | `f8ff23e` |
@@ -597,17 +606,20 @@ Prefill from the plain runs; with the draft head loaded the 8K prefill
 ran at 700 to 796 tok/s, the 32K one unchanged. Plain decode moved within
 the cold runs' noise; what changed is that drafts run under the cache by
 default since 2026-10-09, 24% more at 8K and 18% at 32K. `f8ff23e`'s first
-repeat was the slowest in all four of its cells, run right after
-`13f7b54`'s; swap held 1.2 GB from earlier server runs. The same series
+repeat, run right after `13f7b54`'s, was the slowest in three of its four
+decode cells (8K plain, 8K and 32K with drafts); swap held 1.2 GB from earlier server runs. The same series
 run through `tools/bench/timeline.sh` (which always preloads the n-gram
 table and sets no ranking, so the placement is uniform) measured 1 094
 tok/s prefill and 37.2 plain / 42.5 drafted decode at 8K on `f8ff23e`
-(30.6 plain on `13f7b54`): without the ranking a first run is slower, until
-the server has written the usage it measured.
+(30.6 plain on `13f7b54`), with 9.8% of decode lookups missing against
+2.1% ranked. Two things differ there, the placement and the preloaded
+table competing for the page cache; the miss rates point at the placement.
+A server preloads the table by default; without the ranking it starts as
+that run did, until it has written the usage it measured.
 
 Earlier measurements, with the reads cold under a 60 GB locked balloon,
-as on a 64 GB machine, on the 8K real-text prompt with 256 generated tokens, digests identical to
-the resident path: 929 tok/s prefill and 64.4 tok/s plain
+as on a 64 GB machine, on the 8K real-text prompt with 256 generated
+tokens, digests identical to the resident path: 929 tok/s prefill and 64.4 tok/s plain
 decode at commit `38d2642` (977 and 54.6 at `37cc34c` the day before; the
 cold runs' misses depend on what the page cache still holds), against 2 257 and
 87 with everything resident. Speculative decoding runs under the cache
