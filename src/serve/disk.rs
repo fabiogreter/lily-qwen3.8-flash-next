@@ -318,7 +318,11 @@ impl DiskStore {
             .filter(|e| now.saturating_sub(e.last_used) > max_age)
             .map(|e| e.id.clone())
             .collect();
+        let why = format!("unused for more than {:.1} days", max_age as f64 / 86_400.0);
         for id in stale {
+            if let Some(entry) = self.entries.iter().find(|e| e.id == id) {
+                eprintln!("{}", eviction_line(entry, &why));
+            }
             self.remove(&id);
         }
     }
@@ -657,8 +661,9 @@ impl DiskStore {
     }
 }
 
-/// The log line for an entry the disk tier deletes on its own (the budget or
-/// the durable limit), so a later miss on that prefix can be traced to it.
+/// The log line for an entry the disk tier deletes on its own (the maximum
+/// age, the budget or the durable limit), so a later miss on that prefix can
+/// be traced to it.
 fn eviction_line(entry: &DiskEntry, why: &str) -> String {
     format!(
         "session cache: evicted {} ({} tokens{}, {:.1} GB) from disk {why}",
