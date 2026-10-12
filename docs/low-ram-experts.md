@@ -218,6 +218,18 @@ stale reads; against 2 257 and 87 resident. Cold-run figures move with
 what the page cache still holds when the run starts. The initial fill of 45 GB takes about 20 s from the page
 cache and would take the SSD's 10 to 15 s cold.
 
+Remeasured 2026-10-12 at `f8ff23e` against `13f7b54` on
+`docs/bench/2026-10-01-expert-gemm/prompt-lily.txt`, q4, the 64 GB plan
+(16 246 slots), cold under the 60 GiB balloon, the shipped ranking, no
+n-gram preload, 256 tokens, interleaved, median of three: 949 tok/s
+prefill at 8K and 968 at 32K, decode 54.4 plain and 67.7 with two drafts
+(79% accepted) at 8K, 51.6 and 60.7 (56%) at 32K; `13f7b54`, whose cache
+left the draft head unloaded, 941 and 978 prefill, 51.4 and 49.9 plain.
+Without the ranking (uniform placement, n-gram table preloaded, the
+matrix tool's defaults) the same 8K cell decoded at 37.2 plain and 42.5
+with drafts. Details and disturbances: `docs/performance.md`, "Smaller
+machines".
+
 ### Live usage
 
 Measured the same way (60 GB balloon, `--memory-gb 64`, the shipped

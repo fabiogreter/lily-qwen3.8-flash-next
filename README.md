@@ -62,7 +62,7 @@ batching and the thinking controls: [docs/server.md](docs/server.md).
 
 M5 Max, 40-core GPU, 128 GB, over HTTP with real-text prompts (this
 repository's documentation and code), 256 greedy tokens of new text,
-medians of three repeats, 2026-10-07. oMLX's rows are its own published
+medians of three repeats, 2026-10-12. oMLX's rows are its own published
 numbers for its oQ4e conversion on an M5 Max 128 GB, from the chart in the
 [0.7.0 release notes](https://github.com/jundot/omlx/releases/tag/v0.7.0),
 not measured by us; the chart does not state its sampling or whether its
@@ -70,13 +70,13 @@ generation used MTP.
 
 | tokens per second | 4K context | 16K | 32K | 64K |
 |---|---:|---:|---:|---:|
-| **prefill** q4-xl | 2 219 | 2 370 | 2 373 | 2 180 |
-| prefill q4 | 2 158 | 2 208 | 2 240 | 2 205 |
+| **prefill** q4-xl | 2 413 | 2 510 | 2 519 | 2 449 |
+| prefill q4 | 2 410 | 2 511 | 2 524 | 2 468 |
 | prefill oMLX 0.7.0, published | 2 768 | 2 844 | | 2 366 |
-| **decode** q4-xl, 2 drafts | 101 | 101 | 94 | 94 |
-| decode q4, 2 drafts | 103 | 100 | 99 | 99 |
-| decode q4-xl, no drafts | 73 | 73 | 69 | 68 |
-| decode q4, no drafts | 87 | 82 | 85 | 79 |
+| **decode** q4-xl, 2 drafts | 100 | 103 | 98 | 98 |
+| decode q4, 2 drafts | 107 | 105 | 103 | 100 |
+| decode q4-xl, no drafts | 80 | 80 | 78 | 77 |
+| decode q4, no drafts | 89 | 88 | 85 | 83 |
 | generation oMLX 0.7.0, published | 93.0 | 87.1 | | 75.9 |
 
 A request decoding alone uses two drafts per step from the model's own
@@ -204,10 +204,15 @@ most, so the cache adapts to what you are doing. The cached configuration
 then gets saved to disk and reused on the next run.
 
 Moving experts around between RAM and disk does of course cost time. On a
-simulated 64 GB machine with the checkpoint's pages cold, prefill was measured
-at about 880 tok/s and decode at about 51 tok/s plain and 58 tok/s with
-speculative decoding, which runs in this mode as everywhere (against about
-2 600 and 118 with everything resident). Note that in practice, performance
+simulated 64 GB machine with the checkpoint's pages cold, an 8K prompt was
+measured at about 950 tok/s prefill and decode at about 54 tok/s plain and
+68 tok/s with speculative decoding, which runs in this mode as everywhere
+(against about 2 700 and 110 with everything resident, 2026-10-12). That
+assumes the shipped usage ranking: copy
+`tools/bench/expert-usage-qwen38-flash-next.json` next to the checkpoint as
+`expert-usage.json`. Without it the first run places experts uniformly and
+decodes at about 37 and 42 tok/s, until the server has saved the usage it
+measured. Note that in practice, performance
 may be worse, as there is additional RAM required to hold the session KV
 cache. If anyone wants to test with a real 64 GB machine, your feedback is
 welcome. Less than 64 GB is probably impractical.

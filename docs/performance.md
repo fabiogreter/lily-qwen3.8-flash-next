@@ -145,18 +145,54 @@ then says what assumption it rests on.
 ## The numbers
 
 The README's table is the headline: fresh real prompts over HTTP at 4K to
-64K, last measured 2026-10-07 for both checkpoints (below, "The README
-series, 2026-10-07"): prefill 2 158 to 2 373 tok/s, decode 94 to 103 tok/s
-with two drafts, 79 to 87 without on q4 and 68 to 73 on q4-xl. The
-2026-10-01 series that preceded it is kept below.
+64K, last measured 2026-10-12 for both checkpoints (below, "The README
+series, 2026-10-12"): prefill 2 410 to 2 524 tok/s, decode 98 to 107 tok/s
+with two drafts, 83 to 89 without on q4 and 77 to 80 on q4-xl. The
+2026-10-07 and 2026-10-01 series that preceded it are kept below.
 
-The fixed `lily-bench` matrix that follows was measured 2026-09-18 at
-commit `38d2642` against the commit before that day's kernel work
-(`37cc34c`), interleaved per repeat, median of three, range in
+The fixed `lily-bench` matrix was last measured 2026-10-12 at `f8ff23e`
+against `13f7b54`, the last pushed commit, interleaved per repeat with 20 s
+between runs, median of three, range in parentheses, q4, 96 tokens, on the
+first tokens of `docs/bench/2026-10-01-expert-gemm/prompt-lily.txt`. The 60
+commits between them are mostly the expert cache for smaller machines, its
+prefetch research and replay tools, and the dashboard; on a machine that
+holds the checkpoint they were not meant to change a step, and at 8K and
+32K they do not. Right after a reboot, on mains power, swap empty, nothing
+else running.
+
+| tok/s | `13f7b54` | `f8ff23e` |
+|---|---|---|
+| prefill 1K | 2 239 (2 237 to 2 240) | 2 074 (2 073 to 2 076) |
+| prefill 8K | 2 697 (2 696 to 2 701) | 2 711 (2 606 to 2 714) |
+| prefill 32K | 2 386 (2 378 to 2 414) | 2 379 (2 368 to 2 470) |
+| decode 1K, plain | 92.9 (90.3 to 93.7) | 80.3 (80.0 to 83.4) |
+| decode 8K, plain | 87.7 (84.7 to 89.3) | 87.2 (85.3 to 88.2) |
+| decode 32K, plain | 82.6 (82.2 to 85.5) | 82.7 (81.4 to 84.9) |
+| decode 1K, 2 drafts | 116.3 (116.1 to 116.5), 70% accepted | 100.6 (99.1 to 105.9), 70% accepted |
+| decode 8K, 2 drafts | 109.9 (109.2 to 110.8), 67% accepted | 109.6 (108.9 to 110.5), 67% accepted |
+| decode 32K, 2 drafts | 89.9 (88.6 to 90.1), 52% accepted | 88.8 (88.4 to 89.1), 52% accepted |
+
+**The 1K column measures the seconds after the load, not the engine.** The
+two commits emit the same tokens (equal digests) and `f8ff23e` is steadily
+about 36 ms slower in the 1K prefill and about 1.5 ms per decode step at
+1K, while at 8K, which starts decoding only after a 3 s prefill, there is
+no difference. A 1K run is over within about 1.7 s of the load, and on
+`f8ff23e` something still runs in that window (not identified). Over HTTP,
+with each server idle for 120 s after it reported ready, the same 1K
+prompts (q4, plain decode, five fresh prompts per server, servers
+interleaved `13f7b54`, `f8ff23e`, `13f7b54`, `f8ff23e`) decode at 92.7 and
+94.9 tok/s on `13f7b54` against 95.1 and 94.8 on `f8ff23e`, and prefill
+spends 470 against 471 ms on the GPU: no difference once the load is
+behind. A request arriving right after the server became ready may pay it.
+
+### The matrix of 2026-09-18
+
+Measured at commit `38d2642` against the commit before that day's kernel
+work (`37cc34c`), interleaved per repeat, median of three, range in
 parentheses, on the first tokens of one real-text prompt
-(`docs/bench/prompts/p0.txt`).
+(`docs/bench/prompts/p0.txt`, since removed).
 
-### Prefill, tok/s
+#### Prefill, tok/s
 
 | commit    | 1K prompt              | 8K prompt              | 32K prompt             |
 |-----------|------------------------|------------------------|------------------------|
@@ -167,7 +203,7 @@ parentheses, on the first tokens of one real-text prompt
 GEMM's last tiles at half and quarter height, and the sparse attention over
 gathered rows, all described below.
 
-### Decode without drafts, tok/s
+#### Decode without drafts, tok/s
 
 | commit    | 1K prompt           | 8K prompt           | 32K prompt          |
 |-----------|---------------------|---------------------|---------------------|
@@ -179,7 +215,7 @@ threads, the GDN state walk in register blocks, the split attention kernel's
 shorter latency chains and the four-simdgroup down gather are each a
 percent or less and grow with context.
 
-### Decode with 2 drafts per step, tok/s
+#### Decode with 2 drafts per step, tok/s
 
 | commit    | 1K prompt                          | 8K prompt                           | 32K prompt                         |
 |-----------|------------------------------------|-------------------------------------|------------------------------------|
@@ -251,6 +287,39 @@ bounds, and the 32K cells of the synthetic matrices were trajectory artifacts
 falling into a run of a repeated special token that the head predicts
 poorly). The kernels involved do not depend on position, and the 4-layer
 differential test of the speculative step at position 33 000 passes.
+
+### The README series, 2026-10-12 (`f8ff23e`)
+
+Same method as the series below: `tools/bench/http_bench.py matrix`, a
+fresh real-text prompt per run, 256 greedy tokens, three repeats, servers
+with `--max-seq 131072 --disk-cache-bytes 0 --stats-db off`, one server per
+checkpoint and draft count, run back to back (q4-xl with and without
+drafts, then q4) on one quiet machine after a reboot, swap empty. Prefill
+rows from the 2-draft servers. Medians of three, range in parentheses:
+
+| tok/s | 4K | 16K | 32K | 64K |
+|---|---:|---:|---:|---:|
+| prefill q4-xl | 2 413 (2 287 to 2 462) | 2 510 (2 499 to 2 528) | 2 519 (2 509 to 2 539) | 2 449 (2 448 to 2 457) |
+| prefill q4 | 2 410 (1 720 to 2 434) | 2 511 (2 470 to 2 536) | 2 524 (2 499 to 2 529) | 2 468 (2 441 to 2 476) |
+| decode q4-xl, 2 drafts | 99.7 (94.7 to 104.9) | 103.0 (100.9 to 103.4) | 97.5 (97.0 to 98.6) | 97.7 (97.3 to 102.6) |
+| decode q4, 2 drafts | 106.7 (105.6 to 110.9) | 105.1 (102.3 to 107.4) | 102.7 (100.4 to 111.4) | 100.4 (99.0 to 105.7) |
+| decode q4-xl, no drafts | 80.3 (80.3 to 81.1) | 79.6 (79.0 to 79.7) | 78.3 (77.1 to 78.5) | 76.8 (75.8 to 76.9) |
+| decode q4, no drafts | 88.7 (88.0 to 89.4) | 88.0 (87.5 to 88.9) | 84.7 (84.2 to 85.0) | 83.2 (83.1 to 83.2) |
+
+Acceptance 64 % on both checkpoints. The servers without drafts prefill
+2 484 to 2 643 tok/s: they skip the n-gram table's cold pages (about 100
+ms a request) that the 2-draft servers read. One q4 4K prefill with drafts
+ran at 1 720 tok/s and did not move the median.
+
+Against 2026-10-07, prefill is 3 to 16 % faster, decode with drafts level
+to 6 % faster, and q4-xl without drafts 10 to 13 % faster. The change
+lies before `13f7b54`: the matrix above shows none at 8K and 32K between
+`13f7b54` and `f8ff23e`. The one engine change between the 2026-10-07
+builds (`a4a23d7`, `6d45554`) and `13f7b54` is the switch of the K/V
+caches from bf16 to q8 (`bbaaa61`), introduced as equally fast; the other
+difference is the machine, which on 2026-10-07 had a conversion and a
+build running during parts of the series and today had just been
+rebooted. How much each contributes was not measured.
 
 ### The README series, 2026-10-07 (q4 and q4-xl)
 
@@ -506,9 +575,38 @@ drafting.
 
 On a machine whose memory cannot hold the checkpoint the engine keeps a
 usage-ranked share of the routed experts on the GPU and reads the rest from
-the checkpoint as they are routed to (`docs/low-ram-experts.md`). Measured
-with the reads cold under a 60 GB locked balloon, as on a 64 GB machine,
-on the 8K real-text prompt with 256 generated tokens, digests identical to
+the checkpoint as they are routed to (`docs/low-ram-experts.md`).
+
+Last measured 2026-10-12, `f8ff23e` against `13f7b54`, q4, the 64 GB plan
+(`LILY_MEMORY_GB=64`, 16 246 of 24 576 experts resident), the checkpoint's
+pages cold under a 60 GiB locked balloon, the shipped ranking
+(`LILY_EXPERT_USAGE`), no n-gram preload, the real-text prompt of the
+matrix above, 256 tokens, interleaved per repeat, median of three, range
+in parentheses:
+
+| tok/s | `13f7b54` | `f8ff23e` |
+|---|---|---|
+| prefill 8K | 941 (854 to 992) | 949 (765 to 1 038) |
+| prefill 32K | 978 (877 to 986) | 968 (937 to 1 001) |
+| decode 8K, plain | 51.4 (49.8 to 51.7) | 54.4 (44.0 to 56.3) |
+| decode 32K, plain | 49.9 (44.4 to 50.4) | 51.6 (50.2 to 53.0) |
+| decode 8K, 2 drafts | off by default | 67.7 (56.0 to 68.6), 79% accepted |
+| decode 32K, 2 drafts | off by default | 60.7 (54.1 to 62.0), 56% accepted |
+
+Prefill from the plain runs; with the draft head loaded the 8K prefill
+ran at 700 to 796 tok/s, the 32K one unchanged. Plain decode moved within
+the cold runs' noise; what changed is that drafts run under the cache by
+default since 2026-10-09, 24% more at 8K and 18% at 32K. `f8ff23e`'s first
+repeat was the slowest in all four of its cells, run right after
+`13f7b54`'s; swap held 1.2 GB from earlier server runs. The same series
+run through `tools/bench/timeline.sh` (which always preloads the n-gram
+table and sets no ranking, so the placement is uniform) measured 1 094
+tok/s prefill and 37.2 plain / 42.5 drafted decode at 8K on `f8ff23e`
+(30.6 plain on `13f7b54`): without the ranking a first run is slower, until
+the server has written the usage it measured.
+
+Earlier measurements, with the reads cold under a 60 GB locked balloon,
+as on a 64 GB machine, on the 8K real-text prompt with 256 generated tokens, digests identical to
 the resident path: 929 tok/s prefill and 64.4 tok/s plain
 decode at commit `38d2642` (977 and 54.6 at `37cc34c` the day before; the
 cold runs' misses depend on what the page cache still holds), against 2 257 and
