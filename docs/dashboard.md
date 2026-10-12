@@ -540,7 +540,14 @@ tok/s) and **machine cost** (load, memory pressure, watts).
   other two stay restart-only (§ 7.1).
 - The drop counter's place on the page (the channel holds 1 024 rows).
 
-**Before merge**: the verification still to do.
+**Before merge**: the verification still to do. Status 2026-10-12, after the
+rebase on main 7ca696c: items 1 and 2 done (668 lib tests with Metal, the
+`real_macmon` test; the service under launchd with the database at
+`~/Library/Application Support/lily/` 0700/0600 and the sampler running); 4
+done for dark and light; 5 done for the rebound `Host` (403), framing headers
+and cross-site writes (missing JSON type or a foreign `Origin`: 403); a
+spill on restart and the restore from disk keep lineage ids. Still open: 3,
+6, 7, 8, the non-loopback peer of 5.
 
 1. The Metal test suites (`serve::tests` against the GPU, the engine's) on
    the branch rebased on main.
