@@ -11,8 +11,8 @@
   "license": "Apache-2.0",
   "peerDependencies": {
     "@opencode/plugin": ">=2.0.0",
-    "@opentui/core": ">=0.5.8",
-    "@opentui/solid": ">=0.5.8",
+    "@opentui/core": ">=0.5.17",
+    "@opentui/solid": ">=0.5.17",
     "solid-js": ">=1.9.0"
   },
   "peerDependenciesMeta": {

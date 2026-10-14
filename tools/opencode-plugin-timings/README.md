@@ -63,11 +63,10 @@ know. Checked on a real turn under opencode 1.x: the stored message for it held
 
 ## Installing
 
-TUI (CLI) plugins are listed in **`~/.config/opencode/cli.json`**, not in
-`opencode.json`/`opencode.jsonc`. The `plugins` array in `opencode.jsonc` is
-the *server* plugin list: a module listed there is loaded for its server
-entrypoint and its `./tui` entrypoint is never reached, so the slot stays
-empty.
+The plugin has only a TUI entrypoint, so it belongs in
+**`~/.config/opencode/cli.json`**, the list for CLI-only packages. (opencode 2
+also loads the TUI side of a package listed in `opencode.json`/`opencode.jsonc`,
+so that works too; `cli.json` keeps it active against a remote server.)
 
 Add it to the `plugins` array of `~/.config/opencode/cli.json`, keeping what
 is already there:
@@ -80,8 +79,8 @@ is already there:
 }
 ```
 
-CLI configuration is global in opencode 2; there is no project-local
-equivalent of the old `<project>/.opencode/tui.json`.
+`cli.json` is global in opencode 2. For a single project, opencode also
+discovers local plugins as `<project>/.opencode/plugins/<name>/tui.ts(x)`.
 
 ## Configuring
 
@@ -106,9 +105,9 @@ Options go in the object form of the plugin entry in `cli.json`:
 ```
 
 The plugin is silent and invisible whenever it has nothing to say: a message
-from another provider is ignored without a request, and a server that is not
-there, is not lily, or does not answer `/v1/timings` leaves the slot empty. It
-is safe to leave installed in sessions that never touch lily.
+from another provider is ignored without a request to lily, and a server that
+is not there, is not lily, or does not answer `/v1/timings` leaves the slot
+empty. It is safe to leave installed in sessions that never touch lily.
 
 ## Developing
 
@@ -116,9 +115,10 @@ is safe to leave installed in sessions that never touch lily.
 node --test          # the formatting, the body guard and the settings
 ```
 
-opencode finds the entrypoint, `tui.tsx`, through the package's `./tui`
-export. The file must not be named `index`: opencode treats a package root
-`index.tsx` as a *server* entrypoint and chokes on the JSX there. It loads the
+opencode finds the TUI entrypoint by its file name, `tui.tsx` (the `./tui`
+export names the same file). It must not be named `index`: opencode resolves
+a plugin directory's `index` as the *server* entrypoint and chokes on the JSX
+there. It loads the
 file as TSX and applies the solid transform itself (`tsconfig.json` therefore
 keeps `"jsx": "preserve"`), and resolves `solid-js` to the runtime it already
 has; nothing needs to be installed or built.

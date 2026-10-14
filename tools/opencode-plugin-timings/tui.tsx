@@ -20,6 +20,7 @@
  * this plugin is loaded in sessions that have nothing to do with lily.
  */
 import { Plugin } from "@opencode/plugin/tui"
+import type { CliRenderer } from "@opentui/core"
 import { Show, createSignal } from "solid-js"
 
 import { type Aggregate, type Timings, accumulate, emptyAggregate, formatLine, newestEntry, setting } from "./format.ts"
@@ -52,8 +53,8 @@ type Reading = {
 }
 
 /** The terminal's width, from the renderer if it knows, else from stdout. */
-function terminalColumns(renderer: unknown): number {
-  const rendered = (renderer as { width?: number } | undefined)?.width
+function terminalColumns(renderer: CliRenderer | undefined): number {
+  const rendered = renderer?.width
   if (typeof rendered === "number" && rendered > 0) return rendered
   const columns = process.stdout?.columns
   return typeof columns === "number" && columns > 0 ? columns : FALLBACK_COLUMNS
@@ -108,7 +109,12 @@ export default Plugin.define({
         const { sessionID, assistantMessageID } = event.data
         let message = context.data.session.message.get(sessionID, assistantMessageID)
         if (!message) {
-          await context.data.session.message.sync(sessionID)
+          try {
+            await context.data.session.message.sync(sessionID)
+          } catch {
+            // Server restarting, session deleted mid-step: stay silent.
+            return
+          }
           message = context.data.session.message.get(sessionID, assistantMessageID)
         }
         // Unknown or someone else's provider: leave the slot to whatever it
@@ -121,8 +127,10 @@ export default Plugin.define({
 
     const unregisterSlot = context.ui.slot({
       append: "prompt.footer.status",
-      render: ({ sessionID }) => {
-        const reading = () => (sessionID ? readings().get(sessionID) : undefined)
+      // The input is reactive and the footer outlives a session switch, so
+      // `sessionID` is read inside the accessor, never destructured.
+      render: (input) => {
+        const reading = () => (input.sessionID ? readings().get(input.sessionID) : undefined)
         return (
           <Show when={reading()} fallback={<box flexShrink={0} />}>
             {(current) => (
