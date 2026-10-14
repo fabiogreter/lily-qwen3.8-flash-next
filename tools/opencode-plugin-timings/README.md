@@ -1,7 +1,7 @@
 # opencode TUI plugin: lily timings
 
 Shows what the last request actually cost and what the session has cost so
-far, to the right of the session prompt in [opencode](https://opencode.ai):
+far, in the status row of the prompt footer in [opencode](https://opencode.ai) 2:
 
 ```
 now pf 21.9k 365/s · dec 16 38.5/s · spec 100%  Σ 7 req · pf 1.1k/s · dec 98/s · cached 62% · spec 71%
@@ -38,8 +38,8 @@ never the mean of per-request rates, which would let a sixteen-token answer
 outweigh a two-thousand-token one.
 
 A rate is `—` when the server reported none, which happens when nothing was
-computed in that phase. The line is refreshed after every assistant message
-and stays on screen until the next one. The totals live in memory for the
+computed in that phase. The line is refreshed after every model step (one
+lily request) and stays on screen until the next one. The totals live in memory for the
 life of the process and are not written anywhere.
 
 In a narrow terminal the aggregate gives way first, in stages, and the latest
@@ -48,40 +48,40 @@ cannot reconstruct from the server log afterwards.
 
 ## Where the numbers come from
 
-`GET /v1/timings` on the lily server, read right after each assistant message
-completes; it returns the last 32 completed requests, newest first.
+`GET /v1/timings` on the lily server, read right after each model step
+(`session.step.ended`) whose assistant message belongs to the configured
+provider; it returns the last 32 completed requests, newest first.
 
 Not from the response itself, although lily also puts the same `timings`
 object next to `usage` in every response: nothing carries a custom response
-field to a plugin. opencode's `AssistantMessage` is a closed schema (`tokens`,
+field to a plugin. opencode's assistant message is a closed schema (`tokens`,
 `cost`, `finish`, `providerID`, …) with no free-form provider field, and the
 AI SDK's `@ai-sdk/openai-compatible` provider drops response keys it does not
-know. Checked on a real turn: the stored message for it held
+know. Checked on a real turn under opencode 1.x: the stored message for it held
 `"tokens":{"total":21950,"input":21934,"output":16,…}` and the string
 `timings` appeared in no row of opencode's database.
 
 ## Installing
 
-TUI plugins are listed in **`~/.config/opencode/tui.json`**, not in
-`opencode.json`/`opencode.jsonc`. The `plugin` array in `opencode.jsonc` (the
-one holding `opencode-pty`) is the *server* plugin list: a module listed there
-is loaded for its `server` entrypoint and its `tui` entrypoint is never
-reached, so the slot stays empty. Verified against opencode 1.18.31 with this
-plugin in both places.
+TUI (CLI) plugins are listed in **`~/.config/opencode/cli.json`**, not in
+`opencode.json`/`opencode.jsonc`. The `plugins` array in `opencode.jsonc` is
+the *server* plugin list: a module listed there is loaded for its server
+entrypoint and its `./tui` entrypoint is never reached, so the slot stays
+empty.
 
-Add it to the `plugin` array of `~/.config/opencode/tui.json`, keeping what is
-already there:
+Add it to the `plugins` array of `~/.config/opencode/cli.json`, keeping what
+is already there:
 
 ```json
 {
-  "plugin": [
-    "@jimicze-opencode/opencode-tps",
+  "plugins": [
     "file:///Users/you/projects/personal/local-llms/lily/tools/opencode-plugin-timings"
   ]
 }
 ```
 
-A project can do the same in its own `<project>/.opencode/tui.json`.
+CLI configuration is global in opencode 2; there is no project-local
+equivalent of the old `<project>/.opencode/tui.json`.
 
 ## Configuring
 
@@ -92,15 +92,15 @@ Both settings are optional; the defaults match a stock lily.
 | server base URL | `baseUrl` | `LILY_TIMINGS_BASE_URL` | `http://127.0.0.1:8000` |
 | opencode provider id whose messages the numbers belong to | `provider` | `LILY_TIMINGS_PROVIDER` | `lily` |
 
-Options go in the tuple form of the plugin entry:
+Options go in the object form of the plugin entry in `cli.json`:
 
 ```json
 {
-  "plugin": [
-    [
-      "file:///Users/you/projects/personal/local-llms/lily/tools/opencode-plugin-timings",
-      { "baseUrl": "http://127.0.0.1:8000", "provider": "lily" }
-    ]
+  "plugins": [
+    {
+      "package": "file:///Users/you/projects/personal/local-llms/lily/tools/opencode-plugin-timings",
+      "options": { "baseUrl": "http://127.0.0.1:8000", "provider": "lily" }
+    }
   ]
 }
 ```
@@ -116,7 +116,9 @@ is safe to leave installed in sessions that never touch lily.
 node --test          # the formatting, the body guard and the settings
 ```
 
-`index.tsx` is loaded as TSX by opencode, which applies the solid transform
-itself (`tsconfig.json` therefore keeps `"jsx": "preserve"`), and resolves
-`solid-js` to the runtime it already has; nothing needs to be installed or
-built.
+opencode finds the entrypoint, `tui.tsx`, through the package's `./tui`
+export. The file must not be named `index`: opencode treats a package root
+`index.tsx` as a *server* entrypoint and chokes on the JSX there. It loads the
+file as TSX and applies the solid transform itself (`tsconfig.json` therefore
+keeps `"jsx": "preserve"`), and resolves `solid-js` to the runtime it already
+has; nothing needs to be installed or built.

@@ -191,7 +191,7 @@ export function accumulate(aggregate: Aggregate, entry: TimingsEntry): Aggregate
       prefill_ms: previous.prefill_ms + t.prefill_ms,
       generated_tokens: previous.generated_tokens + t.generated_tokens,
       decode_ms: previous.decode_ms + t.decode_ms,
-      drafted_tokens: previous.drafted_tokens + (speculative ? t.drafted_tokens : 0),
+      drafted_tokens: previous.drafted_tokens + (speculative && isNumber(t.drafted_tokens) ? t.drafted_tokens : 0),
       accepted_tokens: previous.accepted_tokens + (speculative && isNumber(t.accepted_tokens) ? t.accepted_tokens : 0),
     },
   }

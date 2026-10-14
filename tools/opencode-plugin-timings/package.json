@@ -5,16 +5,20 @@
   "description": "opencode TUI plugin showing lily's own prefill, decode and speculation numbers",
   "type": "module",
   "exports": {
-    "./tui": "./index.tsx"
+    "./tui": "./tui.tsx"
   },
   "keywords": ["opencode", "opencode-plugin", "tui", "lily"],
   "license": "Apache-2.0",
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.17.0",
+    "@opencode/plugin": ">=2.0.0",
+    "@opentui/core": ">=0.5.8",
+    "@opentui/solid": ">=0.5.8",
     "solid-js": ">=1.9.0"
   },
   "peerDependenciesMeta": {
-    "@opencode-ai/plugin": { "optional": true },
+    "@opencode/plugin": { "optional": true },
+    "@opentui/core": { "optional": true },
+    "@opentui/solid": { "optional": true },
     "solid-js": { "optional": true }
   }
 }
