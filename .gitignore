@@ -7,6 +7,11 @@ Cargo.lock.bak
 tools/.venv/
 .venv/
 __pycache__/
+.mypy_cache/
+.ruff_cache/
+
+# JavaScript dependencies (dashboard/ also ignores its own).
+node_modules/
 
 # Full tensors behind the vision goldens (pixel_values, tower embeddings); the
 # committed JSON keeps their shape, sha256, statistics and a seeded sample.
@@ -29,8 +34,9 @@ docs/phase2-server-design.md
 docs/optimization-potential.md
 docs/continuous-batching-draft.md
 
-# Claude Code agent worktrees.
+# Claude Code agent worktrees and per-user settings.
 /.claude/worktrees/
+/.claude/settings.local.json
 
 # Recorded-session traces and what is derived from them (lily-trace-routing,
 # tools/bench/expert_predictor.py): token ids, routing, hidden states and
