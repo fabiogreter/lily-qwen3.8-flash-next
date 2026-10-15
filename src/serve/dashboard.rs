@@ -1144,10 +1144,10 @@ impl Dashboard {
                 gpu_w: round(s.reading.gpu_w, 100.0),
                 ane_w: round(s.reading.ane_w, 100.0),
                 sys_w: s.reading.sys_w.map(|w| round(w, 100.0)),
-                lily: s.reading.lily.map(|l| LilyPower {
-                    w: round(l.w(), 100.0),
-                    cpu_w: round(l.cpu_w, 100.0),
-                    gpu_w: round(l.gpu_w, 100.0),
+                lily: s.reading.lily.map(|l| {
+                    let (cpu_w, gpu_w) = (round(l.cpu_w, 100.0), round(l.gpu_w, 100.0));
+                    // The sum of the rounded parts, so the page's figures add up.
+                    LilyPower { w: round(cpu_w + gpu_w, 100.0), cpu_w, gpu_w }
                 }),
             }),
             // Both or none: the contract has no half a pair.

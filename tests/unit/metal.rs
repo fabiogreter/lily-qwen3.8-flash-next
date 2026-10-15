@@ -1617,11 +1617,24 @@ fn a_passs_busy_time_is_the_union_of_its_command_buffers_whatever_their_order() 
     // timestamps (never reported, or ending before they start).
     let spans =
         [(5.0, 6.0), (1.0, 2.0), (0.0, 0.0), (1.5, 3.0), (3.0, 3.5), (8.0, 7.0)];
-    assert_eq!(busy::pass_union(&spans), [(1.0, 3.5), (5.0, 6.0)]);
+    assert_eq!(busy::pass_union(&spans, NOW), [(1.0, 3.5), (5.0, 6.0)]);
     let mut reversed = spans;
     reversed.reverse();
-    assert_eq!(busy::pass_union(&reversed), busy::pass_union(&spans));
-    assert!(busy::pass_union(&[(f64::NAN, 1.0), (-1.0, 2.0), (0.0, 0.0)]).is_empty());
+    assert_eq!(busy::pass_union(&reversed, NOW), busy::pass_union(&spans, NOW));
+    assert!(
+        busy::pass_union(&[(f64::NAN, 1.0), (-1.0, 2.0), (0.0, 0.0)], NOW).is_empty()
+    );
+}
+
+/// The host time the pure busy tests run at, past every span they use.
+const NOW: f64 = 100.0;
+
+#[test]
+fn spans_no_command_buffer_can_have_are_not_counted() {
+    // Longer than a minute, and ending well after the handler's clock: either
+    // would move the recent set's newest end far ahead.
+    let spans = [(1.0, 62.0), (90.0, NOW + 1e12), (2.0, 2.5), (99.0, NOW + 0.5)];
+    assert_eq!(busy::pass_union(&spans, NOW), [(2.0, 2.5), (99.0, NOW + 0.5)]);
 }
 
 #[test]

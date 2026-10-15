@@ -216,14 +216,21 @@ pub mod profile {
 /// whose union reaches back past that horizon (its feedback completed more
 /// than that after an overlapping pass's) could be counted twice where they
 /// overlap. Passes on one queue run one after the other with an overlap of a
-/// command buffer at most, so that is not expected to happen.
+/// command buffer at most, so that is not expected to happen. The server
+/// has one context and so one queue; several contexts submitting at once in
+/// one process (tests, tools) would overlap more and are not what the count
+/// is for.
 ///
 /// **When it is counted.** A pass's time is booked when its last feedback
 /// arrives, not as it runs: a long prefill pass lands whole in the window its
 /// feedback completes in. A pass that never completes (a fault, a pass
 /// dropped before all its command buffers were committed) is not counted.
 /// Spans with no usable timestamps (not finite, not after 0, ending before
-/// they start) are left out.
+/// they start) are left out, and so are spans no command buffer can have:
+/// longer than [`MAX_SPAN_SECS`], or ending more than [`FUTURE_SLACK_SECS`]
+/// after the handler runs. One such span would otherwise move the set's
+/// newest end far ahead, and every later interval would be forgotten as soon
+/// as it is added, counting overlaps twice for the rest of the process.
 ///
 /// The cost on the feedback path (a vector per pass, a sort and a lock held
 /// for a merge into a set of about a second of intervals, on Metal's
@@ -235,6 +242,12 @@ pub mod busy {
     /// How far back from the newest end seen the set keeps intervals, in
     /// seconds.
     pub const HORIZON_SECS: f64 = 1.0;
+    /// The longest span one command buffer can plausibly have, in seconds
+    /// (lily's longest, a prefill chunk's, takes well under one).
+    pub const MAX_SPAN_SECS: f64 = 60.0;
+    /// How far past the handler's own clock a span may end, in seconds: the
+    /// feedback reports a buffer that has finished.
+    pub const FUTURE_SLACK_SECS: f64 = 1.0;
 
     /// The busy time counted so far, in nanoseconds.
     static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
@@ -242,13 +255,19 @@ pub mod busy {
 
     /// The union of a pass's command-buffer spans `(start, end)` in seconds,
     /// sorted and disjoint (touching spans merged); spans without usable
-    /// timestamps are dropped.
-    pub fn pass_union(spans: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    /// timestamps, or implausible at host time `now` (seconds, the clock of
+    /// [`super::host_secs`]), are dropped.
+    pub fn pass_union(spans: &[(f64, f64)], now: f64) -> Vec<(f64, f64)> {
         let mut valid: Vec<(f64, f64)> = spans
             .iter()
             .copied()
             .filter(|&(start, end)| {
-                start.is_finite() && end.is_finite() && start > 0.0 && end > start
+                start.is_finite()
+                    && end.is_finite()
+                    && start > 0.0
+                    && end > start
+                    && end - start <= MAX_SPAN_SECS
+                    && end <= now + FUTURE_SLACK_SECS
             })
             .collect();
         valid.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -311,14 +330,18 @@ pub mod busy {
 
     /// Counts a completed pass's command-buffer spans.
     pub(super) fn record(spans: &[(f64, f64)]) {
-        let union = pass_union(spans);
+        let union = pass_union(spans, super::host_secs());
         if union.is_empty() {
             return;
         }
         let added = RECENT.lock().unwrap_or_else(|e| e.into_inner()).add(&union);
         let ns = (added * 1e9).round();
         if ns >= 1.0 {
-            TOTAL_NS.fetch_add(ns as u64, Ordering::Relaxed);
+            // Saturating: a counter that wrapped would read as one that went
+            // backwards, and the sampler would drop that window's figure.
+            let _ = TOTAL_NS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
+                Some(t.saturating_add(ns as u64))
+            });
         }
     }
 
