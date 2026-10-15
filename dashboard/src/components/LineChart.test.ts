@@ -26,6 +26,7 @@ function pt(i: number, v: number | null): HistoryPoint {
     power_w: null,
     gpu_power_w: null,
     gpu_freq_mhz: null,
+    lily_power_w: null,
   };
 }
 

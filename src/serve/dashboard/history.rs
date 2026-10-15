@@ -29,7 +29,9 @@
 //! system power over the time the sampler covered, and its energy: the sum
 //! over the minutes of mean power times covered time, so a gap (the sampler
 //! off, failed or lily not running) adds nothing and is not filled in
-//! (`null` while nothing measures power).
+//! (`null` while nothing measures power). lily's own estimated power
+//! (`lily_power_w`, `lily_energy_wh`) is the same over the time that had a
+//! figure of it.
 
 use rusqlite::{Connection, params};
 
@@ -116,6 +118,13 @@ pub struct MachineRow {
     /// Of those, the milliseconds that had a system power: the weight of
     /// `power_w` and the time the energy is integrated over.
     pub sys_covered_ms: Option<u64>,
+    /// lily's own estimated power (CPU and GPU), its mean over
+    /// `lily_covered_ms`.
+    pub lily_power_w: Option<f64>,
+    /// Of `power_covered_ms`, the milliseconds that had a figure of lily's
+    /// own power: the weight of `lily_power_w` and the time lily's energy is
+    /// integrated over.
+    pub lily_covered_ms: Option<u64>,
 }
 
 /// The mean of the values present.
@@ -130,6 +139,10 @@ fn gpu_weight(m: &MachineRow) -> Option<u64> {
 
 fn sys_weight(m: &MachineRow) -> Option<u64> {
     m.sys_covered_ms
+}
+
+fn lily_weight(m: &MachineRow) -> Option<u64> {
+    m.lily_covered_ms
 }
 
 /// The mean of a sampler series over the time its windows covered: each
@@ -275,6 +288,8 @@ pub fn build(
                     .map(|v| round(v, 100.0)),
                 gpu_freq_mhz: weighted_mean(ms, |m| m.gpu_freq_mhz, gpu_weight)
                     .map(|v| round(v, 10.0)),
+                lily_power_w: weighted_mean(ms, |m| m.lily_power_w, lily_weight)
+                    .map(|v| round(v, 100.0)),
             }
         })
         .collect();
@@ -282,11 +297,17 @@ pub fn build(
     // The energy is each minute's mean power over the time the sampler
     // covered in it (watt-milliseconds), and the average power is the same
     // sum over the covered time: minutes it did not cover count for nothing.
-    let (covered_ms, watt_ms) = machines
-        .iter()
-        .flatten()
-        .filter_map(|m| m.power_w.zip(m.sys_covered_ms.filter(|&c| c > 0)))
-        .fold((0.0, 0.0), |(ms, sum), (w, c)| (ms + c as f64, sum + w * c as f64));
+    let integrate = |series: fn(&MachineRow) -> Option<f64>,
+                     weight: fn(&MachineRow) -> Option<u64>| {
+        machines
+            .iter()
+            .flatten()
+            .filter_map(|m| series(m).zip(weight(m).filter(|&c| c > 0)))
+            .fold((0.0, 0.0), |(ms, sum), (w, c)| (ms + c as f64, sum + w * c as f64))
+    };
+    let (covered_ms, watt_ms) = integrate(|m| m.power_w, sys_weight);
+    // lily's own the same way, over the time that had a figure of it.
+    let (lily_ms, lily_watt_ms) = integrate(|m| m.lily_power_w, lily_weight);
     let wall_ms = grid.data_end.saturating_sub(grid.start).max(1) as f64;
     let summary = HistorySummary {
         decode: Rate {
@@ -305,6 +326,7 @@ pub fn build(
         acceptance: ratio(all.accepted_tokens, all.drafted_tokens),
         power_avg_w: (covered_ms > 0.0).then(|| round(watt_ms / covered_ms, 100.0)),
         energy_wh: (covered_ms > 0.0).then(|| round(watt_ms / 3_600_000.0, 1e3)),
+        lily_energy_wh: (lily_ms > 0.0).then(|| round(lily_watt_ms / 3_600_000.0, 1e3)),
     };
     History { range, step_s: grid.step / 1000, points, summary }
 }
@@ -374,7 +396,7 @@ pub fn machine(
     let mut select = conn.prepare_cached(
         "SELECT minute, cpu_load_mean, memory_pressure, swap_bytes_max, gpu_active_mean,
                 power_w_mean, gpu_power_w_mean, gpu_freq_mhz_mean, power_covered_ms,
-                sys_covered_ms
+                sys_covered_ms, lily_w_mean, lily_covered_ms
          FROM machine WHERE minute >= ?1 AND minute < ?2",
     )?;
     select
@@ -390,6 +412,8 @@ pub fn machine(
                 gpu_freq_mhz: r.get(7)?,
                 power_covered_ms: r.get(8)?,
                 sys_covered_ms: r.get(9)?,
+                lily_power_w: r.get(10)?,
+                lily_covered_ms: r.get(11)?,
             })
         })?
         .collect()

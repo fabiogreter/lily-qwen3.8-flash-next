@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use super::*;
 use crate::serve::dashboard::contract::{DiskTier, GpuTier, Range};
 use crate::serve::dashboard::history;
-use crate::serve::machine::Machine;
+use crate::serve::machine::{LilyPower, Machine};
 use crate::serve::session::Lineage;
 
 /// A fresh directory under `$TMPDIR` for one test.
@@ -924,7 +924,7 @@ fn a_v1_database_gains_the_sampler_columns_and_keeps_its_rows() {
     }
     let (conn, aside) = open(&path, 5).expect("migrates");
     assert_eq!(aside, None);
-    assert_eq!(pragma(&conn, "user_version"), 2);
+    assert_eq!(pragma(&conn, "user_version"), SCHEMA_VERSION);
     let mut w = Writer::new(conn, Some(path.clone()), Arc::default(), 0);
     let old = power_columns(&w, M).expect("the old row is kept");
     assert_eq!((old.samples, old.covered_ms, old.sys_w.1), (6, None, None));
@@ -1489,6 +1489,90 @@ fn a_window_without_system_power_covers_the_gpu_series_but_not_the_energy() {
     assert_eq!((row.covered_ms, row.sys_covered_ms), (Some(40_000), Some(10_000)));
     assert!(close(row.sys_w.1, 50.0), "{row:?}");
     assert!(close(row.gpu_w, (8.0 * 30.0 + 12.5 * 10.0) / 40.0), "{row:?}");
+}
+
+/// [`window`] with lily's own power at `lily_w` (`None`: no figure).
+fn window_with_lily(start_ms: u64, end_ms: u64, lily_w: Option<f64>) -> Sample {
+    let mut s = window(start_ms, end_ms, 20.0);
+    s.reading.lily = lily_w.map(|w| LilyPower { cpu_w: w / 4.0, gpu_w: w - w / 4.0 });
+    s
+}
+
+fn lily_columns(w: &Writer, minute: u64) -> (Option<u64>, Option<f64>) {
+    w.connection()
+        .query_row(
+            "SELECT lily_covered_ms, lily_w_mean FROM machine WHERE minute = ?1",
+            [minute],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+}
+
+#[test]
+fn lilys_power_has_a_coverage_of_its_own_and_merges_like_system_power() {
+    // 20 s at 4 W, 20 s with no figure of lily's, 20 s at 10 W.
+    let parts = spread(&[
+        window_with_lily(T0, T0 + 20_000, Some(4.0)),
+        window_with_lily(T0 + 20_000, T0 + 40_000, None),
+        window_with_lily(T0 + 40_000, T0 + 60_000, Some(10.0)),
+    ]);
+    let p = parts[&M];
+    assert_eq!((p.covered_ms, p.sys_ms, p.lily_ms), (60_000, 60_000, 40_000));
+    assert!(close(p.lily_w_mean(), 7.0), "over the time that had it: {p:?}");
+    assert!(close(p.lily_energy_wh(), 7.0 * 40.0 / 3600.0));
+    assert_eq!(PowerMinute::default().lily_energy_wh(), None);
+
+    // Stored in two parts, as two ticks (or two processes) would.
+    let mut w = writer();
+    let first = spread(&[window_with_lily(T0, T0 + 30_000, Some(4.0))]);
+    assert!(w.power(M, &first[&M]));
+    assert_eq!(lily_columns(&w, M), (Some(30_000), Some(4.0)));
+    let second = spread(&[
+        window_with_lily(T0 + 30_000, T0 + 40_000, None),
+        window_with_lily(T0 + 40_000, T0 + 50_000, Some(10.0)),
+    ]);
+    assert!(w.power(M, &second[&M]));
+    let (ms, mean) = lily_columns(&w, M);
+    assert_eq!(ms, Some(40_000));
+    assert!(close(mean, (4.0 * 30.0 + 10.0 * 10.0) / 40.0), "{mean:?}");
+    assert_eq!(power_columns(&w, M).expect("row").covered_ms, Some(50_000));
+    // A minute with no figure of lily's at all stores none, not 0 W.
+    assert!(
+        w.power(M + 1, &spread(&[window(T0 + 60_000, T0 + 70_000, 5.0)])[&(M + 1)])
+    );
+    assert_eq!(lily_columns(&w, M + 1), (Some(0), None));
+}
+
+#[test]
+fn a_v2_database_gains_the_lily_columns_and_its_rows_have_no_lily_series() {
+    let root = temp_root("v2");
+    let path = root.join("lily.sqlite");
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(&format!(
+            "INSERT INTO machine (minute, samples, power_covered_ms, sys_covered_ms,
+                 power_w_mean, gpu_power_w_mean, gpu_active_mean, gpu_freq_mhz_mean)
+             VALUES ({M}, 6, 30000, 30000, 20.0, 5.0, 0.2, 200.0);
+             PRAGMA user_version = 2;"
+        ))
+        .unwrap();
+    }
+    let (conn, aside) = open(&path, 5).expect("migrates");
+    assert_eq!(aside, None);
+    assert_eq!(pragma(&conn, "user_version"), 3);
+    let mut w = Writer::new(conn, Some(path.clone()), Arc::default(), 0);
+    assert_eq!(lily_columns(&w, M), (None, None), "an old row has no lily series");
+    // lily's power merges into the old row; the old covered time has none.
+    let part = spread(&[window_with_lily(T0 + 30_000, T0 + 60_000, Some(8.0))]);
+    assert!(w.power(M, &part[&M]));
+    assert_eq!(lily_columns(&w, M), (Some(30_000), Some(8.0)));
+    let row = power_columns(&w, M).expect("row");
+    assert_eq!((row.covered_ms, row.samples), (Some(60_000), 6));
+    assert!(close(row.sys_w.1, 20.0));
+    drop(w);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]

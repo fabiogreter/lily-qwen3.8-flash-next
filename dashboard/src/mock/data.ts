@@ -102,6 +102,7 @@ function emptyPoint(t: number): HistoryPoint {
     power_w: null,
     gpu_power_w: null,
     gpu_freq_mhz: null,
+    lily_power_w: null,
   };
 }
 
@@ -140,6 +141,7 @@ function point(t: number, seed: number, stepMs: number): HistoryPoint {
     power_w: round1(busy ? 18 + a * 62 + r() * 6 : 7 + r() * 3),
     gpu_power_w: round1(busy ? 8 + a * 44 + r() * 4 : 0.4 + r()),
     gpu_freq_mhz: busy ? Math.round(1240 + a * 380) : 340,
+    lily_power_w: round1(busy ? 4 + a * 42 + r() * 3 : 0.2 + r() * 0.2),
   };
 }
 
@@ -168,6 +170,8 @@ export function summarize(points: HistoryPoint[], lastCoveredMs?: number): Histo
   const busyMs = points.reduce((s, p, i) => s + p.busy_share * covered(i), 0);
   const withPower = points.filter((p) => p.power_w != null);
   const powerSum = withPower.reduce((s, p) => s + (p.power_w ?? 0), 0);
+  const withLily = points.filter((p) => p.lily_power_w != null);
+  const lilySum = withLily.reduce((s, p) => s + (p.lily_power_w ?? 0), 0);
   return {
     decode: { avg: wavg('decode_tps_avg', 1), max: max('decode_tps_max') },
     prefill: { avg: wavg('prefill_tps_avg', 1), max: max('prefill_tps_max') },
@@ -179,6 +183,7 @@ export function summarize(points: HistoryPoint[], lastCoveredMs?: number): Histo
     acceptance: wavg('acceptance', 3),
     power_avg_w: withPower.length ? round1(powerSum / withPower.length) : null,
     energy_wh: withPower.length ? round1((powerSum * stepMs) / 3600e3) : null,
+    lily_energy_wh: withLily.length ? round1((lilySum * stepMs) / 3600e3) : null,
   };
 }
 
@@ -270,6 +275,7 @@ export function buildSessionHistory(sessions: Session[], lineage: number, range:
     p.power_w = null;
     p.gpu_power_w = null;
     p.gpu_freq_mhz = null;
+    p.lily_power_w = null;
   }
   const covered = grid(range, now).lastCovered;
   const base = summarize(h.points, covered);

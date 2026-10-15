@@ -151,9 +151,15 @@ was off or failed, lily was not running, a stall) or that had no system power
 adds nothing and is never filled in, so `summary.energy_wh` is what the machine
 used while it was being measured, not an extrapolation over the range, and
 `power_avg_w` is the mean over the same time. Both are `null` while no minute
-has a system power. The database is at schema 2 (`power_covered_ms`,
-`sys_covered_ms` and the temperature columns are added to a v1 database when it
-is opened).
+has a system power. lily's own estimated power is kept the same way, one
+series with a coverage of its own (`lily_w_mean`, `lily_covered_ms`): the
+buckets' `lily_power_w` and the summary's `lily_energy_wh`, `null` where no
+reading had a figure. The database is at schema 3 (`power_covered_ms`,
+`sys_covered_ms` and the temperature columns are added to a v1 database, the
+two lily columns to a v1 or v2 one, when it is opened). A lily from before
+schema 3 refuses a v3 database as newer and runs with history off (the file
+untouched): rolling the service back to such a binary stops the history until
+a schema-3 lily runs again.
 
 ### Runtime settings
 

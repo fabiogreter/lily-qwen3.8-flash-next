@@ -220,7 +220,7 @@ As built (phase 3):
 | `requests` | one per finished request: time, lineage id, prompt/cached/prefill/generated tokens, prefill/decode ms and rates, drafted/accepted, queue ms, batch size, cancelled, pinned, forced thinking close | 7 d |
 | `minute` | one per minute: per-series sum, count, max, busy ms (§ 5) | 7 d |
 | `minute_session` | one per minute and lineage id active in it: tokens, busy ms, max rate | 7 d |
-| `machine` | one per minute: load, memory pressure, swap (min/mean/max); from the sampler: system power (min/mean/max), GPU power, activity and frequency, hottest temperatures, covered milliseconds (§ 6) | 7 d |
+| `machine` | one per minute: load, memory pressure, swap (min/mean/max); from the sampler: system power (min/mean/max), GPU power, activity and frequency, hottest temperatures, covered milliseconds, lily's own estimated power and its covered milliseconds (§ 6) | 7 d |
 | `tiers` | one per minute: bytes and entries per cache tier | 7 d |
 | `settings` | one per overridden setting: name, JSON value, changed at | until reset |
 | `settings_log` | every change: time, name, old, new, source (`dashboard`, `startup`) | 7 d (open item, § 10) |
@@ -400,7 +400,7 @@ taken outside the sandbox by the owner: `Sampler::new()` about 0.7 s,
   sampler's). From `macmon`: `cpu_power`, `gpu_power`, `ane_power`, `sys_power`,
   `gpu_active_ratio`, `gpu_freq_mhz` and the two average temperatures (`temp_c`
   needs both).
-- **Recorder** (schema 2): every reading goes to a bounded queue the recorder
+- **Recorder** (schema 3): every reading goes to a bounded queue the recorder
   drains on its 10 s tick (60 s while quiet). A reading carries its window, the monotonic time
   since the previous call placed by the wall clock at its end, so a clock that
   jumps moves a window and never stretches it. The recorder spreads it over the
@@ -412,7 +412,18 @@ taken outside the sandbox by the owner: `Sampler::new()` about 0.7 s,
   covered time (system power by `sys_covered_ms`, the GPU series by
   `power_covered_ms`), a bucket's `energy_wh` is the sum of mean system power
   times `sys_covered_ms`, `power_avg_w` the mean over the same time, and a minute
-  without coverage adds nothing and is not filled in.
+  without coverage adds nothing and is not filled in. **lily's own power** is
+  one series (CPU and GPU together, `lily_w_mean`) with a coverage of its own
+  (`lily_covered_ms`, a reading can have the machine's figures and none of
+  lily's), merged the same way: a bucket's `lily_power_w` is weighted by it
+  and the summary's `lily_energy_wh` integrates over it, `null` where no
+  reading had a figure. Schema 3 adds those two columns; rows from before
+  have them `NULL` and no lily series. **A downgrade turns history off**: a
+  lily built before schema 3 (main's binary before this change) refuses a v3
+  database as newer (`recorder: failed`, "has schema 3, this lily knows 2:
+  history off") and leaves it untouched, so a service rolled back to such a
+  binary records nothing until it runs a schema-3 lily again (or the
+  database is moved aside).
 - **Idle wake-up budget** (also in [server.md](server.md), "Idle wake-ups"):
 
   | state | sampler | recorder |

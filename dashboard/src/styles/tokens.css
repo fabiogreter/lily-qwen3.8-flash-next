@@ -15,6 +15,7 @@
   --ai-wash: rgba(38, 74, 122, 0.08);
   --s1: #2a2723; /* series 1: sumi ink */
   --s2: #4f74ad; /* series 2: indigo, lighter step for lines */
+  --s3: #3f7a6f; /* series 3: verdigris, lily's own share */
   --s1-wash: rgba(42, 39, 35, 0.08);
   --good: #4f7a47;
   --warn: #9a7424;
@@ -51,6 +52,7 @@
     --ai-wash: rgba(142, 170, 219, 0.1);
     --s1: #e8e0d0;
     --s2: #86a6db;
+  --s3: #7fbfb1;
     --s1-wash: rgba(232, 224, 208, 0.08);
     --good: #8fb585;
     --warn: #d4b062;
@@ -79,6 +81,7 @@
   --ai-wash: rgba(142, 170, 219, 0.1);
   --s1: #e8e0d0;
   --s2: #86a6db;
+  --s3: #7fbfb1;
   --s1-wash: rgba(232, 224, 208, 0.08);
   --good: #8fb585;
   --warn: #d4b062;

@@ -250,6 +250,53 @@ fn power_is_weighted_by_the_time_the_sampler_covered_and_gaps_add_no_energy() {
 }
 
 #[test]
+fn lilys_power_is_weighted_by_its_own_coverage_and_integrates_into_its_energy() {
+    let first = (EDGE - 900_000) / MIN;
+    let machine = [
+        MachineRow {
+            minute: first,
+            power_w: Some(60.0),
+            power_covered_ms: Some(60_000),
+            sys_covered_ms: Some(60_000),
+            lily_power_w: Some(40.0),
+            lily_covered_ms: Some(60_000),
+            ..MachineRow::default()
+        },
+        // Half a minute with a figure of lily's own (the other half had
+        // none), and a minute from before lily's series was recorded.
+        MachineRow {
+            minute: first + 1,
+            power_w: Some(30.0),
+            power_covered_ms: Some(60_000),
+            sys_covered_ms: Some(60_000),
+            lily_power_w: Some(10.0),
+            lily_covered_ms: Some(30_000),
+            ..MachineRow::default()
+        },
+        MachineRow {
+            minute: first + 2,
+            power_w: Some(30.0),
+            power_covered_ms: Some(60_000),
+            sys_covered_ms: Some(60_000),
+            ..MachineRow::default()
+        },
+    ];
+    let h = build(Range::Day, EDGE, &[], Some(&machine), &[]);
+    let p = h.points.last().unwrap();
+    // (40 W x 60 s + 10 W x 30 s) / 90 s = 30 W.
+    assert_eq!(p.lily_power_w, Some(30.0));
+    // 2 400 J + 300 J over the 90 s that had a figure: 0.75 Wh.
+    assert_eq!(h.summary.lily_energy_wh, Some(0.75));
+    assert_eq!(h.summary.energy_wh, Some(2.0), "the machine's is unchanged");
+    // No figure of lily's in any minute: null, not 0.
+    let h = build(Range::Day, EDGE, &[], Some(&machine[2..]), &[]);
+    assert_eq!(
+        (h.points.last().unwrap().lily_power_w, h.summary.lily_energy_wh),
+        (None, None)
+    );
+}
+
+#[test]
 fn queue_times_are_the_median_by_rank_and_the_longest_of_the_bucket() {
     let t = EDGE - 30_000;
     let queue = [(t, 4.0), (t, 1.0), (t, 100.0), (t, 2.0), (EDGE, 999.0)];

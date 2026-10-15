@@ -272,6 +272,8 @@ export interface HistoryPoint {
   power_w: number | null;
   gpu_power_w: number | null;
   gpu_freq_mhz: number | null;
+  /** lily's own estimated CPU+GPU power, watts (see `LilyPower`); null where no reading had a figure of it. */
+  lily_power_w: number | null;
 }
 
 export interface Rate {
@@ -295,6 +297,8 @@ export interface HistorySummary {
   power_avg_w: number | null;
   /** Energy over the interval, watt-hours; null when unavailable. */
   energy_wh: number | null;
+  /** lily's own estimated energy over the time that had a figure of it, watt-hours; null without one. */
+  lily_energy_wh: number | null;
 }
 
 export interface History {

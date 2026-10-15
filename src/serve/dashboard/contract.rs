@@ -285,6 +285,8 @@ pub struct HistoryPoint {
     pub power_w: Option<f64>,
     pub gpu_power_w: Option<f64>,
     pub gpu_freq_mhz: Option<f64>,
+    /// lily's own estimated CPU+GPU power (docs/dashboard.md § 6).
+    pub lily_power_w: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -305,6 +307,8 @@ pub struct HistorySummary {
     pub acceptance: Option<f64>,
     pub power_avg_w: Option<f64>,
     pub energy_wh: Option<f64>,
+    /// lily's own estimated energy over the time that had a figure of it.
+    pub lily_energy_wh: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

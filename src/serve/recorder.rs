@@ -72,11 +72,12 @@
 //! the recorder spreads it over the minutes it overlaps ([`spread`]) and
 //! merges each part into that minute's row ([`Writer::power`]): means weighted
 //! by the milliseconds covered, the least and most of the windows, the hottest
-//! temperatures and `power_covered_ms`. Parts of a minute arriving on
-//! different ticks, or in a later process, add up; the machine's own samples
-//! ([`Writer::machine`]) write their columns of the same row and leave these
-//! alone. History turns them into series and an energy that counts the
-//! covered time only (`dashboard::history`).
+//! temperatures and `power_covered_ms`, and lily's own estimated power with a
+//! coverage of its own (`lily_covered_ms`), as a reading can lack it. Parts of
+//! a minute arriving on different ticks, or in a later process, add up; the
+//! machine's own samples ([`Writer::machine`]) write their columns of the same
+//! row and leave these alone. History turns them into series and an energy
+//! that counts the covered time only (`dashboard::history`).
 //!
 //! **A broken probe never breaks serving** (§ 2.4). A file that is not a
 //! database or fails `quick_check` is renamed aside (`<path>.corrupt-<unix
@@ -135,7 +136,7 @@ use crate::stats::CpuTicks;
 
 /// The schema this lily writes (`PRAGMA user_version`). Migrations only go
 /// forward; a database with a larger version is left alone.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 /// How long everything is kept.
 pub const RETENTION_MS: u64 = 7 * 86_400_000;
 /// Kept on top of [`RETENTION_MS`], pruned at the hour: the 7d range's
@@ -178,7 +179,7 @@ pub const SETTINGS_WAIT: Duration = Duration::from_secs(3);
 pub const SETTINGS_LOG_LIMIT: usize = 500;
 
 /// The forward-only migrations: `MIGRATIONS[v]` takes version `v` to `v + 1`.
-const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [SCHEMA_V1, SCHEMA_V2];
+const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3];
 
 /// Times are unix milliseconds (`t`, `*_t`) or unix minutes (`minute`, unix
 /// milliseconds / 60 000); tokens in the rollups are fractional, a request's
@@ -301,6 +302,17 @@ ALTER TABLE machine ADD COLUMN power_covered_ms INTEGER;
 ALTER TABLE machine ADD COLUMN sys_covered_ms INTEGER;
 ALTER TABLE machine ADD COLUMN cpu_temp_c_max REAL;
 ALTER TABLE machine ADD COLUMN gpu_temp_c_max REAL;
+";
+
+/// lily's own estimated power (§ 6, `serve::machine::attribute`): its mean
+/// over the milliseconds of the minute that had a figure (`lily_covered_ms`,
+/// never more than `power_covered_ms`: a reading can have the machine's
+/// figures and none of lily's). One series, CPU and GPU together. Rows from
+/// before have both `NULL`. A lily before this schema refuses a v3 database
+/// and runs with history off (a newer schema is never touched).
+const SCHEMA_V3: &str = "
+ALTER TABLE machine ADD COLUMN lily_w_mean REAL;
+ALTER TABLE machine ADD COLUMN lily_covered_ms INTEGER;
 ";
 
 /// The tables pruning trims and the column that dates their rows (`true`:
@@ -1273,7 +1285,10 @@ pub struct PowerMinute {
     pub covered_ms: u64,
     /// Of those, the milliseconds that had a system power.
     pub sys_ms: u64,
+    /// Of those, the milliseconds that had a figure of lily's own power.
+    pub lily_ms: u64,
     sys_w: Weighted,
+    lily_w: Weighted,
     gpu_w: Weighted,
     gpu_active: Weighted,
     gpu_freq_mhz: Weighted,
@@ -1302,6 +1317,12 @@ impl PowerMinute {
             self.sys_ms += sys;
             self.sys_w.add(w, sys, first);
         }
+        if let Some(lily) = r.lily {
+            let part = ms.min(MINUTE_MS.saturating_sub(self.lily_ms));
+            let first = self.lily_ms == 0;
+            self.lily_ms += part;
+            self.lily_w.add(lily.w(), part, first);
+        }
     }
 
     /// Takes in `other`, another part of the same minute; what does not fit
@@ -1323,6 +1344,12 @@ impl PowerMinute {
             let first = self.sys_ms == 0;
             self.sys_ms += (other.sys_ms as f64 * fit) as u64;
             self.sys_w.merge(&other.sys_w, fit, first);
+        }
+        if other.lily_ms > 0 {
+            let fit = room(self.lily_ms, other.lily_ms);
+            let first = self.lily_ms == 0;
+            self.lily_ms += (other.lily_ms as f64 * fit) as u64;
+            self.lily_w.merge(&other.lily_w, fit, first);
         }
     }
 
@@ -1369,6 +1396,17 @@ impl PowerMinute {
         self.sys_w_mean().map(|w| w * self.sys_ms as f64 / 3_600_000.0)
     }
 
+    /// lily's mean estimated power over the time that had a figure of it.
+    pub fn lily_w_mean(&self) -> Option<f64> {
+        (self.lily_ms > 0).then(|| self.lily_w.sum / self.lily_ms as f64)
+    }
+
+    /// lily's estimated energy over the time that had a figure of it, in
+    /// watt-hours.
+    pub fn lily_energy_wh(&self) -> Option<f64> {
+        self.lily_w_mean().map(|w| w * self.lily_ms as f64 / 3_600_000.0)
+    }
+
     /// The minute as its stored row says it (`None` for a row without
     /// sampler figures: a v1 row, or a minute with only the machine's own
     /// samples). The gpu power's and activity's least and most are not stored
@@ -1393,10 +1431,18 @@ impl PowerMinute {
         } else {
             None
         };
+        let lily_ms = row.lily_covered_ms.unwrap_or(0).min(covered_ms);
+        let lily_w = if lily_ms > 0 {
+            series(row.lily_w_mean, None, None, lily_ms)
+        } else {
+            None
+        };
         Some(Self {
             covered_ms,
             sys_ms: if sys_w.is_some() { sys_ms } else { 0 },
+            lily_ms: if lily_w.is_some() { lily_ms } else { 0 },
             sys_w: sys_w.unwrap_or_default(),
+            lily_w: lily_w.unwrap_or_default(),
             gpu_w: series(row.gpu_w_mean, None, None, covered_ms)?,
             gpu_active: series(row.gpu_active_mean, None, None, covered_ms)?,
             gpu_freq_mhz: series(
@@ -1426,6 +1472,8 @@ struct StoredPower {
     gpu_freq_mhz_max: Option<f64>,
     cpu_temp_max: Option<f64>,
     gpu_temp_max: Option<f64>,
+    lily_covered_ms: Option<u64>,
+    lily_w_mean: Option<f64>,
 }
 
 /// The longest window [`spread`] takes at its word: the sampler's own are
@@ -1661,7 +1709,7 @@ impl Writer {
             "SELECT power_covered_ms, power_w_min, power_w_mean, power_w_max,
                     gpu_power_w_mean, gpu_active_mean, gpu_freq_mhz_min,
                     gpu_freq_mhz_mean, gpu_freq_mhz_max, cpu_temp_c_max, gpu_temp_c_max,
-                    sys_covered_ms
+                    sys_covered_ms, lily_covered_ms, lily_w_mean
              FROM machine WHERE minute = ?1",
             [minute],
             |r| {
@@ -1678,6 +1726,8 @@ impl Writer {
                     cpu_temp_max: r.get(9)?,
                     gpu_temp_max: r.get(10)?,
                     sys_covered_ms: r.get(11)?,
+                    lily_covered_ms: r.get(12)?,
+                    lily_w_mean: r.get(13)?,
                 })
             },
         );
@@ -1694,11 +1744,15 @@ impl Writer {
                 "INSERT INTO machine (minute, samples, power_covered_ms, power_w_min,
                      power_w_mean, power_w_max, gpu_power_w_mean, gpu_active_mean,
                      gpu_freq_mhz_min, gpu_freq_mhz_mean, gpu_freq_mhz_max,
-                     cpu_temp_c_max, gpu_temp_c_max, sys_covered_ms)
-                 VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                     cpu_temp_c_max, gpu_temp_c_max, sys_covered_ms, lily_covered_ms,
+                     lily_w_mean)
+                 VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                     ?15)
                  ON CONFLICT (minute) DO UPDATE SET
                      power_covered_ms = excluded.power_covered_ms,
                      sys_covered_ms = excluded.sys_covered_ms,
+                     lily_covered_ms = excluded.lily_covered_ms,
+                     lily_w_mean = excluded.lily_w_mean,
                      power_w_min = excluded.power_w_min,
                      power_w_mean = excluded.power_w_mean,
                      power_w_max = excluded.power_w_max,
@@ -1725,6 +1779,8 @@ impl Writer {
                     merged.cpu_temp_max,
                     merged.gpu_temp_max,
                     merged.sys_ms,
+                    merged.lily_ms,
+                    merged.lily_w_mean(),
                 ])
             });
         let ok = self.outcome("writing power samples", result).is_some();

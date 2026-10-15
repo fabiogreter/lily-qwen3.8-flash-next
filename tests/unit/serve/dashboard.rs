@@ -1965,6 +1965,8 @@ fn history_fixture() -> History {
             gpu_freq_mhz: (i < 2).then_some(1578.0),
             power_covered_ms: (i < 2).then_some(60_000),
             sys_covered_ms: (i < 2).then_some(60_000),
+            lily_power_w: (i < 2).then_some(50.5),
+            lily_covered_ms: (i < 2).then_some(60_000),
         })
         .collect();
     let queue = [(FIXTURE_NOW - 30_000, 12.0), (FIXTURE_NOW - 31_000, 40.0)];
@@ -2172,6 +2174,7 @@ fn every_nullable_field_is_null_in_some_fixture() {
         "history.points[].power_w",
         "history.points[].gpu_power_w",
         "history.points[].gpu_freq_mhz",
+        "history.points[].lily_power_w",
         "history.summary.decode.avg",
         "history.summary.decode.max",
         "history.summary.prefill.avg",
@@ -2180,6 +2183,7 @@ fn every_nullable_field_is_null_in_some_fixture() {
         "history.summary.acceptance",
         "history.summary.power_avg_w",
         "history.summary.energy_wh",
+        "history.summary.lily_energy_wh",
     ] {
         assert!(nulls.contains(nullable), "no fixture has {nullable} null");
     }

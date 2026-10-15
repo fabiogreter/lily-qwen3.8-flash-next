@@ -1202,7 +1202,8 @@ export const history: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105220000,
@@ -1225,7 +1226,8 @@ export const history: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105280000,
@@ -1248,7 +1250,8 @@ export const history: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105340000,
@@ -1271,7 +1274,8 @@ export const history: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105400000,
@@ -1294,7 +1298,8 @@ export const history: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105460000,
@@ -1317,7 +1322,8 @@ export const history: History = {
       "swap_bytes": 1181116006,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105520000,
@@ -1340,7 +1346,8 @@ export const history: History = {
       "swap_bytes": 1181116006,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105580000,
@@ -1363,7 +1370,8 @@ export const history: History = {
       "swap_bytes": 1181116006,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105640000,
@@ -1386,7 +1394,8 @@ export const history: History = {
       "swap_bytes": 1181116006,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105700000,
@@ -1409,7 +1418,8 @@ export const history: History = {
       "swap_bytes": 1181116006,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105760000,
@@ -1432,7 +1442,8 @@ export const history: History = {
       "swap_bytes": 1181116006,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105820000,
@@ -1455,7 +1466,8 @@ export const history: History = {
       "swap_bytes": 1181116006,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105880000,
@@ -1478,7 +1490,8 @@ export const history: History = {
       "swap_bytes": 1181116006,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105940000,
@@ -1501,7 +1514,8 @@ export const history: History = {
       "swap_bytes": 1181116006,
       "power_w": 71.5,
       "gpu_power_w": 48.25,
-      "gpu_freq_mhz": 1578.0
+      "gpu_freq_mhz": 1578.0,
+      "lily_power_w": 50.5
     },
     {
       "t": 1760106000000,
@@ -1524,7 +1538,8 @@ export const history: History = {
       "swap_bytes": 1181116006,
       "power_w": 71.5,
       "gpu_power_w": 48.25,
-      "gpu_freq_mhz": 1578.0
+      "gpu_freq_mhz": 1578.0,
+      "lily_power_w": 50.5
     }
   ],
   "summary": {
@@ -1543,7 +1558,8 @@ export const history: History = {
     "cache_hit": 0.9333,
     "acceptance": 0.775,
     "power_avg_w": 71.5,
-    "energy_wh": 2.383
+    "energy_wh": 2.383,
+    "lily_energy_wh": 1.683
   }
 };
 
@@ -1572,7 +1588,8 @@ export const sessionHistory: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105220000,
@@ -1595,7 +1612,8 @@ export const sessionHistory: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105280000,
@@ -1618,7 +1636,8 @@ export const sessionHistory: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105340000,
@@ -1641,7 +1660,8 @@ export const sessionHistory: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105400000,
@@ -1664,7 +1684,8 @@ export const sessionHistory: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105460000,
@@ -1687,7 +1708,8 @@ export const sessionHistory: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105520000,
@@ -1710,7 +1732,8 @@ export const sessionHistory: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105580000,
@@ -1733,7 +1756,8 @@ export const sessionHistory: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105640000,
@@ -1756,7 +1780,8 @@ export const sessionHistory: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105700000,
@@ -1779,7 +1804,8 @@ export const sessionHistory: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105760000,
@@ -1802,7 +1828,8 @@ export const sessionHistory: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105820000,
@@ -1825,7 +1852,8 @@ export const sessionHistory: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105880000,
@@ -1848,7 +1876,8 @@ export const sessionHistory: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105940000,
@@ -1871,7 +1900,8 @@ export const sessionHistory: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760106000000,
@@ -1894,7 +1924,8 @@ export const sessionHistory: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     }
   ],
   "summary": {
@@ -1913,7 +1944,8 @@ export const sessionHistory: History = {
     "cache_hit": 0.9333,
     "acceptance": 0.775,
     "power_avg_w": null,
-    "energy_wh": null
+    "energy_wh": null,
+    "lily_energy_wh": null
   }
 };
 
@@ -1942,7 +1974,8 @@ export const historyEmpty: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105220000,
@@ -1965,7 +1998,8 @@ export const historyEmpty: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105280000,
@@ -1988,7 +2022,8 @@ export const historyEmpty: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105340000,
@@ -2011,7 +2046,8 @@ export const historyEmpty: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105400000,
@@ -2034,7 +2070,8 @@ export const historyEmpty: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105460000,
@@ -2057,7 +2094,8 @@ export const historyEmpty: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105520000,
@@ -2080,7 +2118,8 @@ export const historyEmpty: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105580000,
@@ -2103,7 +2142,8 @@ export const historyEmpty: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105640000,
@@ -2126,7 +2166,8 @@ export const historyEmpty: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105700000,
@@ -2149,7 +2190,8 @@ export const historyEmpty: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105760000,
@@ -2172,7 +2214,8 @@ export const historyEmpty: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105820000,
@@ -2195,7 +2238,8 @@ export const historyEmpty: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105880000,
@@ -2218,7 +2262,8 @@ export const historyEmpty: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760105940000,
@@ -2241,7 +2286,8 @@ export const historyEmpty: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     },
     {
       "t": 1760106000000,
@@ -2264,7 +2310,8 @@ export const historyEmpty: History = {
       "swap_bytes": null,
       "power_w": null,
       "gpu_power_w": null,
-      "gpu_freq_mhz": null
+      "gpu_freq_mhz": null,
+      "lily_power_w": null
     }
   ],
   "summary": {
@@ -2283,7 +2330,8 @@ export const historyEmpty: History = {
     "cache_hit": null,
     "acceptance": null,
     "power_avg_w": null,
-    "energy_wh": null
+    "energy_wh": null,
+    "lily_energy_wh": null
   }
 };
 

@@ -37,7 +37,7 @@ async function bare(): Promise<Status> {
 class NoHistoryMax extends MockBackend {
   async history(range: Parameters<MockBackend['history']>[0]) {
     const h = await super.history(range);
-    return { ...h, summary: { ...h.summary, decode: { avg: null, max: null }, prefill: { avg: null, max: null }, energy_wh: null, power_avg_w: null } };
+    return { ...h, summary: { ...h.summary, decode: { avg: null, max: null }, prefill: { avg: null, max: null }, energy_wh: null, power_avg_w: null, lily_energy_wh: null } };
   }
 }
 
@@ -88,6 +88,9 @@ describe('null-safe rendering', () => {
     });
     await flushPromises();
     expect(overview.text()).toMatch(/lily CPU\+GPU 50\.5 W \(est\.\)/);
+    // The history's power chart has lily's series, and the summary its energy.
+    expect(overview.text()).toContain('lily CPU+GPU (est.)');
+    expect(overview.text()).toMatch(/lily CPU\+GPU \d+ Wh \(est\.\)/);
 
     s.machine.power = { ...s.machine.power, lily: null };
     const without = mount(EngineSchematic, { props: { st: s, mtp: 2, bind: null, ngram: null } });

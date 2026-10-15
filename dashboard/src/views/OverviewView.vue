@@ -55,6 +55,7 @@ const loadSeries: SeriesDef[] = [
 const powerSeries: SeriesDef[] = [
   { key: 'power_w', label: 'system', color: 'var(--s1)', area: true },
   { key: 'gpu_power_w', label: 'GPU', color: 'var(--s2)', width: 1.5 },
+  { key: 'lily_power_w', label: 'lily CPU+GPU (est.)', color: 'var(--s3)', width: 1.5 },
 ];
 </script>
 
@@ -161,6 +162,9 @@ const powerSeries: SeriesDef[] = [
           <div>
             <div class="k">energy</div>
             <div class="v">{{ energy(hist.summary.energy_wh) }}<small>avg {{ rate(hist.summary.power_avg_w) }} W</small></div>
+            <div v-if="hist.summary.lily_energy_wh != null" class="m" title="lily's own CPU energy plus its share of the GPU's, over the time that had a figure of it; DRAM and the rest of the SoC not attributed">
+              lily CPU+GPU {{ energy(hist.summary.lily_energy_wh) }} (est.)
+            </div>
           </div>
         </div>
         <div class="stack" style="margin-top: 22px">
