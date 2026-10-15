@@ -128,8 +128,9 @@ response with `Content-Type` and `Cache-Control`; `index.html` is
   `failed` (`error` says why); the history routes answer 503 unless `open`.
 - Memory pressure is lily's own names everywhere: `normal`, `warning`,
   `critical` or `null`; a history bucket carries the worst in it.
-- Machine power is `{cpu_w, gpu_w, ane_w, sys_w}` or `null`, with
-  `machine.sampler` saying why (`ok`, `off`, `failed`).
+- Machine power is `{cpu_w, gpu_w, ane_w, sys_w, lily}` or `null`, with
+  `machine.sampler` saying why (`ok`, `off`, `failed`); `lily` is lily's own
+  estimated share, `{w, cpu_w, gpu_w}` or `null` (§ 6).
 - Durations in settings are the flag text, parsed exactly as
   `parse_duration_secs` parses the flag, plus `value_s`.
 - `PATCH /v1/lily/settings` takes several names, applied all or none, and
@@ -356,6 +357,41 @@ taken outside the sandbox by the owner: `Sampler::new()` about 0.7 s,
   system power is 0 or below that sum has none. `machine.power.sys_w` is then
   `null` (the parts are still shown; the UI shows "–"), and the recorder counts
   the window for the GPU series but not for system power or energy.
+- **lily's own power** (`machine.power.lily`, "lily CPU+GPU (est.)" on the
+  page) is an attribution, not a measurement: macOS has no per-process power
+  meter. Per reading window (`serve::machine::attribute`):
+
+  ```
+  lily_cpu_w = Δ ri_energy_nj (proc_pid_rusage, RUSAGE_INFO_V6, own pid) / Δt
+  lily_gpu_w = gpu_w × min(1, lily_gpu_busy / (gpu_active × Δt))
+  lily_w     = lily_cpu_w + lily_gpu_w
+  ```
+
+  With the GPU (nearly, under 1 µs) idle by IOReport's account the share is
+  1 if lily was busy at all and 0 otherwise. `ri_energy_nj` is the kernel's
+  per-process energy estimate over both core clusters (`ri_penergy_nj` would
+  be the performance cores only); `libc` stops at `rusage_info_v4`, so
+  `stats.rs` declares the SDK's 464-byte `rusage_info_v6` itself.
+  `lily_gpu_busy` comes from lily's own Metal commit feedback (`metal::busy`):
+  each command buffer's `GPUStartTime`..`GPUEndTime`, merged per pass into
+  their union when the pass's last feedback arrives (feedback arrives out of
+  order), and that union added to a set of the intervals of the last second,
+  so overlapping passes count once. **Limits**: the ANE (lily uses none), DRAM
+  (large while decoding) and the rest of the SoC are not attributed; a span is
+  wall time with stalls, so the share over-attributes when other processes'
+  GPU work runs inside lily's spans; busy time is booked when a pass's
+  feedback completes, so a long prefill pass can land in the 2 s window after
+  the one it ran in (the clamp at 1 hides the overshoot, the next window
+  shows the shortfall); a pass that never completes is not counted. The
+  counters are re-read after every call to `macmon`, success, error or skip,
+  because its baseline moves on every call; the first reading uses counters
+  read just before the first call. A figure that cannot be right (a counter
+  call failed, a counter went back, not finite, outside 0 to 1 000 W) is
+  `null` and never skips the reading or counts toward the five failures. The
+  cost on the feedback path (a vector per pass, a sort, a lock held for a
+  merge on Metal's completion thread) is not measured. A cross-check on the
+  hardware: `ioreg -r -c IOAccelerator -l` lists `accumulatedGPUTime` per
+  process (not read by lily: a second FFI surface next to `macmon`).
 - **Sources of the rest**: CPU load stays lily's tick-based figure
   (`stats::cpu_ticks`: it works without the sampler, measures the same span as
   the other live rates, and the history's 10 s samples use it); memory,

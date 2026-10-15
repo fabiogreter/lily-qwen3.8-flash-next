@@ -15,11 +15,12 @@
 //! Machine figures (CPU load, memory, swap, pressure) are read on the HTTP
 //! thread directly; the power, the GPU's activity and frequency and the
 //! temperatures are the sampler's latest reading (`serve::machine`), shown
-//! while it is fresh. The history and the per-session figures come from the
-//! recorder's database (`serve::recorder`), which the board feeds each
-//! finished request's row through a bounded channel (`try_send`; a full
-//! channel drops the row and counts it), read here through a read-only
-//! connection of the HTTP thread's own.
+//! while it is fresh, with lily's own estimated share of the power. The
+//! history and the per-session figures come from the recorder's database
+//! (`serve::recorder`), which the board feeds each finished request's row
+//! through a bounded channel (`try_send`; a full channel drops the row and
+//! counts it), read here through a read-only connection of the HTTP thread's
+//! own.
 //!
 //! **This machine only** (§ 3.2). Every dashboard route refuses with 403 a
 //! peer that is not loopback, whatever `--bind` says, and a `Host` that is
@@ -66,10 +67,10 @@ use std::time::{Duration, Instant};
 
 use contract::{
     CancelledBy, DiskTier, ErrorBody, ErrorDetail, ExpertTier, GpuTier, LifecycleState,
-    LiveStatus, MachineStatus, MemoryPressure, NgramTier, Power, QueueStatus, Range,
-    RequestRow, RequestsResponse, SamplerState, Session, SessionTier, SessionsResponse,
-    Setting, SettingResetResponse, SettingsLogResponse, SettingsResponse,
-    SettingsUpdateResponse, Status, Temperatures, Tiers, WeightsTier,
+    LilyPower, LiveStatus, MachineStatus, MemoryPressure, NgramTier, Power,
+    QueueStatus, Range, RequestRow, RequestsResponse, SamplerState, Session,
+    SessionTier, SessionsResponse, Setting, SettingResetResponse, SettingsLogResponse,
+    SettingsResponse, SettingsUpdateResponse, Status, Temperatures, Tiers, WeightsTier,
 };
 use serde::Serialize;
 
@@ -1143,6 +1144,11 @@ impl Dashboard {
                 gpu_w: round(s.reading.gpu_w, 100.0),
                 ane_w: round(s.reading.ane_w, 100.0),
                 sys_w: s.reading.sys_w.map(|w| round(w, 100.0)),
+                lily: s.reading.lily.map(|l| LilyPower {
+                    w: round(l.w(), 100.0),
+                    cpu_w: round(l.cpu_w, 100.0),
+                    gpu_w: round(l.gpu_w, 100.0),
+                }),
             }),
             // Both or none: the contract has no half a pair.
             temp_c: sample

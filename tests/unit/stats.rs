@@ -88,3 +88,15 @@ fn machine_figures_can_be_sampled() {
         assert!(swap < 64 * memory.total, "swap {swap}");
     }
 }
+
+#[test]
+fn own_cpu_energy_is_cumulative() {
+    let a = own_energy_nj().expect("proc_pid_rusage");
+    // Some work for the counter to count.
+    let mut x = 0u64;
+    for i in 0..2_000_000u64 {
+        x = std::hint::black_box(x.wrapping_mul(31).wrapping_add(i));
+    }
+    let b = own_energy_nj().expect("proc_pid_rusage");
+    assert!(b >= a, "energy went back: {a} -> {b} ({x})");
+}

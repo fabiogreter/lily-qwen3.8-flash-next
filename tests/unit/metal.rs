@@ -1607,3 +1607,51 @@ fn witness_signal_cost_probe() {
         );
     }
 }
+
+// --- lily's GPU busy time (pure helpers; the process-wide count is never
+// asserted, the tests' own Metal contexts add to it in parallel) ------------
+
+#[test]
+fn a_passs_busy_time_is_the_union_of_its_command_buffers_whatever_their_order() {
+    // Delivered out of order, overlapping, touching, and two with no usable
+    // timestamps (never reported, or ending before they start).
+    let spans =
+        [(5.0, 6.0), (1.0, 2.0), (0.0, 0.0), (1.5, 3.0), (3.0, 3.5), (8.0, 7.0)];
+    assert_eq!(busy::pass_union(&spans), [(1.0, 3.5), (5.0, 6.0)]);
+    let mut reversed = spans;
+    reversed.reverse();
+    assert_eq!(busy::pass_union(&reversed), busy::pass_union(&spans));
+    assert!(busy::pass_union(&[(f64::NAN, 1.0), (-1.0, 2.0), (0.0, 0.0)]).is_empty());
+}
+
+#[test]
+fn overlapping_passes_are_counted_once_in_any_order() {
+    let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+    let mut recent = busy::Recent::new();
+    // Two passes overlapping by 0.1 s whose feedback completes late-first.
+    assert!(close(recent.add(&[(10.4, 10.6)]), 0.2));
+    assert!(close(recent.add(&[(10.0, 10.5)]), 0.4));
+    // A pass inside what is counted adds nothing; one spanning a gap adds
+    // only the gap.
+    assert!(close(recent.add(&[(10.1, 10.2)]), 0.0));
+    assert!(close(recent.add(&[(10.7, 10.8)]), 0.1));
+    assert!(close(recent.add(&[(10.55, 10.75)]), 0.1));
+    assert_eq!(recent.intervals(), &[(10.0, 10.8)]);
+}
+
+#[test]
+fn the_recent_set_forgets_what_ended_more_than_its_horizon_ago() {
+    let mut recent = busy::Recent::new();
+    recent.add(&[(1.0, 1.2), (1.5, 1.6)]);
+    recent.add(&[(2.4, 2.5)]);
+    // 2.5 minus the 1 s horizon: the interval ending at 1.2 is gone, the one
+    // ending at 1.6 stays.
+    assert_eq!(recent.intervals(), &[(1.5, 1.6), (2.4, 2.5)]);
+    recent.add(&[(10.0, 10.1)]);
+    assert_eq!(recent.intervals(), &[(10.0, 10.1)]);
+    // A pass that reaches back before the horizon is still counted whole
+    // where nothing kept covers it.
+    let added = recent.add(&[(9.0, 10.05)]);
+    assert!((added - 1.0).abs() < 1e-9, "{added}");
+    assert_eq!(recent.intervals(), &[(9.0, 10.1)]);
+}

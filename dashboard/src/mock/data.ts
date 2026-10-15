@@ -486,6 +486,7 @@ export function buildStatus(tick: number, sessions: Session[], now: number): Sta
         gpu_w: round1(busy ? 44 + r() * 8 : 0.5),
         ane_w: 0,
         sys_w: round1(busy ? 68 + r() * 10 : 9.5),
+        lily: busy ? { w: 47.6, cpu_w: 3.4, gpu_w: 44.2 } : { w: 0.3, cpu_w: 0.2, gpu_w: 0.1 },
       },
       temp_c: { cpu: Math.round(busy ? 64 + r() * 6 : 41), gpu: Math.round(busy ? 71 + r() * 5 : 39) },
     },

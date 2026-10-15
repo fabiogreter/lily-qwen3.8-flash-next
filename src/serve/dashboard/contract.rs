@@ -80,6 +80,18 @@ pub struct Power {
     pub ane_w: f64,
     /// `None` when the SMC does not report the system's power.
     pub sys_w: Option<f64>,
+    /// lily's own share, an estimate (`serve::machine::attribute`); `None`
+    /// when it cannot be told for this reading.
+    pub lily: Option<LilyPower>,
+}
+
+/// lily's estimated CPU and GPU power (docs/dashboard.md § 6): `w` is their
+/// sum. DRAM and the rest of the SoC are not attributed.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LilyPower {
+    pub w: f64,
+    pub cpu_w: f64,
+    pub gpu_w: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

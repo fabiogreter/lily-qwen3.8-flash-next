@@ -775,6 +775,7 @@ fn window(start_ms: u64, end_ms: u64, sys_w: f64) -> Sample {
             gpu_freq_mhz: sys_w * 10.0,
             cpu_temp_c: Some(40.0 + sys_w / 10.0),
             gpu_temp_c: None,
+            lily: None,
         },
     }
 }

@@ -114,6 +114,9 @@ const powerSeries: SeriesDef[] = [
           <div class="k">Power</div>
           <div v-if="st.machine.power" class="v">{{ st.machine.power.sys_w === null ? '–' : rate(st.machine.power.sys_w) }}<small>W system</small></div>
           <div v-else class="v" :title="`Sampler ${st.machine.sampler}`"><small>unavailable</small></div>
+          <div v-if="st.machine.power?.lily" class="m" title="lily's own CPU energy plus its share of the GPU's power; DRAM and the rest of the SoC not attributed">
+            lily CPU+GPU {{ rate(st.machine.power.lily.w) }} W (est.)
+          </div>
           <div class="m">
             <template v-if="st.machine.power">GPU {{ rate(st.machine.power.gpu_w) }} W</template>
             <template v-if="st.machine.power && st.machine.temp_c"> · </template>

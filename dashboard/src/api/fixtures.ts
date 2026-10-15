@@ -59,7 +59,12 @@ export const status: Status = {
       "cpu_w": 7.5,
       "gpu_w": 48.25,
       "ane_w": 0.0,
-      "sys_w": 71.5
+      "sys_w": 71.5,
+      "lily": {
+        "w": 50.5,
+        "cpu_w": 3.25,
+        "gpu_w": 47.25
+      }
     },
     "temp_c": {
       "cpu": 66.0,
@@ -198,7 +203,8 @@ export const statusSmallMachine: Status = {
       "cpu_w": 7.5,
       "gpu_w": 48.25,
       "ane_w": 0.0,
-      "sys_w": null
+      "sys_w": null,
+      "lily": null
     },
     "temp_c": {
       "cpu": 66.0,

@@ -197,6 +197,143 @@ pub mod profile {
     }
 }
 
+/// lily's own GPU busy time, process-wide: what the dashboard's estimate of
+/// lily's GPU power divides the machine's GPU power by (`serve::machine`,
+/// docs/dashboard.md § 6). Every command buffer lily commits goes through
+/// [`super::submit_items`] with a commit feedback handler, so every pass is
+/// counted, whichever context it ran on (the model, the drafts, vision, the
+/// expert cache).
+///
+/// **What is counted.** Each command buffer's GPU span (`GPUStartTime` to
+/// `GPUEndTime`, wall time on the host clock, stalls inside the buffer
+/// included). Command buffers of one pass and consecutive passes can overlap,
+/// and their feedback arrives out of order, so nothing can be added as it
+/// arrives: the handler that completes a pass merges the pass's own spans
+/// into their union ([`pass_union`]) and adds that union to a small set of
+/// recent intervals ([`Recent`]), counting only the time the set did not
+/// cover yet. The set forgets intervals that ended more than
+/// [`HORIZON_SECS`] before the newest end it saw, which keeps it small; a pass
+/// whose union reaches back past that horizon (its feedback completed more
+/// than that after an overlapping pass's) could be counted twice where they
+/// overlap. Passes on one queue run one after the other with an overlap of a
+/// command buffer at most, so that is not expected to happen.
+///
+/// **When it is counted.** A pass's time is booked when its last feedback
+/// arrives, not as it runs: a long prefill pass lands whole in the window its
+/// feedback completes in. A pass that never completes (a fault, a pass
+/// dropped before all its command buffers were committed) is not counted.
+/// Spans with no usable timestamps (not finite, not after 0, ending before
+/// they start) are left out.
+///
+/// The cost on the feedback path (a vector per pass, a sort and a lock held
+/// for a merge into a set of about a second of intervals, on Metal's
+/// completion thread) is not measured.
+pub mod busy {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// How far back from the newest end seen the set keeps intervals, in
+    /// seconds.
+    pub const HORIZON_SECS: f64 = 1.0;
+
+    /// The busy time counted so far, in nanoseconds.
+    static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+    static RECENT: Mutex<Recent> = Mutex::new(Recent::new());
+
+    /// The union of a pass's command-buffer spans `(start, end)` in seconds,
+    /// sorted and disjoint (touching spans merged); spans without usable
+    /// timestamps are dropped.
+    pub fn pass_union(spans: &[(f64, f64)]) -> Vec<(f64, f64)> {
+        let mut valid: Vec<(f64, f64)> = spans
+            .iter()
+            .copied()
+            .filter(|&(start, end)| {
+                start.is_finite() && end.is_finite() && start > 0.0 && end > start
+            })
+            .collect();
+        valid.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut union: Vec<(f64, f64)> = Vec::with_capacity(valid.len());
+        for (start, end) in valid {
+            match union.last_mut() {
+                Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                _ => union.push((start, end)),
+            }
+        }
+        union
+    }
+
+    /// The intervals counted within the last [`HORIZON_SECS`], sorted and
+    /// disjoint, and the newest end seen.
+    #[derive(Debug, Default)]
+    pub struct Recent {
+        intervals: Vec<(f64, f64)>,
+        newest_end: f64,
+    }
+
+    impl Recent {
+        pub const fn new() -> Self {
+            Self { intervals: Vec::new(), newest_end: 0.0 }
+        }
+
+        /// Adds a pass's union (from [`pass_union`]: sorted, disjoint,
+        /// valid) and returns the seconds of it the set did not cover yet;
+        /// then forgets what ended more than [`HORIZON_SECS`] before the
+        /// newest end.
+        pub fn add(&mut self, union: &[(f64, f64)]) -> f64 {
+            let mut added = 0.0;
+            for &(start, end) in union {
+                let mut covered = 0.0;
+                let (mut lo, mut hi) = (start, end);
+                self.intervals.retain(|&(a, b)| {
+                    if b < start || a > end {
+                        return true;
+                    }
+                    covered += b.min(end) - a.max(start);
+                    lo = lo.min(a);
+                    hi = hi.max(b);
+                    false
+                });
+                added += (end - start - covered).max(0.0);
+                let at = self.intervals.partition_point(|&(a, _)| a < lo);
+                self.intervals.insert(at, (lo, hi));
+                self.newest_end = self.newest_end.max(end);
+            }
+            let horizon = self.newest_end - HORIZON_SECS;
+            self.intervals.retain(|&(_, b)| b >= horizon);
+            added
+        }
+
+        /// The intervals the set holds (tests).
+        pub fn intervals(&self) -> &[(f64, f64)] {
+            &self.intervals
+        }
+    }
+
+    /// Counts a completed pass's command-buffer spans.
+    pub(super) fn record(spans: &[(f64, f64)]) {
+        let union = pass_union(spans);
+        if union.is_empty() {
+            return;
+        }
+        let added = RECENT.lock().unwrap_or_else(|e| e.into_inner()).add(&union);
+        let ns = (added * 1e9).round();
+        if ns >= 1.0 {
+            TOTAL_NS.fetch_add(ns as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// lily's GPU busy time since the process started, in nanoseconds.
+    pub fn total_ns() -> u64 {
+        TOTAL_NS.load(Ordering::Relaxed)
+    }
+}
+
+/// lily's GPU busy time since the process started, in nanoseconds; see
+/// [`busy`].
+pub fn gpu_busy_ns() -> u64 {
+    busy::total_ns()
+}
+
 pub struct MetalContext {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
@@ -1450,9 +1587,10 @@ fn describe_error(error: &NSError) -> String {
 }
 
 /// Commit feedback for one pass: how many of its command buffers reported,
-/// their GPU time span, and any error. In profile mode also each command
-/// buffer's own span, recorded as a [`profile::PassProfile`] once the last
-/// handler has run (handlers may arrive out of order).
+/// their GPU time span, and any error. Also each command buffer's own span:
+/// once the last handler has run (handlers may arrive out of order) their
+/// union is counted as lily's GPU busy time ([`busy`]), and in profile mode
+/// they are recorded as a [`profile::PassProfile`] as well.
 struct Feedback {
     expected: usize,
     profile: Option<ProfileInfo>,
@@ -1552,7 +1690,8 @@ struct FeedbackState {
     error: Option<String>,
     gpu_start_secs: f64,
     gpu_end_secs: f64,
-    /// Profile mode only: (start, end) per command buffer, by submission index.
+    /// (start, end) per command buffer, by submission index: the pass's
+    /// busy time ([`busy`]) and, in profile mode, its per-kernel profile.
     spans: Vec<(f64, f64)>,
     /// Watches checked so far.
     watched: usize,
@@ -1564,8 +1703,8 @@ impl Feedback {
         profile: Option<ProfileInfo>,
         watches: Vec<Watch>,
     ) -> Arc<Self> {
-        let spans =
-            if profile.is_some() { vec![(0.0, 0.0); expected] } else { Vec::new() };
+        // A span never reported stays (0, 0), which the busy count skips.
+        let spans = vec![(0.0, 0.0); expected];
         Arc::new(Self {
             expected,
             profile,
@@ -1601,6 +1740,9 @@ impl Feedback {
                     *span = (start, end);
                 }
                 state.received += 1;
+                if state.received == feedback.expected {
+                    busy::record(&state.spans);
+                }
                 if state.received == feedback.expected
                     && let Some(info) = &feedback.profile
                 {

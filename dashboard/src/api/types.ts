@@ -97,6 +97,19 @@ export interface Power {
   ane_w: number;
   /** null when the SMC does not report the system's power (the parts above are still measured). */
   sys_w: number | null;
+  /** lily's own share, an estimate; null when it cannot be told for this reading. */
+  lily: LilyPower | null;
+}
+
+/**
+ * lily's estimated power, watts (docs/dashboard.md § 6). `cpu_w`: lily's CPU energy over the window
+ * (the kernel's per-process account); `gpu_w`: the GPU's power times lily's share of the GPU's active
+ * time; `w`: their sum. DRAM and the rest of the SoC are not attributed.
+ */
+export interface LilyPower {
+  w: number;
+  cpu_w: number;
+  gpu_w: number;
 }
 
 /**

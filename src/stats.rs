@@ -17,6 +17,9 @@
 //! thread, which samples them (with [`pressure_level`] and [`task_memory`])
 //! for the 7-day history (`serve::recorder`). They are declared here rather than
 //! taken from the `libc` crate, whose Mach bindings are deprecated.
+//! [`own_energy_nj`] is lily's own CPU energy, which the machine sampler
+//! (`serve::machine`) turns into lily's CPU power; it needs a newer
+//! `rusage_info` revision than `libc` declares.
 
 use std::cell::Cell;
 
@@ -407,6 +410,27 @@ pub fn task_memory() -> Option<TaskMemory> {
     })
 }
 
+/// The CPU energy this process has used since it started, in nanojoules
+/// (`proc_pid_rusage`, `RUSAGE_INFO_V6`, `ri_energy_nj`): the kernel's
+/// estimate summed over the efficiency and the performance cores (the field
+/// next to it, `ri_penergy_nj`, is the performance cores' share). `None` when
+/// the call fails. Two readings give lily's CPU power between them; the
+/// dashboard labels it an estimate (docs/dashboard.md § 6).
+pub fn own_energy_nj() -> Option<u64> {
+    let mut info = sys::RusageInfoV6::default();
+    // SAFETY: `info` is laid out as the SDK's `struct rusage_info_v6` (its
+    // size is asserted below), the flavor asks for exactly that revision, and
+    // `rusage_info_t` is a `void *` the kernel writes that struct through.
+    let rc = unsafe {
+        sys::proc_pid_rusage(
+            std::process::id() as i32,
+            sys::RUSAGE_INFO_V6,
+            (&raw mut info).cast(),
+        )
+    };
+    (rc == 0).then_some(info.ri_energy_nj)
+}
+
 /// The Mach and sysctl calls above. Layouts are the macOS SDK's
 /// `vm_statistics64` and `task_vm_info` (checked against the headers with
 /// `offsetof`: `pageins` at 32, `swapouts` at 120; `compressed` at 120,
@@ -416,6 +440,8 @@ mod sys {
     use std::sync::OnceLock;
 
     pub const HOST_CPU_LOAD_INFO: c_int = 3;
+    /// `RUSAGE_INFO_V6` (`sys/resource.h`).
+    pub const RUSAGE_INFO_V6: c_int = 6;
     pub const HOST_VM_INFO64: c_int = 4;
     pub const TASK_VM_INFO: c_int = 22;
 
@@ -483,6 +509,68 @@ mod sys {
         pub const COUNT: u32 = (std::mem::size_of::<Self>() / 4) as u32;
     }
 
+    /// `struct rusage_info_v6` of the macOS SDK's `sys/resource.h`, field for
+    /// field (`libc` 0.2.190 stops at `rusage_info_v4`): 16 bytes of UUID, 50
+    /// counters and 6 reserved words, 464 bytes. Only `ri_energy_nj` is read.
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct RusageInfoV6 {
+        pub ri_uuid: [u8; 16],
+        pub ri_user_time: u64,
+        pub ri_system_time: u64,
+        pub ri_pkg_idle_wkups: u64,
+        pub ri_interrupt_wkups: u64,
+        pub ri_pageins: u64,
+        pub ri_wired_size: u64,
+        pub ri_resident_size: u64,
+        pub ri_phys_footprint: u64,
+        pub ri_proc_start_abstime: u64,
+        pub ri_proc_exit_abstime: u64,
+        pub ri_child_user_time: u64,
+        pub ri_child_system_time: u64,
+        pub ri_child_pkg_idle_wkups: u64,
+        pub ri_child_interrupt_wkups: u64,
+        pub ri_child_pageins: u64,
+        pub ri_child_elapsed_abstime: u64,
+        pub ri_diskio_bytesread: u64,
+        pub ri_diskio_byteswritten: u64,
+        pub ri_cpu_time_qos_default: u64,
+        pub ri_cpu_time_qos_maintenance: u64,
+        pub ri_cpu_time_qos_background: u64,
+        pub ri_cpu_time_qos_utility: u64,
+        pub ri_cpu_time_qos_legacy: u64,
+        pub ri_cpu_time_qos_user_initiated: u64,
+        pub ri_cpu_time_qos_user_interactive: u64,
+        pub ri_billed_system_time: u64,
+        pub ri_serviced_system_time: u64,
+        pub ri_logical_writes: u64,
+        pub ri_lifetime_max_phys_footprint: u64,
+        pub ri_instructions: u64,
+        pub ri_cycles: u64,
+        pub ri_billed_energy: u64,
+        pub ri_serviced_energy: u64,
+        pub ri_interval_max_phys_footprint: u64,
+        pub ri_runnable_time: u64,
+        pub ri_flags: u64,
+        pub ri_user_ptime: u64,
+        pub ri_system_ptime: u64,
+        pub ri_pinstructions: u64,
+        pub ri_pcycles: u64,
+        pub ri_energy_nj: u64,
+        pub ri_penergy_nj: u64,
+        pub ri_secure_time_in_system: u64,
+        pub ri_secure_ptime_in_system: u64,
+        pub ri_neural_footprint: u64,
+        pub ri_lifetime_max_neural_footprint: u64,
+        pub ri_interval_max_neural_footprint: u64,
+        pub ri_conclave_footprint: u64,
+        pub ri_page_wait_time_mach: u64,
+        pub ri_page_cache_hits: u64,
+        pub ri_reserved: [u64; 6],
+    }
+
+    const _: () = assert!(std::mem::size_of::<RusageInfoV6>() == 464);
+
     unsafe extern "C" {
         pub static mach_task_self_: u32;
         fn mach_host_self() -> u32;
@@ -504,6 +592,10 @@ mod sys {
             info: *mut c_int,
             count: *mut u32,
         ) -> c_int;
+        /// `libproc.h`; `buffer` is a `rusage_info_t *`, which is `void **`
+        /// in the header but is written through as the struct itself.
+        pub fn proc_pid_rusage(pid: c_int, flavor: c_int, buffer: *mut c_void)
+        -> c_int;
         pub fn sysctlbyname(
             name: *const c_char,
             oldp: *mut c_void,

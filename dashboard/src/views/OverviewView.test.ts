@@ -77,6 +77,24 @@ describe('null-safe rendering', () => {
     expect(wrapper.text()).toContain('off');
   });
 
+  it("lily's own power shows as an estimate next to the system's, and not at all without one", async () => {
+    const s = await new MockBackend({ clock }).status();
+    s.machine.power = { cpu_w: 7.5, gpu_w: 48.25, ane_w: 0, sys_w: 71.5, lily: { w: 50.5, cpu_w: 3.25, gpu_w: 47.25 } };
+    const schematic = mount(EngineSchematic, { props: { st: s, mtp: 2, bind: null, ngram: null } });
+    expect(schematic.text()).toContain('lily CPU+GPU 50.5 W (est.)');
+    const backend = new MockBackend({ clock });
+    const overview = mount(OverviewView, {
+      global: { provide: { [dashboardKey as symbol]: { backend, range: ref('1h'), status: { data: ref(s), error: ref(null), refresh: async () => {} } } } },
+    });
+    await flushPromises();
+    expect(overview.text()).toMatch(/lily CPU\+GPU 50\.5 W \(est\.\)/);
+
+    s.machine.power = { ...s.machine.power, lily: null };
+    const without = mount(EngineSchematic, { props: { st: s, mtp: 2, bind: null, ngram: null } });
+    expect(without.text()).not.toContain('lily CPU+GPU');
+    expect(without.text()).toContain('71.5 W');
+  });
+
   it('pin hold and clocks are formatted, not raw', async () => {
     const s = await new MockBackend({ clock }).status();
     s.state = 'ready';

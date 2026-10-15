@@ -1239,6 +1239,7 @@ fn sampled(sys_w: f64) -> machine::Sample {
             gpu_freq_mhz: 1577.6,
             cpu_temp_c: Some(61.26),
             gpu_temp_c: Some(55.0),
+            lily: Some(machine::LilyPower { cpu_w: 2.344, gpu_w: 37.996 }),
         },
     }
 }
@@ -1268,7 +1269,13 @@ fn the_status_shows_the_samplers_fresh_reading_and_nothing_stale() {
     assert_eq!(m.sampler, SamplerState::Ok);
     assert_eq!(
         m.power,
-        Some(Power { cpu_w: 8.12, gpu_w: 41.99, ane_w: 0.0, sys_w: Some(61.46) })
+        Some(Power {
+            cpu_w: 8.12,
+            gpu_w: 41.99,
+            ane_w: 0.0,
+            sys_w: Some(61.46),
+            lily: Some(LilyPower { w: 40.34, cpu_w: 2.34, gpu_w: 38.0 }),
+        })
     );
     assert_eq!((m.gpu_active, m.gpu_freq_mhz), (Some(0.914), Some(1578.0)));
     assert_eq!(m.temp_c, Some(Temperatures { cpu: 61.3, gpu: 55.0 }));
@@ -1282,6 +1289,12 @@ fn the_status_shows_the_samplers_fresh_reading_and_nothing_stale() {
     let m = d.status(READY).machine;
     assert_eq!(m.temp_c, None);
     assert!(m.power.is_some(), "the rest of the reading stays");
+    // No estimate of lily's own share: null, the machine's figures stay.
+    let mut unattributed = sampled(10.0);
+    unattributed.reading.lily = None;
+    machine.publish(machine::BUSY_INTERVAL, unattributed);
+    let power = d.status(READY).machine.power.expect("power");
+    assert_eq!((power.lily, power.gpu_w), (None, 41.99));
     // A ratio past 1 (a rounding in the source) is shown as 1.
     let mut over = sampled(10.0);
     over.reading.gpu_active = 1.0004;
@@ -1628,6 +1641,7 @@ fn busy_status() -> Status {
                 gpu_w: 48.25,
                 ane_w: 0.0,
                 sys_w: Some(71.5),
+                lily: Some(LilyPower { w: 50.5, cpu_w: 3.25, gpu_w: 47.25 }),
             }),
             temp_c: Some(Temperatures { cpu: 66.0, gpu: 72.5 }),
         },
@@ -1724,9 +1738,11 @@ fn unloaded_status() -> Status {
 fn small_machine_status() -> Status {
     let mut status = busy_status();
     status.tiers.experts = Some(ExpertTier { slots: 1536, used: 1536, hit_rate: None });
-    // The SMC's system power failed: the parts are still measured.
+    // The SMC's system power failed: the parts are still measured. lily's
+    // own share could not be told (its counter call failed).
     if let Some(power) = &mut status.machine.power {
         power.sys_w = None;
+        power.lily = None;
     }
     status.recorder = RecorderStatus {
         state: RecorderState::Opening,
@@ -2108,6 +2124,7 @@ fn every_nullable_field_is_null_in_some_fixture() {
         "status.machine.swap_used_bytes",
         "status.machine.power",
         "status.machine.power.sys_w",
+        "status.machine.power.lily",
         "status.machine.temp_c",
         "status.tiers.gpu.budget_bytes",
         "status.tiers.disk",

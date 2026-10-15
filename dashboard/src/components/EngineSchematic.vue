@@ -73,6 +73,7 @@ const temps = computed(() => (m.value.temp_c ? `CPU ${Math.round(m.value.temp_c.
       <text class="n-sub" x="0" y="4">Power, system</text>
       <text class="n-val" x="0" y="31">{{ power ? (power.sys_w === null ? '–' : power.sys_w.toFixed(1) + ' W') : 'n/a' }}</text>
       <text v-if="power" class="n-small" x="0" y="54">CPU {{ power.cpu_w.toFixed(1) }} · GPU {{ power.gpu_w.toFixed(1) }} W</text>
+      <text v-if="power?.lily" class="n-small" x="0" y="72">lily CPU+GPU {{ power.lily.w.toFixed(1) }} W (est.)</text>
     </g>
     <g transform="translate(660,456)" :class="pressure?.cls">
       <text class="n-sub" x="0" y="4">Memory pressure</text>

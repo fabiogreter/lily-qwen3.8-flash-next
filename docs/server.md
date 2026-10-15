@@ -112,6 +112,19 @@ runs; the figures can be `null` until the first fresh reading), `off`
 (`--machine-stats off`: no thread) or `failed` (it could not start, or stopped
 after repeated errors).
 
+`machine.power.lily` is lily's own share of that power, **an estimate**:
+`{ w, cpu_w, gpu_w }` in watts, `w` being the sum. `cpu_w` is the change of
+lily's CPU energy over the reading's window (the kernel's per-process account,
+`proc_pid_rusage` `ri_energy_nj`, both core clusters), `gpu_w` the reading's
+GPU power times lily's GPU busy time (its command buffers' spans from Metal's
+commit feedback) over the GPU's active time in the window, at most all of it.
+The ANE, DRAM and the rest of the SoC are not attributed, so `w` stays below
+what lily costs the machine, by a lot while decoding (DRAM). It is `null`
+when it cannot be told for a reading (a counter call failed, a counter went
+back, a value out of range); the rest of the reading is shown regardless.
+The dashboard labels it "lily CPU+GPU (est.)"; dashboard.md § 6 has the
+method and its limits.
+
 A reading that fails, is not finite, or is out of range (a power or the system
 power above 1 000 W, a frequency above 10 000 MHz, a temperature outside
 -20 to 150 °C) is skipped and counted, and one good reading resets the count;

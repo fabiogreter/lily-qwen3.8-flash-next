@@ -13,6 +13,7 @@ fn reading(sys_w: f64) -> Reading {
         gpu_freq_mhz: 338.0,
         cpu_temp_c: Some(48.0),
         gpu_temp_c: Some(47.0),
+        lily: None,
     }
 }
 
@@ -684,6 +685,113 @@ fn an_unknown_system_power_and_a_wild_activity_are_published_not_skipped() {
     assert_eq!(taken[0].reading.gpu_w, 40.0, "the parts are kept");
     assert_eq!(taken[1].reading.gpu_active, 1.0, "clamped before it is stored");
     machine.finish(Duration::from_secs(5));
+}
+
+// --- lily's own share -------------------------------------------------------
+
+fn close(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1e-9
+}
+
+#[test]
+fn lilys_gpu_share_is_its_busy_time_over_the_gpus_active_time() {
+    let second = Duration::from_secs(1);
+    // The GPU active half the second at 40 W; lily busy a quarter second: half
+    // of the GPU's work, half its power. 2 J of CPU energy over 2 s is 1 W.
+    let p = attribute(40.0, 0.5, second, 0, 250_000_000).expect("figure");
+    assert!(close(p.gpu_w, 20.0), "{p:?}");
+    let p = attribute(40.0, 0.5, 2 * second, 2_000_000_000, 0).expect("figure");
+    assert!(close(p.cpu_w, 1.0) && p.gpu_w == 0.0, "lily idle: none of the GPU");
+    assert!(close(p.w(), 1.0));
+    // lily busy for longer than IOReport says the GPU was active (its spans
+    // are wall time, stalls included): the whole GPU, never more.
+    let p = attribute(40.0, 0.25, second, 0, 900_000_000).expect("figure");
+    assert!(close(p.gpu_w, 40.0), "{p:?}");
+}
+
+#[test]
+fn an_idle_gpu_by_ioreports_account_is_all_lilys_if_lily_was_busy() {
+    let second = Duration::from_secs(1);
+    let p = attribute(0.3, 0.0, second, 0, 1_000).expect("figure");
+    assert!(close(p.gpu_w, 0.3));
+    let p = attribute(0.3, 0.0, second, 0, 0).expect("figure");
+    assert_eq!(p.gpu_w, 0.0);
+    // Active for less than a microsecond counts as idle too.
+    let p = attribute(0.3, 1e-7, second, 0, 0).expect("figure");
+    assert_eq!(p.gpu_w, 0.0);
+}
+
+#[test]
+fn no_figure_for_a_zero_window_or_one_that_cannot_be_right() {
+    assert_eq!(attribute(40.0, 0.5, Duration::ZERO, 1_000, 1_000), None);
+    // 10 kJ in a second: no CPU draws 10 kW.
+    assert_eq!(attribute(40.0, 0.5, Duration::from_secs(1), 10u64.pow(13), 0), None);
+    assert_eq!(attribute(f64::NAN, 0.5, Duration::from_secs(1), 0, 1_000), None);
+}
+
+#[test]
+fn own_counters_subtract_and_refuse_to_go_back() {
+    let at = |energy_nj, gpu_busy_ns| OwnCounters { energy_nj, gpu_busy_ns };
+    assert_eq!(at(Some(30), 7).since(at(Some(10), 2)), Some((20, 5)));
+    assert_eq!(at(Some(5), 7).since(at(Some(10), 2)), None, "energy went back");
+    assert_eq!(at(Some(30), 1).since(at(Some(10), 2)), None, "busy went back");
+    assert_eq!(at(None, 7).since(at(Some(10), 2)), None, "the call failed");
+    assert_eq!(at(Some(30), 7).since(at(None, 2)), None);
+}
+
+#[test]
+fn lilys_counters_are_read_after_every_call_and_a_bad_figure_is_dropped_not_the_reading()
+ {
+    let at = |energy, busy| OwnCounters { energy_nj: Some(energy), gpu_busy_ns: busy };
+    let counters = Arc::new(Mutex::new(VecDeque::from([
+        at(0, 0),                   // the baseline, before the first call
+        at(100_000_000, 2_000_000), // after the first: a figure
+        at(50_000_000, 3_000_000),  // energy went back: none
+        at(60_000_000, 9_000_000),  // after the failed call
+        at(70_000_000, 9_000_000),  // no GPU time since the failed call
+    ])));
+    let reads = Arc::new(AtomicU64::new(0));
+    let played = calls();
+    let script = vec![
+        Ok(reading(11.0)),
+        Ok(reading(12.0)),
+        Err("IOReport hiccup".to_owned()),
+        Ok(reading(13.0)),
+    ];
+    let machine = Machine::spawn_counting(
+        {
+            let played = played.clone();
+            move || Ok(Script::new(script, &played))
+        },
+        {
+            let (counters, reads) = (counters.clone(), reads.clone());
+            move || {
+                reads.fetch_add(1, Ordering::Relaxed);
+                lock(&counters).pop_front().unwrap_or_default()
+            }
+        },
+        || true,
+        FAST,
+    );
+    let mut taken = Vec::new();
+    assert!(eventually(|| {
+        taken.extend(machine.drain());
+        taken.len() >= 3
+    }));
+    machine.finish(Duration::from_secs(5));
+    assert_eq!(machine.skipped(), 1, "only the failed call was skipped");
+    let first = taken[0].reading.lily.expect("a figure from the baseline on");
+    assert!(first.cpu_w > 0.0 && first.gpu_w > 0.0 && first.gpu_w <= 0.5, "{first:?}");
+    assert_eq!(taken[1].reading.lily, None, "a counter that went back");
+    assert_eq!(taken[1].reading.sys_w, Some(12.0), "the reading itself stays");
+    // Measured from the counters read after the failed call: no GPU time.
+    let third = taken[2].reading.lily.expect("a figure");
+    assert_eq!(third.gpu_w, 0.0, "{third:?}");
+    assert!(third.cpu_w > 0.0);
+    // Once before the first call and once after each.
+    assert_eq!(reads.load(Ordering::Relaxed) as usize, count(&played) + 1);
+    // Counters without an energy (the call failed): no figure, readings go on.
+    assert!(taken.iter().skip(3).all(|s| s.reading.lily.is_none()));
 }
 
 #[test]

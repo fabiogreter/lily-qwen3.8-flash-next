@@ -1,7 +1,8 @@
 //! The dashboard's machine sampling (docs/dashboard.md § 6): CPU, GPU, ANE
 //! and system power, the GPU's activity and frequency and the CPU and GPU
 //! temperatures, read from IOReport and the SMC by the `macmon` crate, which
-//! needs no root. This is the one module that knows `macmon` ([`Macmon`]);
+//! needs no root, and lily's own share of that power, estimated from lily's
+//! own counters. This is the one module that knows `macmon` ([`Macmon`]);
 //! [`Source`] is the whole of what the rest of lily asks of it, so a
 //! replacement (our own IOReport bindings) changes nothing outside this file.
 //!
@@ -11,9 +12,29 @@
 //! the `macmon` sampler itself (about 0.7 s, so never on the main thread, and
 //! never while the server starts). Nothing here runs on the engine's thread
 //! or on an HTTP thread (§ 2.3), reads the engine's state beyond one cheap
-//! predicate, or wakes the engine (§ 2.2): the sampler only asks "is anything
-//! running" through the closure it was given and reads IOReport, which is the
-//! machine's, not lily's.
+//! predicate, or wakes the engine (§ 2.2): the sampler asks "is anything
+//! running" through the closure it was given, reads IOReport, which is the
+//! machine's, and reads two of lily's own counters ([`OwnCounters`]), which
+//! the engine never waits for: the kernel's CPU energy account of the process
+//! and the GPU busy time Metal's commit feedback adds up (`metal::busy`).
+//!
+//! **lily's own power is an estimate** ([`attribute`], [`LilyPower`]). macOS
+//! has no per-process power meter. lily's CPU power is the change of its CPU
+//! energy (`stats::own_energy_nj`, the kernel's per-process estimate over
+//! both core clusters) over the window; its GPU power is the machine's GPU
+//! power times lily's share of the GPU's active time: lily's busy time over
+//! the window divided by the GPU's active ratio times the window, at most 1.
+//! Neither the ANE (lily uses none) nor DRAM and the rest of the SoC are
+//! attributed, and DRAM is large while decoding. The share over-attributes
+//! when other processes' GPU work runs inside lily's command buffers' spans
+//! (a span is wall time, stalls included), and busy time is booked when a
+//! pass's feedback completes, so a long prefill pass can land in the window
+//! after the one it ran in. The counters are read after every call to the
+//! source, whatever it returned, because the source's own baseline moves on
+//! every call: a figure always spans the same window as the reading. A figure
+//! that cannot be right (a counter that went back, a failed call, a value out
+//! of range) is `None`, and the reading is published without it; it never
+//! skips a reading or counts as a failure.
 //!
 //! **Waiting is lily's, the measuring is `macmon`'s.** `macmon` measures from
 //! the end of its previous call to its next one, and sleeps only if the
@@ -169,6 +190,89 @@ impl FromStr for MachineStats {
     }
 }
 
+/// lily's own share of the machine's power over a reading's window, in watts:
+/// an estimate (the module docs say how, and what it leaves out).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LilyPower {
+    /// The CPU energy lily used over the window, per second.
+    pub cpu_w: f64,
+    /// The machine's GPU power times lily's share of the GPU's active time.
+    pub gpu_w: f64,
+}
+
+impl LilyPower {
+    /// CPU and GPU together.
+    pub fn w(&self) -> f64 {
+        self.cpu_w + self.gpu_w
+    }
+}
+
+/// lily's own cumulative counters, read on the sampler thread after every
+/// call to the source.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OwnCounters {
+    /// The process's CPU energy so far, in nanojoules (`None`: the call
+    /// failed).
+    pub energy_nj: Option<u64>,
+    /// lily's GPU busy time so far, in nanoseconds.
+    pub gpu_busy_ns: u64,
+}
+
+impl OwnCounters {
+    /// The production counters: `stats::own_energy_nj` and
+    /// `metal::gpu_busy_ns`.
+    pub fn read() -> Self {
+        Self {
+            energy_nj: crate::stats::own_energy_nj(),
+            gpu_busy_ns: crate::metal::gpu_busy_ns(),
+        }
+    }
+
+    /// The energy and busy time from `earlier` to `self`; `None` when either
+    /// reading has no energy or a counter went back (neither should happen).
+    pub fn since(self, earlier: OwnCounters) -> Option<(u64, u64)> {
+        let energy = self.energy_nj?.checked_sub(earlier.energy_nj?)?;
+        let busy = self.gpu_busy_ns.checked_sub(earlier.gpu_busy_ns)?;
+        Some((energy, busy))
+    }
+}
+
+/// The GPU active time below which the GPU counts as idle for the share, in
+/// seconds: a share of nearly nothing would be noise.
+const IDLE_GPU_SECS: f64 = 1e-6;
+
+/// lily's power over a window of length `window`, from the machine's GPU
+/// power `gpu_w` and active ratio `gpu_active` over it and lily's CPU energy
+/// `energy_nj` and GPU busy time `busy_ns` over the same window. The GPU
+/// share is `busy / (gpu_active × window)`, at most 1; with the GPU (nearly)
+/// idle by IOReport's account it is 1 if lily was busy at all and 0
+/// otherwise. `None` for a zero window and for a figure that is not finite or
+/// is out of range (0 to [`MAX_WATTS`]).
+pub fn attribute(
+    gpu_w: f64,
+    gpu_active: f64,
+    window: Duration,
+    energy_nj: u64,
+    busy_ns: u64,
+) -> Option<LilyPower> {
+    let secs = window.as_secs_f64();
+    if secs <= 0.0 {
+        return None;
+    }
+    let busy_secs = busy_ns as f64 * 1e-9;
+    let active_secs = gpu_active.clamp(0.0, 1.0) * secs;
+    let share = if active_secs <= IDLE_GPU_SECS {
+        if busy_ns > 0 { 1.0 } else { 0.0 }
+    } else {
+        (busy_secs / active_secs).min(1.0)
+    };
+    let power =
+        LilyPower { cpu_w: energy_nj as f64 * 1e-9 / secs, gpu_w: gpu_w * share };
+    let plausible = |w: f64| w.is_finite() && (0.0..=MAX_WATTS).contains(&w);
+    (plausible(power.cpu_w) && plausible(power.gpu_w) && plausible(power.w()))
+        .then_some(power)
+}
+
 /// One reading of the machine over a window. Power in watts, `gpu_active` a
 /// ratio 0..1, the frequency in MHz, temperatures in degrees Celsius (`None`
 /// where no sensor reported).
@@ -184,6 +288,10 @@ pub struct Reading {
     pub gpu_freq_mhz: f64,
     pub cpu_temp_c: Option<f64>,
     pub gpu_temp_c: Option<f64>,
+    /// lily's own share ([`attribute`]); `None` where it cannot be told.
+    /// The sampler fills it in after [`Reading::check`], which does not look
+    /// at it: a bad estimate is dropped, never the reading.
+    pub lily: Option<LilyPower>,
 }
 
 impl Reading {
@@ -294,6 +402,7 @@ impl Source for Macmon {
             gpu_freq_mhz: f64::from(m.gpu_freq_mhz),
             cpu_temp_c: m.temp.cpu_temp_avg.map(f64::from),
             gpu_temp_c: m.temp.gpu_temp_avg.map(f64::from),
+            lily: None,
         })
     }
 }
@@ -456,20 +565,38 @@ impl Machine {
         machine
     }
 
-    /// Starts the production sampler ([`Macmon`], the default
-    /// [`Intervals`]); `busy` says whether the engine is working. Returns at
-    /// once: the thread creates the sampler.
+    /// Starts the production sampler ([`Macmon`], [`OwnCounters::read`], the
+    /// default [`Intervals`]); `busy` says whether the engine is working.
+    /// Returns at once: the thread creates the sampler.
     pub fn start(busy: impl Fn() -> bool + Send + 'static) -> Arc<Self> {
-        Self::spawn(Macmon::new, busy, Intervals::default())
+        Self::spawn_counting(Macmon::new, OwnCounters::read, busy, Intervals::default())
     }
 
     /// Starts a sampler thread that creates its source with `make` (on the
     /// thread) and reads it as often as `intervals`, `busy` and the
-    /// dashboard's requests say.
+    /// dashboard's requests say, with no counters of lily's own (the readings
+    /// have no [`Reading::lily`]).
     pub fn spawn<S, F, B>(make: F, busy: B, intervals: Intervals) -> Arc<Self>
     where
         S: Source + 'static,
         F: FnOnce() -> Result<S, String> + Send + 'static,
+        B: Fn() -> bool + Send + 'static,
+    {
+        Self::spawn_counting(make, OwnCounters::default, busy, intervals)
+    }
+
+    /// [`Machine::spawn`], with `own` read after every call to the source
+    /// (and once before the first) for lily's share of the power.
+    pub fn spawn_counting<S, F, O, B>(
+        make: F,
+        own: O,
+        busy: B,
+        intervals: Intervals,
+    ) -> Arc<Self>
+    where
+        S: Source + 'static,
+        F: FnOnce() -> Result<S, String> + Send + 'static,
+        O: Fn() -> OwnCounters + Send + 'static,
         B: Fn() -> bool + Send + 'static,
     {
         let machine = Self::new(RUNNING, intervals.page_open);
@@ -477,7 +604,7 @@ impl Machine {
             let machine = machine.clone();
             std::thread::Builder::new()
                 .name("lily-machine".into())
-                .spawn(move || machine.run(make, busy, intervals))
+                .spawn(move || machine.run(make, own, busy, intervals))
         };
         match thread {
             Ok(thread) => *lock(&machine.thread) = Some(thread),
@@ -497,10 +624,11 @@ impl Machine {
     }
 
     /// The loop of the sampler thread.
-    fn run<S, F, B>(&self, make: F, busy: B, intervals: Intervals)
+    fn run<S, F, O, B>(&self, make: F, own: O, busy: B, intervals: Intervals)
     where
         S: Source,
         F: FnOnce() -> Result<S, String>,
+        O: Fn() -> OwnCounters,
         B: Fn() -> bool,
     {
         let _ended = Ended(self);
@@ -517,6 +645,8 @@ impl Machine {
         let mut failures = Failures::default();
         // When the previous call returned: `macmon`'s baseline, near enough.
         let mut previous: Option<Instant> = None;
+        // lily's counters then (before the first call: its baseline).
+        let mut counted: Option<OwnCounters> = None;
         while !self.stop.load(Ordering::Acquire) {
             let (window, interval) = match previous {
                 None => (intervals.first, intervals.first),
@@ -525,9 +655,17 @@ impl Machine {
                     None => break,
                 },
             };
+            if counted.is_none() {
+                counted = Some(own());
+            }
             let call_start = Instant::now();
             let result = guarded("sampling", || source.read(window));
             let end = Instant::now();
+            // After every call, whatever it returned: the source's baseline
+            // moved, so lily's must too.
+            let own_now = own();
+            let own_window =
+                counted.replace(own_now).and_then(|then| own_now.since(then));
             let end_ms = super::now_ms();
             let since = end.saturating_duration_since(previous.unwrap_or(call_start));
             previous = Some(end);
@@ -548,10 +686,22 @@ impl Machine {
                             window.as_millis()
                         ))
                     } else {
-                        let reading = reading.normalised();
+                        let mut reading = reading.normalised();
+                        reading.lily = None;
                         reading
                             .check()
-                            .map(|()| reading)
+                            .map(|()| Reading {
+                                lily: own_window.and_then(|(energy, busy)| {
+                                    attribute(
+                                        reading.gpu_w,
+                                        reading.gpu_active,
+                                        since,
+                                        energy,
+                                        busy,
+                                    )
+                                }),
+                                ..reading
+                            })
                             .map_err(|why| format!("sampling returned {why}"))
                     }
                 }
