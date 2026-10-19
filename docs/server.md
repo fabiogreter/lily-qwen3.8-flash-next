@@ -106,8 +106,9 @@ end, at most a minute late (the sampler's power readings are not delayed).
 `/v1/lily/status` shows the latest reading as `machine.power`, `gpu_active`,
 `gpu_freq_mhz` and `temp_c` while it is younger than three waits (6 s, or 90 s
 after an idle one) and `null` otherwise. `machine.power.sys_w` is `null` when
-the SMC does not report the system's power (macmon then gives 0, or less than
-the parts); the parts are still shown. `machine.sampler` is `ok` (the thread
+the SMC does not report the system's power: macmon then gives 0, or exactly
+the sum of the parts (it never reports less, so a sum means the SMC read below
+them). The parts are still shown. `machine.sampler` is `ok` (the thread
 runs; the figures can be `null` until the first fresh reading), `off`
 (`--machine-stats off`: no thread) or `failed` (it could not start, or stopped
 after repeated errors).
@@ -128,9 +129,9 @@ method and its limits.
 `machine.power.rest_w` is the system power the parts do not account for:
 `sys_w` minus CPU, GPU and ANE (never below 0, `null` with `sys_w`). It is
 memory, fabric, display, storage, board and conversion losses, measured only
-as a whole; while lily decodes it is about half the system's power and mostly
-lily's memory traffic, but macOS gives no split of it, so it is attributed to
-no one (dashboard.md § 6).
+as a whole. While lily decoded on 2026-10-15 (macOS 26.6) it was about half
+the system's power, the memory side about 40 W of it; macOS 27 gives no split
+of it, so it is attributed to no one (dashboard.md § 6).
 
 A reading that fails, is not finite, or is out of range (a power or the system
 power above 1 000 W, a frequency above 10 000 MHz, a temperature outside

@@ -289,7 +289,12 @@ and requests every 60 s and on a range change.
 ## 6. Machine sampling (IOReport)
 
 `macmon` 0.9.0 (MIT, 2026-10-07) is a Rust library over IOReport and SMC
-that needs no root. With `default-features = false` its dependencies are
+that needs no root. On macOS 26 it reads CPU, GPU and ANE power from IOReport's
+Energy Model; on macOS 27, where those counters stay at 0 for unentitled
+processes, from the CLPC energy counters (IOReport channels it builds from a
+table of driver ids; this machine's `AppleT6050CLPC` is in it), which keeps
+the figures working (checked in lily's history after the upgrade,
+2026-10-19). With `default-features = false` its dependencies are
 `core-foundation`, `libc`, `serde`, `serde_json`. It gives CPU/GPU/ANE/system
 watts, CPU and GPU frequency and active ratio, temperatures, RAM and swap.
 
@@ -354,8 +359,10 @@ taken outside the sandbox by the owner: `Sampler::new()` about 0.7 s,
   three of the waits before it (6 s, 90 s after an idle wait, never less than
   3 s), and `null` otherwise or after a failure.
 - **System power can be unknown**: `macmon` reads it from the SMC's `PSTR` and
-  reports 0 when that fails, and never less than CPU + GPU + ANE; a reading whose
-  system power is 0 or below that sum has none. `machine.power.sys_w` is then
+  reports 0 when that fails, and otherwise the larger of `PSTR` and CPU + GPU +
+  ANE, so a `PSTR` that read below the parts (a spot reading against window
+  averages) comes back as exactly their sum. A reading whose system power is 0
+  or not above that sum by more than a milliwatt has none. `machine.power.sys_w` is then
   `null` (the parts are still shown; the UI shows "–"), and the recorder counts
   the window for the GPU series but not for system power or energy.
 - **lily's own power** (`machine.power.lily`, "lily CPU+GPU (est.)" on the
@@ -397,17 +404,22 @@ taken outside the sandbox by the owner: `Sampler::new()` about 0.7 s,
   attributed)" on the page) is `sys_w` minus CPU, GPU and ANE, from the
   rounded figures and never below 0: memory, fabric, display, storage, board
   and conversion losses, measured as a whole by the SMC. While lily decodes it
-  is about half the system's power, nearly all of it lily's doing, but it is
-  attributed to no one because macOS no longer gives its parts. Measured on
+  was about half the system's power in the measurement below, and most of it
+  plausibly lily's (memory traffic; an inference, not a measurement), but it is
+  attributed to no one because macOS 27 no longer gives its parts. Measured on
   the M5 Max (2026-10-15, macOS 26.6, IOReport Energy Model; system about
   106 to 113 W): GPU about 38 W, `AFR` (the GPU's memory path, stepped by GPU
   memory bandwidth) about 10.5 W, DRAM 14.4, DCS (memory controllers) 8.4,
   AMCC (memory cache) 6.2, CPU 7.7, fabric 0.8. On macOS 27 every one of those
-  channels except `GPU Energy` reads 0 (a private entitlement gates them; they
+  channels except `GPU Energy` reads 0 (inferred to be the private
+  `com.apple.private.pmgr.nrg.reporting` entitlement that macmon names; they
   publish only in rare, irregular catch-ups, none in a 12-minute log on
   2026-10-19), and the SMC's 81 power keys have no documented memory rail on
   this machine (`PMVC`, DRAM on M1/M3 Pro, is absent). A lily attribution of
   memory would be a guess, so the page shows the remainder honestly instead.
+  The 2026-10-15 breakdown came from the Energy Model; on macOS 27 macmon's
+  CPU, GPU and ANE figures come from the CLPC energy counters instead (below),
+  a different source whose agreement with the old one is not verified.
 - **Sources of the rest**: CPU load stays lily's tick-based figure
   (`stats::cpu_ticks`: it works without the sampler, measures the same span as
   the other live rates, and the history's 10 s samples use it); memory,

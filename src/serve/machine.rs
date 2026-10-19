@@ -1,7 +1,8 @@
 //! The dashboard's machine sampling (docs/dashboard.md § 6): CPU, GPU, ANE
 //! and system power, the GPU's activity and frequency and the CPU and GPU
 //! temperatures, read from IOReport and the SMC by the `macmon` crate, which
-//! needs no root, and lily's own share of that power, estimated from lily's
+//! needs no root (on macOS 27 its CPU, GPU and ANE power come from the CLPC
+//! energy counters, the Energy Model's staying at 0), and lily's own share of that power, estimated from lily's
 //! own counters. This is the one module that knows `macmon` ([`Macmon`]);
 //! [`Source`] is the whole of what the rest of lily asks of it, so a
 //! replacement (our own IOReport bindings) changes nothing outside this file.
@@ -87,9 +88,11 @@
 //! a clock that jumps shifts a window and never stretches it.
 //!
 //! **System power can be unknown.** `macmon` reads it from the SMC's `PSTR`
-//! key and reports 0 when that fails, and it never reports less than the sum
-//! of the three components. A reading whose system power is not above that sum
-//! (or is 0) has none ([`Reading::sys_w`] is `None`): the status shows
+//! key and reports 0 when that fails, and it reports the larger of `PSTR` and
+//! the sum of the three components, so a `PSTR` that read below them (a spot
+//! reading against window averages) comes back as exactly the sum. A reading
+//! whose system power is not above that sum by more than a milliwatt (or is
+//! 0) has none ([`Reading::sys_w`] is `None`): the status shows
 //! `null` for it, and the recorder counts the window for the GPU series but
 //! not for system power or energy.
 //!
@@ -304,11 +307,14 @@ impl Reading {
         }
         let parts = self.cpu_w + self.gpu_w + self.ane_w;
         // `macmon` takes the larger of the SMC's figure and this sum, so a
-        // real reading is never below it; a milliwatt of slack for the
-        // rounding of the sum.
+        // figure at the sum is the floor, not a measurement (the SMC read
+        // below the parts), and one below it is no reading at all; a
+        // milliwatt of slack for the rounding of the sum. Taking the floor as
+        // known would show a rest of the system of 0 W and count the parts
+        // as the system's energy.
         // A value that is not a number stays, for the check to refuse.
         self.sys_w =
-            self.sys_w.filter(|&w| !w.is_finite() || (w > 0.0 && w >= parts - 1e-3));
+            self.sys_w.filter(|&w| !w.is_finite() || (w > 0.0 && w > parts + 1e-3));
         self
     }
 

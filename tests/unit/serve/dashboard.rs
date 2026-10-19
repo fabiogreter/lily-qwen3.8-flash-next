@@ -1297,9 +1297,13 @@ fn the_status_shows_the_samplers_fresh_reading_and_nothing_stale() {
     machine.publish(machine::BUSY_INTERVAL, unattributed);
     let power = d.status(READY).machine.power.expect("power");
     assert_eq!((power.lily, power.gpu_w), (None, 41.99));
-    // A system power below the rounded parts by a rounding leaves no rest
-    // below 0.
-    machine.publish(machine::BUSY_INTERVAL, sampled(50.1));
+    // A system power just above the parts (so known) can round below the
+    // rounded parts; the rest is then 0, never below it.
+    let mut tight = sampled(50.114);
+    tight.reading.cpu_w = 8.126; // 8.13
+    tight.reading.gpu_w = 41.986; // 41.99, system 50.11
+    assert_eq!(tight.reading.normalised().sys_w, Some(50.114), "a reachable reading");
+    machine.publish(machine::BUSY_INTERVAL, tight);
     assert_eq!(d.status(READY).machine.power.expect("power").rest_w, Some(0.0));
     // A ratio past 1 (a rounding in the source) is shown as 1.
     let mut over = sampled(10.0);

@@ -189,7 +189,7 @@ fn a_window_is_the_monotonic_time_since_the_previous_call_placed_by_the_wall_clo
 // --- the readings --------------------------------------------------------------
 
 #[test]
-fn a_system_power_that_is_zero_or_below_the_parts_is_unknown() {
+fn a_system_power_that_is_zero_or_not_above_the_parts_is_unknown() {
     let with = |sys_w: Option<f64>| Reading {
         cpu_w: 8.0,
         gpu_w: 40.0,
@@ -201,8 +201,12 @@ fn a_system_power_that_is_zero_or_below_the_parts_is_unknown() {
     assert_eq!(with(Some(0.0)).normalised().sys_w, None);
     // Below the sum cannot be a real reading either.
     assert_eq!(with(Some(48.4)).normalised().sys_w, None);
-    // At the sum (macmon's floor) or above, it is known.
-    assert_eq!(with(Some(48.5)).normalised().sys_w, Some(48.5));
+    // At the sum is macmon's floor: the SMC read below the parts, so the
+    // system's own figure is not known (within a milliwatt of the sum too).
+    assert_eq!(with(Some(48.5)).normalised().sys_w, None);
+    assert_eq!(with(Some(48.5005)).normalised().sys_w, None);
+    // Above it, it is known.
+    assert_eq!(with(Some(48.52)).normalised().sys_w, Some(48.52));
     assert_eq!(with(Some(61.0)).normalised().sys_w, Some(61.0));
     assert_eq!(with(None).normalised().sys_w, None);
     // An idle machine whose parts are all 0 and whose system power is not.
