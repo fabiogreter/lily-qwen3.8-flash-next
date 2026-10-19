@@ -17,15 +17,17 @@
 //! failed exit, so launchd starts it again after its 30 s throttle and the
 //! service comes back by itself once the other instance has exited.
 
+use std::ffi::{CStr, OsStr, OsString};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Seek as _, Write as _};
 use std::os::fd::AsRawFd as _;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Mutex;
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 
 /// The exit status of a process refused because another instance runs.
 pub const EXIT_ALREADY_RUNNING: u8 = 75;
@@ -34,11 +36,65 @@ pub const EXIT_ALREADY_RUNNING: u8 = 75;
 /// `~/Library/Caches/lily/instance.lock`, next to the disk tier's default
 /// directory. Deliberately not configurable, so no two processes can
 /// disagree about it; tests lock their own file through [`InstanceLock::acquire_at`].
-pub fn default_path() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join("Library").join("Caches").join("lily").join("instance.lock")
+///
+/// The home directory is the account's (the user database), not `HOME`: a
+/// process started without `HOME` used to lock `./Library/...` relative to
+/// its working directory, never saw the service's lock and could load a
+/// second model (2026-10-19, benchmarks started with a cleared
+/// environment). An absolute `HOME` stands in only when the user database
+/// has no entry; with neither, this fails rather than guess.
+pub fn default_path() -> Result<PathBuf> {
+    let home = resolve_home(account_home(), std::env::var_os("HOME"))?;
+    Ok(home.join("Library").join("Caches").join("lily").join("instance.lock"))
+}
+
+/// [`default_path`]'s choice of home: `account` (the user database's entry)
+/// when absolute, else `env` (`HOME`) when absolute, else an error.
+fn resolve_home(account: Option<PathBuf>, env: Option<OsString>) -> Result<PathBuf> {
+    if let Some(home) = account.filter(|p| p.is_absolute()) {
+        return Ok(home);
+    }
+    if let Some(home) = env.map(PathBuf::from).filter(|p| p.is_absolute()) {
+        return Ok(home);
+    }
+    bail!(
+        "no home directory for the instance lock: the user database has no entry for this \
+         user and HOME is unset or relative"
+    )
+}
+
+/// The current user's home directory from the user database
+/// (`getpwuid_r`), whatever the environment says; `None` without an entry.
+fn account_home() -> Option<PathBuf> {
+    let mut buf: Vec<libc::c_char> = vec![0; 4096];
+    loop {
+        // SAFETY: an all-zero `passwd` is a valid out-parameter (null
+        // pointers, zero ids) that `getpwuid_r` fills.
+        let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: `entry` and `buf` outlive the call, `buf.len()` is its
+        // size, and `found` receives either null or `&mut entry`.
+        let rc = unsafe {
+            libc::getpwuid_r(
+                libc::getuid(),
+                &mut entry,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut found,
+            )
+        };
+        if rc == libc::ERANGE && buf.len() < 1 << 20 {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if rc != 0 || found.is_null() || entry.pw_dir.is_null() {
+            return None;
+        }
+        // SAFETY: `pw_dir` points into `buf`, NUL-terminated, and `buf` is
+        // still alive; the bytes are copied out before it goes.
+        let dir = unsafe { CStr::from_ptr(entry.pw_dir) };
+        return Some(PathBuf::from(OsStr::from_bytes(dir.to_bytes())));
+    }
 }
 
 /// Another process holds the lock.
@@ -157,7 +213,7 @@ static HELD: Mutex<Option<InstanceLock>> = Mutex::new(None);
 pub fn acquire() -> Result<()> {
     let mut held = HELD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if held.is_none() {
-        *held = Some(InstanceLock::acquire_at(&default_path())?);
+        *held = Some(InstanceLock::acquire_at(&default_path()?)?);
     }
     Ok(())
 }

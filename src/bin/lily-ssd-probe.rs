@@ -753,9 +753,9 @@ fn main() -> Result<()> {
 /// probe can see, still run the recorded binary (`proc_pidpath`; a reused
 /// pid runs another one). No file or no record: no lily runs (a holder
 /// writes its record right after locking). `None` when the file cannot be
-/// read.
+/// read, or its path not determined (no home directory).
 fn other_lily_running() -> Option<bool> {
-    let text = match std::fs::read_to_string(lily::instance::default_path()) {
+    let text = match std::fs::read_to_string(lily::instance::default_path().ok()?) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(false),
         Err(_) => return None,

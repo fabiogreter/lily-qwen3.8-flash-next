@@ -1620,7 +1620,10 @@ server, `lily-bench`, `lily-probe`, `lily-vision-probe`, `lily-experts`,
 `lily-trace-routing` and the ignored tests that load a real checkpoint are
 all covered; the server takes it again, first thing, before it binds the
 port, so a second server names the holder instead of failing on "address
-in use". A process takes it
+in use". The `~` is the account's home from the user database, not `HOME`,
+so a process started with a cleared or altered environment still locks the
+same file (until 2026-10-19 one without `HOME` locked a path relative to its
+working directory and could load next to the service). A process takes it
 once and keeps it until it exits: the idle unload and the reloads (after an
 idle unload or a GPU fault) find it held, and the kernel drops it on any
 exit, a crash or a SIGKILL included, so no stale lock can block a start.

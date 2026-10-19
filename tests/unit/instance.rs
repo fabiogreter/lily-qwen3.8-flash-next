@@ -123,6 +123,84 @@ fn a_second_handle_in_the_same_process_is_refused_and_dropping_frees_it() {
     InstanceLock::acquire_at(&path).expect("free after the first handle dropped");
 }
 
+/// Set in the environment of [`lock_path_child`]: print the default lock
+/// path and exit.
+const PATH_CHILD_ENV: &str = "LILY_TEST_INSTANCE_PATH_CHILD";
+
+/// Not a test of its own: the body of a child process that prints
+/// [`default_path`] as it resolves in the child's environment.
+#[test]
+#[ignore = "run as the child process of the lock path test"]
+fn lock_path_child() {
+    if std::env::var_os(PATH_CHILD_ENV).is_none() {
+        return;
+    }
+    let path = default_path().expect("the child resolves a lock path");
+    println!("lock path: {}", path.display());
+}
+
+/// The lock path a child process of this test binary resolves with `home`
+/// as its `HOME` (`None`: unset), in another working directory.
+fn child_lock_path(home: Option<&str>) -> String {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "instance::tests::lock_path_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(PATH_CHILD_ENV, "1")
+        .current_dir(std::env::temp_dir())
+        .stderr(Stdio::inherit());
+    match home {
+        Some(home) => command.env("HOME", home),
+        None => command.env_remove("HOME"),
+    };
+    let output = command.output().expect("run the path child");
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("lock path: ").map(str::to_owned))
+        .expect("the child printed its lock path")
+}
+
+/// Every process of the user locks the same absolute file whatever its
+/// environment: without `HOME`, with a relative one, or with one pointing
+/// elsewhere, as a benchmark started with a cleared environment once did.
+#[test]
+fn the_lock_path_does_not_depend_on_home() {
+    let here = default_path().expect("lock path");
+    assert!(here.is_absolute(), "{}", here.display());
+    assert!(here.ends_with("Library/Caches/lily/instance.lock"), "{}", here.display());
+    let here = here.display().to_string();
+    assert_eq!(child_lock_path(None), here, "HOME unset");
+    assert_eq!(child_lock_path(Some(".")), here, "HOME relative");
+    assert_eq!(child_lock_path(Some("/nonexistent/elsewhere")), here, "HOME elsewhere");
+}
+
+#[test]
+fn the_home_falls_back_to_an_absolute_home_and_never_to_a_relative_one() {
+    let account = Some(PathBuf::from("/Users/account"));
+    assert_eq!(
+        resolve_home(account.clone(), Some("/Users/env".into())).unwrap(),
+        PathBuf::from("/Users/account")
+    );
+    assert_eq!(
+        resolve_home(None, Some("/Users/env".into())).unwrap(),
+        PathBuf::from("/Users/env")
+    );
+    assert_eq!(
+        resolve_home(Some("relative".into()), Some("/Users/env".into())).unwrap(),
+        PathBuf::from("/Users/env")
+    );
+    for env in [None, Some(OsString::from(".")), Some(OsString::from(""))] {
+        let error = resolve_home(None, env.clone()).expect_err("no absolute home");
+        assert!(format!("{error}").contains("no home directory"), "{env:?}: {error}");
+    }
+}
+
 #[test]
 fn a_refusal_behind_context_still_exits_75_and_other_errors_exit_1() {
     let refused =
