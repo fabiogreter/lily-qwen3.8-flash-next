@@ -961,12 +961,14 @@ pub fn load(
     }
 
     // The draft head loads under an expert cache as everywhere: its own
-    // experts are resident, a speculative step's verify pass pays the same
-    // 48 handshakes as a plain token, and with the requests of the verify
-    // passes encoded ahead for the other outcomes cancelled when those are
-    // dropped (`expert_cache::QueuedRequests`) it decodes 58 tok/s cold
+    // experts are resident and a speculative step's verify pass pays the
+    // same 48 handshakes as a plain token. Measured on 2026-10-09, when the
+    // next verify pass was still encoded ahead for every outcome and the
+    // dropped variants cancelled their requests, it decoded 58 tok/s cold
     // against 51 plain, 87 against 66 warm (docs/low-ram-experts.md,
-    // "Speculative decoding under the cache"). `--mtp-drafts 0` turns it off.
+    // "Speculative decoding under the cache"); each verify pass is now
+    // encoded once and committed whole, and those numbers are not yet
+    // re-measured. `--mtp-drafts 0` turns it off.
     let mtp = match (&config.mtp, with_mtp) {
         (Some(_), true) => Some(Box::new(load_mtp(&loader, config)?)),
         _ => None,

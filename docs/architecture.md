@@ -204,12 +204,15 @@ The speculative loop does not park. Its verify pass needs the n-gram rows
 of the draft pass's proposals, so a parked verify pass always reached its
 wait before the host could release it, and on macOS 27, while the window
 server composites, a pass in that state resumes about 2 ms after the
-release and every dozen or so steps only after about 360 ms. Neither a
-second submission, a release signalled from the GPU, nor submitting the
-tail after the release avoids it; a pass committed whole does. So the
-verify pass is encoded and committed once its inputs are staged, at 2.5%
-with the screen idle (124.6 against 127.8 tok/s with 2 drafts) and 88%
-faster under a steady compositing load (119.1 against 63.3;
+release and every dozen or so steps only after about 360 ms. It takes a
+large residency set: a standalone program shows it with 64 GB resident
+on its queue, not with 32 (lily keeps its 75 GB of weights in one).
+Neither a second submission, a release signalled from the GPU, nor
+submitting the tail after the release avoids it; a pass committed whole
+does. So the verify pass is encoded and committed once its inputs are
+staged, at a cost of 2.5% with the screen idle (124.6 against 127.8 tok/s
+with 2 drafts) and 88% faster under a steady compositing load (119.1
+against 63.3;
 `docs/performance.md`, "Waiting for the GPU"). Plain decode and the
 batched step park as before: under the same load they never stalled and
 lost only the window server's share of the GPU (3 to 4%).
@@ -945,8 +948,9 @@ takes a checkpoint every `--decode-checkpoint-tokens` (default 2 048)
 generated tokens. It is taken at rest: when one is due, the plain decode
 loop does not encode the following step ahead, so once the current step
 completes nothing is in flight or parked, and the speculative loop completes
-its verify pass without committing the next one (as at the end of a
-generation, no step pending), snapshots, and proposes afresh with the
+its verify pass without proposals (`finish_speculation` without `propose`,
+as at the end of a generation, no step pending), snapshots, and proposes
+afresh with the
 head's initial draft pass. The position is then exactly the tokens fed: the
 prompt and every drawn token but the last, which is the next step's input,
 and the session's tokens are recorded to the same count after the

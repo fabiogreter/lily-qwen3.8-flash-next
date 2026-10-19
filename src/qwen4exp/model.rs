@@ -2983,7 +2983,7 @@ impl Qwen4ExpModel {
                     self.mtp_catch_up(ctx, &pass, mtp, mst, pos, s, ps, rope, images)?;
                 }
             }
-            BatchMode::Verify { params, step0, .. } => {
+            BatchMode::Verify { params, step0 } => {
                 let sp = s.spec.as_ref().ok_or_else(|| {
                     anyhow::anyhow!("verify pass without spec scratch")
                 })?;

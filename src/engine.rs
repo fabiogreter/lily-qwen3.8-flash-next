@@ -1026,8 +1026,9 @@ pub trait LanguageModel: Sized {
     /// with [`Self::finish_speculation`] before anything else. The pass is
     /// encoded and committed here, whole, once its inputs are staged: a
     /// verify pass committed ahead and parked on the GPU until its inputs
-    /// exist stalled for about 360 ms whenever the window server was busy
-    /// (`docs/performance.md`, "Waiting for the GPU"). Returns the draws and
+    /// existed resumed about 2 ms late while the window server composited,
+    /// and every dozen or so steps about 360 ms late (`docs/performance.md`,
+    /// "Waiting for the GPU"). Returns the draws and
     /// the draft pass the model committed behind the verify pass: it decides
     /// the accepted count on the GPU, rolls the state back to it and proposes
     /// up to `next_drafts` tokens following the accepted draw. Hand it to

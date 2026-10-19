@@ -143,8 +143,8 @@ then says what assumption it rests on.
   row) and by acceptance totals over several prompts, never by one cell.
 - **A screen in use slows the GPU's work.** The window server's frames
   take the GPU for short slices and, on macOS 27, delay the continuation
-  of any pass already in flight that waits on the host (see "Waiting for
-  the GPU"). With the verify pass committed whole, 2-draft decode under a
+  of a pass that reached its host wait before the release (see "Waiting
+  for the GPU"). With the verify pass committed whole, 2-draft decode under a
   steady compositing load ran at 119.1 tok/s against 124.6 with a static
   screen, plain decode at 83.5 against 86.6 (2026-10-19). How much the
   screen costs depends on what is on it, so speculative cells are measured
@@ -637,9 +637,11 @@ cold runs' misses depend on what the page cache still holds), against 2 257 and
 87 with everything resident. Speculative decoding runs under the cache
 since 2026-10-09: 58.1 tok/s cold with two drafts against 50.7 plain, 87.3
 against 66.2 warm (`docs/low-ram-experts.md`, "Speculative decoding under
-the cache"). Before, the verify passes encoded ahead for the other accepted
-counts left their cache requests behind when dropped, and a step collapsed
-to 14 tok/s.
+the cache"), measured while the next verify pass was still encoded ahead
+and parked; since 2026-10-19 it is committed whole ("Waiting for the GPU")
+and these two numbers are not yet re-measured. Before 2026-10-09, the
+verify passes encoded ahead for the other accepted counts left their cache
+requests behind when dropped, and a step collapsed to 14 tok/s.
 
 ## What was done
 
@@ -967,9 +969,24 @@ a second queue on the GPU instead of the CPU, and submitting the pass's
 tail only after the release (`gate_host_waits`) each still stalled 12 to
 26 times a run. A verify pass encoded and committed whole after its inputs
 are staged never stalled. Plain decode and the batched step park too, and
-under the same load lost only their share of the GPU (3 to 4%); in the
-speculative loop the GPU reaches the parked wait before the host can
-release it, since the rows depend on the draft pass's proposals.
+under the same load never stalled and lost only their share of the GPU
+(1K, 512 steps, two rounds: the production loop 86.4 to 86.7 tok/s static
+against 83.6 to 83.7, the one-row batched step 80.9 to 81.2 against 78.4,
+its maximum step 14 and 13 ms); in the speculative loop the GPU reaches the
+parked wait before the host can release it, since the rows depend on the
+draft pass's proposals.
+
+**Not lily's alone.** A standalone Metal program (the classic command
+queue, a 0.3 ms kernel, a wait on a shared event the CPU signals once the
+GPU reached it, then a 19 ms kernel, 300 iterations) shows the same under
+the same animated window, but only with a large residency set attached to
+its queue: with 64 GB, the CPU signal to resumption took 3.2 to 3.3 ms
+(0.012 static) and 13 to 18 of 300 iterations over 100 ms (up to 157 ms),
+a second command buffer committed after the first ended 7 to 24, and even
+a single command buffer without a wait took over 100 ms in up to 24
+iterations (up to 192 ms); with 16 or 32 GB, or with a static screen,
+none. Machine and system: M5 Max, 128 GB, macOS 27.0.1
+(26A434).
 
 Since then the verify pass is committed whole (`spec.rs`). `lily-bench` at
 1K, 768 tokens with 2 drafts, `ba2da3c` against the change, interleaved,
@@ -983,9 +1000,11 @@ three rounds each, order rotating, machine untouched:
 | animated window | whole verify | 83.5 (83.5 to 83.6) | 119.1 (118.9 to 119.3) |
 
 The 2.5% given up with a static screen is the submission latency parking
-hid. Outputs are bit-identical (token digests equal). The probes,
-sampler, animator and a standalone reproducer are throwaway tools, not
-kept in the repository.
+hid. Outputs are bit-identical (token digests equal). `LILY_PROFILE` and
+`LILY_PROBE_ARRIVAL` are in the repository; the host poller that timed the
+speculative loop's probes, the per-process GPU-time sampler (IORegistry
+`accumulatedGPUTime`), the animated window and the standalone program are
+throwaway tools, not kept in it.
 
 ### Smaller machines
 

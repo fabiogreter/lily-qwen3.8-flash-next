@@ -148,7 +148,8 @@ scratch, caches and pipelines); a 64 GB machine therefore gets about
    step's draft pass pays no handshakes; only the verify pass's 48 do, as
    for a plain token. Each verify pass is encoded once and committed whole
    (since 2026-10-19, `docs/performance.md`, "Waiting for the GPU"), so
-   every request it enqueues is for a pass that runs. Until then the next
+   every request it enqueues is for a pass that runs, except when its
+   encoding fails partway (as before). Until then the next
    verify pass was encoded ahead for every possible accepted count, and the
    variants not committed had to hand their requests back
    (`QueuedRequests`); without that the service thread resolved up to 96
@@ -259,8 +260,9 @@ Until today the draft head stayed unloaded under the cache
 (`LILY_EXPERT_CACHE_DRAFTS=1` loaded it) because a step with two drafts
 decoded at 14 tok/s cold against 55 plain, which the design notes above
 attributed to the passes. The cause was elsewhere: the speculative step
-encodes the next verify pass for every possible accepted count while the
-verify pass runs and commits only the matching one, and encoding a cached
+encoded the next verify pass for every possible accepted count while the
+verify pass ran and committed only the matching one (until 2026-10-19,
+when it began to commit each verify pass whole), and encoding a cached
 layer enqueues its request at once. The dropped variants left 96 requests
 per step in the queue, which the service thread resolved when the next pass
 signalled, reading the ids that pass had just routed under the dropped
