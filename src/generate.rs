@@ -27,9 +27,8 @@ use anyhow::{Result, ensure};
 use crate::chat::Conversation;
 use crate::engine::{DecodeStateApi, Draw, LanguageModel, NextStep, ScratchApi};
 use crate::kernels::sample::SamplingParams;
-use std::time::Instant;
 
-use crate::metal::{EncodedPass, MetalContext, Pacer, PendingPass};
+use crate::metal::{EncodedPass, MetalContext, PendingPass};
 use crate::thinking::{Action, ThinkingControl};
 pub use crate::tokenizer::Thinking;
 use crate::tokenizer::Tokenizer;
@@ -813,9 +812,6 @@ impl Generator {
         // Declared after `parked` so that it drops first: dropping a pending
         // pass waits for it, and a parked one never finishes unreleased.
         let _release = ReleaseOnExit { model, scratch };
-        // Sleep-then-poll waits: the step interval is regular enough to
-        // predict, and polling wakes ~0.1 ms sooner than a blocked thread.
-        let mut pacer = Pacer::default();
         while tokens.len() < options.max_tokens {
             let input = *tokens.last().expect("tokens holds the prefill draw");
             // The GPU is idle here (every committed pass has been waited on
@@ -869,7 +865,6 @@ impl Generator {
                     model.prepare_step_inputs(state, scratch, input)?;
                     let pass = encoded.commit()?;
                     state.advance(1);
-                    pacer.begin(Instant::now());
                     pass
                 }
             };
@@ -912,11 +907,9 @@ impl Generator {
                     )?);
                 }
             }
-            pending.wait_paced(&mut pacer)?;
-            // A parked step started running the moment this one finished.
-            if parked.is_some() {
-                pacer.begin(Instant::now());
-            }
+            // Polled: wakes within about 0.03 ms of the step's end, where a
+            // blocked thread wakes about 0.09 ms after it.
+            pending.wait_polled()?;
             slot_in = 1 - slot_in;
             let drawn = read_slot(slot_in)?;
             if let Some(hook) = thinking {

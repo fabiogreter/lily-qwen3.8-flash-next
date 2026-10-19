@@ -600,7 +600,10 @@ The hold itself was close to the probe: 0.64 ms per missed layer against
   that ends without reaching it, on an error path, is not paced and does
   not count towards the estimate). Same as
   no pacing at all, which measured 24.49 against 26.24 at 64 GB and 14.45
-  against 15.05 at the reference.
+  against 15.05 at the reference. Since 2026-10-19 waits poll at a fixed
+  interval instead of pacing (`docs/performance.md`, "Waiting for the
+  GPU"); the milestone stays, so a polled wait blocks on `ready` and polls
+  only the rest, rather than keeping a core polling through the misses.
 - **The reads started late.** The nine reads of a missed expert started
   one by one, 8 microseconds apart as pool threads woke, after 18
   microseconds of the service thread spawning eight jobs; the down

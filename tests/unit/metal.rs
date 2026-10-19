@@ -618,10 +618,7 @@ fn blocking_wait_latency() {
         let done = if i % 2 == 0 {
             pending.wait_retain().expect("wait")
         } else {
-            let mut pacer = Pacer::default();
-            pacer.begin(Instant::now());
-            pacer.end(Instant::now(), false); // estimate 0: poll from the start
-            pending.wait_retain_paced(&mut pacer).expect("wait")
+            pending.wait_retain_polled().expect("wait")
         };
         let wall = t0.elapsed().as_secs_f64() * 1e3;
         let t = done.timing().expect("timing");
@@ -1001,6 +998,34 @@ fn a_wait_passed_before_the_host_signal_faults_the_context() {
     assert!(ctx.fault().is_some());
 }
 
+/// The polled wait reports the same fault as the blocking one: decode and
+/// speculative passes are waited on by polling.
+#[test]
+fn a_polled_wait_reports_a_wait_passed_before_the_host_signal() {
+    let ctx = MetalContext::new().expect("metal context");
+    let words = 1usize << 16;
+    let a = Tensor::zeros(&ctx, &[words], DType::U32).expect("a");
+    let b = Tensor::zeros(&ctx, &[words], DType::U32).expect("b");
+    let event = ctx.new_watched_event().expect("event");
+    let done = ctx.new_shared_event().expect("event");
+    let pass = ctx.begin().expect("pass");
+    pass.wait_event(&event, 1).expect("wait");
+    copy_words(&ctx, &pass, &a, &b).expect("copy");
+    pass.signal_done(&done, 1).expect("signal");
+    event.signal_unlogged(1);
+    event
+        .log
+        .as_ref()
+        .expect("watched")
+        .lock()
+        .expect("log")
+        .push(1, host_secs() + 10.0);
+    let pending = pass.commit().expect("commit");
+    let err = pending.wait_polled().expect_err("the early release goes unnoticed");
+    assert!(format!("{err:#}").contains("queue wait timed out"), "{err:#}");
+    assert!(ctx.fault().is_some());
+}
+
 /// Waits on events that are not watched (the parked pass's, and every wait
 /// without the expert cache) are submitted as before: no witness command
 /// buffer, no check; a wait on a watched event gets both.
@@ -1285,26 +1310,43 @@ fn a_gated_wait_holds_past_the_queue_wait_limit() {
     assert!(ctx.fault().is_none(), "{:?}", ctx.fault());
 }
 
-/// A paced wait whose pass ends without reaching its milestone is not
-/// paced: no sleep on the pacer's estimate, and the estimate is unchanged.
+/// A polled wait whose pass ends without reaching its milestone returns when
+/// the pass ends, not after the milestone wait's poll interval or never.
 #[test]
-fn a_milestone_never_reached_skips_pacing() {
+fn a_milestone_never_reached_does_not_hold_a_polled_wait() {
     let ctx = MetalContext::new().expect("metal context");
     let n = 4096usize;
     let a = Tensor::zeros(&ctx, &[n], DType::U32).expect("a");
     let b = Tensor::zeros(&ctx, &[n], DType::U32).expect("b");
+    let data: Vec<u32> = (0..n as u32).collect();
+    a.write_bytes(bytemuck::cast_slice(&data)).expect("write");
     let milestone = ctx.new_shared_event().expect("event");
-    let mut pacer = Pacer::default();
-    let t = Instant::now();
-    pacer.begin(t);
-    pacer.end(t + Duration::from_secs(2), false);
     let pass = ctx.begin().expect("pass");
     copy_words(&ctx, &pass, &a, &b).expect("copy");
     pass.set_milestone(&milestone, 1);
     let t0 = Instant::now();
-    pass.commit().expect("commit").wait_paced(&mut pacer).expect("wait");
+    pass.commit().expect("commit").wait_polled().expect("wait");
     assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
-    assert_eq!(pacer.ema_secs, Some(2.0));
+    assert_eq!(b.to_u32().expect("read"), data);
+}
+
+/// A polled wait on a pass with a done signal returns only after the pass's
+/// work, with its outputs visible.
+#[test]
+fn a_polled_wait_returns_after_the_done_signal() {
+    let ctx = MetalContext::new().expect("metal context");
+    let n = 1usize << 20;
+    let a = Tensor::zeros(&ctx, &[n], DType::U32).expect("a");
+    let b = Tensor::zeros(&ctx, &[n], DType::U32).expect("b");
+    let data: Vec<u32> = (0..n as u32).map(|i| i.wrapping_mul(3)).collect();
+    a.write_bytes(bytemuck::cast_slice(&data)).expect("write");
+    let done = ctx.new_shared_event().expect("event");
+    let pass = ctx.begin().expect("pass");
+    copy_words(&ctx, &pass, &a, &b).expect("copy");
+    pass.signal_done(&done, 1).expect("signal");
+    pass.commit().expect("commit").wait_polled().expect("wait");
+    assert!(done.signaled_value() >= 1);
+    assert_eq!(b.to_u32().expect("read"), data);
 }
 
 /// How long a queue-level wait holds when nothing signals it in time: `n`

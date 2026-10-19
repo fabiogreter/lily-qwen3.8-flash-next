@@ -9,9 +9,12 @@
 //! notice (`docs/performance.md`, the noise section). `NSProcessInfo`'s
 //! activity assertion with the user-initiated and latency-critical options
 //! is the system's own way to say the opposite: it keeps the performance
-//! envelope and disables timer coalescing for the process. The engine holds
-//! one while a request runs and releases it in between, so an idle machine
-//! can still sleep.
+//! envelope. It does not take away timer leeway: on macOS 27 (2026-10-19) a
+//! 5 ms sleep lasted 6.26 ms with the assertion held and without it, from a
+//! terminal and from a launchd agent alike, which is one reason the engine's
+//! waits poll at a fixed interval rather than sleep to a prediction
+//! (`metal::POLL_INTERVAL`). The engine holds one while a request runs and
+//! releases it in between, so an idle machine can still sleep.
 
 use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};

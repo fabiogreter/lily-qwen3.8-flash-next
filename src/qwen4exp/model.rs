@@ -49,7 +49,7 @@ use crate::kernels::spec::ctrl_words;
 use crate::kernels::{Arg, Pos, Rope};
 use crate::kernels::{quant, skinny};
 use crate::metal::{
-    BlitCopy, ComputePass, DetachedPass, EncodedPass, MetalContext, Pacer, PendingPass,
+    BlitCopy, ComputePass, DetachedPass, EncodedPass, MetalContext, PendingPass,
     SharedEvent,
 };
 use crate::moe_ffn::{
@@ -243,12 +243,8 @@ pub(super) struct StepSync {
     /// Value the outstanding parked pass waits for; 0 when none.
     armed: Cell<u64>,
     last: Cell<u64>,
-    /// Completion predictors for the speculative loop's verify and draft
-    /// passes (sleep-then-poll waits).
-    pub(super) pace_verify: Cell<Pacer>,
-    pub(super) pace_draft: Cell<Pacer>,
     /// Raised by the GPU at the end of every decode, verify and draft pass
-    /// (`done_last` is the last value handed out), for paced waits.
+    /// (`done_last` is the last value handed out), for polled waits.
     done: SharedEvent,
     done_last: Cell<u64>,
 }
@@ -264,8 +260,6 @@ impl StepSync {
             resumed,
             armed: Cell::new(0),
             last: Cell::new(0),
-            pace_verify: Cell::new(Pacer::default()),
-            pace_draft: Cell::new(Pacer::default()),
             done: ctx.new_shared_event()?,
             done_last: Cell::new(0),
         })

@@ -15,7 +15,7 @@ use lily::kernels::attention::MAX_SEQ;
 use lily::kernels::sample::SamplingParams;
 use lily::metal::MetalContext;
 use lily::metal::profile::{self, PassProfile};
-use lily::metal::{EncodedPass, Pacer, PendingPass, host_secs};
+use lily::metal::{EncodedPass, PendingPass, host_secs};
 use lily::qwen4exp::Qwen4ExpModel;
 use lily::serve::checkpoint_model_type;
 
@@ -549,8 +549,6 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
                 }
             })
         });
-    let mut pacer = Pacer::default();
-    pacer.begin(Instant::now());
     for index in 1..cli.decode_steps {
         let levels_before = profile::levels();
         let (parked, encoded) =
@@ -559,12 +557,11 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
             eprintln!("levels per step: {}", profile::levels() - levels_before);
         }
         let completed = if cli.gpu_timing {
-            Some(pending.wait_retain_paced(&mut pacer)?)
+            Some(pending.wait_retain_polled()?)
         } else {
-            pending.wait_paced(&mut pacer)?;
+            pending.wait_polled()?;
             None
         };
-        pacer.begin(Instant::now());
         let woke = if cli.gpu_timing { host_secs() } else { 0.0 };
         let (token, next) = deliver(
             &model,

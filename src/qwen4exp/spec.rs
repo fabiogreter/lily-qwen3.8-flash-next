@@ -135,21 +135,15 @@ impl Qwen4ExpModel {
                 s.sync.release()?;
                 pass
             }
-            None => {
-                let pass = self
-                    .encode_batch(
-                        ctx,
-                        state,
-                        s,
-                        &ps,
-                        BatchMode::Verify { params, step0, park: None },
-                    )?
-                    .commit()?;
-                let mut pace = s.sync.pace_verify.get();
-                pace.begin(Instant::now());
-                s.sync.pace_verify.set(pace);
-                pass
-            }
+            None => self
+                .encode_batch(
+                    ctx,
+                    state,
+                    s,
+                    &ps,
+                    BatchMode::Verify { params, step0, park: None },
+                )?
+                .commit()?,
         };
         // Same bookkeeping as a prefill chunk; the draft pass rolls it back.
         // Done before the draft pass is encoded: it sees the state as the
@@ -180,13 +174,7 @@ impl Qwen4ExpModel {
         } else {
             Vec::new()
         };
-        let mut pace = s.sync.pace_verify.get();
-        let done = committed.wait_retain_paced(&mut pace)?;
-        s.sync.pace_verify.set(pace);
-        // The draft pass starts as the verify pass ends.
-        let mut pace = s.sync.pace_draft.get();
-        pace.begin(Instant::now());
-        s.sync.pace_draft.set(pace);
+        let done = committed.wait_retain_polled()?;
         let verify_gpu_end = if profiling() {
             let t = done.timing()?;
             eprintln!(
@@ -426,18 +414,11 @@ impl Qwen4ExpModel {
                 }
             }
         };
-        let s = &*s;
         if profiling() {
             eprintln!(
                 "profile host finish: done {:.2} ms after entry",
                 entered.elapsed().as_secs_f64() * 1e3
             );
-        }
-        if parked.is_some() {
-            // The parked verify pass starts when the draft pass finishes.
-            let mut pace = s.sync.pace_verify.get();
-            pace.begin(Instant::now());
-            s.sync.pace_verify.set(pace);
         }
         Ok((proposals, parked))
     }
@@ -485,12 +466,7 @@ impl Qwen4ExpModel {
         )?;
         let sp = s.spec.as_ref().ok_or_else(|| anyhow::anyhow!("no spec scratch"))?;
         sp.mtp_ids.view(0, &[1])?.write_bytes(bytemuck::cast_slice(&[first]))?;
-        let mut pace = s.sync.pace_draft.get();
-        pace.begin(Instant::now());
-        s.sync.pace_draft.set(pace);
-        let committed = encoded.commit()?;
-        let done = committed.wait_retain_paced(&mut pace)?;
-        s.sync.pace_draft.set(pace);
+        let done = encoded.commit()?.wait_retain_polled()?;
         if profiling() {
             let t = done.timing()?;
             eprintln!(
@@ -513,9 +489,7 @@ impl Qwen4ExpModel {
         drafts: usize,
         pending: &SpecPending,
     ) -> Result<Vec<u32>> {
-        let mut pace = s.sync.pace_draft.get();
-        let done = committed.wait_retain_paced(&mut pace)?;
-        s.sync.pace_draft.set(pace);
+        let done = committed.wait_retain_polled()?;
         if profiling() {
             let t = done.timing()?;
             let gap = pending

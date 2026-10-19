@@ -141,6 +141,14 @@ then says what assumption it rests on.
   change to prefill numerics is judged by its logits against the previous
   build's on the same prompt (`lily-probe`, top-64 of the last prefill
   row) and by acceptance totals over several prompts, never by one cell.
+- **A screen in use slows speculative decoding.** The window server's
+  frames make pass lengths irregular even at 1 to 3% of the GPU's time:
+  with the screen in use, 2-draft decode ran at 97 to 113 tok/s against
+  123.6 with it locked, on the same tokens (2026-10-19, polled waits; the
+  old paced waits fell as low as 33). Plain decode did not notice (86.7
+  against 86.7). Speculative cells are measured with the screen locked
+  (`caffeinate -ims` keeps the machine awake) or interleaved under the
+  same screen use (see "Waiting for the GPU").
 
 ## The numbers
 
@@ -886,6 +894,54 @@ against them (`min(1, p / q)`, the residual `max(0, p - q)`), which changes
 no output distribution and accepts 65 to 67% of sampled proposals against 55
 to 65% for argmax proposals on the synthetic prompt. Two drafts per step.
 
+### Waiting for the GPU
+
+Every decode, verify and draft pass ends with a done signal the host polls
+every 20 us (`metal::POLL_INTERVAL`), instead of sleeping until a completion
+predicted from past pass lengths (the pacer, 2026-09-09 to 2026-10-19).
+
+**What went wrong.** After the update to macOS 27.0.1 (2026-10-15) the
+service decoded at 15 to 60 tok/s where it had run at 88 to 97, irregularly,
+with the GPU drawing 7 to 10 W at a full clock and busy only a quarter of
+the time. A stack sample showed the engine thread asleep in the pacer's
+sleep 77% of the time. It came and went with the screen: with the screen
+locked, 20 requests in a row decoded at 146 to 147 tok/s; with it in use,
+the same request ran at 27 to 147, slowest whenever the window server took
+2.5 to 6% of the GPU. Plain decode under `lily-bench` held 78 to 86 tok/s
+through the same screen use; speculative decode ran at 65 to 110. The
+plain loop always has its next pass parked on the GPU, so a late wake-up
+costs nothing; in the speculative loop the host's wake-up gates the next
+pass. The window server's frames make pass lengths irregular, the pacer's
+average follows the long ones, the next short pass is overslept with the
+GPU idle, and the estimate shrinks only 15% per oversleep. Interleaved
+under screen use, five rounds each, the same build paced against blocking
+on the fence: 33 to 123 tok/s, median 84, against 87 to 123, median 113.
+What macOS 27 changed is not established: the 25% `nanosleep` overshoot
+was already there (the dropped row in "What was tried and dropped"), and
+the activity assertion does not remove it under macOS 27 either, from a
+terminal or a launchd agent.
+
+**Why polling.** A fixed poll has nothing to mispredict, and it wakes about
+0.015 ms after the signal against 0.04 ms for the pacer and 0.09 ms for a
+blocked thread. A 20 us sleep lasts 27 us and a loop of them costs 3.9% of
+a core (10 us: 14.5 us and 6.9%). The pacer cost more than that: it woke
+1.5 ms early and spun. Decode CPU over the last 4 s of a 768-token 2-draft
+run: 15.9% of a core and 0.75 W polled, against 24.8% and 1.03 W paced. A
+pass with a milestone (the expert cache) still blocks until the milestone
+and polls only the rest.
+
+**Measured, 2026-10-19**, `lily-bench` at 1K, 512 steps, `287ee74` against
+the change, interleaved, three rounds each, order rotating:
+
+| screen | build | plain tok/s | 2 drafts tok/s |
+|---|---|---|---|
+| locked | paced | 85.0 (84.9 to 85.0) | 122.7 (122.7 to 123.0) |
+| locked | polled | 86.7 (86.7 to 86.8) | 123.6 (123.5 to 123.6) |
+| in use | paced | 86.2 (85.2 to 86.3) | 98.7 (54.1 to 100.1) |
+| in use | polled | 86.7 (86.5 to 86.9) | 101.4 (96.7 to 112.9) |
+
+Outputs are bit-identical (token digests equal).
+
 ### Smaller machines
 
 The expert cache: a slab of expert slots on the GPU, a slot table per layer,
@@ -946,7 +1002,7 @@ none is kept behind a knob. The reason is what the measurement said.
 | the split attention kernel with a barrier-free lane-per-token design; 32-token splits; a 128-thread threadgroup; the combine's prologue parallelized | 82 us against 49; 58; 3 us faster but reorders the reductions; noise and not bit-identical | the barriers and staging were not the cost |
 | the split attention kernel with eight K rows in flight and the V rows requested before the softmax barriers; one threadgroup per K/V head and split with no cross-simdgroup staging (bit-identical) | 49.5 against 44.4 us; 42.8 against 44.4 at 8K and 43.3 against 44.4 at 32K | register pressure; and 1.6 us was not worth a new kernel, since what remains is the per-token score and reduction chain |
 | the GDN step with 16- or 32-row register blocks, or the head split over thread groups or column groups | equal, not bit-identical; 15 to 16 us | no faster than eight rows |
-| the pacer's sleeps scaled by the measured 25% `nanosleep` overshoot | 93.1 against 93.1 tok/s | the shipped pacer's own adaptation already covers it |
+| the pacer's sleeps scaled by the measured 25% `nanosleep` overshoot | 93.1 against 93.1 tok/s | the pacer's own adaptation already covered it; the pacer itself was replaced by polling on 2026-10-19 ("Waiting for the GPU") |
 | three drafts per step | 100.8 against 113.9 tok/s greedy, 96.6 to 106.1 against 101.3 to 111.9 sampled | the third draft is accepted too rarely for its verify row and draft pass |
 | speculation inside the continuous batch (estimated from measured pass costs, 2026-10-09: 1 to 16 rows of the trunk graph, the verify pass, the batched step and the draft pass, four real sessions, 1K and 8K) | at 66 % acceptance (prose) 2 sessions x 2 drafts +1 to -12 %, 4 x 2 -18 to -26 % against the plain batched step; at 79 % (agent traffic) +12 to -2 % and -9 to -18 %; one session +12 to +23 % and +25 to +37 % | a draft row routes to 6 to 7 new experts per layer and costs 80 to 90 % of another session's row (about 3.4 ms each up to 8 rows), and the ninth row of a pass costs 14 to 17.5 ms (the small-m MoE route and the register-A GEMM stop at 8); `docs/architecture.md`, "Continuous batching" |
 

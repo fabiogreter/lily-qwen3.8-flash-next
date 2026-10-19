@@ -175,10 +175,20 @@ The engine removes it by **parking** the next pass. Step N+1 is encoded and
 committed while step N runs, and waits on a shared event immediately before
 its first host-staged input, the n-gram gather in layer 1. The embedding and
 layer 0 run while the host wakes, stages the rows and signals. Waits are
-paced: every pass signals a done event as its last command and the host
-sleeps until shortly before the predicted completion, which brings wake-up
-latency from 0.09 ms to 0.04 ms. Polling a command buffer's status instead
-does not work; it is not updated promptly.
+polled: every pass signals a done event as its last command and the host
+checks it every 20 us (`metal::POLL_INTERVAL`, about 27 us with the
+kernel's timer leeway), which brings wake-up latency from 0.09 ms to about
+0.015 ms for about 4% of a core while a request runs. Polling a command
+buffer's status instead does not work; it is not updated promptly.
+
+Until 2026-10-19 the waits were paced instead: the host slept until shortly
+before a completion predicted from an average of past pass lengths, then
+polled. Any window-server activity made pass lengths irregular, the
+estimate then overslept, and in the speculative loop, where the host's
+wake-up gates the next pass, the GPU sat idle: on macOS 27 with the screen
+in use, speculative decoding ran at 33 to 52 tok/s where it ran at 110 with
+the screen locked (`docs/performance.md`, "Waiting for the GPU"). A fixed
+poll has nothing to mispredict.
 
 What parking costs in return is a fixed penalty: a pass whose wait was still
 unsatisfied when the command buffer was scheduled runs about 0.3 ms longer,

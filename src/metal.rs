@@ -2080,7 +2080,7 @@ impl<'a> ComputePass<'a> {
     }
 
     /// Encodes, as the pass's last command, a GPU signal of `event` to
-    /// `value`, and remembers it: [`PendingPass::wait_paced`] then polls the
+    /// `value`, and remembers it: [`PendingPass::wait_polled`] then polls the
     /// event (which the GPU writes directly) instead of blocking on the
     /// fence. Call after everything else is encoded.
     pub fn signal_done(&self, event: &SharedEvent, value: u64) -> Result<()> {
@@ -2108,11 +2108,12 @@ impl<'a> ComputePass<'a> {
 
     /// Marks `event` reaching `value` as the pass's milestone: a wait the
     /// pass encoded ([`Self::wait_event`]) that the host satisfies, after
-    /// which little of the pass is left. A paced wait
-    /// ([`PendingPass::wait_paced`]) then blocks until the host has signalled
-    /// it and paces only the rest, which is what makes pacing work for a pass
-    /// whose length varies with host work it waits for (the expert cache's
-    /// misses). Called again, the later milestone replaces the earlier one.
+    /// which little of the pass is left. A polled wait
+    /// ([`PendingPass::wait_polled`]) then blocks until the host has
+    /// signalled it and polls only the rest, so a pass whose length varies
+    /// with host work it waits for (the expert cache's misses) does not keep
+    /// a core polling through that work. Called again, the later milestone
+    /// replaces the earlier one.
     pub fn set_milestone(&self, event: &SharedEvent, value: u64) {
         *self.milestone.borrow_mut() = Some((event.clone(), value));
     }
@@ -2339,17 +2340,22 @@ impl PendingPass<'_> {
         self.finished()
     }
 
-    /// Like [`Self::wait`], paced: sleeps until `pacer` predicts the pass is
-    /// about to finish, then polls the pass's done signal (see
-    /// [`ComputePass::signal_done`], falling back to the fence) and returns
-    /// within microseconds of it. A blocked thread would learn of the
-    /// completion later. Polling is capped so a wrong prediction cannot pin
-    /// a core; the pacer learns from the outcome.
-    pub fn wait_paced(self, pacer: &mut Pacer) -> Result<()> {
-        self.wait_retain_paced(pacer).map(|_| ())
+    /// Like [`Self::wait`], polled: checks the pass's done signal (see
+    /// [`ComputePass::signal_done`], falling back to the fence) every
+    /// [`POLL_INTERVAL`] and returns within about that much of it, where a
+    /// thread blocked on the fence learns of the completion about 0.09 ms
+    /// later. Polling replaced a pacer that slept until a predicted
+    /// completion: when the window server's frames made pass lengths
+    /// irregular, its estimate overslept and left the GPU idle, and
+    /// speculative decoding fell from 110 to 33 to 52 tok/s
+    /// (docs/performance.md, "Waiting for the GPU").
+    pub fn wait_polled(self) -> Result<()> {
+        self.wait_retain_polled().map(|_| ())
     }
 
-    pub fn wait_retain_paced(mut self, pacer: &mut Pacer) -> Result<CompletedPass> {
+    /// [`Self::wait_polled`], keeping the pass's feedback like
+    /// [`Self::wait_retain`].
+    pub fn wait_retain_polled(mut self) -> Result<CompletedPass> {
         self.join_feeder()?;
         let (event, value) = match &self.done {
             Some((event, value)) => (event.clone(), *value),
@@ -2357,42 +2363,23 @@ impl PendingPass<'_> {
         };
         if let Some((milestone, reached)) = &self.milestone {
             // Blocks: the host signals the milestone only after work of its
-            // own of unpredictable length. The poll of the pass's end keeps
-            // a milestone that is never signalled (an error path that
-            // released the pass's waits) from holding the thread forever;
-            // such a pass is not paced, nor does its length teach the pacer.
-            let mut ended = false;
+            // own of unpredictable length, so polling would only burn the
+            // core for that long. The check of the pass's end keeps a
+            // milestone that is never signalled (an error path that released
+            // the pass's waits) from holding the thread forever.
             while !milestone.wait_until(*reached, MILESTONE_POLL_MS) {
                 if event.signaled_value() >= value {
-                    ended = true;
                     break;
                 }
                 self.ctx.fault.check()?;
             }
-            if ended {
-                pacer.skip();
-            } else {
-                pacer.begin(Instant::now());
-            }
         }
-        if let Some(wake_at) = pacer.wake_at() {
-            let now = Instant::now();
-            if wake_at > now {
-                std::thread::sleep(wake_at - now);
-            }
+        // The fault check is an uncontended lock, cheap next to the sleep;
+        // it ends the wait on a failed command buffer as the fence wait does.
+        while event.signaled_value() < value {
+            self.ctx.fault.check()?;
+            std::thread::sleep(POLL_INTERVAL);
         }
-        let overslept = event.signaled_value() >= value;
-        if !overslept {
-            let spin_until = Instant::now() + SPIN_CAP;
-            while event.signaled_value() < value {
-                if Instant::now() > spin_until {
-                    self.ctx.wait_fence(self.fence_value)?;
-                    break;
-                }
-                std::hint::spin_loop();
-            }
-        }
-        pacer.end(Instant::now(), overslept);
         // The done event may lead the fence by the trailing signal; the
         // command memory is only safe to reuse after the fence.
         if self.done.is_some() {
@@ -2438,63 +2425,17 @@ impl PendingPass<'_> {
     }
 }
 
-/// How often a paced wait blocked on a milestone checks whether the pass
+/// How often a polled wait blocked on a milestone checks whether the pass
 /// ended without it.
 const MILESTONE_POLL_MS: u64 = 50;
 
-/// Longest a paced wait polls before falling back to a blocking wait.
-const SPIN_CAP: Duration = Duration::from_millis(20);
-
-/// Predicts when a repeating GPU pass completes so the host can sleep until
-/// shortly before and then poll ([`PendingPass::wait_paced`]). Tracks an
-/// exponential average of the interval between `begin` and `end` marks; for
-/// a pass with a milestone ([`ComputePass::set_milestone`]) the paced wait
-/// begins the interval when the milestone is reached.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Pacer {
-    began: Option<Instant>,
-    ema_secs: Option<f64>,
-}
-
-impl Pacer {
-    /// How far ahead of the predicted completion to wake: covers sleep
-    /// overshoot and prediction error at the cost of that much polling.
-    pub const MARGIN: Duration = Duration::from_micros(1500);
-
-    /// Marks the start of an interval (the pass will run from about now).
-    pub fn begin(&mut self, now: Instant) {
-        self.began = Some(now);
-    }
-
-    /// Forgets the interval begun last: the wait does not sleep and its
-    /// end is not folded into the estimate.
-    pub fn skip(&mut self) {
-        self.began = None;
-    }
-
-    /// When to wake for the pass begun last: `None` until an estimate exists.
-    pub fn wake_at(&self) -> Option<Instant> {
-        let (began, ema) = (self.began?, self.ema_secs?);
-        let predicted = began + Duration::from_secs_f64(ema);
-        Some(predicted.checked_sub(Self::MARGIN).unwrap_or(began))
-    }
-
-    /// Marks completion and folds the interval into the estimate. When the
-    /// waiter `overslept` (the pass was already done on wake-up) the true
-    /// completion time is unknown, so the estimate only shrinks; it grows
-    /// again from observed completions. This keeps a too-long estimate from
-    /// feeding on the late wake-ups it causes.
-    pub fn end(&mut self, now: Instant, overslept: bool) {
-        if let Some(began) = self.began.take() {
-            let secs = now.duration_since(began).as_secs_f64();
-            self.ema_secs = Some(match (self.ema_secs, overslept) {
-                (Some(ema), true) => (0.85 * ema).min(secs),
-                (Some(ema), false) => 0.7 * ema + 0.3 * secs,
-                (None, _) => secs,
-            });
-        }
-    }
-}
+/// How long a polled wait ([`PendingPass::wait_polled`]) sleeps between
+/// checks of the pass's done signal. Measured on an M5 Max (2026-10-19), a
+/// requested 20 us sleep lasts 27 us (the kernel's timer leeway adds a
+/// quarter) and a loop of them costs 3.9% of a core; 10 us cost 6.9% for
+/// about 6 us less latency, and a blocking fence wait wakes about 90 us
+/// after the signal.
+pub const POLL_INTERVAL: Duration = Duration::from_micros(20);
 
 #[cfg(test)]
 #[path = "../tests/unit/metal.rs"]
