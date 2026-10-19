@@ -80,6 +80,11 @@ pub struct Power {
     pub ane_w: f64,
     /// `None` when the SMC does not report the system's power.
     pub sys_w: Option<f64>,
+    /// The system's power the parts do not account for: memory, fabric,
+    /// display, storage, board and conversion losses (`sys_w` minus CPU, GPU
+    /// and ANE). Measured as a whole, attributed to no one; `None` with
+    /// `sys_w`.
+    pub rest_w: Option<f64>,
     /// lily's own share, an estimate (`serve::machine::attribute`); `None`
     /// when it cannot be told for this reading.
     pub lily: Option<LilyPower>,

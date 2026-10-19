@@ -125,6 +125,13 @@ back, a value out of range); the rest of the reading is shown regardless.
 The dashboard labels it "lily CPU+GPU (est.)"; dashboard.md § 6 has the
 method and its limits.
 
+`machine.power.rest_w` is the system power the parts do not account for:
+`sys_w` minus CPU, GPU and ANE (never below 0, `null` with `sys_w`). It is
+memory, fabric, display, storage, board and conversion losses, measured only
+as a whole; while lily decodes it is about half the system's power and mostly
+lily's memory traffic, but macOS gives no split of it, so it is attributed to
+no one (dashboard.md § 6).
+
 A reading that fails, is not finite, or is out of range (a power or the system
 power above 1 000 W, a frequency above 10 000 MHz, a temperature outside
 -20 to 150 °C) is skipped and counted, and one good reading resets the count;

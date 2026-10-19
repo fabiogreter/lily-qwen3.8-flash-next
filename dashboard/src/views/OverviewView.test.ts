@@ -79,7 +79,14 @@ describe('null-safe rendering', () => {
 
   it("lily's own power shows as an estimate next to the system's, and not at all without one", async () => {
     const s = await new MockBackend({ clock }).status();
-    s.machine.power = { cpu_w: 7.5, gpu_w: 48.25, ane_w: 0, sys_w: 71.5, lily: { w: 50.5, cpu_w: 3.25, gpu_w: 47.25 } };
+    s.machine.power = {
+      cpu_w: 7.5,
+      gpu_w: 48.25,
+      ane_w: 0,
+      sys_w: 71.5,
+      rest_w: 15.75,
+      lily: { w: 50.5, cpu_w: 3.25, gpu_w: 47.25 },
+    };
     const schematic = mount(EngineSchematic, { props: { st: s, mtp: 2, bind: null, ngram: null } });
     expect(schematic.text()).toContain('lily CPU+GPU 50.5 W (est.)');
     const backend = new MockBackend({ clock });
@@ -88,6 +95,8 @@ describe('null-safe rendering', () => {
     });
     await flushPromises();
     expect(overview.text()).toMatch(/lily CPU\+GPU 50\.5 W \(est\.\)/);
+    // The system's remainder is shown as such, attributed to no one.
+    expect(overview.text()).toMatch(/rest of system 15\.8 W \(not attributed\)/);
     // The history's power chart has lily's series, and the summary its energy.
     expect(overview.text()).toContain('lily CPU+GPU (est.)');
     expect(overview.text()).toMatch(/lily CPU\+GPU \d+ Wh \(est\.\)/);
@@ -96,6 +105,14 @@ describe('null-safe rendering', () => {
     const without = mount(EngineSchematic, { props: { st: s, mtp: 2, bind: null, ngram: null } });
     expect(without.text()).not.toContain('lily CPU+GPU');
     expect(without.text()).toContain('71.5 W');
+
+    // Without a system power there is no remainder either.
+    s.machine.power = { ...s.machine.power, sys_w: null, rest_w: null };
+    const unknown = mount(OverviewView, {
+      global: { provide: { [dashboardKey as symbol]: { backend, range: ref('1h'), status: { data: ref(s), error: ref(null), refresh: async () => {} } } } },
+    });
+    await flushPromises();
+    expect(unknown.text()).not.toContain('rest of system');
   });
 
   it('pin hold and clocks are formatted, not raw', async () => {

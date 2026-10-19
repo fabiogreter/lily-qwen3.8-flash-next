@@ -487,13 +487,7 @@ export function buildStatus(tick: number, sessions: Session[], now: number): Sta
       ram_used_bytes: Math.round(97.4 * GiB + r() * GiB),
       lily_resident_bytes: Math.round(71.2 * GiB),
       swap_used_bytes: Math.round(1.1 * GiB),
-      power: {
-        cpu_w: round1(busy ? 6 + r() * 3 : 1.2),
-        gpu_w: round1(busy ? 44 + r() * 8 : 0.5),
-        ane_w: 0,
-        sys_w: round1(busy ? 68 + r() * 10 : 9.5),
-        lily: busy ? { w: 47.6, cpu_w: 3.4, gpu_w: 44.2 } : { w: 0.3, cpu_w: 0.2, gpu_w: 0.1 },
-      },
+      power: mockPower(busy, r),
       temp_c: { cpu: Math.round(busy ? 64 + r() * 6 : 41), gpu: Math.round(busy ? 71 + r() * 5 : 39) },
     },
     tiers: {
@@ -510,5 +504,21 @@ export function buildStatus(tick: number, sessions: Session[], now: number): Sta
       weights: { bytes: Math.round(42.8 * GiB), pinned: true },
     },
     recorder: { state: 'open', ok: true, dropped_rows: 0, db_bytes: Math.round(6.3 * 1024 ** 2), oldest: now - 7 * DAY, error: null },
+  };
+}
+
+/** Watts by part, with the rest of the system computed as the server does (sys minus the parts). */
+function mockPower(busy: boolean, r: () => number) {
+  const cpu_w = round1(busy ? 6 + r() * 3 : 1.2);
+  const gpu_w = round1(busy ? 44 + r() * 8 : 0.5);
+  const ane_w = 0;
+  const sys_w = round1(busy ? 68 + r() * 10 : 9.5);
+  return {
+    cpu_w,
+    gpu_w,
+    ane_w,
+    sys_w,
+    rest_w: round1(Math.max(0, sys_w - cpu_w - gpu_w - ane_w)),
+    lily: busy ? { w: 47.6, cpu_w: 3.4, gpu_w: 44.2 } : { w: 0.3, cpu_w: 0.2, gpu_w: 0.1 },
   };
 }

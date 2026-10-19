@@ -1274,6 +1274,8 @@ fn the_status_shows_the_samplers_fresh_reading_and_nothing_stale() {
             gpu_w: 41.99,
             ane_w: 0.0,
             sys_w: Some(61.46),
+            // 61.46 - 8.12 - 41.99 - 0.0
+            rest_w: Some(11.35),
             lily: Some(LilyPower { w: 40.34, cpu_w: 2.34, gpu_w: 38.0 }),
         })
     );
@@ -1295,6 +1297,10 @@ fn the_status_shows_the_samplers_fresh_reading_and_nothing_stale() {
     machine.publish(machine::BUSY_INTERVAL, unattributed);
     let power = d.status(READY).machine.power.expect("power");
     assert_eq!((power.lily, power.gpu_w), (None, 41.99));
+    // A system power below the rounded parts by a rounding leaves no rest
+    // below 0.
+    machine.publish(machine::BUSY_INTERVAL, sampled(50.1));
+    assert_eq!(d.status(READY).machine.power.expect("power").rest_w, Some(0.0));
     // A ratio past 1 (a rounding in the source) is shown as 1.
     let mut over = sampled(10.0);
     over.reading.gpu_active = 1.0004;
@@ -1641,6 +1647,7 @@ fn busy_status() -> Status {
                 gpu_w: 48.25,
                 ane_w: 0.0,
                 sys_w: Some(71.5),
+                rest_w: Some(15.75),
                 lily: Some(LilyPower { w: 50.5, cpu_w: 3.25, gpu_w: 47.25 }),
             }),
             temp_c: Some(Temperatures { cpu: 66.0, gpu: 72.5 }),
@@ -1742,6 +1749,7 @@ fn small_machine_status() -> Status {
     // own share could not be told (its counter call failed).
     if let Some(power) = &mut status.machine.power {
         power.sys_w = None;
+        power.rest_w = None;
         power.lily = None;
     }
     status.recorder = RecorderStatus {

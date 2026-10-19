@@ -1139,16 +1139,30 @@ impl Dashboard {
             ram_used_bytes: memory.map(|m| m.used),
             lily_resident_bytes: crate::stats::task_memory().map(|t| t.phys_footprint),
             swap_used_bytes: crate::stats::swap_used(),
-            power: sample.map(|s| Power {
-                cpu_w: round(s.reading.cpu_w, 100.0),
-                gpu_w: round(s.reading.gpu_w, 100.0),
-                ane_w: round(s.reading.ane_w, 100.0),
-                sys_w: s.reading.sys_w.map(|w| round(w, 100.0)),
-                lily: s.reading.lily.map(|l| {
-                    let (cpu_w, gpu_w) = (round(l.cpu_w, 100.0), round(l.gpu_w, 100.0));
-                    // The sum of the rounded parts, so the page's figures add up.
-                    LilyPower { w: round(cpu_w + gpu_w, 100.0), cpu_w, gpu_w }
-                }),
+            power: sample.map(|s| {
+                let (cpu_w, gpu_w, ane_w) = (
+                    round(s.reading.cpu_w, 100.0),
+                    round(s.reading.gpu_w, 100.0),
+                    round(s.reading.ane_w, 100.0),
+                );
+                let sys_w = s.reading.sys_w.map(|w| round(w, 100.0));
+                Power {
+                    cpu_w,
+                    gpu_w,
+                    ane_w,
+                    sys_w,
+                    // From the rounded figures, so the page's figures add up;
+                    // never below 0 (the sampler keeps a system power only
+                    // when it is at least the parts, within a milliwatt).
+                    rest_w: sys_w
+                        .map(|w| round((w - cpu_w - gpu_w - ane_w).max(0.0), 100.0)),
+                    lily: s.reading.lily.map(|l| {
+                        let (cpu_w, gpu_w) =
+                            (round(l.cpu_w, 100.0), round(l.gpu_w, 100.0));
+                        // The sum of the rounded parts, as above.
+                        LilyPower { w: round(cpu_w + gpu_w, 100.0), cpu_w, gpu_w }
+                    }),
+                }
             }),
             // Both or none: the contract has no half a pair.
             temp_c: sample

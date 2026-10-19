@@ -97,6 +97,12 @@ export interface Power {
   ane_w: number;
   /** null when the SMC does not report the system's power (the parts above are still measured). */
   sys_w: number | null;
+  /**
+   * The system's power the parts do not account for (sys_w minus CPU, GPU and ANE): memory, fabric,
+   * display, storage, board and conversion losses, measured as a whole and attributed to no one;
+   * null with sys_w.
+   */
+  rest_w: number | null;
   /** lily's own share, an estimate; null when it cannot be told for this reading. */
   lily: LilyPower | null;
 }

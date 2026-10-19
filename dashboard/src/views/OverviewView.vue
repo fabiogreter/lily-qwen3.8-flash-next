@@ -118,6 +118,9 @@ const powerSeries: SeriesDef[] = [
           <div v-if="st.machine.power?.lily" class="m" title="lily's own CPU energy plus its share of the GPU's power; DRAM and the rest of the SoC not attributed">
             lily CPU+GPU {{ rate(st.machine.power.lily.w) }} W (est.)
           </div>
+          <div v-if="st.machine.power?.rest_w != null" class="m" title="System power minus CPU, GPU and ANE: memory, fabric, display, storage, board and conversion losses. Measured as a whole; macOS gives no split of it, so none of it is attributed to lily.">
+            rest of system {{ rate(st.machine.power.rest_w) }} W (not attributed)
+          </div>
           <div class="m">
             <template v-if="st.machine.power">GPU {{ rate(st.machine.power.gpu_w) }} W</template>
             <template v-if="st.machine.power && st.machine.temp_c"> · </template>

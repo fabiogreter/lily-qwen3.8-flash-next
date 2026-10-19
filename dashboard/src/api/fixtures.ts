@@ -60,6 +60,7 @@ export const status: Status = {
       "gpu_w": 48.25,
       "ane_w": 0.0,
       "sys_w": 71.5,
+      "rest_w": 15.75,
       "lily": {
         "w": 50.5,
         "cpu_w": 3.25,
@@ -204,6 +205,7 @@ export const statusSmallMachine: Status = {
       "gpu_w": 48.25,
       "ane_w": 0.0,
       "sys_w": null,
+      "rest_w": null,
       "lily": null
     },
     "temp_c": {

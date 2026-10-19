@@ -128,9 +128,10 @@ response with `Content-Type` and `Cache-Control`; `index.html` is
   `failed` (`error` says why); the history routes answer 503 unless `open`.
 - Memory pressure is lily's own names everywhere: `normal`, `warning`,
   `critical` or `null`; a history bucket carries the worst in it.
-- Machine power is `{cpu_w, gpu_w, ane_w, sys_w, lily}` or `null`, with
-  `machine.sampler` saying why (`ok`, `off`, `failed`); `lily` is lily's own
-  estimated share, `{w, cpu_w, gpu_w}` or `null` (§ 6).
+- Machine power is `{cpu_w, gpu_w, ane_w, sys_w, rest_w, lily}` or `null`,
+  with `machine.sampler` saying why (`ok`, `off`, `failed`); `rest_w` is the
+  system power the parts do not account for (`null` with `sys_w`), `lily` is
+  lily's own estimated share, `{w, cpu_w, gpu_w}` or `null` (§ 6).
 - Durations in settings are the flag text, parsed exactly as
   `parse_duration_secs` parses the flag, plus `value_s`.
 - `PATCH /v1/lily/settings` takes several names, applied all or none, and
@@ -392,6 +393,21 @@ taken outside the sandbox by the owner: `Sampler::new()` about 0.7 s,
   merge on Metal's completion thread) is not measured. A cross-check on the
   hardware: `ioreg -r -c IOAccelerator -l` lists `accumulatedGPUTime` per
   process (not read by lily: a second FFI surface next to `macmon`).
+- **The rest of the system** (`machine.power.rest_w`, "rest of system (not
+  attributed)" on the page) is `sys_w` minus CPU, GPU and ANE, from the
+  rounded figures and never below 0: memory, fabric, display, storage, board
+  and conversion losses, measured as a whole by the SMC. While lily decodes it
+  is about half the system's power, nearly all of it lily's doing, but it is
+  attributed to no one because macOS no longer gives its parts. Measured on
+  the M5 Max (2026-10-15, macOS 26.6, IOReport Energy Model; system about
+  106 to 113 W): GPU about 38 W, `AFR` (the GPU's memory path, stepped by GPU
+  memory bandwidth) about 10.5 W, DRAM 14.4, DCS (memory controllers) 8.4,
+  AMCC (memory cache) 6.2, CPU 7.7, fabric 0.8. On macOS 27 every one of those
+  channels except `GPU Energy` reads 0 (a private entitlement gates them; they
+  publish only in rare, irregular catch-ups, none in a 12-minute log on
+  2026-10-19), and the SMC's 81 power keys have no documented memory rail on
+  this machine (`PMVC`, DRAM on M1/M3 Pro, is absent). A lily attribution of
+  memory would be a guess, so the page shows the remainder honestly instead.
 - **Sources of the rest**: CPU load stays lily's tick-based figure
   (`stats::cpu_ticks`: it works without the sampler, measures the same span as
   the other live rates, and the history's 10 s samples use it); memory,
