@@ -178,7 +178,8 @@ layer 0 run while the host wakes, stages the rows and signals. Waits are
 polled: every pass signals a done event as its last command and the host
 checks it every 20 us (`metal::POLL_INTERVAL`, about 27 us with the
 kernel's timer leeway), which brings wake-up latency from 0.09 ms to about
-0.015 ms for about 4% of a core while a request runs. Polling a command
+0.015 ms on average and 0.03 ms at most, for about 4% of a core while a
+request runs. Polling a command
 buffer's status instead does not work; it is not updated promptly.
 
 Until 2026-10-19 the waits were paced instead: the host slept until shortly
@@ -186,16 +187,18 @@ before a completion predicted from an average of past pass lengths, then
 polled. Any window-server activity made pass lengths irregular, the
 estimate then overslept, and in the speculative loop, where the host's
 wake-up gates the next pass, the GPU sat idle: on macOS 27 with the screen
-in use, speculative decoding ran at 33 to 52 tok/s where it ran at 110 with
+in use, paced speculative decoding ran at 33 to 123 tok/s (median 84)
+against 87 to 123 (median 113) blocking on the fence, and about 123 with
 the screen locked (`docs/performance.md`, "Waiting for the GPU"). A fixed
 poll has nothing to mispredict.
 
 What parking costs in return is a fixed penalty: a pass whose wait was still
 unsatisfied when the command buffer was scheduled runs about 0.3 ms longer,
 whatever the release time, and lateness adds on top of that. So parking
-converts 0.40 ms of submission latency into a 0.3 ms segment penalty. The
-host is no longer on the critical path in either the plain or the speculative
-loop.
+converts 0.40 ms of submission latency into a 0.3 ms segment penalty. In
+the plain loop the host is no longer on the critical path. In the
+speculative loop its wake-up after each pass still gates the next one,
+which is why how it waits matters there (above).
 
 When a generation stops with a step parked, that step runs anyway, fed with
 the final token, so the number of tokens fed into the state can exceed the

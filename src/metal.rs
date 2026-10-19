@@ -2347,7 +2347,8 @@ impl PendingPass<'_> {
     /// later. Polling replaced a pacer that slept until a predicted
     /// completion: when the window server's frames made pass lengths
     /// irregular, its estimate overslept and left the GPU idle, and
-    /// speculative decoding fell from 110 to 33 to 52 tok/s
+    /// speculative decoding under screen use ran at 33 to 123 tok/s
+    /// (median 84) against 87 to 123 (median 113) blocking
     /// (docs/performance.md, "Waiting for the GPU").
     pub fn wait_polled(self) -> Result<()> {
         self.wait_retain_polled().map(|_| ())
@@ -2431,8 +2432,10 @@ const MILESTONE_POLL_MS: u64 = 50;
 
 /// How long a polled wait ([`PendingPass::wait_polled`]) sleeps between
 /// checks of the pass's done signal. Measured on an M5 Max (2026-10-19), a
-/// requested 20 us sleep lasts 27 us (the kernel's timer leeway adds a
-/// quarter) and a loop of them costs 3.9% of a core; 10 us cost 6.9% for
+/// requested 20 us sleep lasts 27 us (the kernel's timer leeway and the
+/// wake-up add about a third) and a loop of them costs 3.9% of a core, so
+/// a completion is seen about 15 us after it on average and 30 us at most;
+/// 10 us cost 6.9% for
 /// about 6 us less latency, and a blocking fence wait wakes about 90 us
 /// after the signal.
 pub const POLL_INTERVAL: Duration = Duration::from_micros(20);

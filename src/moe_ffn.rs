@@ -653,8 +653,9 @@ fn resolve_experts(
         pass.signal_event(&link.routed, seq)?;
         pass.wait_event(&link.ready, seq)?;
         // The last cached layer's resolution leaves only that layer's
-        // experts and the pass's tail to run: a paced wait for the pass
-        // blocks until then instead of predicting a length the misses vary.
+        // experts and the pass's tail to run: a polled wait for the pass
+        // blocks until then and polls only that tail, instead of keeping a
+        // core polling through misses of varying length.
         pass.set_milestone(&link.ready, seq);
     }
     Ok(())

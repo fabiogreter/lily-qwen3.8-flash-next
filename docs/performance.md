@@ -922,13 +922,17 @@ the activity assertion does not remove it under macOS 27 either, from a
 terminal or a launchd agent.
 
 **Why polling.** A fixed poll has nothing to mispredict, and it wakes about
-0.015 ms after the signal against 0.04 ms for the pacer and 0.09 ms for a
-blocked thread. A 20 us sleep lasts 27 us and a loop of them costs 3.9% of
-a core (10 us: 14.5 us and 6.9%). The pacer cost more than that: it woke
-1.5 ms early and spun. Decode CPU over the last 4 s of a 768-token 2-draft
-run: 15.9% of a core and 0.75 W polled, against 24.8% and 1.03 W paced. A
-pass with a milestone (the expert cache) still blocks until the milestone
-and polls only the rest.
+0.015 ms after the signal on average (0.03 ms at most) against 0.04 ms for
+the pacer and 0.09 ms for a blocked thread. A 20 us sleep lasts 27 us and a
+loop of them costs 3.9% of a core (10 us: 14.5 us and 6.9%). The pacer cost
+more than that: it woke 1.5 ms early and spun. Decode CPU over the last 4 s
+of a 768-token 2-draft run: 15.9% of a core and 0.75 W polled, against
+24.8% and 1.03 W paced. A pass with a milestone (the expert cache) still
+blocks until the milestone and polls only the rest. The sleep and CPU
+figures come from throwaway probes run that day (a `nanosleep` loop timed
+against `getrusage`, and `proc_pid_rusage` with `RUSAGE_INFO_V6` sampled
+every 0.25 s around `lily-bench`), not kept in the repository; the 0.04
+and 0.09 ms are from 2026-09-09 (`4727252`).
 
 **Measured, 2026-10-19**, `lily-bench` at 1K, 512 steps, `287ee74` against
 the change, interleaved, three rounds each, order rotating:

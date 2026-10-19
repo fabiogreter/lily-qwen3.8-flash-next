@@ -592,9 +592,10 @@ fn feedback_latency_and_residency_commit_cost() {
     );
 }
 
-/// Wake-up latency of the blocking fence wait against polling the event, for
-/// a pass of about a millisecond: what every `commit_wait` (prefill chunks,
-/// blits) pays on top of the GPU time.
+/// Wake-up latency of the blocking fence wait against a polled wait, for a
+/// pass of about a millisecond: what every `commit_wait` (prefill chunks,
+/// blits) pays on top of the GPU time. The pass has no done signal, so the
+/// polled wait polls the fence.
 #[test]
 #[ignore = "timing probe; run with --ignored --nocapture"]
 fn blocking_wait_latency() {
@@ -607,7 +608,7 @@ fn blocking_wait_latency() {
         v[v.len() / 2]
     };
     let mut blocking = Vec::new();
-    let mut spinning = Vec::new();
+    let mut polled = Vec::new();
     let mut gpu = Vec::new();
     for i in 0..60 {
         let pass = ctx.begin_concurrent().expect("pass");
@@ -623,13 +624,13 @@ fn blocking_wait_latency() {
         let wall = t0.elapsed().as_secs_f64() * 1e3;
         let t = done.timing().expect("timing");
         gpu.push((t.gpu_end_secs - t.gpu_start_secs) * 1e3);
-        if i % 2 == 0 { blocking.push(wall) } else { spinning.push(wall) }
+        if i % 2 == 0 { blocking.push(wall) } else { polled.push(wall) }
     }
     eprintln!(
         "commit-to-return for a {:.3} ms pass: blocking wait {:.3} ms, polling {:.3} ms",
         median(&mut gpu),
         median(&mut blocking),
-        median(&mut spinning)
+        median(&mut polled)
     );
 }
 
@@ -1310,8 +1311,9 @@ fn a_gated_wait_holds_past_the_queue_wait_limit() {
     assert!(ctx.fault().is_none(), "{:?}", ctx.fault());
 }
 
-/// A polled wait whose pass ends without reaching its milestone returns when
-/// the pass ends, not after the milestone wait's poll interval or never.
+/// A polled wait whose pass ends without reaching its milestone returns
+/// within about the milestone wait's poll interval (`MILESTONE_POLL_MS`) of
+/// the pass's end, rather than never.
 #[test]
 fn a_milestone_never_reached_does_not_hold_a_polled_wait() {
     let ctx = MetalContext::new().expect("metal context");
@@ -1328,6 +1330,36 @@ fn a_milestone_never_reached_does_not_hold_a_polled_wait() {
     pass.commit().expect("commit").wait_polled().expect("wait");
     assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
     assert_eq!(b.to_u32().expect("read"), data);
+}
+
+/// A polled wait on a pass that never signals its end (it waits for a host
+/// event nobody signals) ends with the context's fault instead of polling
+/// forever: the poll loop's own fault check, not the end-of-pass checks.
+#[test]
+fn a_polled_wait_on_a_stuck_pass_ends_with_the_fault() {
+    let ctx = MetalContext::new().expect("metal context");
+    let words = 1usize << 12;
+    let a = Tensor::zeros(&ctx, &[words], DType::U32).expect("a");
+    let b = Tensor::zeros(&ctx, &[words], DType::U32).expect("b");
+    let stuck = ctx.new_shared_event().expect("event");
+    let done = ctx.new_shared_event().expect("event");
+    let pass = ctx.begin().expect("pass");
+    pass.wait_event(&stuck, 1).expect("wait");
+    copy_words(&ctx, &pass, &a, &b).expect("copy");
+    pass.signal_done(&done, 1).expect("signal");
+    let pending = pass.commit().expect("commit");
+    // Submitted already: the fault is only seen by the wait.
+    ctx.inject_fault("injected for the test");
+    let t0 = Instant::now();
+    let err = pending.wait_polled().expect_err("a faulted context ends the wait");
+    assert!(format!("{err:#}").contains("injected for the test"), "{err:#}");
+    // The poll loop sees the fault at once; the error's return then drops
+    // the pass, whose fence wait checks the fault only after its first
+    // one-second timeout (`MetalContext::wait_fence`), as before polling.
+    assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
+    assert_eq!(done.signaled_value(), 0, "the pass must not have finished");
+    // Let the GPU drain the stuck pass before the context goes away.
+    stuck.release_all();
 }
 
 /// A polled wait on a pass with a done signal returns only after the pass's
