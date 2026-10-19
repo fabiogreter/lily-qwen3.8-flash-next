@@ -35,7 +35,10 @@ target="gui/$uid/$label"
 agents="$HOME/Library/LaunchAgents"
 plist="$agents/$label.plist"
 log_dir="$HOME/Library/Logs/lily"
-lock_file="$HOME/Library/Caches/lily/instance.lock"
+# The lock lives under the account's home from the user database, as lily
+# resolves it (`src/instance.rs`, `home_dir`), whatever HOME says.
+account_home=$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)
+lock_file="${account_home:-$HOME}/Library/Caches/lily/instance.lock"
 
 die() { echo "lily-service: $*" >&2; exit 1; }
 

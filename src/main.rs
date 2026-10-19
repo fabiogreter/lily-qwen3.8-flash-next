@@ -326,11 +326,16 @@ fn parse_bytes(text: &str) -> Result<usize> {
     Ok((value * scale) as usize)
 }
 
-fn default_disk_cache_dir() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join("Library").join("Caches").join("lily").join("sessions")
+/// The disk tier's default directory, under the account's home like the
+/// instance lock (`lily::instance::home_dir`): without `HOME` it used to be
+/// relative to the working directory, so a server started that way spilled
+/// its sessions there.
+fn default_disk_cache_dir() -> Result<PathBuf> {
+    Ok(lily::instance::home_dir()?
+        .join("Library")
+        .join("Caches")
+        .join("lily")
+        .join("sessions"))
 }
 
 /// Every argument of the command line as the dashboard's settings view
@@ -353,7 +358,7 @@ fn flag_values(matches: &ArgMatches) -> Vec<FlagValue> {
                 });
             let default = match name {
                 "disk_cache_dir" => {
-                    Some(default_disk_cache_dir().display().to_string())
+                    default_disk_cache_dir().ok().map(|path| path.display().to_string())
                 }
                 "stats_db" => Some(lily::serve::recorder::default_path().map_or_else(
                     || "off".to_owned(),
@@ -383,7 +388,10 @@ fn run() -> Result<()> {
         max_seq: cli.max_seq,
         cache_bytes: cli.cache_bytes.as_deref().map(parse_bytes).transpose()?,
         max_sessions: cli.max_sessions,
-        disk_cache_dir: Some(cli.disk_cache_dir.unwrap_or_else(default_disk_cache_dir)),
+        disk_cache_dir: Some(match cli.disk_cache_dir {
+            Some(dir) => dir,
+            None => default_disk_cache_dir()?,
+        }),
         disk_cache_bytes: parse_bytes(&cli.disk_cache_bytes)? as u64,
         disk_cache_ttl_secs: parse_duration_secs(&cli.disk_cache_ttl)?,
         durable_min_tokens: cli.durable_min_tokens,

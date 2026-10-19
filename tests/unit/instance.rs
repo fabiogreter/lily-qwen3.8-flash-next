@@ -171,6 +171,8 @@ fn child_lock_path(home: Option<&str>) -> String {
 /// elsewhere, as a benchmark started with a cleared environment once did.
 #[test]
 fn the_lock_path_does_not_depend_on_home() {
+    // Children forked now could inherit another test's lock descriptor.
+    let _serial = serial();
     let here = default_path().expect("lock path");
     assert!(here.is_absolute(), "{}", here.display());
     assert!(here.ends_with("Library/Caches/lily/instance.lock"), "{}", here.display());

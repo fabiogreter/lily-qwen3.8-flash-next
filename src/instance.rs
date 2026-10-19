@@ -37,19 +37,27 @@ pub const EXIT_ALREADY_RUNNING: u8 = 75;
 /// directory. Deliberately not configurable, so no two processes can
 /// disagree about it; tests lock their own file through [`InstanceLock::acquire_at`].
 ///
-/// The home directory is the account's (the user database), not `HOME`: a
+/// The home directory is [`home_dir`]'s. The lock is therefore per account:
+/// a process of another user, root under `sudo` included, resolves another
+/// home and does not see this one.
+pub fn default_path() -> Result<PathBuf> {
+    Ok(home_dir()?.join("Library").join("Caches").join("lily").join("instance.lock"))
+}
+
+/// The account's home directory from the user database, not `HOME`: a
 /// process started without `HOME` used to lock `./Library/...` relative to
 /// its working directory, never saw the service's lock and could load a
 /// second model (2026-10-19, benchmarks started with a cleared
-/// environment). An absolute `HOME` stands in only when the user database
-/// has no entry; with neither, this fails rather than guess.
-pub fn default_path() -> Result<PathBuf> {
-    let home = resolve_home(account_home(), std::env::var_os("HOME"))?;
-    Ok(home.join("Library").join("Caches").join("lily").join("instance.lock"))
+/// environment). An absolute `HOME` stands in when the user database
+/// lookup fails (no entry, or a sandbox or directory service refusing it);
+/// with neither, this fails rather than guess. The disk tier's default
+/// directory uses it too.
+pub fn home_dir() -> Result<PathBuf> {
+    resolve_home(account_home(), std::env::var_os("HOME"))
 }
 
-/// [`default_path`]'s choice of home: `account` (the user database's entry)
-/// when absolute, else `env` (`HOME`) when absolute, else an error.
+/// [`home_dir`]'s choice: `account` (the user database's entry) when
+/// absolute, else `env` (`HOME`) when absolute, else an error.
 fn resolve_home(account: Option<PathBuf>, env: Option<OsString>) -> Result<PathBuf> {
     if let Some(home) = account.filter(|p| p.is_absolute()) {
         return Ok(home);

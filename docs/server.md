@@ -270,8 +270,8 @@ flag's message. Two threads are new: `lily-machine` (the sampler, unless
 `--machine-stats off`) and `lily-recorder` (unless `--stats-db off`). The
 recorder creates `~/Library/Application Support/lily/lily.sqlite` by default
 (its directory `0700` if lily creates it, the database and its WAL files
-`0600`); a service whose `HOME` is unset writes it under its working
-directory, so set `--stats-db` there. Unknown paths answer `404` as before,
+`0600`); a service whose `HOME` is unset or relative keeps no history unless
+`--stats-db` names a file. Unknown paths answer `404` as before,
 except a browser's navigation (a path with no extension whose `Accept` names
 `text/html`), which gets the dashboard (see The dashboard above).
 
