@@ -1023,13 +1023,14 @@ pub trait LanguageModel: Sized {
     /// Feeds `pending` and `drafts` in one batched pass and draws one token
     /// per row (draw `step0 + row` of the request), waiting for the GPU. The
     /// state is then mid-step: it has fed every row, and must be completed
-    /// with [`Self::finish_speculation`] before anything else. `parked` is the
-    /// pass [`Self::finish_speculation`] may have committed for exactly these
-    /// arguments, parked on the GPU until its host inputs exist; the model
-    /// stages them and releases it. Returns the draws and the draft pass the
-    /// model committed behind the verify pass: it decides the accepted count
-    /// on the GPU, rolls the state back to it and proposes up to
-    /// `next_drafts` tokens following the accepted draw. Hand it to
+    /// with [`Self::finish_speculation`] before anything else. The pass is
+    /// encoded and committed here, whole, once its inputs are staged: a
+    /// verify pass committed ahead and parked on the GPU until its inputs
+    /// exist stalled for about 360 ms whenever the window server was busy
+    /// (`docs/performance.md`, "Waiting for the GPU"). Returns the draws and
+    /// the draft pass the model committed behind the verify pass: it decides
+    /// the accepted count on the GPU, rolls the state back to it and proposes
+    /// up to `next_drafts` tokens following the accepted draw. Hand it to
     /// [`Self::finish_speculation`].
     #[allow(clippy::too_many_arguments)]
     fn verify<'a>(
@@ -1041,11 +1042,9 @@ pub trait LanguageModel: Sized {
         drafts: &[u32],
         params: &SamplingParams,
         step0: usize,
-        parked: Option<PendingPass<'a>>,
         next_drafts: usize,
     ) -> Result<(Vec<u32>, PendingPass<'a>)> {
-        let _ =
-            (ctx, state, scratch, pending, drafts, params, step0, parked, next_drafts);
+        let _ = (ctx, state, scratch, pending, drafts, params, step0, next_drafts);
         anyhow::bail!("this model has no draft head")
     }
 
@@ -1053,33 +1052,21 @@ pub trait LanguageModel: Sized {
     /// drafts as fed. `accepted` may not exceed the number of drafts the
     /// draws confirmed (which is what `draft` rolled back to); it is smaller
     /// when the generation ends at a confirmed draft, and the model then
-    /// rolls back further. With `next` given (the accepted draw and the
-    /// sampler settings of the following step) returns the draft pass's
-    /// proposals and, when it could, the next verify pass, already committed
-    /// and parked behind the draft pass, to hand back to [`Self::verify`].
-    /// Waits for the GPU.
-    fn finish_speculation<'a>(
+    /// rolls back further. With `propose` (the generation goes on from the
+    /// accepted draw) returns the draft pass's proposals for the next
+    /// [`Self::verify`]; without it, none. Waits for the GPU.
+    fn finish_speculation(
         &self,
-        ctx: &'a MetalContext,
+        ctx: &MetalContext,
         state: &mut Self::State,
         scratch: &mut Self::Scratch,
         accepted: usize,
-        next: Option<NextStep<'_>>,
-        draft: PendingPass<'a>,
-    ) -> Result<(Vec<u32>, Option<PendingPass<'a>>)> {
-        let _ = (ctx, state, scratch, accepted, next, draft);
+        propose: bool,
+        draft: PendingPass<'_>,
+    ) -> Result<Vec<u32>> {
+        let _ = (ctx, state, scratch, accepted, propose, draft);
         anyhow::bail!("this model has no draft head")
     }
-}
-
-/// What the following speculative step will verify with: the fresh token and
-/// the sampler settings of its pass.
-#[derive(Clone, Copy)]
-pub struct NextStep<'p> {
-    pub token: u32,
-    pub params: &'p SamplingParams,
-    /// Draw index of the pass's first row.
-    pub step0: usize,
 }
 
 #[cfg(test)]

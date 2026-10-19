@@ -121,6 +121,9 @@ impl Service {
 /// outcomes). Dropped, it cancels them, so the service thread never resolves
 /// a layer the GPU will not run with whatever the indices buffer holds at
 /// the time; [`Self::keep`] lets them stand once the pass is committed.
+// TODO: unused since verify passes are no longer encoded ahead (2026-10-19,
+// `spec.rs`); remove with the service's cancellation path and its counters
+// once small-machine mode can be retested end to end.
 pub struct QueuedRequests {
     service: Arc<Service>,
     from: u64,

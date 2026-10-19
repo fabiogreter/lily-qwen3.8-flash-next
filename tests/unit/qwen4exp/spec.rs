@@ -53,7 +53,7 @@ fn host_verify(
             state,
             s,
             &ps,
-            BatchMode::Verify { params: &greedy, step0: 0, park: None },
+            BatchMode::Verify { params: &greedy, step0: 0 },
         )
         .expect("encode")
         .commit()
@@ -104,7 +104,6 @@ fn host_draft(
             Some(&keep),
             rollback,
             chain,
-            None,
             &SamplingParams::greedy(),
             0,
         )
@@ -246,18 +245,18 @@ fn gpu_selected_drafts_equal_host_driven_drafts() {
                 chain,
             );
 
-            // GPU-selected step, without parking (the fed drafts are not the
-            // head's proposals, so a parked next pass would verify the wrong
-            // rows and advance the state wrongly).
+            // GPU-selected step. The fed drafts are not the head's proposals,
+            // so the step ends without proposing (`propose` false) and the
+            // test reads the head's chain from the spec scratch itself.
             let (sampled_g, draft) = model
-                .verify(&ctx, &mut g, &mut s, pending, &drafts, &greedy, 0, None, chain)
+                .verify(&ctx, &mut g, &mut s, pending, &drafts, &greedy, 0, chain)
                 .expect("verify");
             assert_eq!(
                 sampled_g, sampled,
                 "step {step} at {prompt_len}: draws differ (trunk states diverged)"
             );
             model
-                .finish_speculation(&ctx, &mut g, &mut s, a, None, draft)
+                .finish_speculation(&ctx, &mut g, &mut s, a, false, draft)
                 .expect("finish");
             let gpu_proposals =
                 s.spec.as_ref().expect("spec").draft_tokens.to_u32().expect("drafts")

@@ -146,15 +146,14 @@ scratch, caches and pipelines); a 64 GB machine therefore gets about
 4. **Drafts under the cache.** The draft head loads as on the full
    machine. Its own experts are resident, not slots, so a speculative
    step's draft pass pays no handshakes; only the verify pass's 48 do, as
-   for a plain token. The verify passes encoded ahead for every possible
-   accepted count (`spec.rs`, `prepare_variants`) enqueue their cached
-   layers' requests while they are encoded, and the variants that are not
-   committed hand them back (`QueuedRequests`, dropped with the `Prepared`
-   pass, before the matching one is committed: a committed pass runs its
-   first layer and that layer's handshake ahead of its parked wait); without
-   that the service thread resolved up to 96 requests per step for passes
-   that never ran, which was the 14 tok/s of 2026-09-18 ("Speculative
-   decoding under the cache" below).
+   for a plain token. Each verify pass is encoded once and committed whole
+   (since 2026-10-19, `docs/performance.md`, "Waiting for the GPU"), so
+   every request it enqueues is for a pass that runs. Until then the next
+   verify pass was encoded ahead for every possible accepted count, and the
+   variants not committed had to hand their requests back
+   (`QueuedRequests`); without that the service thread resolved up to 96
+   requests per step for passes that never ran, which was the 14 tok/s of
+   2026-09-18 ("Speculative decoding under the cache" below).
 5. **Live usage, promotion and persistence.** The service thread counts
    every resolved (layer, expert), decode-class passes (up to 256 routed
    ids: a step, a verify pass) apart from prefill. A slice's score is the
@@ -686,7 +685,7 @@ host-signalled event:
 |-----------------------------------------|--------------------------------|----------------------------------------------------------------|------------------------------------|
 | `ready`, each cached MoE layer           | prefill (more than 4 rows)     | the layer's misses: 85 ms a layer at 40 GB, 5.6 s a pass         | yes at 40 GB; 64 GB at 3.8 to 4 s   |
 | `ready`, each cached MoE layer           | decode, verify (up to 4 rows), short prefills | a few ms a layer; at most 40 experts a layer, about 9 ms when all miss, 0.45 s a pass | only with a drive or host stalled for seconds |
-| `StepSync`, a parked pass's first input  | decode, verify, batched rows   | the pass before it plus the host's per-token callbacks (ms; the token stream's channel is unbounded, so a slow client does not hold them) | only with a stalled host; not watched, below |
+| `StepSync`, a parked pass's first input  | decode, batched rows           | the pass before it plus the host's per-token callbacks (ms; the token stream's channel is unbounded, so a slow client does not hold them) | only with a stalled host; not watched, below |
 | none                                     | the warm pass, blits, vision, everything resident | (the warm pass polls a host-written word, capped at 65 536 polls) | no |
 
 The draft head's experts are resident, so draft passes have no cache

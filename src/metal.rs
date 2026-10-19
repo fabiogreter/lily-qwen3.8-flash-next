@@ -2345,49 +2345,6 @@ impl<'a> EncodedPass<'a> {
             slot: Some(slot),
         })
     }
-
-    /// Drops the context lifetime so the pass can be kept inside long-lived
-    /// state (passes encoded ahead for several possible outcomes). The
-    /// context must outlive it; [`DetachedPass::attach`] restores the tie.
-    pub fn detach(self) -> DetachedPass {
-        DetachedPass {
-            program: self.program,
-            done: self.done,
-            milestone: self.milestone,
-            gated: self.gated,
-            slot: self.slot,
-            label: self.label,
-            names: self.names,
-        }
-    }
-}
-
-/// An [`EncodedPass`] held without its context lifetime; see
-/// [`EncodedPass::detach`]. Dropping it un-committed returns its command
-/// memory to the pool.
-pub struct DetachedPass {
-    program: Vec<Item>,
-    done: Option<(SharedEvent, u64)>,
-    milestone: Option<(SharedEvent, u64)>,
-    gated: bool,
-    slot: Slot,
-    label: &'static str,
-    names: Vec<&'static str>,
-}
-
-impl DetachedPass {
-    pub fn attach<'a>(self, ctx: &'a MetalContext) -> EncodedPass<'a> {
-        EncodedPass {
-            ctx,
-            program: self.program,
-            done: self.done,
-            milestone: self.milestone,
-            gated: self.gated,
-            slot: self.slot,
-            label: self.label,
-            names: self.names,
-        }
-    }
 }
 
 /// One buffer-to-buffer copy for [`MetalContext::blit_copy`], in bytes.

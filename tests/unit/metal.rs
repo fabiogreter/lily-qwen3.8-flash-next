@@ -490,9 +490,9 @@ fn buffer_recordings_return_the_live_buffers_allocated_meanwhile() {
     assert!(ctx.record_buffers().expect("free again").finish().is_empty());
 }
 
-/// An encoded pass that is never committed (a pre-encoded speculative
-/// variant that lost) returns its command memory without touching the GPU,
-/// and a pending pass dropped without a wait completes first.
+/// An encoded pass that is never committed (an error between encoding and
+/// commit) returns its command memory without touching the GPU, and a
+/// pending pass dropped without a wait completes first.
 #[test]
 fn uncommitted_and_unawaited_passes_release_cleanly() {
     let ctx = MetalContext::new().expect("metal context");
@@ -508,7 +508,7 @@ fn uncommitted_and_unawaited_passes_release_cleanly() {
     for _ in 0..8 {
         let pass = ctx.begin_concurrent().expect("pass");
         copy_words(&ctx, &pass, &src, &dst).expect("copy");
-        let encoded = pass.end().expect("end").detach();
+        let encoded = pass.end().expect("end");
         drop(encoded);
     }
     assert!(dst.to_u32().expect("dst").iter().all(|&v| v == 0));

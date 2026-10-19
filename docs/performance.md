@@ -141,14 +141,15 @@ then says what assumption it rests on.
   change to prefill numerics is judged by its logits against the previous
   build's on the same prompt (`lily-probe`, top-64 of the last prefill
   row) and by acceptance totals over several prompts, never by one cell.
-- **A screen in use slows speculative decoding.** The window server's
-  frames make pass lengths irregular even at 1 to 3% of the GPU's time:
-  with the screen in use, 2-draft decode ran at 97 to 113 tok/s against
-  123.6 with it locked, on the same tokens (2026-10-19, polled waits; the
-  old paced waits fell as low as 33). Plain decode did not notice (86.7
-  against 86.7). Speculative cells are measured with the screen locked
-  (`caffeinate -ims` keeps the machine awake) or interleaved under the
-  same screen use (see "Waiting for the GPU").
+- **A screen in use slows the GPU's work.** The window server's frames
+  take the GPU for short slices and, on macOS 27, delay the continuation
+  of any pass already in flight that waits on the host (see "Waiting for
+  the GPU"). With the verify pass committed whole, 2-draft decode under a
+  steady compositing load ran at 119.1 tok/s against 124.6 with a static
+  screen, plain decode at 83.5 against 86.6 (2026-10-19). How much the
+  screen costs depends on what is on it, so speculative cells are measured
+  with the screen locked or static (`caffeinate -ims` keeps the machine
+  awake) or interleaved under the same synthetic load.
 
 ## The numbers
 
@@ -945,6 +946,46 @@ the change, interleaved, three rounds each, order rotating:
 | in use | polled | 86.7 (86.5 to 86.9) | 101.4 (96.7 to 112.9) |
 
 Outputs are bit-identical (token digests equal).
+
+**The parked verify pass.** Polling left the service spiky, jumping
+between 95 and 50 tok/s while the machine was in use. Per-pass profiles
+(`LILY_PROFILE`) showed why: most verify passes took 19 ms, but every dozen
+or so took 353 to 377 ms, while the draft passes (2.3 ms) and the gaps
+between passes never moved. A synthetic load made it reproducible: a window
+redrawn every display frame (the window server at about 4.4% of the GPU,
+137 submissions a second), against a static screen. The speculative loop
+committed the next verify pass parked, encoded ahead for every possible
+accepted count, waiting on the GPU for its n-gram rows after the draft
+pass. Probes on the parked wait (`LILY_PROBE_ARRIVAL`, timed by a host
+poller) placed the whole stall between the host's release and the GPU
+resuming: 0.005 ms with a static screen, 2 ms typically under the load,
+and 355 to 370 ms for the stalled passes, released on time, sometimes
+before the GPU even reached the wait. During a stall the GPU is mostly
+idle: the window server used 6 to 29 ms of it. Nothing moved the stall:
+an empty submission right after the release, signalling the release from
+a second queue on the GPU instead of the CPU, and submitting the pass's
+tail only after the release (`gate_host_waits`) each still stalled 12 to
+26 times a run. A verify pass encoded and committed whole after its inputs
+are staged never stalled. Plain decode and the batched step park too, and
+under the same load lost only their share of the GPU (3 to 4%); in the
+speculative loop the GPU reaches the parked wait before the host can
+release it, since the rows depend on the draft pass's proposals.
+
+Since then the verify pass is committed whole (`spec.rs`). `lily-bench` at
+1K, 768 tokens with 2 drafts, `ba2da3c` against the change, interleaved,
+three rounds each, order rotating, machine untouched:
+
+| screen | build | plain tok/s | 2 drafts tok/s |
+|---|---|---|---|
+| static | parked verify | 86.7 (86.6 to 86.7) | 127.8 (127.5 to 127.9) |
+| static | whole verify | 86.6 (86.4 to 86.8) | 124.6 (124.2 to 124.7) |
+| animated window | parked verify | 83.6 (83.3 to 83.7) | 63.3 (61.1 to 67.8) |
+| animated window | whole verify | 83.5 (83.5 to 83.6) | 119.1 (118.9 to 119.3) |
+
+The 2.5% given up with a static screen is the submission latency parking
+hid. Outputs are bit-identical (token digests equal). The probes,
+sampler, animator and a standalone reproducer are throwaway tools, not
+kept in the repository.
 
 ### Smaller machines
 

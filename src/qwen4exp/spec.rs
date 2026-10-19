@@ -12,14 +12,21 @@
 //! verified row with real trunk hiddens (rows past the accepted one are
 //! position-indexed garbage the chain overwrites before anything reads them),
 //! chains `k` new proposals from the head's own residual at GPU-supplied
-//! positions, and writes the next verify pass's ids. Attention caches are
-//! position indexed, so rejected rows are simply overwritten later.
+//! positions. Attention caches are position indexed, so rejected rows are
+//! simply overwritten later.
 //!
-//! The host meanwhile reads the draws, emits tokens, and commits the next
-//! verify pass (encoded ahead for every possible accepted count while the
-//! verify pass ran) parked behind the draft pass. When a generation ends at a
-//! row before the one the GPU accepted (a stop token among accepted drafts),
-//! a small host-encoded pass rolls the state back further.
+//! The host meanwhile reads the draws and emits tokens, then reads the
+//! proposals, stages the next verify pass's inputs and encodes and commits
+//! it whole. Until 2026-10-19 the next verify pass was encoded ahead for
+//! every possible accepted count and committed parked behind the draft pass,
+//! waiting on the GPU for its n-gram rows; under window-server activity on
+//! macOS 27 a parked pass resumed about 2 ms after its release, and every
+//! dozen or so steps only after about 360 ms, which halved speculative
+//! decode while the screen was in use. Committing the pass whole costs 2.5%
+//! with the screen idle (`docs/performance.md`, "Waiting for the GPU").
+//! When a generation ends at a row before the one the GPU accepted (a stop
+//! token among accepted drafts), a small host-encoded pass rolls the state
+//! back further.
 //!
 //! Outputs are exact: every emitted token is a draw from the trunk's own
 //! distribution for its prefix; the drafts only decide how many rows a pass
@@ -29,7 +36,7 @@ use std::time::Instant;
 
 use anyhow::{Result, ensure};
 
-use crate::engine::{DecodeStateApi, NextStep};
+use crate::engine::DecodeStateApi;
 use crate::kernels::elementwise::copy_words;
 use crate::kernels::gdn::{GDN_HEAD_DIM, conv_window_rollback};
 use crate::kernels::sample::{
@@ -45,8 +52,8 @@ use crate::moe_ffn::{prefix_rows, project_mat};
 use crate::tensor::Tensor;
 
 use super::model::{
-    AttnPos, BatchMode, DecodeState, LayerState, MAX_DRAFTS, Prepared, Qwen4ExpModel,
-    Scratch, SpecPending,
+    AttnPos, BatchMode, DecodeState, LayerState, MAX_DRAFTS, Qwen4ExpModel, Scratch,
+    SpecPending,
 };
 use super::ngram::NgramHasher;
 
@@ -83,7 +90,6 @@ impl Qwen4ExpModel {
         drafts: &[u32],
         params: &SamplingParams,
         step0: usize,
-        parked: Option<PendingPass<'a>>,
         next_drafts: usize,
     ) -> Result<(Vec<u32>, PendingPass<'a>)> {
         ensure!(state.spec.is_none(), "verify while a speculative step is pending");
@@ -101,50 +107,23 @@ impl Qwen4ExpModel {
         tokens.extend_from_slice(drafts);
         let m = tokens.len();
         let chain = next_drafts.min(MAX_DRAFTS);
-        // Room for this pass, the draft pass behind it (its chain rows), the
-        // next verify pass (1 + chain rows at any of m positions) and the draft
-        // pass after that, so a parked pass (which cannot grow the caches)
-        // still finds room. Growing is only possible when nothing runs: the
-        // unparked case.
-        let ahead_rows = 2 * (1 + chain);
-        if parked.is_none() {
-            self.ensure_room(ctx, state, s, m + ahead_rows)?;
-        }
-        let can_prepare =
-            chain > 0 && state.pos + m + ahead_rows + MAX_DRAFTS <= state.capacity();
+        // Room for this pass and the draft pass behind it (its chain rows);
+        // nothing runs, so the caches can grow.
+        self.ensure_room(ctx, state, s, m)?;
         let s = &*s;
-        // Whatever happens below, a parked pass must be let go.
-        let _release = parked.as_ref().map(|_| s.sync.release_on_drop());
         let capacity = s.prefill.as_ref().expect("prefill scratch just ensured");
-        // The token-dependent inputs. A parked pass is already running with
-        // ids the draft pass wrote; only the n-gram rows are staged here, read
-        // after its wait. Otherwise both are written now and the pass encoded.
-        let ps = if parked.is_some() {
-            capacity.rows(m)?
-        } else {
-            capacity.chunk(&tokens)?
-        };
+        // The token-dependent inputs, ids and n-gram rows, are written before
+        // the pass is encoded and committed whole.
+        let ps = capacity.chunk(&tokens)?;
         let ple_w = self.weights.layers.iter().find_map(|l| l.ple.as_deref());
         if let (Some(w), Some(p), Some(pst)) = (ple_w, &ps.ple, &state.ple) {
             self.stage_ngram(w, p, &tokens, pst.hist)?;
         }
         let pos_before = state.pos;
         let hist_before = state.ple.as_ref().map(|p| p.hist);
-        let committed = match parked {
-            Some(pass) => {
-                s.sync.release()?;
-                pass
-            }
-            None => self
-                .encode_batch(
-                    ctx,
-                    state,
-                    s,
-                    &ps,
-                    BatchMode::Verify { params, step0, park: None },
-                )?
-                .commit()?,
-        };
+        let committed = self
+            .encode_batch(ctx, state, s, &ps, BatchMode::Verify { params, step0 })?
+            .commit()?;
         // Same bookkeeping as a prefill chunk; the draft pass rolls it back.
         // Done before the draft pass is encoded: it sees the state as the
         // verify pass leaves it.
@@ -167,13 +146,6 @@ impl Qwen4ExpModel {
                 step0 + m,
             )?
             .commit()?;
-        // While the GPU works, encode the next verify pass for every possible
-        // outcome; finish_speculation then only commits the matching one.
-        let prepared = if can_prepare {
-            self.prepare_variants(ctx, state, s, pos_before, m, chain, params, step0)?
-        } else {
-            Vec::new()
-        };
         let done = committed.wait_retain_polled()?;
         let verify_gpu_end = if profiling() {
             let t = done.timing()?;
@@ -195,80 +167,23 @@ impl Qwen4ExpModel {
             sampled: sampled.clone(),
             uses_penalties: params.uses_penalties(),
             chain,
-            prepared,
             verify_gpu_end,
         });
         Ok((sampled, draft))
     }
 
-    /// Encodes, for each accepted count `a` in `0..m` of the running verify
-    /// pass, the next verify pass (1 + `chain` rows at the position after
-    /// `a`, parked on the step sync). `state` is as the verify pass leaves it
-    /// (position advanced by `m`); the variants see the position after `a`.
-    /// Nothing is committed; the ids are written by the draft pass.
-    #[allow(clippy::too_many_arguments)]
-    fn prepare_variants(
+    /// See [`crate::engine::LanguageModel::finish_speculation`].
+    pub fn finish_speculation(
         &self,
         ctx: &MetalContext,
         state: &mut DecodeState,
-        s: &Scratch,
-        pos_before: usize,
-        m: usize,
-        chain: usize,
-        params: &SamplingParams,
-        step0: usize,
-    ) -> Result<Vec<Prepared>> {
-        let capacity = s
-            .prefill
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("prefill scratch missing"))?;
-        let pos_after = state.pos;
-        let park = s.sync.peek();
-        let link = self.weights.expert_cache.as_ref().map(|c| c.link());
-        let mut prepared = Vec::with_capacity(m);
-        let result = (|| -> Result<()> {
-            for a in 0..m {
-                state.pos = pos_before + a + 1;
-                let ps = capacity.rows(1 + chain)?;
-                let mode = BatchMode::Verify {
-                    params,
-                    step0: step0 + a + 1,
-                    park: Some(park),
-                };
-                // Encoding a cached layer enqueues its request; all but the
-                // variant that gets committed must take theirs back.
-                let first = link.as_ref().map_or(0, |l| l.last_seq() + 1);
-                let verify = match self.encode_batch(ctx, state, s, &ps, mode) {
-                    Ok(pass) => pass.detach(),
-                    Err(e) => {
-                        // Whatever the failed encode enqueued is cancelled
-                        // with the handle it never got to keep.
-                        drop(link.as_ref().and_then(|l| l.queued_since(first)));
-                        return Err(e);
-                    }
-                };
-                let cache = link.as_ref().and_then(|l| l.queued_since(first));
-                prepared.push(Prepared { verify, park, drafts: chain, cache });
-            }
-            Ok(())
-        })();
-        state.pos = pos_after;
-        result?;
-        Ok(prepared)
-    }
-
-    /// See [`crate::engine::LanguageModel::finish_speculation`].
-    pub fn finish_speculation<'a>(
-        &self,
-        ctx: &'a MetalContext,
-        state: &mut DecodeState,
         s: &mut Scratch,
         accepted: usize,
-        next: Option<NextStep<'_>>,
-        draft: PendingPass<'a>,
-    ) -> Result<(Vec<u32>, Option<PendingPass<'a>>)> {
+        propose: bool,
+        draft: PendingPass<'_>,
+    ) -> Result<Vec<u32>> {
         let entered = Instant::now();
-        let mut pending = state.spec.take().ok_or_else(|| {
+        let pending = state.spec.take().ok_or_else(|| {
             anyhow::anyhow!("finish_speculation without a verify pass")
         })?;
         let m = pending.tokens.len();
@@ -287,17 +202,6 @@ impl Qwen4ExpModel {
             "accepted {accepted} rows but only {gpu_accepted} drafts were confirmed"
         );
         let chain = pending.chain;
-        // The variants encoded ahead for the other outcomes: dropped now,
-        // before the matching one is committed, because a committed pass
-        // runs its first layer (and that layer's expert-cache handshake)
-        // ahead of its parked wait, and the losers' cache requests sit ahead
-        // of its own in the service queue until their handles cancel them
-        // (`Prepared::cache`). The matching variant is kept aside first.
-        let ahead = (next.is_some()
-            && pending.prepared.len() == m
-            && pending.prepared[accepted].drafts == chain)
-            .then(|| pending.prepared.swap_remove(accepted));
-        pending.prepared.clear();
 
         // Host-side rollback: position, hash history, penalty counts of the
         // rejected rows' draws. (The running draft pass never touches the
@@ -312,107 +216,47 @@ impl Qwen4ExpModel {
             }
         }
 
-        let (proposals, parked) = match next {
-            None => {
-                // The generation ends here: the draft pass's proposals are not
-                // needed, but its state changes must be complete before the
-                // state is used again.
-                self.collect_drafts(s, draft, 0, &pending)?;
-                if accepted < gpu_accepted {
-                    // The draft pass rolled back to the GPU's count; roll back
-                    // further to the engine's.
-                    let s = &*s;
-                    let capacity = s
-                        .prefill
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("prefill scratch missing"))?;
-                    let wide = self.config.hc_width();
-                    let hidden = capacity.hyper.view(0, &[1, wide])?;
-                    let keep = capacity.hyper.view(accepted * wide, &[wide])?;
-                    self.encode_draft(
-                        ctx,
-                        state,
-                        s,
-                        &hidden,
-                        0,
-                        0,
-                        pending.pos_before,
-                        Some(&keep),
-                        Some((accepted, m)),
-                        0,
-                        None,
-                        &SamplingParams::greedy(),
-                        0,
-                    )?
-                    .commit()?
-                    .wait()?;
-                }
-                (Vec::new(), None)
+        let proposals = if !propose {
+            // The generation ends here: the draft pass's proposals are not
+            // needed, but its state changes must be complete before the state
+            // is used again.
+            self.collect_drafts(s, draft, 0, &pending)?;
+            if accepted < gpu_accepted {
+                // The draft pass rolled back to the GPU's count; roll back
+                // further to the engine's.
+                let s = &*s;
+                let capacity = s
+                    .prefill
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("prefill scratch missing"))?;
+                let wide = self.config.hc_width();
+                let hidden = capacity.hyper.view(0, &[1, wide])?;
+                let keep = capacity.hyper.view(accepted * wide, &[wide])?;
+                self.encode_draft(
+                    ctx,
+                    state,
+                    s,
+                    &hidden,
+                    0,
+                    0,
+                    pending.pos_before,
+                    Some(&keep),
+                    Some((accepted, m)),
+                    0,
+                    &SamplingParams::greedy(),
+                    0,
+                )?
+                .commit()?
+                .wait()?;
             }
-            Some(n) => {
-                ensure!(
-                    accepted == gpu_accepted,
-                    "the step continues past a row the GPU did not confirm"
-                );
-                ensure!(chain > 0, "the draft pass proposed nothing to verify next");
-                match ahead {
-                    Some(mut prep) => {
-                        // Encoded ahead, ids written by the draft pass: commit
-                        // it parked, then read the proposals.
-                        let s = &*s;
-                        let value = s.sync.arm()?;
-                        ensure!(
-                            value == prep.park,
-                            "step sync value {value} does not match the prepared pass ({})",
-                            prep.park
-                        );
-                        let parked = match prep.verify.attach(ctx).commit() {
-                            Ok(pass) => pass,
-                            Err(e) => {
-                                s.sync.release()?;
-                                return Err(e);
-                            }
-                        };
-                        // Committed: its cached layers' requests stand (the
-                        // other variants cancelled theirs above).
-                        if let Some(queued) = prep.cache.take() {
-                            queued.keep();
-                        }
-                        let proposals =
-                            self.collect_drafts(s, draft, chain, &pending)?;
-                        (proposals, Some(parked))
-                    }
-                    None => {
-                        // Nothing (fitting) encoded ahead: wait for the draft
-                        // pass, then make room (only possible with the GPU
-                        // idle) and encode the next verify pass now.
-                        let proposals =
-                            self.collect_drafts(s, draft, chain, &pending)?;
-                        self.ensure_room(ctx, state, s, 1 + chain)?;
-                        let s = &*s;
-                        let capacity = s.prefill.as_ref().ok_or_else(|| {
-                            anyhow::anyhow!("prefill scratch missing")
-                        })?;
-                        let ps = capacity.rows(1 + chain)?;
-                        let value = s.sync.arm()?;
-                        let mode = BatchMode::Verify {
-                            params: n.params,
-                            step0: n.step0,
-                            park: Some(value),
-                        };
-                        match self
-                            .encode_batch(ctx, state, s, &ps, mode)
-                            .and_then(|pass| pass.commit())
-                        {
-                            Ok(pass) => (proposals, Some(pass)),
-                            Err(e) => {
-                                s.sync.release()?;
-                                return Err(e);
-                            }
-                        }
-                    }
-                }
-            }
+            Vec::new()
+        } else {
+            ensure!(
+                accepted == gpu_accepted,
+                "the step continues past a row the GPU did not confirm"
+            );
+            ensure!(chain > 0, "the draft pass proposed nothing to verify next");
+            self.collect_drafts(s, draft, chain, &pending)?
         };
         if profiling() {
             eprintln!(
@@ -420,7 +264,7 @@ impl Qwen4ExpModel {
                 entered.elapsed().as_secs_f64() * 1e3
             );
         }
-        Ok((proposals, parked))
+        Ok(proposals)
     }
 
     /// See [`crate::engine::LanguageModel::draft_initial`].
@@ -460,7 +304,6 @@ impl Qwen4ExpModel {
             None,
             None,
             drafts,
-            None,
             params,
             step0,
         )?;
@@ -515,9 +358,8 @@ impl Qwen4ExpModel {
     /// read the control words. It rolls the recurrent state back to the
     /// accepted prefix, sets the head's hidden to the accepted row's trunk
     /// hidden, catches the head up on every verified row (ids are the trunk's
-    /// draws: the accepted rows' successors, garbage past them), chains
-    /// `chain` proposals into the spec scratch and writes the next verify
-    /// pass's ids (accepted draw, then the proposals).
+    /// draws: the accepted rows' successors, garbage past them) and chains
+    /// `chain` proposals into the spec scratch.
     #[allow(clippy::too_many_arguments)]
     fn encode_draft_selected<'a>(
         &self,
@@ -706,21 +548,6 @@ impl Qwen4ExpModel {
                     last = hyper.view(0, &[1, wide])?;
                 }
             }
-            // The next verify pass's ids: the accepted row's draw, then the
-            // proposals. (The accept dispatch read the old ids long before.)
-            copy_row(
-                ctx,
-                &pass,
-                &sp.verify_tokens.view(0, &[m, 1])?,
-                Arg::Gpu(&accepted),
-                &capacity.ids.view(0, &[1])?,
-            )?;
-            copy_words(
-                ctx,
-                &pass,
-                &sp.draft_tokens.view(0, &[chain])?,
-                &capacity.ids.view(1, &[chain])?,
-            )?;
         }
         s.sync.signal_done(&pass)?;
         pass.end()
@@ -732,7 +559,7 @@ impl Qwen4ExpModel {
     /// spec scratch's `mtp_ids`, head positions from `pos0`), `keep` copied
     /// into the state's hidden, and `drafts` chained proposals from the
     /// residual of catch-up row `chain_row` (chain positions follow it) into
-    /// the spec scratch, also copied into `next_ids` when given. Used for the
+    /// the spec scratch. Used for the
     /// first proposals of a request, for rolling back past the GPU's count,
     /// and as the reference the GPU-selected pass is tested against.
     #[allow(clippy::too_many_arguments)]
@@ -748,7 +575,6 @@ impl Qwen4ExpModel {
         keep: Option<&Tensor>,
         rollback: Option<(usize, usize)>,
         drafts: usize,
-        next_ids: Option<&Tensor>,
         params: &SamplingParams,
         draw0: usize,
     ) -> Result<EncodedPass<'a>> {
@@ -880,9 +706,6 @@ impl Qwen4ExpModel {
                         )?;
                         last = hyper.view(0, &[1, wide])?;
                     }
-                }
-                if let Some(ids) = next_ids {
-                    copy_words(ctx, &pass, &sp.draft_tokens.view(0, &[drafts])?, ids)?;
                 }
             }
         }

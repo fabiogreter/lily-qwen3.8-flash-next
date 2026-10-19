@@ -200,6 +200,20 @@ the plain loop the host is no longer on the critical path. In the
 speculative loop its wake-up after each pass still gates the next one,
 which is why how it waits matters there (above).
 
+The speculative loop does not park. Its verify pass needs the n-gram rows
+of the draft pass's proposals, so a parked verify pass always reached its
+wait before the host could release it, and on macOS 27, while the window
+server composites, a pass in that state resumes about 2 ms after the
+release and every dozen or so steps only after about 360 ms. Neither a
+second submission, a release signalled from the GPU, nor submitting the
+tail after the release avoids it; a pass committed whole does. So the
+verify pass is encoded and committed once its inputs are staged, at 2.5%
+with the screen idle (124.6 against 127.8 tok/s with 2 drafts) and 88%
+faster under a steady compositing load (119.1 against 63.3;
+`docs/performance.md`, "Waiting for the GPU"). Plain decode and the
+batched step park as before: under the same load they never stalled and
+lost only the window server's share of the GPU (3 to 4%).
+
 When a generation stops with a step parked, that step runs anyway, fed with
 the final token, so the number of tokens fed into the state can exceed the
 number drawn. The server accounts for both cases, because a continued
@@ -695,7 +709,10 @@ row its position, the indexer block that position completes and a 0/1 flag
 whether it does. Later dispatches of the same pass read those words as inline
 parameters through `Param::Gpu`. **The accepted count is decided on the
 GPU**, so the loop has no host dependency between verify and draft; measured
-GPU idle between the two passes is 0.013 ms.
+GPU idle between the two passes is 0.013 ms. The next verify pass needs the
+proposals, so the host reads them once the draft pass ends, stages that
+pass's ids and n-gram rows and encodes and commits it whole (not parked,
+see "Hiding the host round trip").
 
 A GPU-supplied position works because every host decision that depends on a
 position is monotone in it, so sizing for the whole candidate range is exact:
@@ -1660,7 +1677,7 @@ tokens are not drawn, so they cannot ride a speculative step: where the
 control acts, the loop comes to rest as for a decode checkpoint. In the
 speculative loop the verify pass ends at the row in question (the state
 keeps the rows before it, plus the row itself when the insertion follows
-it, through `finish_speculation` without a next step, as at the end of a
+it, through `finish_speculation` without `propose`, as at the end of a
 generation), the inserted tokens are emitted and fed as a prefill without
 a draw (which also catches the draft head up), and the head proposes
 afresh from the last of them (`draft_initial`, as after the prefill). A

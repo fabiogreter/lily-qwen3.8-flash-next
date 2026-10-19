@@ -25,7 +25,7 @@ use std::path::Path;
 use anyhow::{Result, ensure};
 
 use crate::chat::Conversation;
-use crate::engine::{DecodeStateApi, Draw, LanguageModel, NextStep, ScratchApi};
+use crate::engine::{DecodeStateApi, Draw, LanguageModel, ScratchApi};
 use crate::kernels::sample::SamplingParams;
 
 use crate::metal::{EncodedPass, MetalContext, PendingPass};
@@ -268,8 +268,8 @@ pub fn speculate<M: LanguageModel>(
 }
 
 /// [`speculate`] with decode checkpoints. A step after which one is due
-/// completes its verify pass without committing the next one
-/// ([`LanguageModel::finish_speculation`] without a next step, as at the end
+/// completes its verify pass without proposals
+/// ([`LanguageModel::finish_speculation`] without `propose`, as at the end
 /// of a generation), so the state is at rest with the accepted rows fed; the
 /// checkpoint is taken there and the head proposes afresh for the fresh draw
 /// ([`LanguageModel::draft_initial`], as after the prefill). The emitted
@@ -316,23 +316,11 @@ fn speculate_checkpointed<M: LanguageModel>(
     let (mut drafted, mut accepted) = (0usize, 0usize);
     let mut proposals =
         model.draft_initial(ctx, state, scratch, last, k, params, tokens.len())?;
-    // The next verify pass, committed by finish_speculation and parked on the
-    // GPU until verify stages its n-gram rows.
-    let mut parked: Option<PendingPass<'_>> = None;
     loop {
         let pending = *tokens.last().expect("tokens is never empty");
         let step0 = tokens.len();
-        let (sampled, draft) = model.verify(
-            ctx,
-            state,
-            scratch,
-            pending,
-            &proposals,
-            params,
-            step0,
-            parked.take(),
-            k,
-        )?;
+        let (sampled, draft) =
+            model.verify(ctx, state, scratch, pending, &proposals, params, step0, k)?;
         if std::env::var_os("LILY_TRACE_SPEC").is_some() {
             eprintln!(
                 "trace step0={step0} pending={pending} proposals={proposals:?} sampled={sampled:?}"
@@ -395,7 +383,7 @@ fn speculate_checkpointed<M: LanguageModel>(
         }
         if let Some(group) = group {
             // At rest with the kept rows fed, as at the end of a generation.
-            model.finish_speculation(ctx, state, scratch, kept, None, draft)?;
+            model.finish_speculation(ctx, state, scratch, kept, false, draft)?;
             if let Some(end) = push_group(tokens, &group, max_tokens, on_token)? {
                 finish.get_or_insert(end);
             }
@@ -418,18 +406,18 @@ fn speculate_checkpointed<M: LanguageModel>(
                 params,
                 tokens.len(),
             )?;
-            // Nothing is parked: `verify` encodes and commits the next pass.
             continue;
         }
         match finish {
             Some(finish) => {
-                model.finish_speculation(ctx, state, scratch, kept, None, draft)?;
+                model.finish_speculation(ctx, state, scratch, kept, false, draft)?;
                 return Ok(Speculated { finish, drafted, accepted });
             }
             None => {
                 let rest = base + tokens.len() - 1;
                 if checkpoints.as_mut().is_some_and(|c| c.due(rest)) {
-                    model.finish_speculation(ctx, state, scratch, kept, None, draft)?;
+                    model
+                        .finish_speculation(ctx, state, scratch, kept, false, draft)?;
                     ensure!(
                         state.pos() == rest,
                         "speculation came to rest at {} instead of {rest}",
@@ -447,22 +435,10 @@ fn speculate_checkpointed<M: LanguageModel>(
                         params,
                         tokens.len(),
                     )?;
-                    // Nothing is parked: the next verify pass is encoded and
-                    // committed by `verify` itself.
                     continue;
                 }
-                let next =
-                    NextStep { token: sampled[kept], params, step0: tokens.len() };
-                let (next_proposals, next_parked) = model.finish_speculation(
-                    ctx,
-                    state,
-                    scratch,
-                    kept,
-                    Some(next),
-                    draft,
-                )?;
-                proposals = next_proposals;
-                parked = next_parked;
+                proposals =
+                    model.finish_speculation(ctx, state, scratch, kept, true, draft)?;
             }
         }
     }
