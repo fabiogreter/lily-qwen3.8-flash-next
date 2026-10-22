@@ -183,6 +183,10 @@ impl InstanceLock {
     /// to write its record and would otherwise truncate whatever a link
     /// points at. A file this process owns is made `0666` whatever the
     /// umask, so the next lily of another user can open it for writing too.
+    /// A file another account owns without granting write access (its
+    /// creator was killed between the open and the `fchmod`, or it was
+    /// planted) is opened read-only instead: `flock` needs no write access,
+    /// so the exclusion holds, and only the record is left unwritten.
     pub fn acquire_at(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
@@ -190,26 +194,39 @@ impl InstanceLock {
         }
         // Not truncated on open: the holder's record must survive a
         // refused open so the refusal can name it.
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o666)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
+        let open = |write: bool| {
+            OpenOptions::new()
+                .read(true)
+                .write(write)
+                .create(write)
+                .truncate(false)
+                .mode(0o666)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)
+        };
+        let (opened, writable) = match open(true) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                (open(false), false)
+            }
+            opened => (opened, true),
+        };
+        let mut file = opened
             .with_context(|| format!("opening the instance lock {}", path.display()))?;
         let meta = file
             .metadata()
             .with_context(|| format!("reading the instance lock {}", path.display()))?;
         ensure!(
             meta.file_type().is_file() && meta.nlink() == 1,
-            "the instance lock {} is not a regular file with a single link; remove it \
-             (it may have been planted by another account)",
+            "the instance lock {} is not a regular file with a single link (it may have been \
+             planted by another account); remove it with `sudo rm {}`",
+            path.display(),
             path.display()
         );
         // SAFETY: getuid cannot fail.
-        if meta.uid() == unsafe { libc::getuid() } && meta.mode() & 0o777 != 0o666 {
+        if writable
+            && meta.uid() == unsafe { libc::getuid() }
+            && meta.mode() & 0o777 != 0o666
+        {
             file.set_permissions(std::fs::Permissions::from_mode(0o666)).with_context(
                 || {
                     format!(
@@ -235,6 +252,12 @@ impl InstanceLock {
             return Err(error).with_context(|| {
                 format!("locking the instance lock {}", path.display())
             });
+        }
+        if !writable {
+            // The previous holder's record stays: a refusal may name a pid
+            // that is gone, which `lily-service.sh` and `lily-ssd-probe`
+            // already treat as stale.
+            return Ok(Self { _file: file, path: path.to_owned() });
         }
         let binary = std::env::current_exe()
             .map(|p| p.display().to_string())

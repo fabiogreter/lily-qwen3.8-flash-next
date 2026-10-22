@@ -11,9 +11,9 @@
 #   tools/service/lily-service.sh status     launchd state, pid, exit code, /health, memory
 #   tools/service/lily-service.sh logs [N]   the last N (default 40) log lines, then follow
 #
-# Only one lily instance runs on the machine at a time, whichever user starts it
-# (/Users/Shared/lily-instance.lock): while another lily process (a development server, lily-bench, lily-probe)
-# holds the lock the service's start exits 75, and launchd retries every 30 s
+# Only one lily instance runs on the machine at a time, whichever user starts
+# it (/Users/Shared/lily-instance.lock): while another lily process (a
+# development server, lily-bench, lily-probe) holds the lock the service's start exits 75, and launchd retries every 30 s
 # until that process has exited. `install`, `start`, `restart` and `status`
 # say when that is the case.
 #
@@ -175,13 +175,15 @@ wait_for_exit() {
 # The live process the instance lock file names, as "pid command", or
 # nothing. The lock itself is an flock its holder keeps until it exits; the
 # pid and binary written into the file are informational, so a pid that is
-# gone or now runs something else is a stale record, not a holder.
+# gone or now runs something else is a stale record, not a holder. Every
+# account can write the file, so a record without a binary names nothing
+# (an empty pattern would match any process).
 lock_holder() {
-    [ -f "$lock_file" ] || return 0
+    [ -r "$lock_file" ] || return 0
     local pid binary command
     pid=$(awk '/^pid /{print $2; exit}' "$lock_file")
     binary=$(sed -n 2p "$lock_file")
-    [ -n "$pid" ] || return 0
+    { [ -n "$pid" ] && [ -n "$binary" ]; } || return 0
     # ps rather than kill -0, which fails for another user's process: the
     # lock is machine-wide, so the holder may belong to any account.
     command=$(ps -o command= -p "$pid" 2>/dev/null) || return 0

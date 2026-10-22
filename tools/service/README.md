@@ -33,12 +33,13 @@ Only one lily instance runs on the machine at a time. Every process that
 loads the model (this service, a server started by hand, `lily-bench`,
 `lily-probe`), whichever user starts it, takes an exclusive lock on
 `/Users/Shared/lily-instance.lock` first; the kernel drops it when the
-process exits, however it exits. While another process holds it the service's start is refused with exit status 75 (`EX_TEMPFAIL`),
-launchd tries again every 30 s, and the service comes up by itself once the
-other process has exited. For development, `stop` the service first (it stays
-down) and `start` it afterwards; `start`, `restart`, `install` and `status`
-say when another instance holds the lock. `restart` waits for the old
-process to exit, which releases the lock, before it starts the new one.
+process exits, however it exits. While another process holds it the service's
+start is refused with exit status 75 (`EX_TEMPFAIL`), launchd tries again
+every 30 s, and the service comes up by itself once the other process has
+exited. For development, `stop` the service first (it stays down) and `start`
+it afterwards; `start`, `restart`, `install` and `status` say when another
+instance holds the lock. `restart` waits for the old process to exit, which
+releases the lock, before it starts the new one.
 
 ## What the plist says, and why
 

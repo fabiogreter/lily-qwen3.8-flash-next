@@ -181,17 +181,41 @@ fn the_lock_path_is_machine_wide_and_does_not_depend_on_home() {
     assert_eq!(child_lock_path(Some("/nonexistent/elsewhere")), here, "HOME elsewhere");
 }
 
-/// The file is created `0666` whatever the umask (this process's is at
-/// least `022`), so the next lily of another account can open it too.
+/// A lock file this process owns becomes `0666` whatever the umask left
+/// it with (here `0644`, as a umask of `022` creates it), so the next lily
+/// of another account can open it too.
 #[test]
-fn a_new_lock_file_is_writable_for_every_account() {
+fn an_owned_lock_file_becomes_writable_for_every_account() {
     use std::os::unix::fs::PermissionsExt as _;
     let _serial = serial();
     let path = temp_lock("mode");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
     let lock = InstanceLock::acquire_at(&path).expect("lock");
     let mode = std::fs::metadata(&path).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o666, "{mode:o}");
     drop(lock);
+}
+
+/// A lock file this process may not write (as one of another account
+/// without write access for others) is still locked, through a read-only
+/// descriptor, and excludes a second handle; its record stays as it was.
+#[test]
+fn a_lock_file_without_write_access_is_locked_read_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _serial = serial();
+    let path = temp_lock("readonly");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "pid 1\n/old/lily\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let lock = InstanceLock::acquire_at(&path).expect("locked read-only");
+    let refused = refusal(&path);
+    assert_eq!(refused.holder.map(|h| h.pid), Some(1));
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o444, "{mode:o}");
+    drop(lock);
+    InstanceLock::acquire_at(&path).expect("free after the handle dropped");
 }
 
 /// A link planted at the lock's path is refused rather than followed, and
@@ -216,6 +240,21 @@ fn a_planted_symlink_or_hard_link_is_refused_and_its_target_untouched() {
     let error = InstanceLock::acquire_at(&path).expect_err("hard link refused");
     assert!(format!("{error}").contains("single link"), "{error}");
     assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+}
+
+/// A FIFO planted at the lock's path neither blocks the open (read and
+/// write: no wait for the other end) nor passes as the lock file.
+#[test]
+fn a_planted_fifo_is_refused_without_blocking() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let _serial = serial();
+    let path = temp_lock("fifo");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: a NUL-terminated path that outlives the call.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o666) }, 0);
+    let error = InstanceLock::acquire_at(&path).expect_err("FIFO refused");
+    assert!(format!("{error}").contains("not a regular file"), "{error}");
 }
 
 #[test]

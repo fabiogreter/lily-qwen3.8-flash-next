@@ -1610,38 +1610,44 @@ pressure rather than compilation, but that is not measured, and the
 breakdown in the log line is there to show it. With the preload now
 starting after the warm-up, the warm-up no longer runs behind it.
 
-**One instance per machine.** Two full instances on a 128 GB machine
-(102.8 GB and 68.6 GB resident, 62 MB free) panicked it on 2026-09-12, so
-every process that loads the weights refuses to run next to another one,
-whichever account started either (`src/instance.rs`). The load path itself (`qwen4exp::weights::load`, and
-`VisionTower::load_from_dir` for the tower alone) takes an exclusive
-`flock(LOCK_EX | LOCK_NB)` on `/Users/Shared/lily-instance.lock`, so the
-server, `lily-bench`, `lily-probe`, `lily-vision-probe`, `lily-experts`,
-`lily-trace-routing` and the ignored tests that load a real checkpoint are
-all covered; the server takes it again, first thing, before it binds the
-port, so a second server names the holder instead of failing on "address
-in use". The path is machine-wide and does not depend on the account or
-the environment: until 2026-10-22 it was `~/Library/Caches/lily/instance.lock`,
-so a lily of another user (root under `sudo` included) did not see the
-service's lock, and until 2026-10-19 one started without `HOME` locked a path
-relative to its working directory. `/Users/Shared` is world-writable with
-the sticky bit, so the file is created `0666` for every account to open, and
-opened as one another user may have planted: no symbolic link is followed
-and anything but a regular file with a single link is refused, because the
-holder truncates the file to write its record. Any account can hold the lock
-and so keep lily from starting; on a machine whose accounts are trusted that
-is the intended effect. A process takes it
-once and keeps it until it exits: the idle unload and the reloads (after an
-idle unload or a GPU fault) find it held, and the kernel drops it on any
-exit, a crash or a SIGKILL included, so no stale lock can block a start.
-The holder writes its pid and binary into the file; a refused process
-prints them, how to stop the service, and exits 75 (`EX_TEMPFAIL`), which
-launchd's `KeepAlive {SuccessfulExit: false}` retries every 30 s
-(`ThrottleInterval`), so the service comes back by itself once the other
-process is gone, while a service stopped with `lily-service.sh stop` (exit
-0) stays down. Processes that only read the tokenizer or the chat template
-take no lock. The path is fixed rather than configurable so that no two
-processes can disagree about it; the tests lock files of their own.
+**One instance per machine.** Two full instances on a 128 GB machine (102.8
+GB and 68.6 GB resident, 62 MB free) panicked it on 2026-09-12, so every
+process that loads the weights refuses to run next to another one, whichever
+account started either (`src/instance.rs`). The load path itself
+(`qwen4exp::weights::load`, and `VisionTower::load_from_dir` for the tower
+alone) takes an exclusive `flock(LOCK_EX | LOCK_NB)` on
+`/Users/Shared/lily-instance.lock`, so the server, `lily-bench`,
+`lily-probe`, `lily-vision-probe`, `lily-experts`, `lily-trace-routing` and
+the ignored tests that load a real checkpoint are all covered; the server
+takes it again, first thing, before it binds the port, so a second server
+names the holder instead of failing on "address in use". The path is
+machine-wide and depends neither on the account nor on the environment:
+until 2026-10-22 it was `~/Library/Caches/lily/instance.lock`, so a lily of
+another user (root under `sudo` included) did not see the service's lock,
+and until 2026-10-19 one started without `HOME` locked a path relative to
+its working directory. `/Users/Shared` is world-writable with the sticky
+bit, so the file is made `0666` for every account to open, and opened as one
+another user may have planted: no symbolic link is followed and anything but
+a regular file with a single link is refused, because the holder truncates
+the file to write its record; a file the process may not write is locked
+through a read-only descriptor, which `flock` allows, and keeps its old
+record. The guarantee has two limits on a machine whose accounts are
+trusted: any account can hold the lock and so keep lily from starting, and
+the file's owner (or root) can unlink it while another account's lily holds
+it, after which the next lily locks a new file. A file created by root
+(`sudo install -m 0666 /dev/null /Users/Shared/lily-instance.lock`) closes
+the second for every other account. A process takes it once and keeps it
+until it exits: the idle unload and the reloads (after an idle unload or a
+GPU fault) find it held, and the kernel drops it on any exit, a crash or a
+SIGKILL included, so no stale lock can block a start. The holder writes its
+pid and binary into the file; a refused process prints them, how to stop the
+service, and exits 75 (`EX_TEMPFAIL`), which launchd's `KeepAlive
+{SuccessfulExit: false}` retries every 30 s (`ThrottleInterval`), so the
+service comes back by itself once the other process is gone, while a service
+stopped with `lily-service.sh stop` (exit 0) stays down. Processes that only
+read the tokenizer or the chat template take no lock. The path is fixed
+rather than configurable so that no two processes can disagree about it; the
+tests lock files of their own.
 
 A Metal command-queue error is treated as a transport failure rather than a
 request failure, because the queue's state after one is unknown: the context
