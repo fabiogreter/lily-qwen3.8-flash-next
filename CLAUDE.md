@@ -119,6 +119,23 @@ database store numbers only, never prompt text or token ids.
   with the owner's go. Dependencies (crates like `rayon`) are fine when they
   earn their place.
 
+## Versions and releases
+
+- The version lives in `Cargo.toml` (`lily --version` and `lily-bench`'s
+  `crate_version` read it). It follows semver; while it is `0.x`, a minor
+  bump (`0.2.0`) marks a breaking change (CLI flags, HTTP routes or
+  responses, checkpoint format, on-disk cache or stats database) and a patch
+  bump everything else.
+- The version changes only in a release commit, `Release: 0.2.0`, which
+  carries `Cargo.toml` and `Cargo.lock` together and nothing else.
+  `dashboard/package.json` is private and embedded; its version is not
+  maintained.
+- A release is an annotated tag `vX.Y.Z` on that commit on `main` and a
+  GitHub release (`gh release create`) whose notes summarise the changes
+  since the previous tag, with a prebuilt `aarch64-apple-darwin` binary
+  attached. Tags, releases and their uploads only with the owner's go, like
+  pushes.
+
 ## The dashboard
 
 `dashboard/` is a Vue 3 + Vite + TypeScript app served by lily at `/` and

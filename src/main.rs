@@ -20,6 +20,7 @@ const DEFAULT_THINKING_BUDGET: &str = "low=8000,medium=8000,xhigh=16000";
 #[derive(Parser)]
 #[command(
     name = "lily",
+    version,
     about = "Qwen3.8-Flash-Next inference server",
     after_help = "Only one lily instance runs at a time: a server, lily-bench or lily-probe started \
                   while another one, of any user, holds /Users/Shared/lily-instance.lock refuses \
