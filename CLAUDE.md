@@ -123,17 +123,25 @@ database store numbers only, never prompt text or token ids.
 
 - The version lives in `Cargo.toml` (`lily --version` and `lily-bench`'s
   `crate_version` read it). It follows semver; while it is `0.x`, a minor
-  bump (`0.2.0`) marks a breaking change (CLI flags, HTTP routes or
-  responses, checkpoint format, on-disk cache or stats database) and a patch
-  bump everything else.
+  bump (`0.2.0`) marks a breaking change and a patch bump everything else.
+  Breaking is anything that makes a working setup fail or behave differently
+  after an upgrade: a CLI flag removed, renamed or newly refused, an HTTP
+  route or response changed, a checkpoint, disk-cache or stats-database
+  format an older file no longer opens with, a dashboard setting whose
+  meaning changes, or a change to how `tools/service/lily-service.sh` is
+  called. A forward migration of the stats database is not breaking, but
+  it prevents a downgrade, and the release notes say so. The rest of
+  `tools/` is not covered.
 - The version changes only in a release commit, `Release: 0.2.0`, which
   carries `Cargo.toml` and `Cargo.lock` together and nothing else.
-  `dashboard/package.json` is private and embedded; its version is not
-  maintained.
+  `dashboard/package.json` and `tools/opencode-plugin-timings/package.json`
+  are private; their versions are not maintained.
 - A release is an annotated tag `vX.Y.Z` on that commit on `main` and a
   GitHub release (`gh release create`) whose notes summarise the changes
   since the previous tag, with a prebuilt `aarch64-apple-darwin` binary
-  attached. Tags, releases and their uploads only with the owner's go, like
+  attached. Upgrade notes (flags that are now refused, new files or
+  threads, downgrade limits) belong in those release notes, not in
+  `docs/`. Tags, releases and their uploads only with the owner's go, like
   pushes.
 
 ## The dashboard

@@ -259,22 +259,6 @@ to see the current value"; the page reloads the settings and the log after
 any 5xx), 500 the change could not be worked out. The change log answers
 503 without the database.
 
-## Notes for upgrading
-
-A server that starts from a script or the launchd service may refuse flags
-it took before the dashboard: a duration over 365 days (`--idle-unload`,
-`--pin-hold`, `--disk-cache-ttl`), a thinking budget or
-`--thinking-budget-grace` over 1 048 576 tokens, and
-`--thinking-budget-tool-turn-factor` over 100 now stop the start with the
-flag's message. Two threads are new: `lily-machine` (the sampler, unless
-`--machine-stats off`) and `lily-recorder` (unless `--stats-db off`). The
-recorder creates `~/Library/Application Support/lily/lily.sqlite` by default
-(its directory `0700` if lily creates it, the database and its WAL files
-`0600`); a service whose `HOME` is unset or relative keeps no history unless
-`--stats-db` names a file. Unknown paths answer `404` as before,
-except a browser's navigation (a path with no extension whose `Accept` names
-`text/html`), which gets the dashboard (see The dashboard above).
-
 ## Batching
 
 Up to four requests decode together (`--max-batch`, continuous batching): a
