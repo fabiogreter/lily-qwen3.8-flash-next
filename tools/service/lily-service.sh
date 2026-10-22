@@ -11,8 +11,8 @@
 #   tools/service/lily-service.sh status     launchd state, pid, exit code, /health, memory
 #   tools/service/lily-service.sh logs [N]   the last N (default 40) log lines, then follow
 #
-# Only one lily instance runs at a time (~/Library/Caches/lily/instance.lock):
-# while another lily process (a development server, lily-bench, lily-probe)
+# Only one lily instance runs on the machine at a time, whichever user starts it
+# (/Users/Shared/lily-instance.lock): while another lily process (a development server, lily-bench, lily-probe)
 # holds the lock the service's start exits 75, and launchd retries every 30 s
 # until that process has exited. `install`, `start`, `restart` and `status`
 # say when that is the case.
@@ -35,10 +35,8 @@ target="gui/$uid/$label"
 agents="$HOME/Library/LaunchAgents"
 plist="$agents/$label.plist"
 log_dir="$HOME/Library/Logs/lily"
-# The lock lives under the account's home from the user database, as lily
-# resolves it (`src/instance.rs`, `home_dir`), whatever HOME says.
-account_home=$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)
-lock_file="${account_home:-$HOME}/Library/Caches/lily/instance.lock"
+# Machine-wide, the same for every user (`src/instance.rs`, `default_path`).
+lock_file=/Users/Shared/lily-instance.lock
 
 die() { echo "lily-service: $*" >&2; exit 1; }
 
@@ -183,7 +181,9 @@ lock_holder() {
     local pid binary command
     pid=$(awk '/^pid /{print $2; exit}' "$lock_file")
     binary=$(sed -n 2p "$lock_file")
-    { [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; } || return 0
+    [ -n "$pid" ] || return 0
+    # ps rather than kill -0, which fails for another user's process: the
+    # lock is machine-wide, so the holder may belong to any account.
     command=$(ps -o command= -p "$pid" 2>/dev/null) || return 0
     case "$command" in
         *"${binary##*/}"*) printf '%s %s\n' "$pid" "$command" ;;

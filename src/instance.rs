@@ -5,6 +5,10 @@
 //! two full models on a 128 GB machine panicked it on 2026-09-12 (102.8 GB
 //! and 68.6 GB resident, 62 MB free).
 //!
+//! The lock is machine-wide, not per account: the memory a second model
+//! would take is the machine's, whoever starts it, so a lily of another
+//! user (root under `sudo` included) is refused the same way.
+//!
 //! The lock is `flock(LOCK_EX | LOCK_NB)` on [`default_path`], taken once per
 //! process ([`acquire`], from the load path, so a reload after an idle unload
 //! finds it held) and never released: the kernel drops it when the process
@@ -23,26 +27,32 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Seek as _, Write as _};
 use std::os::fd::AsRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Mutex;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 
 /// The exit status of a process refused because another instance runs.
 pub const EXIT_ALREADY_RUNNING: u8 = 75;
 
-/// The lock every weight-loading process takes:
-/// `~/Library/Caches/lily/instance.lock`, next to the disk tier's default
-/// directory. Deliberately not configurable, so no two processes can
-/// disagree about it; tests lock their own file through [`InstanceLock::acquire_at`].
-///
-/// The home directory is [`home_dir`]'s. The lock is therefore per account:
-/// a process of another user, root under `sudo` included, resolves another
-/// home and does not see this one.
-pub fn default_path() -> Result<PathBuf> {
-    Ok(home_dir()?.join("Library").join("Caches").join("lily").join("instance.lock"))
+/// The lock every weight-loading process of any user takes:
+/// `/Users/Shared/lily-instance.lock`. `/Users/Shared` is macOS's directory
+/// for data shared between accounts, world-writable with the sticky bit
+/// (`drwxrwxrwt`), so every account can create the file and nobody but its
+/// owner (or root) can remove or replace it; the file sits directly in it
+/// because a subdirectory would carry its creator's mode. Until 2026-10-22
+/// the lock was `~/Library/Caches/lily/instance.lock`, per account, so a
+/// lily of another user did not see it. Deliberately not configurable, so no
+/// two processes can disagree about it; tests lock their own file through
+/// [`InstanceLock::acquire_at`].
+pub fn default_path() -> PathBuf {
+    PathBuf::from(DEFAULT_PATH)
 }
+
+/// [`default_path`] as a string, for messages.
+pub const DEFAULT_PATH: &str = "/Users/Shared/lily-instance.lock";
 
 /// The account's home directory from the user database, not `HOME`: a
 /// process started without `HOME` used to lock `./Library/...` relative to
@@ -50,8 +60,9 @@ pub fn default_path() -> Result<PathBuf> {
 /// second model (2026-10-19, benchmarks started with a cleared
 /// environment). An absolute `HOME` stands in when the user database
 /// lookup fails (no entry, or a sandbox or directory service refusing it);
-/// with neither, this fails rather than guess. The disk tier's default
-/// directory uses it too.
+/// with neither, this fails rather than guess. The instance lock used it
+/// until it became machine-wide (2026-10-22); the disk tier's default
+/// directory, which stays per account, uses it.
 pub fn home_dir() -> Result<PathBuf> {
     resolve_home(account_home(), std::env::var_os("HOME"))
 }
@@ -66,8 +77,8 @@ fn resolve_home(account: Option<PathBuf>, env: Option<OsString>) -> Result<PathB
         return Ok(home);
     }
     bail!(
-        "no home directory for the instance lock: the user database has no entry for this \
-         user and HOME is unset or relative"
+        "no home directory: the user database has no entry for this user and HOME is unset \
+         or relative"
     )
 }
 
@@ -164,6 +175,14 @@ impl InstanceLock {
     /// [`AlreadyRunning`] (downcastable from the error) when another open
     /// file description holds it, which includes another handle in this
     /// same process.
+    ///
+    /// The default path is in a directory every account can write, so the
+    /// file is opened as one that another user may have planted: a symbolic
+    /// link is not followed (`O_NOFOLLOW`), and anything but a regular file
+    /// with a single link is refused, since the holder truncates the file
+    /// to write its record and would otherwise truncate whatever a link
+    /// points at. A file this process owns is made `0666` whatever the
+    /// umask, so the next lily of another user can open it for writing too.
     pub fn acquire_at(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
@@ -176,8 +195,30 @@ impl InstanceLock {
             .write(true)
             .create(true)
             .truncate(false)
+            .mode(0o666)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path)
             .with_context(|| format!("opening the instance lock {}", path.display()))?;
+        let meta = file
+            .metadata()
+            .with_context(|| format!("reading the instance lock {}", path.display()))?;
+        ensure!(
+            meta.file_type().is_file() && meta.nlink() == 1,
+            "the instance lock {} is not a regular file with a single link; remove it \
+             (it may have been planted by another account)",
+            path.display()
+        );
+        // SAFETY: getuid cannot fail.
+        if meta.uid() == unsafe { libc::getuid() } && meta.mode() & 0o777 != 0o666 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o666)).with_context(
+                || {
+                    format!(
+                        "making the instance lock {} writable for all",
+                        path.display()
+                    )
+                },
+            )?;
+        }
         // SAFETY: flock on a descriptor we own.
         let rc =
             unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
@@ -221,7 +262,7 @@ static HELD: Mutex<Option<InstanceLock>> = Mutex::new(None);
 pub fn acquire() -> Result<()> {
     let mut held = HELD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if held.is_none() {
-        *held = Some(InstanceLock::acquire_at(&default_path()?)?);
+        *held = Some(InstanceLock::acquire_at(&default_path())?);
     }
     Ok(())
 }

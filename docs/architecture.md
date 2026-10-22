@@ -1612,18 +1612,25 @@ starting after the warm-up, the warm-up no longer runs behind it.
 
 **One instance per machine.** Two full instances on a 128 GB machine
 (102.8 GB and 68.6 GB resident, 62 MB free) panicked it on 2026-09-12, so
-every process that loads the weights refuses to run next to another one
-(`src/instance.rs`). The load path itself (`qwen4exp::weights::load`, and
+every process that loads the weights refuses to run next to another one,
+whichever account started either (`src/instance.rs`). The load path itself (`qwen4exp::weights::load`, and
 `VisionTower::load_from_dir` for the tower alone) takes an exclusive
-`flock(LOCK_EX | LOCK_NB)` on `~/Library/Caches/lily/instance.lock`, so the
+`flock(LOCK_EX | LOCK_NB)` on `/Users/Shared/lily-instance.lock`, so the
 server, `lily-bench`, `lily-probe`, `lily-vision-probe`, `lily-experts`,
 `lily-trace-routing` and the ignored tests that load a real checkpoint are
 all covered; the server takes it again, first thing, before it binds the
 port, so a second server names the holder instead of failing on "address
-in use". The `~` is the account's home from the user database, not `HOME`,
-so a process started with a cleared or altered environment still locks the
-same file (until 2026-10-19 one without `HOME` locked a path relative to its
-working directory and could load next to the service). A process takes it
+in use". The path is machine-wide and does not depend on the account or
+the environment: until 2026-10-22 it was `~/Library/Caches/lily/instance.lock`,
+so a lily of another user (root under `sudo` included) did not see the
+service's lock, and until 2026-10-19 one started without `HOME` locked a path
+relative to its working directory. `/Users/Shared` is world-writable with
+the sticky bit, so the file is created `0666` for every account to open, and
+opened as one another user may have planted: no symbolic link is followed
+and anything but a regular file with a single link is refused, because the
+holder truncates the file to write its record. Any account can hold the lock
+and so keep lily from starting; on a machine whose accounts are trusted that
+is the intended effect. A process takes it
 once and keeps it until it exits: the idle unload and the reloads (after an
 idle unload or a GPU fault) find it held, and the kernel drops it on any
 exit, a crash or a SIGKILL included, so no stale lock can block a start.

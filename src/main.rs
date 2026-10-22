@@ -22,8 +22,8 @@ const DEFAULT_THINKING_BUDGET: &str = "low=8000,medium=8000,xhigh=16000";
     name = "lily",
     about = "Qwen3.8-Flash-Next inference server",
     after_help = "Only one lily instance runs at a time: a server, lily-bench or lily-probe started \
-                  while another one holds ~/Library/Caches/lily/instance.lock refuses to start \
-                  and exits with status 75 (EX_TEMPFAIL). Stop the background service first \
+                  while another one, of any user, holds /Users/Shared/lily-instance.lock refuses \
+                  to start and exits with status 75 (EX_TEMPFAIL). Stop the background service first \
                   with tools/service/lily-service.sh stop."
 )]
 struct Cli {
@@ -326,8 +326,8 @@ fn parse_bytes(text: &str) -> Result<usize> {
     Ok((value * scale) as usize)
 }
 
-/// The disk tier's default directory, under the account's home like the
-/// instance lock (`lily::instance::home_dir`): without `HOME` it used to be
+/// The disk tier's default directory, under the account's home
+/// (`lily::instance::home_dir`): without `HOME` it used to be
 /// relative to the working directory, so a server started that way spilled
 /// its sessions there.
 fn default_disk_cache_dir() -> Result<PathBuf> {

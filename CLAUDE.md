@@ -66,8 +66,9 @@ claims from an interleaved A/B with repeats.
 ## The machine
 
 - **One instance.** Everything that loads the weights (the server,
-  `lily-bench`, `lily-probe`, checkpoint tests) takes
-  `~/Library/Caches/lily/instance.lock` and exits 75 while another holds it.
+  `lily-bench`, `lily-probe`, checkpoint tests) takes the machine-wide
+  `/Users/Shared/lily-instance.lock` and exits 75 while another process, of
+  any user, holds it.
   Two full models at once panicked this machine (2026-09-12); never work
   around the lock.
 - **The background service** is the launchd agent `com.lily.server`, managed

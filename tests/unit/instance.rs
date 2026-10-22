@@ -135,7 +135,7 @@ fn lock_path_child() {
     if std::env::var_os(PATH_CHILD_ENV).is_none() {
         return;
     }
-    let path = default_path().expect("the child resolves a lock path");
+    let path = default_path();
     println!("lock path: {}", path.display());
 }
 
@@ -166,20 +166,56 @@ fn child_lock_path(home: Option<&str>) -> String {
         .expect("the child printed its lock path")
 }
 
-/// Every process of the user locks the same absolute file whatever its
+/// Every process locks the same machine-wide file whatever its
 /// environment: without `HOME`, with a relative one, or with one pointing
 /// elsewhere, as a benchmark started with a cleared environment once did.
 #[test]
-fn the_lock_path_does_not_depend_on_home() {
+fn the_lock_path_is_machine_wide_and_does_not_depend_on_home() {
     // Children forked now could inherit another test's lock descriptor.
     let _serial = serial();
-    let here = default_path().expect("lock path");
-    assert!(here.is_absolute(), "{}", here.display());
-    assert!(here.ends_with("Library/Caches/lily/instance.lock"), "{}", here.display());
+    let here = default_path();
+    assert_eq!(here, Path::new("/Users/Shared/lily-instance.lock"));
     let here = here.display().to_string();
     assert_eq!(child_lock_path(None), here, "HOME unset");
     assert_eq!(child_lock_path(Some(".")), here, "HOME relative");
     assert_eq!(child_lock_path(Some("/nonexistent/elsewhere")), here, "HOME elsewhere");
+}
+
+/// The file is created `0666` whatever the umask (this process's is at
+/// least `022`), so the next lily of another account can open it too.
+#[test]
+fn a_new_lock_file_is_writable_for_every_account() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _serial = serial();
+    let path = temp_lock("mode");
+    let lock = InstanceLock::acquire_at(&path).expect("lock");
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o666, "{mode:o}");
+    drop(lock);
+}
+
+/// A link planted at the lock's path is refused rather than followed, and
+/// the file it points at is left as it was: the holder truncates the lock
+/// file to write its record.
+#[test]
+fn a_planted_symlink_or_hard_link_is_refused_and_its_target_untouched() {
+    let _serial = serial();
+    let path = temp_lock("links");
+    let dir = path.parent().unwrap();
+    std::fs::create_dir_all(dir).unwrap();
+    let victim = dir.join("victim");
+    std::fs::write(&victim, "precious").unwrap();
+
+    std::os::unix::fs::symlink(&victim, &path).unwrap();
+    let error = InstanceLock::acquire_at(&path).expect_err("symlink refused");
+    assert_eq!(exit_status(&error), 1, "{error:?}");
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+
+    std::fs::remove_file(&path).unwrap();
+    std::fs::hard_link(&victim, &path).unwrap();
+    let error = InstanceLock::acquire_at(&path).expect_err("hard link refused");
+    assert!(format!("{error}").contains("single link"), "{error}");
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
 }
 
 #[test]
