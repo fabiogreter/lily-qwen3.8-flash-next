@@ -138,8 +138,8 @@ database store numbers only, never prompt text or token ids.
   are private; their versions are not maintained.
 - A release is an annotated tag `vX.Y.Z` on that commit on `main` and a
   GitHub release (`gh release create`) whose notes summarise the changes
-  since the previous tag, with a prebuilt `aarch64-apple-darwin` binary
-  attached. Upgrade notes (flags that are now refused, new files or
+  since the previous tag. It ships no binary: lily is built from the tagged
+  source. Upgrade notes (flags that are now refused, new files or
   threads, downgrade limits) belong in those release notes, not in
   `docs/`. Tags, releases and their uploads only with the owner's go, like
   pushes.
